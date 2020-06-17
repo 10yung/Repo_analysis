@@ -1,0 +1,148 @@
+While working with Shio, I ran into an issue where I needed the `shio::http::Method` struct to implement `Clone`. The underlying `http_types::Method` type is `Clone`-able, so the wrapper data structure probably should be too.
+
+I worked around this for now by creating my own custom `Method` struct which is both `Clone` and `Into<shio::http::Method>`, but in general, it's considered good practice to derive common traits (e.g. `Clone`, `Debug`, `Eq`, `Hash`, `PartialEq`) for most public data types where possible.
+The usage example is missing imports for `Context` and `Method` and possibly others.
+
+I read the changelog at https://github.com/mehcode/shio-rs/blob/master/CHANGELOG.md , but could not `use shio::http::{Method};` because:
+
+``` rust
+  |
+8 | use shio::http::{Method};
+  |           ^^^^ Could not find `http` in `shio`
+```
+Fix issues with the tests.
+I am really liking this framework. Thanks for writing it. I started working on a MySQL example based off the Postgres example, but I'm getting stuck on how to move the db connection pool outside of the handler function into a static or thread local variable:
+
+https://github.com/llambda/shio-rs/commit/73f426acb9a9b3422dba06cc64d5405b9fa52774#diff-b8f3d0d19969c0811b90c7114d80f0b1R43
+When registering a route with GET /test and I send a POST request to /test, the return is 404.
+
+It should be 405 Method Not Allowed.
+What I'd like to do is something like this, so I can use some of the struct fields within the response:
+
+```
+extern crate shio;
+
+use shio::prelude::*;
+use shio::Handler;
+
+struct TestStruct {}
+
+impl TestStruct {
+    pub fn test_closure(&self) -> Box<Handler<Result=Response>> {
+        Box::new(|_ctx| Response::with("Hello World"))
+    }
+}
+
+fn main() {
+
+    let test_struct = TestStruct {};
+
+    Shio::default()
+        .route((Method::Get, "/", test_struct.test_closure()))
+        .run(":7878").unwrap();
+}
+```
+This would allow responses to be built up using other struct fields.
+
+But this errors out:
+
+```
+error[E0277]: the trait bound `std::boxed::Box<shio::Handler<Result=shio::Response>>: std::ops::Fn<(shio::Context,)>` is not satisfied
+  --> src/main.rs:19:10
+   |
+19 |         .route((Method::Get, "/", test_struct.test_closure()))
+   |          ^^^^^ the trait `std::ops::Fn<(shio::Context,)>` is not implemented for `std::boxed::Box<shio::Handler<Result=shio::Response>>`
+   |
+   = note: required because of the requirements on the impl of `shio::Handler` for `std::boxed::Box<shio::Handler<Result=shio::Response>>`
+   = note: required because of the requirements on the impl of `std::convert::From<(shio::Method, &str, std::boxed::Box<shio::Handler<Result=shio::Response>>)>` for `shio::router::Route`
+   = note: required because of the requirements on the impl of `std::convert::Into<shio::router::Route>` for `(shio::Method, &str, std::boxed::Box<shio::Handler<Result=shio::Response>>)`
+
+error: aborting due to previous error
+
+error: Could not compile `shiotest`.
+
+To learn more, run the command again with --verbose.
+```
+
+
+Using the new impl trait on nightly works OK though:
+
+```
+#![feature(conservative_impl_trait)]
+extern crate shio;
+
+use shio::prelude::*;
+use shio::Handler;
+
+struct TestStruct {}
+
+impl TestStruct {
+    pub fn test_closure(&self) -> impl Handler<Result=Response> {
+        |_ctx| Response::with("Hello World")
+    }
+}
+
+fn main() {
+
+    let test_struct = TestStruct {};
+
+    Shio::default()
+        .route((Method::Get, "/", test_struct.test_closure()))
+        .run(":7878").unwrap();
+}
+```
+
+Following from https://github.com/hyperium/hyper/issues/1328
+
+Currently the type signature of the shio::Response is heavily coupled to hyper::Body:
+
+```
+pub struct Response {
+    pub inner: hyper::Response<hyper::Body>,
+}
+```
+
+And setting the body requires that it can be at least converted into a hyper::Body:
+
+```
+    pub fn set_body<B: Into<hyper::Body>>(&mut self, body: B) {
+        self.inner.set_body(body.into());
+    }
+```
+
+The body could possibly be more generic, as per the hyper crate which would allow such things as providing a Stream directly to the body, simplifying implementation for more tricky things (like streaming files from disk).
+If I am not mistaken, the example regarding the proxying solution will create a new client per request in https://github.com/mehcode/shio-rs/blob/master/examples/proxy/src/main.rs#L19
+
+If I am correct - how would this be done with a per-thread client?
+Hi,
+
+this is awesome work!! I was just about to start a micro services kit myself but luckily found your effort today. I am looking for some tiny layer on top of hyper, but of less weight than rocket. You seem to be headed towards that direction.
+
+I have use cases where I need to run periodical work in the background (periodic timer-triggered work). I'd like to run this off the same core as hyper server because I am also targeting single threaded scenarios in constrained environments.
+
+Do you have plans for passing a core to Shio, as an alternative to having shia create its own? If so, could you share your plans so I can work in the right direction?
+
+Anyhow - so happy to see this!
+
+Jan
+This may already be handled in another way, but I can't for the life of me work it out.
+
+Using the [HTTP Stream](https://github.com/mehcode/shio-rs/blob/master/examples/proxy/src/main.rs) example, say you wanted to convert this into a POST request and include the body.
+
+You'd do something like this:
+
+```
+    let mut client_req = Request::new(ctx.method().clone(), "http://example.com".parse().unwrap());
+    client_req.headers_mut().extend(ctx.headers().iter());
+    client_req.set_body(ctx.body());
+```
+
+Only the issue is that you can't convert `shio::request::Body` to `hyper::Body`:
+
+```
+error[E0277]: the trait bound `hyper::Body: std::convert::From<shio::request::Body>` is not satisfied
+  --> src/main.rs:17:16
+   |
+17 |     client_req.set_body(ctx.body());
+   |                ^^^^^^^^ the trait `std::convert::From<shio::request::Body>` is not implemented for `hyper::Body`
+```

@@ -1,0 +1,150 @@
+I'm not sure it is intentional or not, but I noticed that if I create an object in a context and I try to pass it around, after returning from a function (or between 2 tasks) the original object is lost and got replaced by a newly constructed one.
+
+eg:
+```
+class BuildContext:
+
+    def __init__(self):
+        print('constructed')
+        self.basedir = Path('/home/builder/code')
+        self.projectdir = self.basedir
+
+    def __copy__(self):
+        print('copied')
+        cop = BuildContext()
+        cop.basedir = self.basedir
+        cop.projectdir = self.projectdir
+        return cop
+
+    def update_projectdir(self, project):
+        self.projectdir /= project
+
+@task
+def setup(c, project):
+    c.build_context = BuildContext()
+    c.build_context.update_projectdir(project)
+    # here the projectdir is ok  
+    deps.setup(c)
+    # here the projectdir is vanilla
+
+```
+
+Overriding `__copy__` doesn't seem to fix the issue. The data is lost somewhere beforehand. Regardless there are loads of copies and constructions happening anyway.
+Here is the output of `inv setup --project bob build`
+```
+Starting builder...
+constructed
+copied
+constructed
+copied
+constructed
+copied
+constructed
+copied
+constructed
+copied
+constructed
+copied
+constructed
+copied
+constructed
+copied
+constructed
+/home/builder/code
+```
+
+Works with plain dicts, but I would have been happier with encapsulated operations.
+I want to write a task such as `invoke run bash -c echo "hello"` where the task `run` is defined as follows in bash:
+
+```
+docker run -it myapp "$@"
+```
+
+How do I do the equivalent of "$@" in pyinvoke?
+I have moved all core logic of a specific task out of my invoke tasks.
+So what I am left with is each task validating user input, whether arguments are ok or not and then calling a separate function doing the actual work. As described here:
+
+http://docs.pyinvoke.org/en/stable/concepts/testing.html#avoid-mocking-dependency-code-paths-altogether
+
+But now I want to test the argument validation part. So basically I want to call my script from pytest as a user would do and then be able to validate the arguments. I guess I need some kind of cli-runner like `click` has. 
+
+https://click.palletsprojects.com/en/7.x/testing/
+
+I went through the docs and searched online but I can't seem to find any pointers on this.
+Anyone any clues ?
+This is one of those "could be considered a bugfix, could be considered a feature" things. Follows (kinda) from #682 as that exposed the need/lack here when it created `Promise`.
+
+tl;dr a subset of run() kwargs are exposed explicitly in `Result`, such as `command`, `pty` etc - but a bunch are _not_ - such as `warn`, `hide`, `out_stream`. It seems like it makes good sense to straight-up copy any and all kwarg values from `run` into the structures that emerge as `Result`, as well as `Promise` (insofar as the "what `run` did you come from?" property applies to both).
+Followup from #682, specifically [this comment subthread](https://github.com/pyinvoke/invoke/issues/682#issuecomment-570618845) around eg:
+
+``` python
+promise = Runner.run("foo", asynchronous=True)
+promise.interrupt()  # SIGINT's or otherwise terminates child, as if ^C
+promise.join()
+```
+
+This is relatively easy for Local but it's harder to come up with a clean API that works for Fabric 2's Remote as well, without either duplication of code, silent no-op behavior (gross) or proliferation of a lot of subroutines.
+
+There's certainly a way forward somewhere, but it was not worth the dev time when wrapping up #682.
+Result.hide‘s default value is False，it’s a empty tuple, it's means weren't hidden from the user when the generating command executed.
+When have a UnexceptionExit, in default(hide = False), it should be printed 10 lines stdout and 10 lines stderr, but beacuse here is not in, so in default, it printed 'already printed' twice.
+
+tasks.py:
+
+```
+from invoke import task
+
+
+@task
+def test(c):
+    with c.cd("/tmp"):
+        c.run("ls")
+        c.sudo("ls")
+
+```
+
+Result:
+
+```
+(tmp) root@pilaf:/home/fermigier/tmp# inv test
+[content of my /tmp]
+sudo: cd: command not found
+```
+
+In other words, `run` is ok, `sudo` is not.
+
+Running with `inv -d test`, I get the following exception:
+```
+invoke.program.run: Received a possibly-skippable exception: <UnexpectedExit: cmd="sudo -S -p '[sudo] password: ' cd /tmp && ls" exited=1>
+```
+
+Note that `/usr/bin/cd` doesn't exist on Debian. It exists on MacOS. I havent tried other distributions.
+
+This looks awesome. If only I could get it to run from the command line. I'm missing something here. Something really obvious and I just know I'm going to feel foolish when I find out the answer. I've googled around for a while and found nothing specifically or generally. 
+
+I do: `pip3 install invoke`, it installs successfully. In the command line (on Ubuntu 18.10) I try to run `invoke` but of course I get `command not found`. How do I run `invoke` from the (linux) command line????!!! Please? :)  
+
+The version that comes with the ubuntu package manager is very old (0.11).
+
+Example code:
+```python3
+from functools import wraps
+from invoke import Task
+
+def somewrapper(**kwargs):
+    def inner(f):
+        @wraps(f)
+        def wrapper(c, *a, **kw):
+            return f(c, *a, **kw)
+        return Task(wrapper, **kwargs)
+    return inner
+
+@somewrapper()
+def mytask(c, arg1, kwarg1=None):
+    pass
+```
+
+Expected: `invoke mytask --help` lists arg1 and kwarg1 as options
+Actual: `invoke mytask --help` lists no options
+
+I have traced this to `Task.argspec` using `inspect.getargspec`, which does not automatically look for a `__wrapped__` property. I have produced a tiny change that should rectify this (PR to follow). As a point of note, `inspect.getargspec` has been [deprecated](https://docs.python.org/3.7/library/inspect.html#inspect.getargspec) since Python 3.0, in favor of `inpect.signature`, which _does_ automatically look for `__wrapped__`.

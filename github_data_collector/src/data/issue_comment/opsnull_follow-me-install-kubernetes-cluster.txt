@@ -1,0 +1,433 @@
+**v1.12**
+
+**现象描述**
+现在，我根据部署文档已经部署了几套环境，都没什么问题，就是时间太长了，我的脚本技术不太行，就是不知道能不能出一个自动化部署脚本啥的，就完美了
+
+# 组件版本
+k8s版本:：v1. 14.2
+etcd版本：3.3.11
+
+# 集群:
+
+主机名 | 角色 | IP | 系统版本 | 内核版本 
+---|--- | --- | --- | -- |
+node01.tracy.com | node01 | 10.0.20.31 | CentOS 7.7 | 5.4.0-1.el7.elrepo.x86_64
+node02.tracy.com | node02 | 10.0.20.32 | CentOS 7.7 | 5.4.0-1.el7.elrepo.x86_64
+node03.tracy.com | node03 | 10.0.20.33 | CentOS 7.7 | 5.4.0-1.el7.elrepo.x86_64
+
+# 各组件配置文件
+
+## ETCD 配置文件
+
+```
+[root@node02 ~]# cat /etc/systemd/system/etcd.service 
+[Unit]
+Description=Etcd Server
+After=network.target
+After=network-online.target
+Wants=network-online.target
+Documentation=https://github.com/coreos
+
+[Service]
+Type=notify
+WorkingDirectory=/data/k8s/etcd/data
+ExecStart=/opt/k8s/bin/etcd \
+  --data-dir=/data/k8s/etcd/data \
+  --wal-dir=/data/k8s/etcd/wal \
+  --name=node02 \
+  --cert-file=/etc/etcd/cert/etcd.pem \
+  --key-file=/etc/etcd/cert/etcd-key.pem \
+  --trusted-ca-file=/etc/kubernetes/cert/ca.pem \
+  --peer-cert-file=/etc/etcd/cert/etcd.pem \
+  --peer-key-file=/etc/etcd/cert/etcd-key.pem \
+  --peer-trusted-ca-file=/etc/kubernetes/cert/ca.pem \
+  --peer-client-cert-auth \
+  --client-cert-auth \
+  --listen-peer-urls=https://10.0.20.32:2380 \
+  --initial-advertise-peer-urls=https://10.0.20.32:2380 \
+  --listen-client-urls=https://10.0.20.32:2379,http://127.0.0.1:2379 \
+  --advertise-client-urls=https://10.0.20.32:2379 \
+  --initial-cluster-token=etcd-cluster-0 \
+  --initial-cluster=node01=https://10.0.20.31:2380,node02=https://10.0.20.32:2380,node03=https://10.0.20.33:2380 \
+  --initial-cluster-state=new \
+  --auto-compaction-mode=periodic \
+  --auto-compaction-retention=1 \
+  --max-request-bytes=33554432 \
+  --quota-backend-bytes=6442450944 \
+  --heartbeat-interval=250 \
+  --election-timeout=2000
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**etcd集群状态**
+
+```
+[root@node01 ~]# etcdctl \
+> --endpoint=https://10.0.20.31:2379 \
+> --ca-file=/etc/kubernetes/cert/ca.pem \
+> --cert-file=/etc/etcd/cert/etcd.pem \
+> --key-file=/etc/etcd/cert/etcd-key.pem cluster-health
+member 20efe5e6128d9e63 is healthy: got healthy result from https://10.0.20.31:2379
+member 7cf960cbc106b63f is healthy: got healthy result from https://10.0.20.33:2379
+member e6886445a833720c is healthy: got healthy result from https://10.0.20.32:2379
+cluster is healthy
+```
+
+
+## flanneld 配置文件
+
+```
+[root@node02 ~]# cat /etc/systemd/system/flanneld.service 
+[Unit]
+Description=Flanneld overlay address etcd agent
+After=network.target
+After=network-online.target
+Wants=network-online.target
+After=etcd.service
+Before=docker.service
+
+[Service]
+Type=notify
+ExecStart=/opt/k8s/bin/flanneld \
+  -etcd-cafile=/etc/kubernetes/cert/ca.pem \
+  -etcd-certfile=/etc/flanneld/cert/flanneld.pem \
+  -etcd-keyfile=/etc/flanneld/cert/flanneld-key.pem \
+  -etcd-endpoints=https://10.0.20.31:2379,https://10.0.20.32:2379,https://10.0.20.33:2379 \
+  -etcd-prefix=/kubernetes/network \
+  -iface=bond0 \
+  -ip-masq
+ExecStartPost=/opt/k8s/bin/mk-docker-opts.sh -k DOCKER_NETWORK_OPTIONS -d /run/flannel/docker
+Restart=always
+RestartSec=5
+StartLimitInterval=0
+
+[Install]
+WantedBy=multi-user.target
+RequiredBy=docker.service
+```
+
+## apiserver 配置文件
+
+```
+[root@node02 ~]# cat /etc/systemd/system/kube-apisserver.service 
+[Unit]
+Description=Kubernetes API Server
+Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+After=network.target
+
+[Service]
+WorkingDirectory=/data/k8s/k8s/kube-apiserver
+ExecStart=/opt/k8s/bin/kube-apiserver \
+  --advertise-address=10.0.20.32 \
+  --default-not-ready-toleration-seconds=360 \
+  --default-unreachable-toleration-seconds=360 \
+  --feature-gates=DynamicAuditing=true \
+  --max-mutating-requests-inflight=2000 \
+  --max-requests-inflight=4000 \
+  --default-watch-cache-size=200 \
+  --delete-collection-workers=2 \
+  --encryption-provider-config=/etc/kubernetes/encryption-config.yaml \
+  --etcd-cafile=/etc/kubernetes/cert/ca.pem \
+  --etcd-certfile=/etc/kubernetes/cert/kubernetes.pem \
+  --etcd-keyfile=/etc/kubernetes/cert/kubernetes-key.pem \
+  --etcd-servers=https://10.0.20.31:2379,https://10.0.20.32:2379,https://10.0.20.33:2379 \
+  --bind-address=10.0.20.32 \
+  --secure-port=6443 \
+  --tls-cert-file=/etc/kubernetes/cert/kubernetes.pem \
+  --tls-private-key-file=/etc/kubernetes/cert/kubernetes-key.pem \
+  --insecure-port=0 \
+  --audit-dynamic-configuration \
+  --audit-log-maxage=15 \
+  --audit-log-maxbackup=3 \
+  --audit-log-maxsize=100 \
+  --audit-log-truncate-enabled \
+  --audit-log-path=/data/k8s/k8s/kube-apiserver/audit.log \
+  --audit-policy-file=/etc/kubernetes/audit-policy.yaml \
+  --profiling \
+  --anonymous-auth=false \
+  --client-ca-file=/etc/kubernetes/cert/ca.pem \
+  --enable-bootstrap-token-auth \
+  --requestheader-allowed-names="aggregator" \
+  --requestheader-client-ca-file=/etc/kubernetes/cert/ca.pem \
+  --requestheader-extra-headers-prefix="X-Remote-Extra-" \
+  --requestheader-group-headers=X-Remote-Group \
+  --requestheader-username-headers=X-Remote-User \
+  --service-account-key-file=/etc/kubernetes/cert/ca.pem \
+  --authorization-mode=Node,RBAC \
+  --runtime-config=api/all=true \
+  --enable-admission-plugins=NodeRestriction \
+  --allow-privileged=true \
+  --apiserver-count=3 \
+  --event-ttl=168h \
+  --kubelet-certificate-authority=/etc/kubernetes/cert/ca.pem \
+  --kubelet-client-certificate=/etc/kubernetes/cert/kubernetes.pem \
+  --kubelet-client-key=/etc/kubernetes/cert/kubernetes-key.pem \
+  --kubelet-https=true \
+  --kubelet-timeout=10s \
+  --proxy-client-cert-file=/etc/kubernetes/cert/proxy-client.pem \
+  --proxy-client-key-file=/etc/kubernetes/cert/proxy-client-key.pem \
+  --service-cluster-ip-range=10.254.0.0/16 \
+  --service-node-port-range=1024-32767 \
+  --logtostderr=true \
+  --v=2
+Restart=on-failure
+RestartSec=10
+Type=notify
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+```
+
+## nginx 配置文件
+
+```
+[root@node02 ~]# cat /opt/k8s/kube-nginx/conf/kube-nginx.conf 
+worker_processes 1;
+events {
+    worker_connections  1024;
+}
+stream {
+    log_format proxy '$remote_addr [$time_local]'
+                '$protocol $status $bytes_sent $bytes_received'
+                '$session_time "$upstream_addr" '
+                '"$upstream_bytes_sent" "$upstream_bytes_received" "$upstream_connect_time"';
+    access_log /opt/k8s/kube-nginx/logs/access.log proxy ;
+    upstream backend {
+        hash  consistent;
+        server 10.0.20.31:6443        max_fails=3 fail_timeout=30s;
+        server 10.0.20.32:6443        max_fails=3 fail_timeout=30s;
+        server 10.0.20.33:6443        max_fails=3 fail_timeout=30s;
+    }
+    server {
+        listen *:8443;
+        proxy_connect_timeout 1s;
+        proxy_pass backend;
+    }
+}
+```
+
+**nginx监听地址使用`127.0.0.1`也测试过**
+
+# 问题现象
+
+## 1、在启动apiserver前
+
+在启动apiserver前都是正常的，但是配置好apiserver后
+
+etcd 查看状态就不正常 就开始报错:
+
+```
+[root@node01 ~]# systemctl status etcd
+● etcd.service - Etcd Server
+   Loaded: loaded (/etc/systemd/system/etcd.service; enabled; vendor preset: disabled)
+   Active: active (running) since Fri 2019-11-29 12:18:52 CST; 25min ago
+     Docs: https://github.com/coreos
+ Main PID: 1342 (etcd)
+   CGroup: /system.slice/etcd.service
+           └─1342 /opt/k8s/bin/etcd --data-dir=/data/k8s/etcd/data --wal-dir=/data/k8s/etcd/wal --name=node01 --cert-file=/etc/etcd/cert/etcd.pem --key-file=/etc/etcd/cert/etcd-key.pem -...
+
+Nov 29 12:18:54 node01.tracy.com etcd[1342]: rejected connection from "10.0.20.31:39976" (error "EOF", ServerName "")
+Nov 29 12:18:54 node01.tracy.com etcd[1342]: rejected connection from "10.0.20.31:39986" (error "EOF", ServerName "")
+```
+
+## 2、apiserver自身报错
+
+在确保了etcd集群正常的情况，message报错如下：
+
+```
+Nov 29 12:18:55 node01 kube-apiserver: W1129 12:18:55.730235    1339 asm_amd64.s:1337] Failed to dial 10.0.20.32:2379: grpc: the connection is closing; please retry.
+Nov 29 12:18:55 node01 kube-apiserver: W1129 12:18:55.730298    1339 asm_amd64.s:1337] Failed to dial 10.0.20.33:2379: grpc: the connection is closing; please retry.
+```
+
+一直会有这样的报错，等一会儿后日志如下:
+
+```
+Nov 29 10:50:47 node01 kube-apiserver: I1129 10:50:47.741463   13902 storage_rbac.go:284] created rolebinding.rbac.authorization.k8s.io/system::leader-locking-kube-scheduler in kube-system
+Nov 29 10:50:47 node01 kube-apiserver: I1129 10:50:47.781732   13902 storage_rbac.go:284] created rolebinding.rbac.authorization.k8s.io/system:controller:bootstrap-signer in kube-system
+Nov 29 10:50:47 node01 kube-apiserver: I1129 10:50:47.821448   13902 storage_rbac.go:284] created rolebinding.rbac.authorization.k8s.io/system:controller:cloud-provider in kube-system
+Nov 29 10:50:47 node01 kube-apiserver: I1129 10:50:47.861600   13902 storage_rbac.go:284] created rolebinding.rbac.authorization.k8s.io/system:controller:token-cleaner in kube-system
+Nov 29 10:50:47 node01 kube-apiserver: I1129 10:50:47.901997   13902 storage_rbac.go:284] created rolebinding.rbac.authorization.k8s.io/system:controller:bootstrap-signer in kube-public
+Nov 29 10:50:47 node01 kube-apiserver: W1129 10:50:47.985238   13902 lease.go:222] Resetting endpoints for master service "kubernetes" to [10.0.20.31]
+Nov 29 10:50:47 node01 kube-apiserver: I1129 10:50:47.985971   13902 controller.go:606] quota admission added evaluator for: endpoints
+```
+
+最后这里日志 看着 apiserver又是正常的了
+
+apiserver看起来正常，但实际不行，操作如下：
+
+```
+[root@node01 ~]# kubectl get cs
+Error from server (BadRequest): the server rejected our request for an unknown reason
+```
+
+# 我的测试
+
+## 1、降级etcd 3.2.x 问题依旧
+## 2、降级内核 4.18  问题依旧
+## 3、修改config，直接连接自己的apiserver，问题依旧
+
+
+还请麻烦您帮忙看看问题在哪里。。谢谢
+
+有可能是我某些看似正常的操作 不正常，但目前已知没找到问题
+
+
+ kubectl describe clusterrole system:kube-controller-manager
+Unable to connect to the server: EOF
+
+kubectl get clusterrole|grep controller
+Unable to connect to the server: EOF
+
+ kubectl describe clusterrole system:controller:deployment-controller
+Unable to connect to the server: EOF
+
+kubectl get endpoints kube-controller-manager --namespace=kube-system  -o yaml
+Unable to connect to the server: EOF
+
+启动日志提示
+7596 leaderelection.go:306] error retrieving resource lock kube-system/kube-controller-manager: Get https://127.0.0.1:8443/api/v1/namespaces/kube-system/endpoints/kube-controller-manager?timeout=10s: context deadline exceeded
+Nov 28 10:05:41 master kube-controller-manager[7596]: E1128 10:05:41.122610    7596 leaderelection.go:306] error retrieving resource lock kube-system/kube-controller-manager: Get https://127.0.0.1:8443/api/v1/namespaces/kube-system/endpoints/kube-controller-manager?timeout=10s: EOF
+Nov 28 10:05:52 master kube-controller-manager[7596]: E1128 10:05:52.919785    7596 leaderelection.go:306] error retrieving resource lock kube-system/kube-controller-manager: an error on the server ("") has prevented the request from succeeding (get endpoints kube-controller-manager)
+Nov 28 10:06:05 master kube-controller-manager[7596]: E1128 10:06:05.626214    7596 leaderelection.go:306] error retrieving resource lock kube-system/kube-controller-manager: Get https://127.0.0.1:8443/api/v1/namespaces/kube-system/endpoints/kube-controller-manager?timeout=10s: context deadline exceeded
+
+求解
+### **服务文件**
+
+[Unit]
+Description=Etcd Server
+After=network.target
+After=network-online.target
+Wants=network-online.target
+Documentation=https://github.com/coreos
+
+[Service]
+Type=notify
+WorkingDirectory=/opt/etcd/data/
+ExecStart=/opt/k8s/bin/etcd \
+  --data-dir=/opt/etcd/data/ \
+  --wal-dir=/home/etcd/wal/ \
+  --name=zhangjun-k8s02 \
+  --cert-file=/etc/etcd/cert/etcd.pem \
+  --key-file=/etc/etcd/cert/etcd-key.pem \
+  --trusted-ca-file=/etc/kubernetes/cert/ca.pem \
+  --peer-cert-file=/etc/etcd/cert/etcd.pem \
+  --peer-key-file=/etc/etcd/cert/etcd-key.pem \
+  --peer-trusted-ca-file=/etc/kubernetes/cert/ca.pem \
+  --peer-client-cert-auth \
+  --client-cert-auth \
+  --listen-peer-urls=https://192.168.1.51:2380 \
+  --initial-advertise-peer-urls=https://192.168.1.51:2380 \
+  --listen-client-urls=https://192.168.1.51:2379,http://127.0.0.1:2379 \
+  --advertise-client-urls=https://192.168.1.51:2379 \
+  --initial-cluster-token=etcd-cluster-0 \
+  --initial-cluster=zhangjun-k8s01,zhangjun-k8s02 \
+  --initial-cluster-state=new \
+  --auto-compaction-mode=periodic \
+  --auto-compaction-retention=1 \
+  --max-request-bytes=33554432 \
+  --quota-backend-bytes=6442450944 \
+  --heartbeat-interval=250 \
+  --election-timeout=2000
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+
+### 报错内容
+11月 27 17:44:16 zhangjun-k8s02 etcd[46592]: etcd Version: 3.4.3
+11月 27 17:44:16 zhangjun-k8s02 etcd[46592]: [WARNING] Deprecated '--logger=capnslog' flag is set; use '--logger=zap' flag instead
+11月 27 17:44:16 zhangjun-k8s02 etcd[46592]: [WARNING] Deprecated '--logger=capnslog' flag is set; use '--logger=zap' flag instead
+11月 27 17:44:16 zhangjun-k8s02 etcd[46592]: Git SHA: 3cf2f69b5
+11月 27 17:44:16 zhangjun-k8s02 etcd[46592]: Go Version: go1.12.12
+11月 27 17:44:16 zhangjun-k8s02 etcd[46592]: Go OS/Arch: linux/amd64
+11月 27 17:44:16 zhangjun-k8s02 etcd[46592]: setting maximum number of CPUs to 2, total number of available CPUs is 2
+11月 27 17:44:16 zhangjun-k8s02 etcd[46592]: peerTLS: cert = /etc/etcd/cert/etcd.pem, key = /etc/etcd/cert/etcd-key.pem, trusted-ca = /etc/kubernetes/cert/ca.pem, client-cert-aut
+11月 27 17:44:16 zhangjun-k8s02 etcd[46592]: The scheme of client url http://127.0.0.1:2379 is HTTP while peer key/cert files are presented. Ignored key/cert files.
+11月 27 17:44:16 zhangjun-k8s02 etcd[46592]: The scheme of client url http://127.0.0.1:2379 is HTTP while client cert auth (--client-cert-auth) is enabled. Ignored client cert au
+11月 27 17:44:16 zhangjun-k8s02 etcd[46592]: error setting up initial cluster: URL scheme must be http, https, unix, or unixs: 
+11月 27 17:44:16 zhangjun-k8s02 systemd[1]: etcd.service: main process exited, code=exited, status=1/FAILURE
+11月 27 17:44:16 zhangjun-k8s02 systemd[1]: Failed to start Etcd Server.
+
+**重点这一句看不懂：**
+error setting up initial cluster: URL scheme must be http, https, unix, or unixs:
+
+**文档版本**
+v1.14.2。
+
+**现象描述**
+按照楼主v1.14.2文档安装kubernetes 1.15.3版本，安装完后集群各服务都是正常的，但是执行kubectl get cs 的返回scheduler 和controller-manager 异常，发现kubectl get cs的健康检查是向 http://127.0.0.1:10251发送get请求，但是按照楼主的文档10251端口是监听在eth0网卡上的，试过更改kube-scheduler.yaml配置文件中的healthzBindAddress参数为127.0.0.1，改完之后10251端口确实监听在了127.0.0.1，但是执行kubectl get cs时还是一样的报错，请问有什么方法可以解决掉这个报错？
+
+[root@kube-master01 prometheus]# kubectl get cs
+NAME                 STATUS      MESSAGE                                                                                     ERROR
+scheduler            Unhealthy   Get http://127.0.0.1:10251/healthz: dial tcp 127.0.0.1:10251: connect: connection refused
+controller-manager   Unhealthy   Get http://127.0.0.1:10252/healthz: dial tcp 127.0.0.1:10252: connect: connection refused
+etcd-2               Healthy     {"health":"true"}
+etcd-0               Healthy     {"health":"true"}
+etcd-1               Healthy     {"health":"true"}
+
+
+**文档版本**
+说明你查看的是哪个 branch 的文档，即 K8S 版本，如 v1.8、v1.12。
+
+**现象描述**
+描述问题的现象。
+
+**文档版本**
+etcd v3.4。
+
+**现象描述**
+[root@k8s-node-01 work]# ETCDCTL_API=2 etcdctl \
+tLen": 21, "Backend": {"Type": "vxlan"}}'>   --endpoints=${ETCD_ENDPOINTS} \
+>   --ca-file=/opt/k8s/work/ca.pem \
+>   --cert-file=/opt/k8s/work/flanneld.pem \
+>   --key-file=/opt/k8s/work/flanneld-key.pem \
+>   mk ${FLANNEL_ETCD_PREFIX}/config '{"Network":"'${CLUSTER_CIDR}'", "SubnetLen": 21, "Backend": {"Type": "vxlan"}}'
+**Error:  client: response is invalid json. The endpoint is probably not valid etcd cluster endpoint**
+
+**文档版本**
+我按照master文档部署，etcd版本 3.3.13 ，k8s 版本1.14.2 ，部署06-2.高可用 kube-apiserver 集群后，kubectl get cs 都能正常显示ETCD状态
+$ kubectl get componentstatuses
+NAME                 STATUS      MESSAGE                                                                                     ERROR
+controller-manager   Unhealthy   Get http://127.0.0.1:10252/healthz: dial tcp 127.0.0.1:10252: connect: connection refused
+scheduler            Unhealthy   Get http://127.0.0.1:10251/healthz: dial tcp 127.0.0.1:10251: connect: connection refused
+etcd-0               Healthy     {"health":"true"}
+etcd-2               Healthy     {"health":"true"}
+etcd-1               Healthy     {"health":"true"}
+
+**现象描述**
+如果我升级K8S版本为1.16.3，ETCD 还是使用3.3.13 ，kubectl get cs看到ETCD状态是unknown的，etcd输出状态都是正常的，升级ETCD版本为3.3.17或者全新部署K8S 1.16.3都一样显示unknown。
+是不是这个文档不适合部署1.16.3吗？或者有什么办法解决这种现象出现。
+
+[root@master01 work]# kubectl get cs
+NAME                 AGE
+scheduler            `<unknown>`
+controller-manager   `<unknown>`
+etcd-1               `<unknown>`
+etcd-2               `<unknown>`
+etcd-0               `<unknown>`
+#517
+**文档版本**
+说明你查看的是哪个 branch 的文档，即 K8S 版本，如 v1.8、v1.12。
+
+**现象描述**
+部署启动etcd报错误！
+:50:11 CST, end at Wed 2019-11-13 13:34:00 CST. --
+Nov 13 11:08:43 k8s-01 systemd[1]: [/etc/systemd/system/etcd.service:10] Not an absolute path, ignoring: ${ETCD_DATA_DIR}
+Nov 13 11:08:43 k8s-01 systemd[1]: [/etc/systemd/system/etcd.service:12] Unknown lvalue '--data-dir' in section 'Service'
+Nov 13 11:08:43 k8s-01 systemd[1]: [/etc/systemd/system/etcd.service:13] Unknown lvalue '--wal-dir' in section 'Service'
+Nov 13 11:08:43 k8s-01 systemd[1]: [/etc/systemd/system/etcd.service:14] Unknown lvalue '--name' in section 'Service'
+Nov 13 11:08:43 k8s-01 systemd[1]: [/etc/systemd/system/etcd.service:15] Unknown lvalue '--cert-file' in section 'Service'
+Nov 13 11:08:43 k8s-01 systemd[1]: [/etc/systemd/system/etcd.service:16] Unknown lvalue '--key-file' in section 'Service'
+Nov 13 11:08:43 k8s-01 systemd[1]: [/etc/systemd/system/etcd.service:17] Unknown lvalue '--trusted-ca-file' in section 'Service'
+Nov 13 11:08:43 k8s-01 systemd[1]: [/etc/systemd/system/etcd.service:18] Unknown lvalue '--peer-cert-file' in section 'Service'
+Nov 13 11:08:43 k8s-01 systemd[1]: [/etc/systemd/system/etcd.service:19] Unknown lvalue '--peer-key-file' in section 'Service'
+Nov 13 11:08:43 k8s-01 systemd[1]: [/etc/systemd/system/etcd.service:20] Unknown lvalue '--peer-trusted-ca-file' in section 'Service'
+Nov 13 11:08:43 k8s-01 systemd[1]: [/etc/systemd/system/etcd.service:21] Missing '='.

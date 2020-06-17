@@ -1,0 +1,73 @@
+This was previously discussed in #605 and others as a source of high
+CPU load when sleeping tasks because of the overhead created by
+retrying a future in short succession.
+
+Personally I've noticed this behaviour as well, but wasn't able to
+recreate test settings since making this change yet.  Maybe someone
+else has some good benchmarks to run.
+I was reading through [file.rs](https://github.com/async-rs/async-std/blob/46cafffc31711d5df1b267dc38d191463ac10bda/src/fs/file.rs) trying to figure out how exactly this stuff works on the inside. I think I found a couple of problems with reading files and `JoinHandle`, **not entirely sure**. I may be missing a detail or two that explain this all away, but it seems possible enough that I found some issues here worth bringing up that I'm willing to look stupid if I'm completely wrong. I'm going to ping @stjepang and @yoshuawuyts as it seems you two are the ones who actually wrote this.
+
+First off is something suspicious on [line 673](https://github.com/async-rs/async-std/blob/46cafffc31711d5df1b267dc38d191463ac10bda/src/fs/file.rs#L673). Seems like we shouldn't run the following code on `is_empty()`. Probably should be an immediate `return Poll::Ready(Ok(0));` in that scenario.
+
+On [line 703](https://github.com/async-rs/async-std/blob/46cafffc31711d5df1b267dc38d191463ac10bda/src/fs/file.rs#L703), a blocking task is spawned and the `JoinHandle` is immediately dropped. It isn't ever properly polled. I am assuming we at least don't poll *immediately* because it will never have been completed anyways, so it's not worth the cost of pinning it and returning its `Poll` result (because it will always just be `Poll::Pending` unless a miracle occurs.)
+
+Without the ability for the `JoinHandle` to actually call `wake` when its `Task` is done, we have the current situation. Basically, after we start reading to the cache with `spawn_blocking(...)`, we're done running `poll_read(...)`, so we drop the `LockGuard`, which will unlock the `Mutex` and wake up everyone who was `register`ed as a "listener" on the file lock. In the case that there isn't anything else going on for our executor to run, we're then immediately going to be woken back up, the lock is going to be attained again, and we're going to check if there is anything to read from the cache. If there isn't, we just keep dropping, unlocking, waking, locking, and checking repeatedly until there is.
+
+What it seems *should* be happening is that when the `JoinHandle` from `spawn_blocking(...)` is `poll`ed, it would, [like the docs say](https://docs.rs/async-std/1.4.0/async_std/future/trait.Future.html#tymethod.poll), call `Waker::wake` on the provided `Context`'s `Waker` when it has completed. The problem is that `JoinHandle` doesn't do this and doesn't store the waker anywhere like a `Future` is supposed to. [It just returns `Poll::Pending` and that's it](https://github.com/async-rs/async-std/blob/87de4e15982bbec890aa909600da5997c4f6edc7/src/task/join_handle.rs#L46). Then we could get rid of the waking that occurs when dropping the LockGuard and the blocking task will just do the waking.
+
+Another possibility would be, I think, using actual platform-specific events for IO, although the issues with `JoinHandle` would still exist for users of `spawn_blocking(...)`
+
+There also seem to be a couple other holes in the file read logic. This may be worthy for another issue. If you think so, I'll move the rest of what's here over.
+
+Since we're setting the cache's length and reading into it, and the cache is the same for all operations on the file, we could be changing this while another read is happening or even writing to the cache two times at once, interleaving the data. After all, we only have mutable access to the cache because the `LockGuard` has [`unsafe` implementations of `Deref`](https://github.com/async-rs/async-std/blob/master/src/fs/file.rs#L550-L562). With the current way the logic associated with locking works, this would be extremely rare because basically another poll_read would have to happen before we got to the point of registering ourselves before them. The chances of that are very slim but it's still possible. It would be a much larger issue though if you go the route of having the `JoinHandle` call `wake` when it's done, because the order of the tasks being woken wouldn't just be FRFW (First Registered First Woke ;) ) any more.
+
+------
+
+Anyways, thanks for your work on the project so far. It's a nice codebase I have been able to traverse and understand very easily! It's far easier to read this than *tokio* and [*asio*](https://think-async.com/Asio/). If not for the structure of this project I wouldn't have been able to find these things in the first place. I'm a beginner with async and have only been using rust for about a year, so the fact that I'm able to delve into this codebase should speak volumes about its quality.
+close: #669 
+The following three modules have been changed to work with no_std.
+
+- task
+- future
+- stream
+
+
+Could we keep a list of what libraries work with async-std's pluggable runtimes?
+
+In particular, the tokio ecosystem seems somewhat "closed", in that those libraries often require tokio to operate. As a user, it's confusing, because many of these libraries are not clear about whether they *require* tokio. For example, I asked about using hyper with async-std's runtime; maybe it's just me, but I found the response hard to understand: https://github.com/hyperium/hyper/issues/2111
+
+My use case is that 1) I use a custom runtime for running tests, and 2) I want my release binaries to use async-std's new runtime (that automatically handles blocking threads).
+
+Thanks!
+In https://github.com/async-rs/async-std/commit/d25dae54191c8a922410cd2e3ca39e631d28982b, the implementation of `TcpStream::connect` was switched from using mio's non-blocking connect to the blocking `std::net::TcpStream::connect` which is performed in a background thread created by `spawn_blocking`. May I ask why you decided to no longer use mio's non-blocking connect? It seems the background thread spawned is unaware of any future cancellation, e.g. due to timeouts, but continues to run until all SYN retries have been exhausted which may easily last a couple of minutes. This in turn can cause a high number of threads to be created in the background.
+It seems like proc macros don't work in doctests:
+
+```
+test src/lib.rs -  (line 167) ... FAILED
+test src/lib.rs -  (line 154) ... FAILED
+test src/lib.rs -  (line 141) ... FAILED
+```
+
+> error[E0433]: failed to resolve: could not find `main` in `async_std`
+> ```
+> --> src/lib.rs:146:14
+>   |
+> 8 | #[async_std::main]
+>   |              ^^^^ could not find `main` in `async_std`
+> ```
+
+The problem is visible when running `cargo test --all`. Tested on Rust 1.40 and 1.42 nightly.
+
+
+There is currently no example for `stream :: timeout` when it times out. 
+I thought it was good to add.
+Consider providing additional methods to configure socket
+
+-  SO_REUSEADDR
+-  SO_LINGER
+
+I refrain from using async-std due to their absence.
+You can check these options in [socket2 ](https://docs.rs/socket2/0.3.11/socket2/)crate.
+We should pin `async-task` to 1.2.1 to include https://github.com/async-rs/async-task/pull/15 and https://github.com/async-rs/async-task/pull/16, together adding `no_std` support. We should also document how to enable `no_std` support in `async_std`.
+
+cc/ @skade @jamesmunns 

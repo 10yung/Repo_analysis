@@ -1,0 +1,269 @@
+This allows `no_std` builds to use the `rdrand` instruction on x86
+to generate a random seed for the random number generators.
+
+An example invocation to enable it be:
+```
+cargo +nightly run --example fib --features alloc --features unstable --features hardware-rng --no-default-features
+```
+```
+$ rustc --version
+rustc 1.41.0-nightly (53712f863 2019-11-21)
+
+$ cargo +nightly build --features alloc --features unstable --no-default-features
+   Compiling proptest v0.9.4 (/root/proptest/proptest)
+warning: unused import: `crate::std_facade::Vec`
+  --> proptest/src/arbitrary/_alloc/char.rs:12:5
+   |
+12 | use crate::std_facade::Vec;
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `crate::collection::vec`
+  --> proptest/src/arbitrary/_alloc/char.rs:17:5
+   |
+17 | use crate::collection::vec;
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `core::hash::Hash`
+  --> proptest/src/arbitrary/_alloc/collections.rs:22:5
+   |
+22 | use core::hash::Hash;
+   |     ^^^^^^^^^^^^^^^^
+
+warning: unused import: `String`
+  --> proptest/src/test_runner/runner.rs:10:45
+   |
+10 | use crate::std_facade::{Arc, BTreeMap, Box, String, Vec};
+   |                                             ^^^^^^
+
+error[E0119]: conflicting implementations of trait `arbitrary::traits::Arbitrary` for type `core::option::Option<!>`:
+  --> proptest/src/arbitrary/macros.rs:19:9
+   |
+19 |         impl<$($bounds)*> $crate::arbitrary::Arbitrary for $typ {
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |         |
+   |         first implementation here
+   |         conflicting implementation for `core::option::Option<!>`
+   |
+  ::: proptest/src/arbitrary/_core/option.rs:29:1
+   |
+29 | arbitrary!(Option<!>; None);
+   | ---------------------------- in this macro invocation
+
+error[E0119]: conflicting implementations of trait `arbitrary::traits::Arbitrary` for type `core::result::Result<_, !>`:
+  --> proptest/src/arbitrary/macros.rs:19:9
+   |
+19 |           impl<$($bounds)*> $crate::arbitrary::Arbitrary for $typ {
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |           |
+   |           first implementation here
+   |           conflicting implementation for `core::result::Result<_, !>`
+   |
+  ::: proptest/src/arbitrary/_core/result.rs:31:1
+   |
+31 | / arbitrary!([A: Arbitrary] Result<A, !>,
+32 | |     SMapped<A, Self>, A::Parameters;
+33 | |     args => static_map(any_with::<A>(args), Result::Ok)
+34 | | );
+   | |__- in this macro invocation
+
+error[E0119]: conflicting implementations of trait `arbitrary::traits::Arbitrary` for type `core::result::Result<!, _>`:
+  --> proptest/src/arbitrary/macros.rs:19:9
+   |
+19 |           impl<$($bounds)*> $crate::arbitrary::Arbitrary for $typ {
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |           |
+   |           first implementation here
+   |           conflicting implementation for `core::result::Result<!, _>`
+   |
+  ::: proptest/src/arbitrary/_core/result.rs:36:1
+   |
+36 | / arbitrary!([A: Arbitrary] Result<!, A>,
+37 | |     SMapped<A, Self>, A::Parameters;
+38 | |     args => static_map(any_with::<A>(args), Result::Err)
+39 | | );
+   | |__- in this macro invocation
+
+error[E0119]: conflicting implementations of trait `arbitrary::functor::ArbitraryF1<_>` for type `core::result::Result<_, !>`:
+   --> proptest/src/arbitrary/functor.rs:195:9
+    |
+195 | /         impl<A: ::core::fmt::Debug + $($bounds)*>
+196 | |         $crate::arbitrary::functor::ArbitraryF1<A>
+197 | |         for $typ {
+198 | |             type Parameters = $params;
+...   |
+206 | |             }
+207 | |         }
+    | |         ^
+    | |         |
+    | |_________first implementation here
+    |           conflicting implementation for `core::result::Result<_, !>`
+    |
+   ::: proptest/src/arbitrary/_core/result.rs:43:1
+    |
+43  |   lift1!([] Result<A, !>; Result::Ok);
+    |   ------------------------------------ in this macro invocation
+
+error: aborting due to 4 previous errors
+```
+
+Unable to derive recursive data
+
+
+```rs
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(test, derive(Arbitrary))]
+pub struct List(Box<Option<List>>);
+```
+
+```
+error[E0275]: overflow evaluating the requirement `<structure::values::List as structure::instructions::_IMPL_ARBITRARY_FOR_NumericInstr::_proptest::arbitrary::Arbitrary>::Parameters`
+  --> src/structure/values.rs:10:25
+   |
+10 | #[cfg_attr(test, derive(Arbitrary))]
+   |         
+```
+The primary change is due to `rand`'s new error handling. With `rand` 0.7, the `rand::Error` type now contains either a boxed `Error` (when `std` is available) or a `NonZeroU32` (in `no_std` cases). As a result, I've introduced a new `PassThroughExhaustedError` type. When `std` is available, the implementation creates a `rand::Error` by boxing a `PassThroughExhaustedError`, while in `no_std` cases, it uses an error code representing the error.
+
+Fixes #168.
+
+hello!
+
+The rand dependency is outdated. I've tried to update it, but `proptest/src/test_runner/rng.rs` is trying to create a `rand::Error` and the way to do that changed. Help appreciated.
+I've been trying to use proptest, but I'm having a hard time implementing `Strategy` for my types. I know that we have other features that are explained in the book, like `prop_compose` and `prop_flat_map`, but it would be nice to have some documentation on how to implement an entirely new strategy.
+
+For example, I have found it a little difficult to generate an arbitrary graph, since we have to have a new random boolean for each possibly edge. My current workaround is to use the aforementioned composition tools:
+```rust
+  pub fn arb_graph(max_nodes: u32) -> impl Strategy<Value = Graph> {
+    (0.0..1.0, 0..max_nodes).prop_flat_map(|(base_prob, nodes)| {
+      let edge_prob = base_prob * base_prob;
+      let possible_edges = nodes * nodes;
+      let vec_edges: Vec<_> = (0..possible_edges)
+        .into_iter()
+        .map(|_| weighted(edge_prob))
+        .collect();
+      vec_edges.prop_map(move |edges| {
+        let mut gr = Graph::new();
+        for i in 0..nodes {
+          for j in (i + 1)..nodes {
+            if edges[(i * nodes + j) as usize] {
+              gr.add_edge(i, j);
+            }
+          }
+        }
+        gr
+      })
+    })
+  }
+```
+
+This is less than nice, and shrinking doesn't work well.
+
+I've looked around the docs, and I'm pretty lost. I thought I would try to look at how some of the included strategies are implemented, but almost all of them seem to be done with macros.
+
+UPDATE: I have fixed my issue and eventually figured out what I needed, but I still suggest adding at least one example and explanation to the book.
+
+(cc: @Centril) 
+
+A WIP implementation of the the proc macros discussed in https://github.com/AltSysrq/proptest/issues/153. This currently supports:
+
+- A single argument + strategy per test.
+
+This does not support:
+
+- Everything else discussed in https://github.com/AltSysrq/proptest/issues/153.
+
+That said, _some_ feedback is better than none, so here we are. The changes are better seen than described, so take a look at the modified `parse_date` example, located in `proptest-attributes/tests/hello.rs`:
+
+```rust
+use proptest::{
+    prelude::*, prop_assert_eq, strategy::Strategy, string::string_regex,
+};
+use proptest_attributes::proptest;
+
+fn parse_date(s: &str) -> Option<(u32, u32, u32)> {
+    if 10 != s.len() {
+        return None;
+    }
+
+    // NEW: Ignore non-ASCII strings so we don't need to deal with Unicode.
+    if !s.is_ascii() {
+        return None;
+    }
+
+    if "-" != &s[4..5] || "-" != &s[7..8] {
+        return None;
+    }
+
+    let year = &s[0..4];
+    let month = &s[5..7];
+    let day = &s[8..10];
+
+    year.parse::<u32>().ok().and_then(|y| {
+        month
+            .parse::<u32>()
+            .ok()
+            .and_then(|m| day.parse::<u32>().ok().map(|d| (y, m, d)))
+    })
+}
+
+fn gen_valid_date() -> impl Strategy<Value = String> {
+    let expr = "[0-9]{4}-[0-9]{2}-[0-9]{2}";
+    string_regex(expr).unwrap()
+}
+
+fn gen_all_utf8() -> impl Strategy<Value = String> {
+    let expr = "\\PC*";
+    string_regex(expr).unwrap()
+}
+
+prop_compose! {
+  fn gen_parsed_date()(year in 0u32..10000, month in 1u32..13, day in 1u32..32) -> (u32, u32, u32) {
+    (year, month, day)
+  }
+}
+
+#[proptest(gen_valid_date())]
+fn parses_all_valid_dates(s: String) {
+    parse_date(&s).unwrap();
+}
+
+#[proptest(gen_all_utf8())]
+fn doesnt_crash(s: String) {
+    parse_date(&s);
+}
+
+#[proptest(gen_parsed_date())]
+fn parses_date_back_to_original(date_tuple: (u32, u32, u32)) {
+    let (y, m, d) = date_tuple;
+    let (y2, m2, d2) =
+        parse_date(&format!("{:04}-{:02}-{:02}", y, m, d)).unwrap();
+    // prop_assert_eq! is basically the same as assert_eq!, but doesn't
+    // cause a bunch of panic messages to be printed on intermediate
+    // test failures. Which one to use is largely a matter of taste.
+    prop_assert_eq!((y, m, d), (y2, m2, d2));
+}
+```
+
+I think that, beyond what was described in #153, there might be an opportunity to simplify the `prop_compose!` macro with a proc macro.
+
+I've check the build times for `rust-analyzer` with `cargo bloat --time` today, and noticed that `proptest` is the longest to build dependency (17 seconds). I haven't looked into this deeply, but thought that you might want to be aware!
+
+```
+  Time Crate
+28.70s ra_ide_api
+27.04s ra_hir
+17.26s proptest
+16.37s syn
+15.00s clap
+14.92s syn
+12.87s lsp_types
+11.55s ra_cli
+10.60s regex_syntax
+10.23s ra_lsp_server
+ 9.04s serde_derive
+ 8.43s regex
+ 7.71s ra_syntax
+ 7.63s serde
+```

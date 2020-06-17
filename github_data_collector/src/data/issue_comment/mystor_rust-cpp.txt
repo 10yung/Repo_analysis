@@ -1,0 +1,130 @@
+C++ allows the use of self-referential structures by convention; Rust does not.  Using cpp_class! to wrap a class that is not trivially relocatable is unsafe because Rust might move the object and break internal references.  Unfortunately this precludes the use of cpp_class! for most of the standard library.
+
+Rust now supports the concept of [pinning](https://doc.rust-lang.org/std/pin/), or preventing an object from being moved/relocated in memory.  With the pinning API it is now possible to do:
+
+```
+#![feature(optin_builtin_traits)]
+cpp_class!(pub unsafe struct CppString as "std::string");
+impl !Unpin for CppString {} // requires optin_builtin_traits
+impl CppString {
+	pub fn new_box() -> std::pin::Pin<std::boxed::Box<CppString>> {
+		// allocate memory
+		let mut memory = std::boxed::Box::pin(std::mem::MaybeUninit::<CppString>::uninit());
+		
+		// get address of allocated memory
+		let address : *mut CppString =  unsafe { memory.as_mut().get_unchecked_mut() }.as_mut_ptr();
+		
+		// use placement new to construct a new string at the address
+		cpp!(unsafe [address as "void*"] {
+			new (address) std::string(cstring_ptr);
+		}
+		
+		// unwrap the MaybeUninit
+		unsafe { std::mem::transmute::<std::pin::Pin<std::boxed::Box<std::mem::MaybeUninit::<CppString>>>, std::pin::Pin<std::boxed::Box<CppString>>>(memory) }
+	}
+}
+```
+
+The only problem is Rust does not know that `struct CppString` is not relocatable and will happily move it out of the `Pin<>`.  We must tell Rust that `CppString` is not `Unpin`, which is achieved in the example above using the nightly feature `impl !Unpin for CppString {}`.  Unfortunately this means the above code doesn't compile with stable Rust.
+
+It is possible to achieve the same effect with stable Rust using the marker type [`PhantonPinned`](https://doc.rust-lang.org/nightly/std/marker/struct.PhantomPinned.html), which implements `!Unpin` and thereby makes any structure containing it also `!Unpin`.  This would conceptually be used to make a structure `MyStruct` implement `!Unpin` like this.  Of note, the presence of phantom types does not increase the size of the structure, affect is alignment, or have any performance drawbacks.
+
+```
+struct MyStruct {
+	my_data: i32, // or whatever type we want
+	_phantom_pinned: std::marker::PhantomPinned
+}
+```
+
+It would seem that to do this for C++ classes would require modification of the `cpp_class!` macro.  I confess I have yet to learn much macro programming and had some trouble following all the `macro_rules!` and downstream parsing functions for the `cpp_class!` macro, so I do apologize that this is not a pull request.  Some ways this could possibly look:
+
+```
+// Option 1
+cpp_class!(pub unsafe !Unpin struct CppString as "std::string");
+
+// Option 2
+struct CppString {
+	cpp_class_data!(pub unsafe struct CppString as "std::string"),
+	_phantom_pinned: std::marker::PhantomPinned
+}
+
+// Option 3: Automatically detect if C++ class is relocatable?
+```
+I'm building tflite 0.7.0 and I got this error:
+```error: proc-macro derive panicked
+  --> /rust/cargo/registry/src/github.com-1ecc6299db9ec823/tflite-0.7.0/src/interpreter/builder.rs:34:13
+   |
+34 | /             cpp!([handle as "InterpreterBuilder*"] {
+35 | |                 delete handle;
+36 | |             });
+   | |_______________^
+   |
+   = help: message:
+           -- rust-cpp fatal error --
+
+           Struct metadata not present in target library file.
+           NOTE: Double-check that the version of cpp_build and cpp_macros match
+   = note: this warning originates in a macro outside of the current crate (in Nightly builds, run with -Z external-macro-backtrace for more info)
+
+error: aborting due to previous error
+```
+I've included the generated files. I'm using g++, gcc, cc, and c++ versions 9.1.1 on a fedora docker image. Interestingly enough, this doesn't happen in the [travis ci](https://travis-ci.org/boncheolgu/tflite-rs/builds/612622319?utm_source=github_status&utm_medium=notification) builds which is also on x86_64-unknown-linux-gnu or if I cross compile for aarch64-unknown-linux-gnu using the linaro 7.4.1-2019.02 toolchain.
+
+[rust_cpp.tar.gz](https://github.com/mystor/rust-cpp/files/3876107/rust_cpp.tar.gz)
+
+I'll look into working on this tomorrow, but its a bit annoying that the whole crate is rebuilt when I run `cargo run`, having not changed anything.
+In theory this would just be a case of `Walker` detecting include macro calls in its `Folder` implementation. Initially it could be limited to handling includes of the form 
+```rust
+include!(concat!(env!("OUT_DIR"), "/path/to/source/file.rs"));
+```
+The main benefit of this is so that files generated from build scripts can contain macros like `cpp!`. I'm also relying on cpp_synmap for [embed_js](https://github.com/dylanede/embed_js), so this would be of use for the `js!` and `include_js!` macros as well.
+I'm noticing that 99% of my errors are type errors during calling `cpp!` macro:
+
+    // Handle
+    struct Wrap {
+        ptr: ::libc::c_void
+    }
+    pub fn test(wrap: &mut Wrap) {
+        cpp!([wrap as "Wrap *"] {
+            wrap->test();
+        });
+    }
+
+This compiles but segfaults. Correct way is:
+
+    // Handle
+    struct Wrap {
+        ptr: ::libc::c_void
+    }
+    pub fn test(wrap: &mut Wrap) {
+        let wrap_ptr = wrap.ptr;
+        cpp!([wrap_ptr as "Wrap *"] {
+            wrap_ptr->test();
+        });
+    }
+
+My code is littered with `_ptr` variables and other casting. It might be nice to have following syntax:
+
+    // Handle
+    struct Wrap {
+        ptr: ::libc::c_void
+    }
+    pub fn test(wrap: &mut Wrap) {
+        cpp!([(wrap.ptr  as ::libc::c_void) as "Wrap *"] {
+            wrap->test();
+        });
+    }
+
+Thus avoiding temporary variables and making code more type safe (if we type by accident `wrap : ::libc::c_void` it will cause type error. Note that mutability should still work, only with slightly different syntax:
+
+    let y: i32 = 10;
+    let mut z: i32 = 20;
+    let x: i32 = cpp!([y as "int32_t", &mut z as "int32_t &"] -> i32 as "int32_t" {
+        z++;
+        return y + z;
+    });
+
+If the C++ code captured throws an exception, it might be nice to have an option for rust-cpp to add an exception handler which translates the exception into a rust panic.
+
+This would have overhead so we may not want it to be the default.
+The readme says that it is not possible to embed the `cpp!` macro in other macros. What is needed to make this possible?

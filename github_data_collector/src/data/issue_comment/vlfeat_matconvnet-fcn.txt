@@ -1,0 +1,498 @@
+fcnTest.m makes error.
+
+~/~/~/~/berkeleyVoc12Segments.tar.gz
+
+ERROR: vocSetupAdditionalSegmentations (line 60)
+untar(archivePath, tempDir) ;
+
+ERROR: fcnTest (line 46)
+    imdb = vocSetupAdditionalSegmentations(...
+
+Any body know how to fix this?
+
+
+
+尝试将 SCRIPT vl_imreadjpeg 作为函数执行:
+C:\Users\Administrator\Desktop\matconvnet-fcn-master\matconvnet\matlab\vl_imreadjpeg.m
+出错 getBatch (line 52)
+    rgb = vl_imreadjpeg({rgbPath}) ;
+出错 fcnTrain>@(imdb,batch)getBatch(imdb,batch,opts,'prefetch',nargout==0) (line 107)
+fn = @(imdb,batch) getBatch(imdb,batch,opts,'prefetch',nargout==0) ;
+出错 cnn_train_dag>process_epoch (line 178)
+    inputs = state.getBatch(state.imdb, batch) ;
+出错 cnn_train_dag (line 89)
+    stats.train(epoch) = process_epoch(net, state, opts, 'train') ;
+出错 fcnTrain (line 98)
+info = cnn_train_dag(net, imdb, getBatchWrapper(bopts), ... 
+
+Anyone Kindly help me or give some code to solve this issue...
+Waiting for your positive response...
+thank you...
+
+Below is the code of fcntest.m. I have trained the model using deep vgg-16. And  i am using the trained model from epoch 20 to test images for segmantation. Everyhting runs smooth but the predicted image is not displayed. Need Help !!
+
+function info = fcnTest(varargin)
+
+% experiment and data paths
+opts.expDir = 'data/fcn32s-voc11' ;
+opts.dataDir = 'data/voc11' ;
+opts.modelPath = 'data/fcn32s-voc11/net-epoch-20.mat' ; 
+
+opts.modelFamily = 'matconvnet' ;
+[opts, varargin] = vl_argparse(opts, varargin) ;
+
+% experiment setup
+opts.imdbPath = fullfile(opts.expDir, 'imdb.mat') ;
+opts.vocEdition = '11' ;
+opts.vocAdditionalSegmentations = true ;
+opts.vocAdditionalSegmentationsMergeMode = 2 ;
+opts.gpus = [] ;
+opts = vl_argparse(opts, varargin) ;
+
+resPath = fullfile(opts.expDir, 'results.mat') ;
+if exist(resPath)
+  info = load(resPath) ;
+  return ;
+end
+
+if ~isempty(opts.gpus)
+  gpuDevice(opts.gpus(1))
+end
+
+% -------------------------------------------------------------------------
+% Setup data
+% -------------------------------------------------------------------------
+
+% Get PASCAL VOC 11/12 segmentation dataset plus Berkeley's additional
+% segmentations
+if exist(opts.imdbPath)
+  imdb = load(opts.imdbPath) ;
+else
+  imdb = vocSetup('dataDir', opts.dataDir, ...
+    'edition', opts.vocEdition, ...
+    'includeTest', false, ...
+    'includeSegmentation', true, ...
+    'includeDetection', false) ;
+  if opts.vocAdditionalSegmentations
+    imdb = vocSetupAdditionalSegmentations(...
+      imdb, ...
+      'dataDir', opts.dataDir, ...
+      'mergeMode', opts.vocAdditionalSegmentationsMergeMode) ;
+  end
+  mkdir(opts.expDir) ;
+  save(opts.imdbPath, '-struct', 'imdb') ;
+end
+
+% Get validation subset
+
+val = find(imdb.images.set == 2 & imdb.images.segmentation) ;
+
+% Compare the validation set to the one used in the FCN paper
+% valNames = sort(imdb.images.name(val)') ;
+% valNames = textread('data/seg11valid.txt', '%s') ;
+% valNames_ = textread('data/seg12valid-tvg.txt', '%s') ;
+%assert(isequal(valNames, valNames_)) ;
+
+% -------------------------------------------------------------------------
+% Setup model
+% -------------------------------------------------------------------------
+
+switch opts.modelFamily
+  case 'matconvnet'
+       net = load(opts.modelPath) ;
+    net = dagnn.DagNN.loadobj(net.net) ;  % makes a DagNN object from net.net
+    net.mode = 'test' ;
+    for name = {'objective', 'accuracy'}
+      net.removeLayer(name) ;
+    end
+    net.meta.normalization.averageImage = reshape(net.meta.normalization.rgbMean,1,1,3) ;
+    predVar = net.getVarIndex('prediction') ;
+    inputVar = 'input' ;
+    imageNeedsToBeMultiple = true ;
+
+  case 'ModelZoo'
+    net = dagnn.DagNN.loadobj(load(opts.modelPath)) ;
+    net.mode = 'test' ;
+    predVar = net.getVarIndex('upscore') ;
+    inputVar = 'data' ;
+    imageNeedsToBeMultiple = false ;
+
+  case 'TVG'
+    net = dagnn.DagNN.loadobj(load(opts.modelPath)) ;
+    net.mode = 'test' ;
+    predVar = net.getVarIndex('coarse') ;
+    inputVar = 'data' ;
+    imageNeedsToBeMultiple = false ;
+end
+
+if ~isempty(opts.gpus)
+  gpuDevice(opts.gpus(1)) ;
+  net.move('gpu') ;
+end
+net.mode = 'test' ;
+
+% -------------------------------------------------------------------------
+% Train
+% -------------------------------------------------------------------------
+
+numGpus = 0 ;
+confusion = zeros(21) ;
+
+for i = 1:numel(val)
+  imId = val(i) ;
+  name = imdb.images.name{imId} ;
+  rgbPath = sprintf(imdb.paths.image, name) ;
+  labelsPath = sprintf(imdb.paths.classSegmentation, name) ;
+
+  % Load an image and gt segmentation
+   rgb = vl_imreadjpeg({rgbPath}) ;
+   rgb = rgb{1} ;
+      
+  anno = imread(labelsPath) ;
+
+  lb = single(anno) ;
+ 
+  lb = mod(lb + 1, 256) ; % 0 = ignore, 1 = bkg
+
+  
+  % Subtract the mean (color) ----> i think its normaliation method
+  im = bsxfun(@minus, single(rgb), net.meta.normalization.averageImage) ;
+ 
+  % Some networks requires the image to be a multiple of 32 pixels
+  if imageNeedsToBeMultiple
+    sz = [size(im,1), size(im,2)] ;
+    sz_ = round(sz / 32)*32 ;
+    im_ = imresize(im, sz_) ;
+    
+  else
+    im_ = im ;
+  end
+
+  if ~isempty(opts.gpus)
+    im_ = gpuArray(im_) ;
+  end
+
+  net.eval({inputVar, im_}) ;
+  scores_ = gather(net.vars(predVar).value) ;
+  
+ [~,pred_] = max(scores_,[],3) ; 
+
+  if imageNeedsToBeMultiple
+  pred = imresize(pred_, sz, 'method', 'nearest') ;  
+   
+  else
+    pred = pred_ ;
+  end
+
+  % Accumulate errors
+  ok = lb > 0 ;    % ok becomes a logical array 
+  
+   confusion = confusion + accumarray([lb(ok),pred(ok)],1,[21 21]) ;
+  % Plots
+  if mod(i - 1,30) == 0 || i == numel(val)
+    clear info ;
+    [info.iu, info.miu, info.pacc, info.macc] = getAccuracies(confusion) ;
+    fprintf('IU ') ;
+    fprintf('%4.1f ', 100 * info.iu) ;
+    fprintf('\n meanIU: %5.2f pixelAcc: %5.2f, meanAcc: %5.2f\n', ...
+            100*info.miu, 100*info.pacc, 100*info.macc) ;
+
+    figure(10) ; clf;
+    imagesc(normalizeConfusion(confusion)) ;
+    axis image ; set(gca,'ydir','normal') ;
+    colormap(jet) ;
+    drawnow ;
+
+    % Print segmentation
+     figure(100) ;clf ;
+    displayImage(rgb/255, lb, pred) ; 
+    drawnow ;
+
+    % Save segmentation
+    imPath = fullfile(opts.expDir, [name '.png']) ;
+    imwrite(pred,labelColors(),imPath,'png');
+  end
+end
+
+% Save results
+save(resPath, '-struct', 'info') ;
+
+% -------------------------------------------------------------------------
+function nconfusion = normalizeConfusion(confusion)
+% -------------------------------------------------------------------------
+% normalize confusion by row (each row contains a gt label)
+nconfusion = bsxfun(@rdivide, double(confusion), double(sum(confusion,2))) ;
+
+% -------------------------------------------------------------------------
+function [IU, meanIU, pixelAccuracy, meanAccuracy] = getAccuracies(confusion)
+% -------------------------------------------------------------------------
+pos = sum(confusion,2) ;
+res = sum(confusion,1)' ;  
+tp = diag(confusion) ;
+IU = tp ./ max(1, pos + res - tp) ;
+meanIU = mean(IU) ;
+pixelAccuracy = sum(tp) / max(1,sum(confusion(:))) ;
+meanAccuracy = mean(tp ./ max(1, pos)) ;
+
+% -------------------------------------------------------------------------
+function displayImage(im, lb, pred)
+% -------------------------------------------------------------------------
+subplot(2,2,1) ;
+image(im) ;
+axis image ;
+title('source image') ;
+
+subplot(2,2,2) ;
+image(uint8(lb)) ; % image(uint8(lb-1)) ;
+axis image ;
+title('ground truth')
+
+cmap = labelColors() ;
+subplot(2,2,3) ;
+image(pred) ; % image(uint8(pred-1)) ;
+axis image ;
+title('predicted') ;
+
+ colormap(cmap) ;
+
+% -------------------------------------------------------------------------
+function cmap = labelColors()
+% -------------------------------------------------------------------------
+N=21;
+cmap = zeros(N,3);
+for i=1:N
+  id = i-1; r=0;g=0;b=0;
+  for j=0:7
+    r = bitor(r, bitshift(bitget(id,1),7 - j));
+    g = bitor(g, bitshift(bitget(id,2),7 - j));
+    b = bitor(b, bitshift(bitget(id,3),7 - j));
+    id = bitshift(id,-3); % bitshift(id,-3);
+  end
+  cmap(i,1)=r; cmap(i,2)=g; cmap(i,3)=b;
+end
+cmap = cmap / 255;
+
+Hi all,
+
+I've met a similar problem, and do not know what to do with it. The error info is as follows:
+
+train: epoch 01: 1/ 11:Error using dagnn.DagNN/eval (line 80)
+No variable of name 'input' could be found in the DAG.
+
+Error in cnn_train_dag>process_epoch (line 213)
+net.eval(inputs, opts.derOutputs) ;
+
+Error in cnn_train_dag (line 83)
+[stats.train(epoch),prof] = process_epoch(net, state, opts, 'train') ;
+
+Error in cnn_four (line 61)
+[net, info] = trainFn(net, imdb, getBatchFn(opts, net.meta), ...
+
+I use the pre-trained model "imagenet-matconvnet-alex.mat", and found that when calling "eval", the net's lacking of some fields results the error. "net"(or "obj" in def. of "eval") lacking fields like "varNames", "numPendingVarRefs", ... . Does any body know how to fix it?
+
+Thanks and Regards
+I want to convert "AlexNet" & "googleNet" network to FCN semantic segmentation network (similar to the way "fcnInitialize" function convert VGG-16 to FCN).
+Is there any initialization function for this networks?
+Hi
+I got error when using vl_nnloss function. @ line 225, there is repeated index generated in "ci" variable.
+I try to fine tune FCN network with batchSize = 200 & numSubbatch = 10, when i change one of this values, i pass the error, So what happen when i choose this parameters and How can i fine-tune the net with this parameters?
+Thanks
+Hello everyone
+I want to finetune vgg16 by using my own dataset.It has 32 classes but I faced with some error.
+train: epoch 01:   1/ 62:148      im2= imdb.images.data(:,:,:,batch);
+Error using dagnn.DagNN/eval (line 83)
+No variable of name 'label' could be found in the DAG.
+
+Error in cnn_train_dag>processEpoch (line 253)
+      net.eval(inputs, params.derOutputs, 'holdOn', s < params.numSubBatches) ;
+
+Error in cnn_train_dag (line 105)
+    [net, state] = processEpoch(net, state, params, 'train') ;
+
+Error in fine_test0 (line 113)
+	info = cnn_train_dag(net, imdb, @(i,b) getBatch(bopts,i,b), opts.train, 'val', find(imdb.images.set == 3)) ;
+%and this my code:
+%finetune vgg16 for cifar10 dataset
+function [net, info] = vgg_train(imdb, expDir)
+%  Demonstrated MatConNet on CIFAR-10 using DAG
+% 	run(fullfile(fileparts(mfilename('fullpath')), '../../', 'matlab', 'vl_setupnn.m')) ;
+run  matlab/vl_setupnn
+%     imdb=load('imdbs.mat', 'imdb')
+  %  imdb=load('imdb_cifar10.mat')
+    load('imdbs.mat', 'imdb')
+	% some common options
+	opts.train.batchSize = 100;
+	opts.train.numEpochs = 20 ;
+	opts.train.continue = true ;
+	opts.train.gpus = [];%[1] ;
+	opts.train.learningRate = [1e-1*ones(1, 10),  1e-2*ones(1, 5)];
+	opts.train.weightDecay = 3e-4;
+	opts.train.momentum = 0.;
+% 	opts.train.expDir = expDir;
+bopts.useGpu = numel(opts.train.gpus) > 0 ; % Usually keep at 0, seems to only work with 3D data.
+	opts.train.numSubBatches = 1;
+	% getBatch options
+	bopts.useGpu = numel(opts.train.gpus) >  0 ;
+
+
+	% network definition!
+	% MATLAB handle, passed by reference
+	net = dagnn.DagNN() ;
+    %vgg16 artitectur
+    net.addLayer('conv1_1', dagnn.Conv('size', [3 3 3 64], 'hasBias', true, 'stride', [1, 1], 'pad', [1 1 1 1]), {'input'},{'conv1'}, {'conv1_1f' 'conv1_1b'}); 
+ 
+ net.addLayer('relu1_1', dagnn.ReLU(), {'conv1'}, {'relu1'}, {}); 
+ net.addLayer('conv1_2', dagnn.Conv('size', [3 3 64 64], 'hasBias', true, 'stride', [1, 1], 'pad', [1 1 1 1]),{'relu1'}, {'conv2'}, {'conv1_2f' 'conv1_2b'}); 
+ 
+ net.addLayer('relu1_2', dagnn.ReLU(), {'conv2'}, {'relu2'}, {}); 
+ %net.addLayer('lrn1', dagnn.LRN('param', [5 1 0.0001/5 0.75]), {'relu1'}, {'lrn1'}, {}); 
+ net.addLayer('pool1', dagnn.Pooling('method', 'max', 'poolSize', [2, 2], 'stride', [2 2], 'pad', [0 0 0 0]),{'relu2'}, {'pool1'}, {});  
+ net.addLayer('conv2_1', dagnn.Conv('size', [3 3 64 128], 'hasBias', true, 'stride', [1, 1], 'pad', [1 1 1 1]),{'pool1'}, {'conv3'}, {'conv2_1f' 'conv2_1b'});  
+
+net.addLayer('relu2_1', dagnn.ReLU(), {'conv3'}, {'relu3'}, {}); 
+%layer8
+net.addLayer('conv2_2', dagnn.Conv('size', [3 3 128 128], 'hasBias', true, 'stride', [1, 1], 'pad', [1 1 1 1]), {'relu3'}, {'conv4'}, {'conv2_2f' 'conv2_2b'}); 
+net.addLayer('relu2_2', dagnn.ReLU(), {'conv4'}, {'relu4'}, {}); 
+ %net.addLayer('lrn2', dagnn.LRN('param', [5 1 0.0001/5 0.75]), {'relu2'}, {'lrn2'}, {}); 
+ %change padding in layer10
+ net.addLayer('pool2', dagnn.Pooling('method', 'max', 'poolSize', [2, 2], 'stride', [2 2], 'pad', [0 0 0 0]),{'relu4'}, {'pool2'}, {});  
+
+net.addLayer('conv3_1', dagnn.Conv('size', [3 3 128 256], 'hasBias', true, 'stride', [1, 1], 'pad', [1 1 1 1]),{'pool2'}, {'conv5'}, {'conv3_1f' 'conv3_1b'}); 
+
+
+ net.addLayer('relu3_1', dagnn.ReLU(), {'conv5'}, {'relu5'}, {}); 
+net.addLayer('conv3_2', dagnn.Conv('size', [3 3 256 256], 'hasBias', true, 'stride', [1, 1], 'pad', [1 1 1 1]),{'relu5'}, {'conv6'}, {'conv3_2f' 'conv3_2b'});  
+
+ net.addLayer('relu3_2', dagnn.ReLU(), {'conv6'}, {'relu6'}, {}); 
+ %layer 15 ok
+ net.addLayer('conv3_3', dagnn.Conv('size', [3 3 256 256], 'hasBias', true, 'stride', [1, 1], 'pad', [1 1 1 1]), {'relu6'}, {'conv7'}, {'conv3_3f' 'conv3_3b'}); 
+
+ net.addLayer('relu3_3', dagnn.ReLU(), {'conv7'}, {'relu7'}, {}); 
+ %net.addLayer('lrn3', dagnn.LRN('param', [5 1 0.0001/5 0.75]), {'relu2'}, {'lrn2'}, {}); 
+ %change in padding in 17 layer
+ net.addLayer('pool3', dagnn.Pooling('method', 'max', 'poolSize', [2, 2], 'stride', [2 2], 'pad', [0 0 0 0]),{'relu7'}, {'pool3'}, {});  
+
+%%%55
+net.addLayer('conv4_1', dagnn.Conv('size', [3 3 256 512], 'hasBias', true, 'stride', [1, 1], 'pad', [1 1 1 1]),{'pool3'}, {'conv8'}, {'conv4_1f' 'conv4_1b'});  
+
+ net.addLayer('relu4_1', dagnn.ReLU(), {'conv8'}, {'relu8'}, {}); 
+ net.addLayer('conv4_2', dagnn.Conv('size', [3 3 512 512], 'hasBias', true, 'stride', [1, 1], 'pad', [1 1 1 1]), {'relu8'}, {'conv9'}, {'conv4_2f' 'conv4_2b'}); 
+
+ net.addLayer('relu4_2', dagnn.ReLU(), {'conv9'}, {'relu9'}, {}); 
+ net.addLayer('conv4_3', dagnn.Conv('size', [3 3 512 512], 'hasBias', true, 'stride', [1, 1], 'pad', [1 1 1 1]), {'relu9'}, {'conv10'}, {'conv4_3f' 'conv4_3b'}); 
+
+ net.addLayer('relu4_3', dagnn.ReLU(), {'conv10'}, {'relu10'}, {}); 
+ %net.addLayer('lrn4', dagnn.LRN('param', [5 1 0.0001/5 0.75]), {'relu2'}, {'lrn2'}, {}); 
+ %layer24 change in padding
+ net.addLayer('pool4', dagnn.Pooling('method', 'max', 'poolSize', [2, 2], 'stride', [2 2], 'pad', [0 0 0 0]),{'relu10'}, {'pool4'}, {});  
+
+net.addLayer('conv5_1', dagnn.Conv('size', [3 3 512 512], 'hasBias', true, 'stride', [1, 1], 'pad', [1 1 1 1]),{'pool4'}, {'conv11'}, {'conv5_1f' 'conv5_1b'});  
+
+ net.addLayer('relu5_1', dagnn.ReLU(), {'conv11'}, {'relu11'}, {}); 
+ net.addLayer('conv5_2', dagnn.Conv('size', [3 3 512 512], 'hasBias', true, 'stride', [1, 1], 'pad', [1 1 1 1]), {'relu11'}, {'conv12'}, {'conv5_2f' 'conv5_2b'}); 
+
+ net.addLayer('relu5_2', dagnn.ReLU(), {'conv12'}, {'relu12'}, {}); 
+ %29 layer
+ net.addLayer('conv5_3', dagnn.Conv('size', [3 3 512 512], 'hasBias', true, 'stride', [1, 1], 'pad', [1 1 1 1]), {'relu12'}, {'conv13'}, {'conv5_3f' 'conv5_3b'}); 
+
+ net.addLayer('relu5_3', dagnn.ReLU(), {'conv13'}, {'relu13'}, {}); 
+ net.addLayer('pool5', dagnn.Pooling('method', 'max', 'poolSize', [2, 2], 'stride', [2 2], 'pad', [0 0 0 0]), {'relu13'}, {'pool5'}, {}); 
+
+ net.addLayer('conv6', dagnn.Conv('size', [7 7 512 4096], 'hasBias', true, 'stride', [1, 1], 'pad', [0 0 0 0]), {'pool5'}, {'conv14'}, {'conv6f' 'conv6b'}); 
+
+ net.addLayer('relu6', dagnn.ReLU(), {'conv14'}, {'relu14'}, {}); 
+ net.addLayer('drop6', dagnn.DropOut('rate', 0.5), {'relu14'}, {'drop6'}, {}); 
+ net.addLayer('conv7', dagnn.Conv('size', [1 1 4096 4096], 'hasBias', true, 'stride', [1, 1], 'pad', [0 0 0 0]), {'drop6'}, {'conv15'}, {'conv7f' 'conv7b'}); 
+
+ net.addLayer('relu7', dagnn.ReLU(), {'conv15'}, {'relu15'}, {}); 
+ net.addLayer('drop7', dagnn.DropOut('rate', 0.5), {'relu15'}, {'drop7'}, {}); 
+ %%%chane in class number
+ net.addLayer('classifier', dagnn.Conv('size', [1 1 4096 32], 'hasBias', true, 'stride', [1, 1], 'pad', [0 0 0 0]), {'drop7'}, {'classifier'}, {'conv8f' 'conv8b'}); 
+
+ net.addLayer('prob', dagnn.SoftMax(), {'classifier'}, {'prob'}, {}); 
+%  net.addLayer('objective', dagnn.Loss('loss', 'log'), {'prob', 'label'}, {'objective'}, {}); 
+%  net.addLayer('error', dagnn.Loss('loss', 'classerror'), {'prob','label'}, 'error') ;
+%  
+    %
+    % initialization of the weights (CRITICAL!!!!) 
+% if(numel(varargin) > 0) 
+%   initNet_FineTuning(net, netPre); 
+%  else 
+%   initNet_He(net); 
+%  end  
+% %train 
+% iinitNet(net, 1/100);
+
+	% do the training!
+	info = cnn_train_dag(net, imdb, @(i,b) getBatch(bopts,i,b), opts.train, 'val', find(imdb.images.set == 3)) ;    
+end
+
+function initNet(net, f)
+	net.initParams();
+	%
+
+	f_ind = net.layers(1).paramIndexes(1);
+	b_ind = net.layers(1).paramIndexes(2);
+	net.params(f_ind).value = 10*f*randn(size(net.params(f_ind).value), 'single');
+	net.params(f_ind).learningRate = 1;
+	net.params(f_ind).weightDecay = 1;
+
+	for l=2:length(net.layers)
+		% is a convolution layer?
+		if(strcmp(class(net.layers(l).block), 'dagnn.Conv'))
+			f_ind = net.layers(l).paramIndexes(1);
+			b_ind = net.layers(l).paramIndexes(2);
+
+			[h,w,in,out] = size(net.params(f_ind).value);
+			net.params(f_ind).value = f*randn(size(net.params(f_ind).value), 'single');
+			net.params(f_ind).learningRate = 1;
+			net.params(f_ind).weightDecay = 1;
+
+			net.params(b_ind).value = f*randn(size(net.params(b_ind).value), 'single');
+			net.params(b_ind).learningRate = 0.5;
+			net.params(b_ind).weightDecay = 1;
+		end
+	end
+end
+% getBatch for IMDBs that are too big to be in RAM 
+function inputs = getBatch(opts, imdb, batch)
+	%images = imdb.images.data(:,:,:,batch) ;
+	labels = imdb.images.labels(1,batch) ;
+%     labels(labels>10)=10;
+     im2= imdb.images.data(:,:,:,batch);
+   im2=im2(1:224,1:224,:,:);
+    s=size(im2);
+   
+    
+    images=zeros(s(1),s(2),3,s(4),'single');
+    images(:,:,1,:)=im2;
+    images(:,:,2,:)=im2;
+    images(:,:,3,:)=im2;
+	if opts.useGpu > 0
+  		images = gpuArray(images) ;
+	end
+
+	inputs = {'input', images, 'label', labels} ;
+end
+
+I observe with my image set (1 class + background) that I achieve much better segmentation accuracy for the validation (val) images during training (pixelAcc = 97%) then during testing (pixelAcc=89%).  By default fcnTrain.m and fcnTest.m are setup to use the same val images.  My understanding is that testing should actually be done on a fully independent (3rd) set of images but when running the default setup I would expect the same accuracy from fcnTrain and fcnTest for a given epoch.  I confirmed by outputting images from predictions in SegmentationAccuracy.m that the segmentations for the val images look better during fcnTrain then fcnTest.  
+hi,
+i got this error when run
+>> fcnTrain
+Error using  ' 
+Transpose on ND array is not defined. Use PERMUTE instead.
+
+Error in vl_argparse (line 77)
+    values = struct2cell(args{ai})' ;
+
+Error in cnn_train_dag (line 34)
+opts = vl_argparse(opts, varargin) ;
+
+Error in fcnTrain (line 98)
+info = cnn_train_dag(net, imdb, getBatchWrapper(bopts), ...
+Hi,
+    Thanks for every one ,I am a newer to FCN and I want to use FCN to train my dataset. The dataset contains original images which are 12000*(800*80*1)(they are gray figure) and labeled
+images which are 12000*(80*80).Because the original images and labeled images are different images, but they have non-linear relationship, and in labeled images, I want to identify 2 classes that the interest(labeled as 1)and background(labeled as 0),so I want to use FCN to learn the non-linear algorithm and identify two parts in labeled images. I have some trouble in how can I do to solve this problem, I think I should convert my data to "imdb.mat" to feed fcntrain firstly, but I didn't achieve it .Then I think I should run fcnInitializeModel to initialize the net and modify some parameters in the code.What I think is right?I hope someone can help me ,and I am grateful if you can share your code to me
+
+Best Regards
+Email:yfs2016@hit.edu.cn

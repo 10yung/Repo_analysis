@@ -1,0 +1,110 @@
+This PR closes https://github.com/Ikuyadeu/vscode-R/issues/76 and https://github.com/Ikuyadeu/vscode-R/pull/193.
+
+This PR is a simple support of code section using DocumentSymbolProvider. It matches all commend lines that starts with # and ends with at least four #, +, -, = and show the string in-between as symbol.
+
+This also addresses the comment at https://github.com/Ikuyadeu/vscode-R/issues/76#issuecomment-575969263 by using unified document symbol provider (all in languageserver), and the symbol information of each code section starts from the first line and ends before the next code section so that a hierarchy of code section containing symbol definitions can be presented.
+
+Following is a screenshot in VSCode:
+
+<img width="633" alt="image" src="https://user-images.githubusercontent.com/4662568/72678086-90381780-3add-11ea-9e93-0d7a4d1c1882.png">
+
+In Atom 1.42 or 1.43 and atom-language-r 1.4.8 on Linux r-languageserver 0.3.3 causes constant ` Uncaught TypeError: Cannot read property 'length' of undefined` errors once you start typing code in an R file.  The problem is severe enough that it makes Atom unusable to edit R files.  When I revert back to 0.3.2 the problem goes away.
+It would be very useful if sections could be defined in the R codes. These would allow to fold the code and to navigate through the script (e.g. the outline tab in VSCode).
+
+In Rstudio one can define sections using comments followed by 4 or more +, - or = signs, here is an example of how it looks:
+
+![Screen Shot 2020-01-17 at 10 44 35](https://user-images.githubusercontent.com/56064362/72601976-beb7c600-3916-11ea-8a54-876fad7622d2.png)
+
+We may provide completion for list-like objects in package such as `.Machine`, `.Platform`, and objects defined in packages such as R6 classes since their elements are known.
+
+In contrast with https://github.com/Ikuyadeu/vscode-R/pull/165 which provides completion for elements in list-like objects in a live R session, languageserver may do similar for list-like objects in packages.
+Currently, we provide signature for functions defined in packages and global namespace. We could use XML parse data to also provide signature for locally defined functions (aka closures).
+
+```r
+foo <- function(var1) {
+  bar <- function(var2) {
+    var1 + var2
+  }
+  bar(|)
+}
+```
+
+where cursor `|` is at `bar(|)`, the signature of `bar` can be extracted from XML parse data and provided to user.
+We can gradually provide `textDocument/onTypeFormatting`. We could use `\n`, `)`, `]`, and `}` to trigger on type formatting.
+
+A starting point could be formatting only the changed line of code. If the line can be formatted on its own, then format it. If not, leave it as it is. This covers the cases of single line expressions.
+
+For multi-line expressions such as
+
+```r
+value <- local({ # multi-line expression start
+  x<-1 # single line expression
+}) # multi-line expression end
+```
+
+We probably need to detect the corresponding opening brackets (`([{`) when a closing bracket (`)]}`) triggers on type formatting, and then we could perform range formatting on the enclosed document range.
+
+As a starting point, only single line of code is formatted at the moment. For example,
+
+```r
+f(1,2,3)
+```
+
+is formatted to the following when `)` is pressed or enter is pressed in the line end
+
+```r
+f(1, 2, 3)
+```
+
+I test this while I'm editing large scripts and the performance is good since it only perform single line formatting and only transfer minimal text through lsp.
+
+As for on-type-formatting with multi-line code chunks, we might need the extend-selection algorithm @andycraig implemented in TypeScript in https://github.com/Ikuyadeu/vscode-R/blob/master/src/selection.ts#L207, so that the following code can be formatted on closing the brace:
+
+```r
+result <- function(x,y,z) {
+x+y+z
+}
+```
+
+When `}` or enter is hit in the last line, the extend-selection algorithm finds that the runnable code chunk is above and formatting this code chunk results in the following code:
+
+```r
+result <- function(x, y, z) {
+  x + y + z
+}
+```
+
+As for incomplete code, we may also calculate the indention. For example,
+
+```r
+test %>%
+  func1(a, b) %>%
+  func2(x, y)
+```
+
+When enter is hit in the end of each line, we should get different indention in the new line. For the first two lines, we should get two spaces; for the last line, we should get zero indention because the expression is complete.
+Previously, #123 enables removing objects in `GlobalNameSpace` when they are removed from document. However, when more and more documents are open in editor, the workspaces contains more and more documents, so that the completion provides more and more items. Even when most documents are closed, although they are removed from `documents`, they are still left in `Workspace`, which seems a bit inconsistent.
+
+I'm not sure if it makes sense that if the workspace is not a package, then closing a document should remove the document from the workspace so that all relevant objects of the documents are removed.
+I'm wondering if it is possible to use `TextDocumentSyncKind.Incremental` update mode on `textDocument/didChange` to avoid the whole document being transferred repeatedly. When the document is large, the transfer looks a bit laggy.
+I'm editing a script of more than 1500 lines of code. I timed the formatting by `syste.time(styler::style_file(file))`:
+
+```
+ℹ 
+────────────────────────────────────────
+Status  Count   Legend 
+✔       0       File unchanged.
+ℹ       1       File changed.
+✖       0       Styling threw an error.
+────────────────────────────────────────
+Please review the changes carefully!
+   user  system elapsed 
+ 46.542   0.059  46.607 
+```
+
+If I execute command `Format document`, then languageserver totally is stuck at formatting the file and stops providing other functionalities, looks like the formatting task completely blocks the langaugeserver.
+
+I also enable `formatOnPaste`, if I copy/paste a large chunk of code (hundreds of lines) to the current document, then range formatting is triggered, which also blocks languageserver.
+<img width="237" alt="Screen Shot 2019-12-12 at 8 43 40 PM" src="https://user-images.githubusercontent.com/1690993/70769889-19f70700-1d20-11ea-8f69-05180221c9d5.png">
+
+In general, it is impossible to infer what could go after $. So I guess we should just ignore everything after $.

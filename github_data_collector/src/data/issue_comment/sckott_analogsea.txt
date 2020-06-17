@@ -1,0 +1,170 @@
+I've been having some inconsistent behavior when creating / destroying a droplet. I have a nightly script that simply spins up a machine from a previously saved snapshot, runs a script on that machine, and then destroys the machine. Essentially the simplest possible script I can have. I'd say that 80% of the time, this runs just fine. However, 20% of the time, I get some odd behavior. Below is my script...I added the Sys.sleep(120) just in case it was a problem where I wasn't giving the droplet enough time to create, but not sure if they really are needed with a droplet_wait()
+
+```r
+library(plumber)
+library(analogsea)
+do_oauth()
+d <- droplet_create(name="rec-machine",
+                          size="g-16vcpu-64gb",
+                          region="nyc3",
+                          image=xxxxxxx) %>%
+         droplet_wait()
+Sys.sleep(120)
+droplet_ssh(d, "/var/scripts/rec_train_upload.sh")
+Sys.sleep(120)
+droplet_delete(d)
+```
+
+The errors I'll get are the following, and they always happen after the machine has been created, but before the I make the droplet_ssh() call (otherwise I'd see information from my R script in the log file that I create)
+
+```r
+Error: Failed to load data from database
+```
+
+Another one I will often see is:
+```r
+The resource you were accessing could not be found
+```
+
+Lastly, very few times the machine is created, the script is run (which I can verify in my logs and the fact that files are updated in the repo where I deposit files into), but the machine never deletes, despite the explicit call. Any help or thoughts would be appreciated. It just seems like something in the script "loses track" of the droplet
+
+
+<details> <summary><strong>Session Info</strong></summary>
+
+```r
+> sessionInfo()
+R version 3.6.0 (2019-04-26)
+Platform: x86_64-pc-linux-gnu (64-bit)
+Running under: Ubuntu 16.04.5 LTS
+
+Matrix products: default
+BLAS:   /usr/lib/libblas/libblas.so.3.6.0
+LAPACK: /usr/lib/lapack/liblapack.so.3.6.0
+
+locale:
+ [1] LC_CTYPE=en_US.UTF-8       LC_NUMERIC=C              
+ [3] LC_TIME=en_US.UTF-8        LC_COLLATE=en_US.UTF-8    
+ [5] LC_MONETARY=en_US.UTF-8    LC_MESSAGES=en_US.UTF-8   
+ [7] LC_PAPER=en_US.UTF-8       LC_NAME=C                 
+ [9] LC_ADDRESS=C               LC_TELEPHONE=C            
+[11] LC_MEASUREMENT=en_US.UTF-8 LC_IDENTIFICATION=C       
+
+attached base packages:
+[1] stats     graphics  grDevices utils     datasets  methods   base     
+
+other attached packages:
+[1] plumber_0.4.6   analogsea_0.6.0
+
+loaded via a namespace (and not attached):
+ [1] Rcpp_1.0.1          later_0.8.0         digest_0.6.19      
+ [4] crayon_1.3.4        aws.signature_0.5.0 R6_2.4.0           
+ [7] jsonlite_1.6        magrittr_1.5        httr_1.4.0         
+[10] stringi_1.4.3       promises_1.0.1      xml2_1.2.0         
+[13] tools_3.6.0         aws.s3_0.3.12       httpuv_1.5.1       
+[16] yaml_2.2.0          compiler_3.6.0      base64enc_0.1-3   
+```
+</details>
+
+https://developers.digitalocean.com/documentation/changelog/api-v2/changes-to-the-droplet-neighbors-report/
+https://developers.digitalocean.com/documentation/changelog/api-v2/api-support-for-digitalocean-managed-databases/
+This is less an 'issue' and more a 'code review' sort of discussion. I'm working with O'Reilly & Paul Teeter to update the R Cookbook for a 2nd edition. One recipe I'd really like to have is "execute code in parallel in the cloud".  It seems to me that `future` with `furrr` is a really good fit as it makes the `purrr` approach parallel. 
+
+Towards that end I'm trying to figure out the most drop dead simple recipe for spinning up a cluster for use with `future`. Thanks to some [good ideas from Andrew Heiss](https://www.andrewheiss.com/blog/2018/07/30/disposable-supercomputer-future/) I have cooked up the following:
+
+```r
+library(analogsea)
+library(tidyverse)
+library(furrr)
+
+cluster_tag <- 'r_cluster' 
+cluster_prefix <- 'node-'
+number_of_nodes <- 4
+
+my_droplets <- docklets_create(names = paste0(cluster_prefix, as.character(1:number_of_nodes)),
+                               region = "sfo2",
+                               size = "1gb",
+                               tags = cluster_tag)
+
+# pull the ip addresses for the droplets
+ips <- droplets(tag=cluster_tag) %>%
+  map(function(x) x$networks$v4[[1]]$ip_address) %>%
+  unlist
+
+# Path to private SSH key that matches key uploaded to DigitalOcean
+# it looks like ~ does not work here... not sure why
+ssh_private_key_file <- "/Users/jal/.ssh/id_rsa"
+
+# Connect and create a cluster
+cl <- makeClusterPSOCK(
+  # vector of IPs in our cluster
+  workers = ips,
+
+  # DigitalOcean droplets use root for user
+  user = "root",
+
+  # use the key connected to Digital Ocean
+  rshopts = c(
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "IdentitiesOnly=yes",
+    "-i", ssh_private_key_file
+  ),
+
+  # run Rscript in the tidyverse docker
+  rscript = c("sudo","docker","run","--net=host","rocker/tidyverse","Rscript"),
+  
+    rscript_args = c(
+    # Install furrr (future too) 
+    "-e", shQuote("install.packages('furrr')")
+  ),
+  homogeneous=FALSE, 
+  verbose=TRUE
+)
+
+```
+My question for you all is simply: Can I make this more simple? This work. It makes a parallel backend. I can explain each step. But can it be even more simple? 
+
+Thanks! 
+
+[On July 25, 2018](https://blog.digitalocean.com/organizing-your-infrastructure-with-projects/), DigitalOcean added support for [Projects](https://www.digitalocean.com/docs/projects/overview/). Currently, the API doesn't support anything with projects, but [they say it will eventually in 2018](https://www.digitalocean.com/docs/projects/overview/#limits).
+
+When the API eventually supports them, it'd be cool to have a new argument in `droplet_create()` to create new images in a specific project (which would allow users to better separate the temporary images they might create with R from more important production images in their account)
+https://developers.digitalocean.com/documentation/changelog/api-v2/create-domains-without-providing-an-ip-address/
+using old `ssh_options` function 
+There's just a few tests right now, only those that don't test against actual interactions with Digitalocean. 
+
+Here's what I think could be the approach for each function:
+
+1. Right now, we can add tests of failure behavior and any other thigns that don't test against requests to Digitalocean - see current tests for examples
+2. Start on testing real functionality of functions, but with mocked data. This may have to take different approaches with different functions. For spaces functions that wrap aws, those internally use `httr`. For other functions, I can convert internal use of `httr` to `crul` and then we can use `vcr` package I'm working on for caching requests for tests - should be ready to go soon. 
+Did we talk yet about making spaces functions follow droplet functions pattern of facilitating piping them together? 
+
+do we not want to do that? or do we?  
+https://github.com/sckott/analogsea/pull/138 added support for part of the Spaces API and we decided in #136 to start a fresh issue to help divvy up the tasks of completing the API. Below is a checklist with items transcribed from the [Spaces API docs](https://developers.digitalocean.com/documentation/spaces):
+
+- [ ] Bucket Operations
+  - [x] Create a Bucket
+  - [x] List All Buckets
+  - [x] List a Bucket's Contents
+  - [x] Delete a Bucket
+  - [ ] Get a Bucket's Location
+  - [ ] Get a Bucket's ACL
+  - [ ] Set a Bucket's ACL
+  - [ ] Get a Bucket's CORS
+  - [ ] Set a Bucket's CORS
+  - [ ] Delete a Bucket's CORS
+- [x] Object Operations
+  - [x] Get an Object
+  - [x] Get Information About an Object
+  - [x] Upload an Object (PUT)
+  - [x] Copy an Object
+  - [x] Get an Object's ACLs
+  - [x] Set an Object ACLs
+  - [x] Delete an Object
+  - [x] Begin a Multi-part Upload
+  - [x] Upload a Part
+  - [x] List Parts
+  - [x] Complete a Multi-part Upload
+  - [x] Cancel a Multi-part Upload
+
+Let me know if the organization of this list doesn't make sense or isn't useful for tackling this.
+  

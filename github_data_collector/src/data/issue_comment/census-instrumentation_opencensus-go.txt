@@ -1,0 +1,216 @@
+Please answer these questions before submitting a bug report.
+
+### What version of OpenCensus are you using?
+
+`v0.22.0`
+
+### What version of Go are you using?
+
+`go1.13.6`
+
+### What did you do?
+
+I was running the new [goleak](https://github.com/uber-go/goleak) tool on my codebase and ran into a leak coming from OpenCensus.
+
+```
+goleak: Errors on successful test run: found unexpected goroutines:
+[Goroutine 37 in state select, with go.opencensus.io/stats/view.(*worker).start on top of the stack:
+goroutine 37 [select]:
+go.opencensus.io/stats/view.(*worker).start(0xc000143310)
+	/Users/adam/code/pkg/mod/go.opencensus.io@v0.22.0/stats/view/worker.go:154 +0x100
+created by go.opencensus.io/stats/view.init.0
+	/Users/adam/code/pkg/mod/go.opencensus.io@v0.22.0/stats/view/worker.go:32 +0x57
+]
+```
+
+### What did you expect to see?
+
+I expected no goroutine leaks in libraries I depend on. 
+
+### What did you see instead?
+
+A crash from goleaks. 
+
+### Additional context
+
+I'm pulling this library in via [gocloud.dev/secrets](https://godoc.org/gocloud.dev/secrets) `v0.17.0`, but that doesn't matter here since `v0.22.0` of OpenCensus is used in both. 
+
+This appears to be coming from internal global state of a default recorder being set.
+
+https://github.com/census-instrumentation/opencensus-go/blob/v0.22.0/stats/view/worker.go#L30-L34
+
+Also, there doesn't seem to be a way to retrieve this reporter to shutdown on application shutdown.
+
+https://github.com/census-instrumentation/opencensus-go/search?q=DefaultRecorder&unscoped_q=DefaultRecorder 
+**Is your feature request related to a problem? Please describe.**
+Greetings! I just started using opencensus in go.  The quality and framework was super easy to use, the primitives are intuitive and there are great docs! One thing I noticed was that runtime (`runmetrics`) metrics didn't include GC information.  I'm wondering if `runmetrics` are a good place to include these metrics? 
+
+**Describe the solution you'd like**
+If `runmetrics` is a good place to include these metrics, I was hoping to have [gc stats](https://github.com/prometheus/client_golang/blob/master/prometheus/go_collector.go#L315) included in the runtime metrics exported.
+
+**Describe alternatives you've considered**
+I could pretty easily instrument these in my own application, even package it as a library so all my go apps could easily get these metrics. 
+
+**Additional context**
+
+This request is based on the [runtime metrics that prometheus go client ships with](https://github.com/prometheus/client_golang/blob/master/prometheus/go_collector.go#L315).
+
+Can see the prometheus metrics in action on their grafana dashboard:
+
+![go_processes](https://user-images.githubusercontent.com/321963/70834608-c7bdf080-1dc8-11ea-9be4-455d0c0571f2.png)
+
+
+-----
+
+Thank you!!!
+
+### What version of OpenCensus are you using?
+
+HEAD of this repo
+
+### What version of Go are you using?
+
+go version go1.13.4 darwin/amd64
+
+### Details
+
+`examples.PrintExporter` seems to require being passed to `view.RegisterExporter`, but `examples.LogExporter` can't be passed there because it doesn't implement the write `Exporter` type.  Instead, you're expected to run the `Start` method on it.
+
+The documentation doesn't explain this difference and I'm not sure they were expected to be different.
+Does Datadog tracing and Opencensus tracing work well together? For example, take the following code:
+
+```golang
+import (
+	"context"
+	"log"
+
+	datadog "github.com/DataDog/opencensus-go-exporter-datadog"
+	opencensustrace "go.opencensus.io/trace"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
+)
+
+func main() {
+	exporter, err := datadog.NewExporter(datadog.Options{Service: "my-app"})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer exporter.Stop()
+
+	opencensustrace.RegisterExporter(exporter)
+
+	opencensustrace.ApplyConfig(opencensustrace.Config{
+		DefaultSampler: opencensustrace.AlwaysSample(),
+	})
+
+	span, ctx :=  tracer.StartSpanFromContext(context.Background(), "/foo")
+	datadogSpan(ctx)
+	openCensusSpan(ctx)
+	span.Finish()
+}
+
+func datadogSpan(ctx context.Context) {
+	span, ctx := tracer.StartSpanFromContext(ctx, "datadogSpan")
+	defer span.Finish()
+}
+
+func openCensusSpan(ctx context.Context) {
+	ctx, span := opencensustrace.StartSpan(ctx, "opencensusSpan")
+	defer span.End()
+}
+```
+
+Will the datadog span and opencensus span have the same trace id?
+Fixes https://github.com/census-instrumentation/opencensus-go/issues/1181 
+
+Or at least I think so :) 
+
+I am not familiar with the code that much so would love some close eyes on this. I am not sure what kind of impact this one line of code would have on performance. However, it does seem to fix the behavior described in the issue above and all the unit tests did pass locally. 
+I have a [program](https://github.com/marwan-at-work/rcrepro) that records the latency of a request using the OCHTTP server middleware. 
+
+In my program, I am using the [DataDog OpenCensus Exporter](https://github.com/DataDog/opencensus-go-exporter-datadog) to report this metric. 
+
+Therefore, I wanted to simulate a latency spike by having my handler do the following:
+
+1. The first 4 minutes, the HTTP Handler takes between 200-400ms to respond.
+
+2. The second 6 minutes, the HTTP handler takes between 1-2seconds (latency spike) 
+
+3. The third 4 minutes, the HTTP handler takes between 200-400ms (latency goes back to normal) 
+
+**The latency gets reported every 10 seconds**
+
+In other words, OpenCensus calls DataDog's ExportView every 10 seconds.
+
+OpenCensus collects the Min/Max latencies and passes them as DistributionData to the DataDog exporter. 
+
+**My expectation is that for every 10 seconds, OpenCensus calculates the Min/Max/Mean/etc and passes them to an Exporter, but then it should reset those numbers so that they don't obscure the next bucket of time. Is this assumption incorrect?**
+
+Even if this assumption is wrong, let's continue with how this behavior has obscured the latency spike significantly:
+
+The fact that OpenCensus does not "reset" the Min every 10 seconds, means that the Min stays the same across the entire lifetime of the Go process. 
+
+Therefore, if we had a dashboard of the "min" value only, you'll see that the min never went up, it stays as ~200ms for the entirety of the 14 minutes. Even though for 6 minutes, the Min value was at least 1000ms. 
+
+On the other hand, if you have a "max" metric, you'll see that it went up to ~2s, but then it never went back down even though the traffic spike ended after 10 minutes. 
+
+Predictably, if I "kill" the process and restart it, suddenly the dashboard gets fixed and that's because we no longer hold the "min/max" that was previously preventing the dashboard to be accurate. See the following screen shot for demonstration:
+
+<img width="1247" alt="Screen Shot 2019-10-30 at 2 27 26 AM" src="https://user-images.githubusercontent.com/16294261/67836920-3d455a00-fac4-11e9-9516-bcf8d2438603.png">
+
+
+What you see here is that the Purple line is the Max metric while the Blue line is the Min metric. 
+
+When 4 minutes passed, the Purple line went up, but the Blue line stayed down. This is because even though new incoming requests were clocking between 1-2 seconds, OpenCensus kept comparing those numbers to the Min that was initially recorded in the first 4 minutes. 
+
+However, once I kill the process and restart the server (resuming the traffic spike) you can see the Min gets updated. Similarly, when the spike finished, the Max never goes down until I forcefully reset the Max. 
+
+*As far as I understand, and at the very least, restarting the process should not significantly affect what the chart looks like as seen in the screenshot above*
+
+My understanding is that OpenCensus creates a metric for a bunch of Measures per Reporting Interval (I can easily be wrong about this). Therefore, if I manually empty out the DistributionData after every interval, you can see the Dashboard now looks very correct: 
+
+<img width="550" alt="ocacc" src="https://user-images.githubusercontent.com/16294261/67837391-4f73c800-fac5-11e9-82dc-e7c43c394e88.png">
+
+Finally, I have created a reproduction Repository here: https://github.com/marwan-at-work/rcrepro
+
+I included a Vendor folder that `fmt.Println`'s the incoming DistributionData and you can notice that even when the traffic starts to go up to 1-2 seconds for 6 minutes, the Min value that DataDog receives stays the same. 
+
+AFAIK, there's no need to actually set up Datadog, you can just run the program and inspect the logs. 
+
+
+Also, I'm not familiar with the OpenCensus codebase (until this issue), but all I had to do to fix it was add this line: https://github.com/marwan-at-work/opencensus-go/commit/1380fae97d1e9d7e7d96593154699df45bfb1b7d#diff-2000ebb97830a1f0f1c5c4856a737f78R236
+
+Not sure how thorough the unit tests are, but this didn't break any of them. 
+The default span name for the `ochttp.Transport` plugin uses the path from the url (https://github.com/census-instrumentation/opencensus-go/blob/v0.22.1/plugin/ochttp/trace.go#L149-L151). Paths often contain unique identifier for resources (for example the gcs client path contains the object identifier https://github.com/googleapis/google-cloud-go/issues/1573).
+
+It might be better to go with a safer default (like method which has a bounded cardinality). This might be related to https://github.com/census-instrumentation/opencensus-go/issues/932.
+
+### What version of OpenCensus are you using?
+`v0.22.1`
+
+### What version of Go are you using?
+`go1.13.1`
+
+### What did you do?
+Used the default `ochttp.Transport`.
+
+### What did you expect to see?
+Low cardinality span names.
+
+### What did you see instead?
+Span names that contained unique identifiers.
+
+
+### Additional context
+Add any other context about the problem here.
+
+Implement a RateLimiting sampler as described at https://github.com/census-instrumentation/opencensus-specs/blob/master/trace/Sampling.md
+
+Adds a StartTime option when creating a new span.
+In some cases, you are able to trace only after the operation
+was made. for example in some post-operation hook/observer.
+
+    func myHook(ctx context.Context, info queryInfo) {
+       _, span := StartSpan("mydatabase", WithStartTime(time.Now().Add(-1 * info.Duration()))
+       span.End()
+    }
+How do I trigger and upload trace to jaeger？

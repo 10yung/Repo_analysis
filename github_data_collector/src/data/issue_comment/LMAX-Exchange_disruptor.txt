@@ -1,0 +1,322 @@
+In version 3.3.6, I found this code in class `SingleProducerSequencer`
+
+```java
+        if (wrapPoint > cachedGatingSequence || cachedGatingSequence > nextValue)
+        {
+            cursor.setVolatile(nextValue);  // StoreLoad fence
+
+            long minSequence;
+            while (wrapPoint > (minSequence = Util.getMinimumSequence(gatingSequences, nextValue)))
+            {
+                waitStrategy.signalAllWhenBlocking();
+                LockSupport.parkNanos(1L); // TODO: Use waitStrategy to spin?
+            }
+
+            this.cachedValue = minSequence;
+        }
+```
+
+should setVolatile be necessary? Does it mean that memory visibility cause the behind of the consumers?
+As we know, the class SingleProducerSequencer uses 14 padded long variables to solve false sharing issue. Then why doesn't the class MultiProducerSequencer use the same way to solve false sharing issue as class SingleProducerSequencer does?
+Is it because there is no false sharing issue while using class MultiProducerSequencer? or some other reason?
+If I close a before the data production is completed, it will cause infinite loop
+
+Here is my test code 
+
+```
+@Slf4j
+public class DisruptorSingleTest {
+
+    private static int len = Constants.EVENT_NUM_OM;
+    private static Disruptor<Data> dataDisruptor;
+
+    public static void main(String[] args) {
+
+        String name = ManagementFactory.getRuntimeMXBean().getName();
+        System.out.println(name);
+
+        int ringBufferSize = 65536;
+        dataDisruptor = new Disruptor<>(new EventFactory<Data>() {
+            @Override
+            public Data newInstance() {
+                return new Data();
+            }
+        }, ringBufferSize, new ThreadFactory() {
+            @Override
+            public Thread newThread(Runnable runnable) {
+                return new Thread(runnable, "disruptor-consumer-thread");
+            }
+        }, ProducerType.SINGLE, new YieldingWaitStrategy());
+
+        DataConsumer dataConsumer = new DataConsumer();
+        EventHandlerGroup<Data> dataEventHandlerGroup = dataDisruptor.handleEventsWith(dataConsumer);
+
+        RingBuffer<Data> start = dataDisruptor.start();
+
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                RingBuffer<Data> ringBuffer = dataDisruptor.getRingBuffer();
+                    for (int i = 0; i < len; i++) {
+                        long seq = ringBuffer.next();
+                        Data data = ringBuffer.get(seq);
+                        data.setId(i);
+                        data.setName("c" + i);
+                        ringBuffer.publish(seq);
+                    }
+            }
+        }).start();
+
+        dataDisruptor.shutdown();
+
+    }
+
+    public static class DataConsumer implements EventHandler<Data> {
+
+        private long startTime;
+
+        private int i;
+
+        public DataConsumer() {
+            this.startTime = System.currentTimeMillis();
+        }
+
+        @Override
+        public void onEvent(Data event, long sequence, boolean endOfBatch) throws Exception {
+            i++;
+            if (endOfBatch) {
+                long endTime = System.currentTimeMillis();
+                log.info("Disruptor constTime = {},{}", (endTime - startTime), i);
+            }
+        }
+    }
+
+}
+```
+The probable causes are as follows  
+com.lmax.disruptor.SingleProducerSequencer#next(int)
+
+![image](https://user-images.githubusercontent.com/13413715/70628656-8102b600-1c63-11ea-990f-7d566008d37b.png)
+
+
+
+
+I'm a noob of Disruptor,I find the following code in the  Disruptor getting started.
+
+```
+ExecutorService executorService = new ThreadPoolExecutor(0, Integer.MAX_VALUE,
+                60L, TimeUnit.SECONDS,
+                new SynchronousQueue<Runnable>());
+        int bufferSize = 1024;
+        LongEventFactory factory = new LongEventFactory();
+        Disruptor<LongEvent> disruptor = new Disruptor<LongEvent>(factory, bufferSize, executorService);
+        // Connect the handler
+        RingBuffer<LongEvent> ringBuffer = disruptor.getRingBuffer();
+```
+But,I find others use this method RingBuffer.createSingleProducer() to create RingBuffer.I don't know which is the best way and the difference between A(Disruptor constructor) and B(RingBuffer.createSingleProducer()).
+
+Thank you!
+
+https://github.com/LMAX-Exchange/disruptor/issues/286#issue-524274860
+This code is copy from my project and WorkProcessor;
+
+```
+@Override
+    public void decrConsumer() {
+        int nextUnUsed = getNextUsed();
+        if (nextUnUsed != -1) {
+            RingBuffer<HandlerEvent> ringBuffer = disruptor.getRingBuffer();
+            WorkProcessor processor = processors[nextUnUsed];
+            AbstractSentinelHandler handler = handlers[nextUnUsed];
+            if (processor == null || handler == null) {
+                System.out.println("remove disruptor thread ,handler == " + handler + " ,processor == " + processor);
+            }
+            if (processor != null && handler != null) {
+               //  ******************** problem in here *********************
+                processor.halt();
+                try {
+                    handler.awaitShutdown();
+                } catch (InterruptedException e) {
+                    System.out.println(e);
+                }
+                ringBuffer.removeGatingSequence(processor.getSequence());
+            }
+
+            processors[nextUnUsed] = null;
+            handlers[nextUnUsed] = null;
+            updateUseState(nextUnUsed, NU_USED);
+        }
+    }
+```
+
+```
+  @Override
+    public void run()
+    {
+        if (!running.compareAndSet(false, true))
+        {
+            throw new IllegalStateException("Thread is already running");
+        }
+        sequenceBarrier.clearAlert();
+
+        notifyStart();
+
+        boolean processedSequence = true;
+        long cachedAvailableSequence = Long.MIN_VALUE;
+        long nextSequence = sequence.get();
+        T event = null;
+        while (true)
+        {
+            try
+            {
+                // if previous sequence was processed - fetch the next sequence and set
+                // that we have successfully processed the previous sequence
+                // typically, this will be true
+                // this prevents the sequence getting too far forward if an exception
+                // is thrown from the WorkHandler
+                if (processedSequence)
+                {
+                    processedSequence = false;
+                    do
+                    {
+                        nextSequence = workSequence.get() + 1L;
+                        sequence.set(nextSequence - 1L);
+                    }
+                    while (!workSequence.compareAndSet(nextSequence - 1L, nextSequence));
+                }
+
+                if (cachedAvailableSequence >= nextSequence)
+                {
+                    event = ringBuffer.get(nextSequence);
+                    workHandler.onEvent(event);
+                    processedSequence = true;
+                }
+                else
+                {
+                    //  ******************** problem in here *********************
+                    cachedAvailableSequence = sequenceBarrier.waitFor(nextSequence);
+                }
+            }
+            catch (final TimeoutException e)
+            {
+                notifyTimeout(sequence.get());
+            }
+            catch (final AlertException ex)
+            {
+                if (!running.get())
+                {
+                    break;
+                }
+            }
+            catch (final Throwable ex)
+            {
+                // handle, mark as processed, unless the exception handler threw an exception
+                exceptionHandler.handleEventException(ex, nextSequence, event);
+                processedSequence = true;
+            }
+        }
+
+        notifyShutdown();
+
+        running.set(false);
+    }
+```
+After  i  use  `processor.halt()` to stop workProcess, `cachedAvailableSequence = sequenceBarrier.waitFor(nextSequence)` throws an AlertException exception, and the message of index nextSequence is lost
+
+How can I solve this problem?
+
+Thank you
+
+
+
+
+![1571746951(1)](https://user-images.githubusercontent.com/15230000/67285460-2faf3380-f50a-11e9-93e5-7c49da07c9e7.png)
+
+ can postion 1 move to postion  2 should be more available
+This is the first step in the process of modularizing the Disruptor JAR #234.
+Adding Automatic-Module-Name in the manifest file makes the library usable as a Java automatic module without moving the library itself to Java 9 (or later) or creating a module-info.java.
+This allows the Disruptor when loaded as an automatic module to get its name from the Automatic-Module-Name entry in MANIFEST.MF instead of being inferred from the filename. This second option is dangerous as filenames are far from being unique and stable.
+This post explains the point of having an Automatic-Module-Name defined: http://branchandbound.net/blog/java/2017/12/automatic-module-name/
+Maybe I misunderstand the TimeoutBlockingWaitStrategy meaning. I thought TimeoutBlockingWaitStrategy will release the producer thread when the ringbuffer is full after waiting for a time period, e.g. 3 sec.  But now the behavior looks producer is waiting still. 
+
+When I debug the code, I found the process is waiting on below code `MultiProducerSequencer` which you already have an comments on `TODO`:
+```
+        do
+        {
+            current = cursor.get();
+            next = current + n;
+
+            long wrapPoint = next - bufferSize;
+            long cachedGatingSequence = gatingSequenceCache.get();
+
+            if (wrapPoint > cachedGatingSequence || cachedGatingSequence > current)
+            {
+                long gatingSequence = Util.getMinimumSequence(gatingSequences, current);
+
+                if (wrapPoint > gatingSequence)
+                {
+                    LockSupport.parkNanos(1); // TODO, should we spin based on the wait strategy?
+                    continue;
+                }
+
+                gatingSequenceCache.set(gatingSequence);
+            }
+            else if (cursor.compareAndSet(current, next))
+            {
+                break;
+            }
+        }
+        while (true);
+```
+So I am thinking is this code don't consider any waiting strategy we choose?
+
+My intention is to not block producer threads even we can drop some messages if the ringbuffer is full. But we hope to let waiting strategy to do so, not to check ringbuffer size by ourselves and also need to maintain some timeout, etc.
+ 
+I am using JDK 11 docker image. 
+
+Thanks. 
+I have the pattern whereby a number of events are produced by multiple threads, I then need to transform these events, and then dispatch them to a number of consumers.
+
+The consumers need to be dynamically added and removed from the system at runtime.
+
+I was thinking of using 2 ring buffers. We would receive the events on the first ring-buffer, and have a single consumer which transforms them, and places the transformed events on the second rind-buffer. We would then have a number of consumers on the second ring-buffer that receive events.
+
+I can't quite figure out how to dynamically add and remove consumers at run-time. I have tried this:
+
+```java
+    private final Disruptor<LockAction> outgoingDisruptor = new Disruptor<>(LockAction::new, RING_BUFFER_SIZE, DaemonThreadFactory.INSTANCE);
+    private final RingBuffer<LockAction> outgoingRingBuffer;
+    private final SequenceGroup outgoingSequenceGroup = new SequenceGroup();
+    private final Map<LockEventListener, BatchEventProcessor<LockAction>> outgoingListenersWithProcessors = new NonBlockingHashMap<>();
+
+
+   this.outgoingRingBuffer = outgoingDisruptor.start();
+
+
+    public void registerListener(final LockEventListener lockEventListener) {
+        final SequenceBarrier barrier = outgoingRingBuffer.newBarrier();
+        final EventHandler<LockAction> handler = (event, sequence, endOfBatch) -> lockEventListener.accept(event);
+        final BatchEventProcessor<LockAction> processor = new BatchEventProcessor<>(outgoingRingBuffer, barrier, handler);
+        processor.getSequence().set(barrier.getCursor());
+        outgoingSequenceGroup.add(processor.getSequence());
+        processor.getSequence().set(outgoingRingBuffer.getCursor());
+        outgoingListenersWithProcessors.put(lockEventListener, processor);
+        processor.run();
+
+        // notify the listener that it was registered
+        lockEventListener.registered();
+    }
+
+    public void deregisterListener(final LockEventListener lockEventListener) {
+        final BatchEventProcessor<LockAction> processor = outgoingListenersWithProcessors.remove(lockEventListener);
+        processor.halt();
+        outgoingSequenceGroup.remove(processor.getSequence());
+
+        // notify the listener that it was deregistered
+        lockEventListener.unregistered();
+    }
+```
+
+However, when I call `registerListener` at runtime it always blocks on `processor.run` and never proceeds from there.
+
+What am I doing wrong here?

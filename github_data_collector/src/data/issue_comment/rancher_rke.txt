@@ -1,0 +1,1120 @@
+**RKE version:** 
+1.0.0
+
+**Type/provider of hosts: (VirtualBox/Bare-metal/AWS/GCE/DO)**
+Bare-metal
+
+We use metallb to assign public ips to LoadBalancer services and it works really well, we also want those public IPs to get DNS entries via the coredns k8s_external feature, currently we have to replace the coredns config with this:
+
+`
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns
+  namespace: kube-system
+  
+data:
+  Corefile: |
+    .:53 {
+        errors
+        health
+        ready
+        kubernetes k8s.rd.stibo.dk in-addr.arpa ip6.arpa {
+          pods insecure
+          fallthrough in-addr.arpa ip6.arpa
+        }
+        prometheus :9153
+        forward . 10.0.37.222 10.0.37.221 10.0.37.223        
+        cache 30
+        loop
+        reload
+        loadbalance
+        k8s_external svc.example.com
+    }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    kubernetes.io/bootstrapping: rbac-defaults
+    k8s-addon: coredns.addons.k8s.io
+  name: system:coredns
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - endpoints
+  - services
+  - pods
+  - namespaces
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  annotations:
+    rbac.authorization.kubernetes.io/autoupdate: "true"
+  labels:
+    kubernetes.io/bootstrapping: rbac-defaults
+    k8s-addon: coredns.addons.k8s.io
+  name: system:coredns
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:coredns
+subjects:
+- kind: ServiceAccount
+  name: coredns
+  namespace: kube-system
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coredns-external
+  namespace: kube-system
+  labels:
+    k8s-app: kube-dns-external
+    kubernetes.io/cluster-service: "true"
+    kubernetes.io/name: "coredns-external"
+    addonmanager.kubernetes.io/mode: Reconcile
+  annotations:
+    prometheus.io/port: "9153"
+    prometheus.io/scrape: "true"
+spec:
+  selector:
+    k8s-app: kube-dns
+  type: LoadBalancer
+  loadBalancerIP: 10.0.37.252
+  ports:
+    - name: dns
+      port: 53
+      protocol: UDP
+`
+
+The Service exposes coredns via a fixed IP, so the external DNS server can delegate the svc.example.com zone to it.
+
+The ClusterRole and 'Binding is needed to allow coredns to discover the load balancer services.
+
+The only change to the ConfigMap is:
+`
+k8s_external svc.example.com
+`
+This bit creates DNS entries on the form:
+$service.$namespace.svc.example.com that resolve to the loadBalancerIP of the service.
+
+We have this all working, but when upgrading the cluster, the ConfigMap gets overwritten and things fall apart until our own one is loaded again, even when our own ConfigMap is listed in the addons_include section of cluster.yml.
+
+I would love to be able to get the above objects simply by addning externalzone and externalip to the cluster.yml, like this:
+`
+dns:
+    provider: coredns
+
+    externalzone: svc.example.com
+    externalip: 10.0.37.252
+
+    upstreamnameservers:
+      - 10.0.37.222
+      - 10.0.37.221
+      - 10.0.37.223
+`
+
+Perhaps a partial solution would be to be able to flag objects so they aren't overwritten in cases like this?
+I'have a runing rke cluster v1.0 in a one note debian buster installation.
+but i can't reach networks outside of my node.
+
+**RKE version:** 1.0.0
+
+```bash
+### version of rke
+
+user@node1:~$ rke -v
+rke version v1.0.0
+```
+
+**Docker version: (`docker version`,`docker info` preferred)**
+
+```bash 
+user@node1:~$ docker info
+Client:
+ Debug Mode: false
+
+Server:
+ Containers: 65
+  Running: 22
+  Paused: 0
+  Stopped: 43
+ Images: 35
+ Server Version: 19.03.5
+ Storage Driver: overlay2
+  Backing Filesystem: extfs
+  Supports d_type: true
+  Native Overlay Diff: true
+ Logging Driver: json-file
+ Cgroup Driver: cgroupfs
+ Plugins:
+  Volume: local
+  Network: bridge host ipvlan macvlan null overlay
+  Log: awslogs fluentd gcplogs gelf journald json-file local logentries splunk syslog
+ Swarm: inactive
+ Runtimes: runc
+ Default Runtime: runc
+ Init Binary: docker-init
+ containerd version: b34a5c8af56e510852c35414db4c1f4fa6172339
+ runc version: 3e425f80a8c931f88e6d94a8c831b9d5aa481657
+ init version: fec3683
+ Security Options:
+  apparmor
+  seccomp
+   Profile: default
+ Kernel Version: 4.19.0-6-amd64
+ Operating System: Debian GNU/Linux 10 (buster)
+ OSType: linux
+ Architecture: x86_64
+ CPUs: 2
+ Total Memory: 7.263GiB
+ Name: node1
+ ID: 3VJ7:6ZSO:4MDH:43PM:S5YM:THLX:XCZS:X2YH:7U6N:ISNJ:F5K7:ILWW
+ Docker Root Dir: /var/lib/docker
+ Debug Mode: false
+ Registry: https://index.docker.io/v1/
+ Labels:
+ Experimental: false
+ Insecure Registries:
+  127.0.0.0/8
+ Live Restore Enabled: false
+
+WARNING: No swap limit support
+
+
+```
+
+**Operating system and kernel: (`cat /etc/os-release`, `uname -r` preferred)**
+
+```bash
+### Kernel
+user@node1:~$ uname -r
+4.19.0-6-amd64
+```
+
+**Type/provider of hosts:**
+
+Bare-metal
+
+**cluster.yml file:**
+
+```yml
+
+# If you intened to deploy Kubernetes in an air-gapped environment,
+# please consult the documentation on how to configure custom RKE images.
+nodes:
+- address: node1.fritz.box
+  port: "22"
+  internal_address: node1.fritz.box
+  role:
+  - controlplane
+  - worker
+  - etcd
+  hostname_override: ""
+  user: rke
+  docker_socket: /var/run/docker.sock
+  ssh_key: ""
+  ssh_key_path: ~/.ssh/id_rsa
+  ssh_cert: ""
+  ssh_cert_path: ""
+  labels: {}
+  taints: []
+services:
+  etcd:
+    image: ""
+    extra_args: {}
+    extra_binds: []
+    extra_env: []
+    external_urls: []
+    ca_cert: ""
+    cert: ""
+    key: ""
+    path: ""
+    uid: 0
+    gid: 0
+    snapshot: null
+    retention: ""
+    creation: ""
+    backup_config: null
+  kube-api:
+    image: ""
+    extra_args: {}
+    extra_binds: []
+    extra_env: []
+    service_cluster_ip_range: 10.43.0.0/16
+    service_node_port_range: ""
+    pod_security_policy: false
+    always_pull_images: false
+    secrets_encryption_config: null
+    audit_log: null
+    admission_configuration: null
+    event_rate_limit: null
+  kube-controller:
+    image: ""
+    extra_args: {}
+    extra_binds: []
+    extra_env: []
+    cluster_cidr: 10.42.0.0/16
+    service_cluster_ip_range: 10.43.0.0/16
+  scheduler:
+    image: ""
+    extra_args: {}
+    extra_binds: []
+    extra_env: []
+  kubelet:
+    image: ""
+    extra_args: {}
+    extra_binds: []
+    extra_env: []
+    cluster_domain: cluster.local
+    infra_container_image: ""
+    cluster_dns_server: 10.43.0.10
+    fail_swap_on: false
+    generate_serving_certificate: false
+  kubeproxy:
+    image: ""
+    extra_args: {}
+    extra_binds: []
+    extra_env: []
+network:
+  plugin: canal
+  options: {}
+  node_selector: {}
+authentication:
+  strategy: x509
+  sans: []
+  webhook: null
+addons: ""
+addons_include: []
+system_images:
+  etcd: rancher/coreos-etcd:v3.3.15-rancher1
+  alpine: rancher/rke-tools:v0.1.51
+  nginx_proxy: rancher/rke-tools:v0.1.51
+  cert_downloader: rancher/rke-tools:v0.1.51
+  kubernetes_services_sidecar: rancher/rke-tools:v0.1.51
+  kubedns: rancher/k8s-dns-kube-dns:1.15.0
+  dnsmasq: rancher/k8s-dns-dnsmasq-nanny:1.15.0
+  kubedns_sidecar: rancher/k8s-dns-sidecar:1.15.0
+  kubedns_autoscaler: rancher/cluster-proportional-autoscaler:1.7.1
+  coredns: rancher/coredns-coredns:1.6.2
+  coredns_autoscaler: rancher/cluster-proportional-autoscaler:1.7.1
+  kubernetes: rancher/hyperkube:v1.16.3-rancher1
+  flannel: rancher/coreos-flannel:v0.11.0-rancher1
+  flannel_cni: rancher/flannel-cni:v0.3.0-rancher5
+  calico_node: rancher/calico-node:v3.8.1
+  calico_cni: rancher/calico-cni:v3.8.1
+  calico_controllers: rancher/calico-kube-controllers:v3.8.1
+  calico_ctl: ""
+  calico_flexvol: rancher/calico-pod2daemon-flexvol:v3.8.1
+  canal_node: rancher/calico-node:v3.8.1
+  canal_cni: rancher/calico-cni:v3.8.1
+  canal_flannel: rancher/coreos-flannel:v0.11.0
+  canal_flexvol: rancher/calico-pod2daemon-flexvol:v3.8.1
+  weave_node: weaveworks/weave-kube:2.5.2
+  weave_cni: weaveworks/weave-npc:2.5.2
+  pod_infra_container: rancher/pause:3.1
+  ingress: rancher/nginx-ingress-controller:nginx-0.25.1-rancher1
+  ingress_backend: rancher/nginx-ingress-controller-defaultbackend:1.5-rancher1
+  metrics_server: rancher/metrics-server:v0.3.4
+  windows_pod_infra_container: rancher/kubelet-pause:v0.1.3
+ssh_key_path: ~/.ssh/id_rsa
+ssh_cert_path: ""
+ssh_agent_auth: false
+authorization:
+  mode: none
+  options: {}
+ignore_docker_version: false
+kubernetes_version: ""
+private_registries: []
+ingress:
+  provider: ""
+  options: {}
+  node_selector: {}
+  extra_args: {}
+  dns_policy: ""
+  extra_envs: []
+  extra_volumes: []
+  extra_volume_mounts: []
+cluster_name: ""
+cloud_provider:
+  name: ""
+prefix_path: ""
+addon_job_timeout: 0
+bastion_host:
+  address: ""
+  port: ""
+  user: ""
+  ssh_key: ""
+  ssh_key_path: ""
+  ssh_cert: ""
+  ssh_cert_path: ""
+monitoring:
+  provider: ""
+  options: {}
+  node_selector: {}
+restore:
+  restore: false
+  snapshot_name: ""
+dns: null
+
+```
+
+**shell-demo.yml file:**
+
+```yml
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: shell-demo
+spec:
+  volumes:
+  - name: shared-data
+    emptyDir: {}
+  containers:
+  - name: multitool
+    image: praqma/network-multitool
+    volumeMounts:
+    - name: shared-data
+      mountPath: /usr/share/nginx/html
+  dnsPolicy: Default
+```
+
+**Steps to Reproduce:**
+
+```bash
+rancher up
+kubectl apply -f shell-demo.yml
+```
+
+**Results:**
+
+not rachabel networkes outside the cluster.
+```bash
+user@node1:~$ kubectl exec -it shell-demo -- /bin/ping -c 2 192.168.178.1
+PING 192.168.178.1 (192.168.178.1) 56(84) bytes of data.
+
+--- 192.168.178.1 ping statistics ---
+2 packets transmitted, 0 received, 100% packet loss, time 9ms
+
+command terminated with exit code 1
+
+```
+
+So without route Internet and DNS are also not reachable:
+
+```bash
+
+user@node1:~$ kubectl exec -it shell-demo -- /bin/ping -c 2 www.heise.de
+ping: www.heise.de: Try again
+command terminated with exit code 2
+
+```
+
+
+## my notes of searching the error
+
+Nodes could access other networks.
+
+```bash
+### version of rke
+
+user@node1:~$ rke -v
+rke version v1.0.0
+
+### version of docker
+
+user@node1:~/Projects/wudo7-rke$ docker -v
+Docker version 19.03.5, build 633a0ea838
+
+### ip settings
+
+user@node1:~$ ip a
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+    inet 127.0.0.1/8 scope host lo
+       valid_lft forever preferred_lft forever
+    inet6 ::1/128 scope host 
+       valid_lft forever preferred_lft forever
+2: enp2s0f0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
+    link/ether 54:80:28:4f:da:0c brd ff:ff:ff:ff:ff:ff
+    inet 192.168.178.100/24 brd 192.168.178.255 scope global dynamic noprefixroute enp2s0f0
+       valid_lft 863933sec preferred_lft 863933sec
+    inet6 2003:a:42f:8900:f973:d5cf:11f9:652e/64 scope global temporary dynamic 
+       valid_lft 7127sec preferred_lft 1241sec
+    inet6 2003:a:42f:8900:5680:28ff:fe4f:da0c/64 scope global dynamic mngtmpaddr noprefixroute 
+       valid_lft 7127sec preferred_lft 1241sec
+    inet6 fe80::5680:28ff:fe4f:da0c/64 scope link noprefixroute 
+       valid_lft forever preferred_lft forever
+...
+
+### version of debian
+
+user@node1:~$ cat /etc/debian_version 
+10.2cd
+
+###
+
+user@node1:~$ cat /etc/os-release
+PRETTY_NAME="Debian GNU/Linux 10 (buster)"
+NAME="Debian GNU/Linux"
+VERSION_ID="10"
+VERSION="10 (buster)"
+VERSION_CODENAME=buster
+ID=debian
+HOME_URL="https://www.debian.org/"
+SUPPORT_URL="https://www.debian.org/support"
+BUG_REPORT_URL="https://bugs.debian.org/"
+
+### Kernel
+user@node1:~$ uname -r
+4.19.0-6-amd64
+
+
+### router is reachble
+
+user@node1:~$ ping -c 1 192.168.178.1
+PING 192.168.178.1 (192.168.178.1) 56(84) bytes of data.
+64 bytes from 192.168.178.1: icmp_seq=1 ttl=64 time=0.388 ms
+
+--- 192.168.178.1 ping statistics ---
+1 packets transmitted, 1 received, 0% packet loss, time 0ms
+rtt min/avg/max/mdev = 0.388/0.388/0.388/0.000 ms
+
+### real world is reachble
+
+user@node1:~$ ping -4 -c 1 www.google.de
+PING www.google.de (172.217.16.131) 56(84) bytes of data.
+64 bytes from zrh04s06-in-f131.1e100.net (172.217.16.131): icmp_seq=1 ttl=56 time=18.10 ms
+
+--- www.google.de ping statistics ---
+1 packets transmitted, 1 received, 0% packet loss, time 0ms
+rtt min/avg/max/mdev = 18.978/18.978/18.978/0.000 ms
+
+### routes are set like this
+
+user@node1:~$ ip route
+default via 192.168.178.1 dev enp2s0f0 proto dhcp metric 100 
+10.42.0.0/24 dev cni0 proto kernel scope link src 10.42.0.1 
+172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1 linkdown 
+192.168.178.0/24 dev enp2s0f0 proto kernel scope link src 192.168.178.100 metric 100
+
+### firewall settings
+
+user@node1:~$ sudo iptables -L
+Chain INPUT (policy ACCEPT)
+target     prot opt source               destination         
+
+Chain FORWARD (policy DROP)
+target     prot opt source               destination         
+DOCKER-USER  all  --  anywhere             anywhere            
+DOCKER-ISOLATION-STAGE-1  all  --  anywhere             anywhere            
+ACCEPT     all  --  anywhere             anywhere             ctstate RELATED,ESTABLISHED
+DOCKER     all  --  anywhere             anywhere            
+ACCEPT     all  --  anywhere             anywhere            
+ACCEPT     all  --  anywhere             anywhere            
+
+Chain OUTPUT (policy ACCEPT)
+target     prot opt source               destination         
+
+Chain DOCKER (1 references)
+target     prot opt source               destination         
+
+Chain DOCKER-ISOLATION-STAGE-1 (1 references)
+target     prot opt source               destination         
+DOCKER-ISOLATION-STAGE-2  all  --  anywhere             anywhere            
+RETURN     all  --  anywhere             anywhere            
+
+Chain DOCKER-ISOLATION-STAGE-2 (1 references)
+target     prot opt source               destination         
+DROP       all  --  anywhere             anywhere            
+RETURN     all  --  anywhere             anywhere            
+
+Chain DOCKER-USER (1 references)
+target     prot opt source               destination         
+RETURN     all  --  anywhere             anywhere            
+# Warning: iptables-legacy tables present, use iptables-legacy to see them
+
+
+### and the iptables-legacy roules 
+
+user@node1:~$ sudo iptables-legacy -L
+Chain INPUT (policy ACCEPT)
+target     prot opt source               destination         
+KUBE-SERVICES  all  --  anywhere             anywhere             ctstate NEW /* kubernetes service portals */
+KUBE-EXTERNAL-SERVICES  all  --  anywhere             anywhere             ctstate NEW /* kubernetes externally-visible service portals */
+KUBE-FIREWALL  all  --  anywhere             anywhere            
+
+Chain FORWARD (policy ACCEPT)
+target     prot opt source               destination         
+KUBE-FORWARD  all  --  anywhere             anywhere             /* kubernetes forwarding rules */
+KUBE-SERVICES  all  --  anywhere             anywhere             ctstate NEW /* kubernetes service portals */
+ACCEPT     all  --  10.42.0.0/16         anywhere            
+ACCEPT     all  --  anywhere             10.42.0.0/16        
+
+Chain OUTPUT (policy ACCEPT)
+target     prot opt source               destination         
+KUBE-SERVICES  all  --  anywhere             anywhere             ctstate NEW /* kubernetes service portals */
+KUBE-FIREWALL  all  --  anywhere             anywhere            
+
+Chain KUBE-EXTERNAL-SERVICES (1 references)
+target     prot opt source               destination         
+
+Chain KUBE-FIREWALL (2 references)
+target     prot opt source               destination         
+DROP       all  --  anywhere             anywhere             /* kubernetes firewall for dropping marked packets */ mark match 0x8000/0x8000
+
+Chain KUBE-FORWARD (1 references)
+target     prot opt source               destination         
+DROP       all  --  anywhere             anywhere             ctstate INVALID
+ACCEPT     all  --  anywhere             anywhere             /* kubernetes forwarding rules */ mark match 0x4000/0x4000
+ACCEPT     all  --  10.42.0.0/16         anywhere             /* kubernetes forwarding conntrack pod source rule */ ctstate RELATED,ESTABLISHED
+ACCEPT     all  --  anywhere             10.42.0.0/16         /* kubernetes forwarding conntrack pod destination rule */ ctstate RELATED,ESTABLISHED
+
+Chain KUBE-SERVICES (3 references)
+target     prot opt source               destination         
+
+### from a started docker container, not in cluster, internt is also reachble.
+
+user@node1:~$ docker run  -a stdout -i -t praqma/network-multitool /bin/ping -c 1 www.heise.de
+The directory /usr/share/nginx/html is not mounted.
+Over-writing the default index.html file with some useful information.
+PING www.heise.de (193.99.144.85) 56(84) bytes of data.
+64 bytes from www.heise.de (193.99.144.85): icmp_seq=1 ttl=246 time=19.2 ms
+
+--- www.heise.de ping statistics ---
+1 packets transmitted, 1 received, 0% packet loss, time 0ms
+rtt min/avg/max/mdev = 19.219/19.219/19.219/0.000 ms
+
+
+```
+
+But inside k8s, all pods i can't reach
+the surrounding network nodes, PCs or router.
+
+
+```bash
+kubectl exec -it shell-demo -- /bin/bash
+bash-5.0# 
+
+### then inside the Pod
+
+bash-5.0# ip a
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+    inet 127.0.0.1/8 scope host lo
+       valid_lft forever preferred_lft forever
+3: eth0@if10: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue state UP group default 
+    link/ether 0a:58:0a:2a:00:0f brd ff:ff:ff:ff:ff:ff link-netnsid 0
+    inet 10.42.0.15/24 scope global eth0
+       valid_lft forever preferred_lft forever
+
+### routing inside my pod
+
+bash-5.0# ip route
+default via 10.42.0.1 dev eth0 
+10.42.0.0/24 dev eth0 proto kernel scope link src 10.42.0.15 
+10.42.0.0/16 via 10.42.0.1 dev eth0
+
+### ping cluster intern:
+
+bash-5.0# ping -c2  10.42.0.1
+PING 10.42.0.1 (10.42.0.1) 56(84) bytes of data.
+64 bytes from 10.42.0.1: icmp_seq=1 ttl=64 time=0.134 ms
+64 bytes from 10.42.0.1: icmp_seq=2 ttl=64 time=0.117 ms
+
+--- 10.42.0.1 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 20ms
+rtt min/avg/max/mdev = 0.117/0.125/0.134/0.014 ms
+
+### inside the pod could reach the hosting node.
+
+bash-5.0# ping -c 2 192.168.178.100
+PING 192.168.178.100 (192.168.178.100) 56(84) bytes of data.
+64 bytes from 192.168.178.100: icmp_seq=1 ttl=64 time=0.102 ms
+64 bytes from 192.168.178.100: icmp_seq=2 ttl=64 time=0.098 ms
+
+--- 192.168.178.100 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 32ms
+rtt min/avg/max/mdev = 0.098/0.100/0.102/0.002 ms
+
+### but I can't reach the PCs, router or dns.
+
+ping -c 2 192.168.178.1
+PING 192.168.178.1 (192.168.178.1) 56(84) bytes of data.
+^C
+--- 192.168.178.1 ping statistics ---
+2 packets transmitted, 0 received, 100% packet loss, time 9ms
+
+
+```
+
+
+
+**RKE version:1.0**
+
+**Docker version: (19
+
+2020-01-14 04:22:49.433423 W | rafthttp: health check for peer 88f0e502373456f1 could not connect: dial tcp 192.168.7.220:2380: connect: no route to host (prober "ROUND_TRIPPER_RAFT_MESSAGE")
+2020-01-14 04:22:54.433709 W | rafthttp: health check for peer 88f0e502373456f1 could not connect: dial tcp 192.168.7.220:2380: connect: no route to host (prober "ROUND_TRIPPER_RAFT_MESSAGE")
+2020-01-14 04:22:54.433779 W | rafthttp: health check for peer 88f0e502373456f1 could not connect: dial tcp 192.168.7.220:2380: connect: no route to host (prober "ROUND_TRIPPER_SNAPSHOT")
+2020-01-14 04:22:59.434030 W | rafthttp: health check for peer 88f0e502373456f1 could not connect: dial tcp 192.168.7.220:2380: connect: no route to host (prober "ROUND_TRIPPER_SNAPSHOT")
+2020-01-14 04:22:59.434095 W | rafthttp: health check for peer 88f0e502373456f1 could not connect: dial tcp 192.168.7.220:2380: i/o timeout (prober "ROUND_TRIPPER_RAFT_MESSAGE")
+2020-01-14 04:23:04.434375 W | rafthttp: health check for peer 88f0e502373456f1 could not connect: dial tcp 192.168.7.220:2380: i/o timeout (prober "ROUND_TRIPPER_RAFT_MESSAGE")
+
+**RKE version:**
+```
+INFO[0000] Running RKE version: v1.0.0
+```
+**Docker version: (`docker version`,`docker info` preferred)**
+```
+Client: Docker Engine - Community
+ Version:           18.09.2
+ API version:       1.39
+ Go version:        go1.10.8
+ Git commit:        6247962
+ Built:             Sun Feb 10 04:11:47 2019
+ OS/Arch:           linux/amd64
+ Experimental:      false
+
+Server: Docker Engine - Community
+ Engine:
+  Version:          18.09.2
+  API version:      1.39 (minimum version 1.12)
+  Go version:       go1.10.6
+  Git commit:       6247962
+  Built:            Sun Feb 10 04:20:28 2019
+  OS/Arch:          linux/amd64
+  Experimental:     false
+```
+**Operating system and kernel: (`cat /etc/os-release`, `uname -r` preferred)**
+```
+NAME="RancherOS"
+VERSION=v1.5.4
+ID=rancheros
+ID_LIKE=
+VERSION_ID=v1.5.4
+PRETTY_NAME="RancherOS v1.5.4"
+HOME_URL="http://rancher.com/rancher-os/"
+SUPPORT_URL="https://forums.rancher.com/c/rancher-os"
+BUG_REPORT_URL="https://github.com/rancher/os/issues"
+BUILD_ID=
+```
+```
+4.14.138-rancher
+```
+**Type/provider of hosts: (VirtualBox/Bare-metal/AWS/GCE/DO)**
+AHV
+**cluster.yml file:**
+```
+cluster_name: rancher
+ssh_agent_auth: true
+ssh_key_path: ~/path/to/key
+kubernetes_version: v1.16.3-rancher1-1
+
+nodes:
+  - address: xxx.xxx.xxx.xxx
+    user: rancher
+    role: [controlplane,worker,etcd]
+  - address: xxx.xxx.xxx.xxx
+    user: rancher
+    role: [controlplane,worker,etcd]
+  - address: xxx.xxx.xxx.xxx
+    user: rancher
+    role: [controlplane,worker,etcd]
+
+services:
+  etcd:
+    snapshot: true
+    retention: 24h
+    creation: 6h
+  kube-api:
+    service_cluster_ip_range: 10.6.32.0/20
+    pod_security_policy: true
+  kube-controller:
+    cluster_cidr: 10.6.0.0/19
+    service_cluster_ip_range: 10.6.32.0/20
+  kubelet:
+    fail_swap_on: true
+    cluster_dns_server: 10.6.32.10
+  authorization:
+    mode: rbac
+```
+**Steps to Reproduce:**
+- `rke up` cluster with `kubernetes_version: v1.13.5-rancher1-2`
+- Change to `kubernetes_version: v1.16.3-rancher1-1` and run `rke up`
+
+**Results:**
+```
+INFO[0038] [dns] removing DNS provider kube-dns         
+WARN[0103] Failed to deploy DNS addon execute job for provider coredns: Failed to get job complete status for job rke-kube-dns-addon-delete-job in namespace kube-system 
+```
+
+Failed job pods had error message about not finding Deployments matching `extentions/v1beta1` or `apps/v1beta1`
+
+I inspected the job and kube-dns manifests. With the upgrade to 1.16 the `kube-dns` and `kube-dns-autoscaler` deployments had `apiVersion: apps/v1`.
+
+I edited the `rke-kube-dns-addon` configmap in the `kube-system` namespace, changing apiVersion to `apps/v1` for both deployments and ran `rke up` again. This workaround seemed to solve the problem. There were no errors and after kube-dns was deleted, CoreDNS deployed without issue.
+
+I suspect this is related to the [deprecation](https://github.com/kubernetes/kubernetes/blob/master/CHANGELOG-1.16.md#deprecations-and-removals) of these apiVersions in k8s v1.16.0
+**RKE version:**
+```
+$ rke -v 
+rke version v1.0.0
+```
+
+**Docker version: (`docker version`,`docker info` preferred)**
+```
+$ docker version 
+Client: Docker Engine - Community
+ Version:           18.09.8
+ API version:       1.39
+ Go version:        go1.10.8
+ Git commit:        0dd43dd87f
+ Built:             Wed Jul 17 17:38:58 2019
+ OS/Arch:           linux/amd64
+ Experimental:      false
+
+Server: Docker Engine - Community
+ Engine:
+  Version:          18.09.8
+  API version:      1.39 (minimum version 1.12)
+  Go version:       go1.10.8
+  Git commit:       0dd43dd87f
+  Built:            Wed Jul 17 17:48:49 2019
+  OS/Arch:          linux/amd64
+  Experimental:     false
+```
+```
+$ docker info 
+Containers: 23
+ Running: 18
+ Paused: 0
+ Stopped: 5
+Images: 12
+Server Version: 18.09.8
+Storage Driver: overlay2
+ Backing Filesystem: extfs
+ Supports d_type: true
+ Native Overlay Diff: true
+Logging Driver: json-file
+Cgroup Driver: cgroupfs
+Plugins:
+ Volume: local
+ Network: bridge host macvlan null overlay
+ Log: awslogs fluentd gcplogs gelf journald json-file local logentries splunk syslog
+Swarm: inactive
+Runtimes: runc
+Default Runtime: runc
+Init Binary: docker-init
+containerd version: 894b81a4b802e4eb2a91d1ce216b8817763c29fb
+runc version: 425e105d5a03fabd737a126ad93d62a9eeede87f
+init version: fec3683
+Security Options:
+ seccomp
+  Profile: default
+Kernel Version: 4.14.138-rancher
+Operating System: RancherOS v1.5.4
+OSType: linux
+Architecture: x86_64
+CPUs: 4
+Total Memory: 15.65GiB
+Name: rke3
+ID: XHDN:HTIG:B6NA:YMYU:76Q2:C74X:QSLV:U3AQ:GZ3L:AYGR:F2XF:M42A
+Docker Root Dir: /mnt/data/docker
+Debug Mode (client): false
+Debug Mode (server): false
+Registry: https://index.docker.io/v1/
+Labels:
+Experimental: false
+Insecure Registries:
+ 127.0.0.0/8
+Live Restore Enabled: false
+Product License: Community Engine
+```
+
+**Operating system and kernel: (`cat /etc/os-release`, `uname -r` preferred)**
+```
+$ cat /etc/os-release
+NAME="RancherOS"
+VERSION=v1.5.4
+ID=rancheros
+ID_LIKE=
+VERSION_ID=v1.5.4
+PRETTY_NAME="RancherOS v1.5.4"
+HOME_URL="http://rancher.com/rancher-os/"
+SUPPORT_URL="https://forums.rancher.com/c/rancher-os"
+BUG_REPORT_URL="https://github.com/rancher/os/issues"
+BUILD_ID=
+```
+
+**Type/provider of hosts: (VirtualBox/Bare-metal/AWS/GCE/DO)**
+Azure VM
+
+**cluster.yml file:**
+```
+nodes:
+- address: rke1
+  role:
+    - controlplane
+    - etcd
+    - worker
+  user: rancher
+  ssh_key_path: ~/.ssh/id_rsa-rke
+- address: rke2
+  role:
+    - controlplane
+    - etcd
+    - worker
+  user: rancher
+  ssh_key_path: ~/.ssh/id_rsa-rke
+- address: rke3
+  role:
+    - worker
+    - etcd
+    - controlplane
+  user: rancher
+  ssh_key_path: ~/.ssh/id_rsa-rke
+ingress:
+  provider: nginx
+  extra_args:
+    http-port: 8080
+    https-port: 8443
+```
+
+**Steps to Reproduce:**
+
+- I wish to configure the provided Rancher `nginx-ingress-controller` to listen on ports `HTTP/8080` and `HTTPS/8443`
+- When installing RKE, I specify the above ports in the `cluster.yml` file
+- The RKE cluster deploys fine, however `nginx-ingress-controller` continues to be bound to `HostPort` `80` and `443`
+
+**Results:**
+- To fix this, after RKE is deployed, I modified `nginx-ingress-controller` daemonset resource like so:
+```
+kubectl edit daemonset nginx-ingress-controller -n ingress-nginx
+```
+- I did a a search and replace, saved the resource config, then did `kubectl delete pod -l app=ingress-nginx -n ingress-nginx` to get fresh pods deployed with the modified config
+- Rancher now is bound to `HostPort` `8080` and `8443`
+- Below is my current daemonset resource config which binds `HostPort` `HTTP/8080` and `HTTPS/78443`
+
+```
+   $ kubectl get daemonset nginx-ingress-controller -n ingress-nginx -o yaml
+   apiVersion: apps/v1
+   kind: DaemonSet
+   metadata:
+     annotations:
+       deprecated.daemonset.template.generation: "2"
+       field.cattle.io/publicEndpoints: '[{"nodeName":"local:machine-bvcdx","addresses":["rke6"],"port":8080,"protocol":"TCP","podName":"ingress-nginx:nginx-ingress-controller-d2m8d","allNodes":false},{"nodeName":"local:machine-bvcdx","addresses":["rke6"],"port":8443,"protocol":"TCP","podName":"ingress-nginx:nginx-ingress-controller-d2m8d","allNodes":false},{"nodeName":"local:machine-2f5db","addresses":["rke4"],"port":8080,"protocol":"TCP","podName":"ingress-nginx:nginx-ingress-controller-9xt8b","allNodes":false},{"nodeName":"local:machine-2f5db","addresses":["rke4"],"port":8443,"protocol":"TCP","podName":"ingress-nginx:nginx-ingress-controller-9xt8b","allNodes":false},{"nodeName":"local:machine-gqw2x","addresses":["rke5"],"port":8080,"protocol":"TCP","podName":"ingress-nginx:nginx-ingress-controller-wk25s","allNodes":false},{"nodeName":"local:machine-gqw2x","addresses":["rke5"],"port":8443,"protocol":"TCP","podName":"ingress-nginx:nginx-ingress-controller-wk25s","allNodes":false}]'
+       kubectl.kubernetes.io/last-applied-configuration: |
+         {"apiVersion":"apps/v1","kind":"DaemonSet","metadata":{"annotations":{},"name":"nginx-ingress-controller","namespace":"ingress-nginx"},"spec":{"selector":{"matchLabels":{"app":"ingress-nginx"}},"template":{"metadata":{"annotations":{"prometheus.io/port":"10254","prometheus.io/scrape":"true"},"labels":{"app":"ingress-nginx"}},"spec":{"affinity":{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"beta.kubernetes.io/os","operator":"NotIn","values":["windows"]},{"key":"node-role.kubernetes.io/worker","operator":"Exists"}]}]}}},"containers":[{"args":["/nginx-ingress-controller","--default-backend-service=$(POD_NAMESPACE)/default-http-backend","--configmap=$(POD_NAMESPACE)/nginx-configuration","--tcp-services-configmap=$(POD_NAMESPACE)/tcp-services","--udp-services-configmap=$(POD_NAMESPACE)/udp-services","--annotations-prefix=nginx.ingress.kubernetes.io","--http-port=8080","--https-port=8443"],"env":[{"name":"POD_NAME","valueFrom":{"fieldRef":{"fieldPath":"metadata.name"}}},{"name":"POD_NAMESPACE","valueFrom":{"fieldRef":{"fieldPath":"metadata.namespace"}}}],"image":"rancher/nginx-ingress-controller:nginx-0.25.1-rancher1","livenessProbe":{"failureThreshold":3,"httpGet":{"path":"/healthz","port":10254,"scheme":"HTTP"},"initialDelaySeconds":10,"periodSeconds":10,"successThreshold":1,"timeoutSeconds":1},"name":"nginx-ingress-controller","ports":[{"containerPort":80,"name":"http"},{"containerPort":443,"name":"https"}],"readinessProbe":{"failureThreshold":3,"httpGet":{"path":"/healthz","port":10254,"scheme":"HTTP"},"periodSeconds":10,"successThreshold":1,"timeoutSeconds":1},"securityContext":{"capabilities":{"add":["NET_BIND_SERVICE"],"drop":["ALL"]},"runAsUser":33}}],"hostNetwork":true,"serviceAccountName":"nginx-ingress-serviceaccount","tolerations":[{"effect":"NoExecute","operator":"Exists"},{"effect":"NoSchedule","operator":"Exists"}]}}}}
+     creationTimestamp: "2019-12-18T05:35:07Z"
+     generation: 2
+     name: nginx-ingress-controller
+     namespace: ingress-nginx
+     resourceVersion: "6720179"
+     selfLink: /apis/apps/v1/namespaces/ingress-nginx/daemonsets/nginx-ingress-controller
+     uid: 91669baa-2495-43b4-8299-e53a2e5a0862
+   spec:
+     revisionHistoryLimit: 10
+     selector:
+       matchLabels:
+         app: ingress-nginx
+     template:
+       metadata:
+         annotations:
+           prometheus.io/port: "10254"
+           prometheus.io/scrape: "true"
+         creationTimestamp: null
+         labels:
+           app: ingress-nginx
+       spec:
+         affinity:
+           nodeAffinity:
+             requiredDuringSchedulingIgnoredDuringExecution:
+               nodeSelectorTerms:
+               - matchExpressions:
+                 - key: beta.kubernetes.io/os
+                   operator: NotIn
+                   values:
+                   - windows
+                 - key: node-role.kubernetes.io/worker
+                   operator: Exists
+         containers:
+         - args:
+           - /nginx-ingress-controller
+           - --default-backend-service=$(POD_NAMESPACE)/default-http-backend
+           - --configmap=$(POD_NAMESPACE)/nginx-configuration
+           - --tcp-services-configmap=$(POD_NAMESPACE)/tcp-services
+           - --udp-services-configmap=$(POD_NAMESPACE)/udp-services
+           - --annotations-prefix=nginx.ingress.kubernetes.io
+           - --http-port=8080
+           - --https-port=8443
+           env:
+           - name: POD_NAME
+             valueFrom:
+               fieldRef:
+                 apiVersion: v1
+                 fieldPath: metadata.name
+           - name: POD_NAMESPACE
+             valueFrom:
+               fieldRef:
+                 apiVersion: v1
+                 fieldPath: metadata.namespace
+           image: rancher/nginx-ingress-controller:nginx-0.25.1-rancher1
+           imagePullPolicy: IfNotPresent
+           livenessProbe:
+             failureThreshold: 3
+             httpGet:
+               path: /healthz
+               port: 10254
+               scheme: HTTP
+             initialDelaySeconds: 10
+             periodSeconds: 10
+             successThreshold: 1
+             timeoutSeconds: 1
+           name: nginx-ingress-controller
+           ports:
+           - containerPort: 8080
+             hostPort: 8080
+             name: http
+             protocol: TCP
+           - containerPort: 8443
+             hostPort: 8443
+             name: https
+             protocol: TCP
+           readinessProbe:
+             failureThreshold: 3
+             httpGet:
+               path: /healthz
+               port: 10254
+               scheme: HTTP
+             periodSeconds: 10
+             successThreshold: 1
+             timeoutSeconds: 1
+           resources: {}
+           securityContext:
+             capabilities:
+               add:
+               - NET_BIND_SERVICE
+               drop:
+               - ALL
+             runAsUser: 33
+           terminationMessagePath: /dev/termination-log
+           terminationMessagePolicy: File
+         dnsPolicy: ClusterFirst
+         hostNetwork: true
+         restartPolicy: Always
+         schedulerName: default-scheduler
+         securityContext: {}
+         serviceAccount: nginx-ingress-serviceaccount
+         serviceAccountName: nginx-ingress-serviceaccount
+         terminationGracePeriodSeconds: 30
+         tolerations:
+         - effect: NoExecute
+           operator: Exists
+         - effect: NoSchedule
+           operator: Exists
+     updateStrategy:
+       rollingUpdate:
+         maxUnavailable: 1
+       type: RollingUpdate
+   status:
+     currentNumberScheduled: 3
+     desiredNumberScheduled: 3
+     numberAvailable: 3
+     numberMisscheduled: 0
+     numberReady: 3
+     observedGeneration: 2
+     updatedNumberScheduled: 3
+   ```
+Hello Rancher/RKE team,
+
+I'm using RKE to manage the clusters. Rke up command is updating cluster fastly but there is something wrong on  upgrade and update progress I think .
+
+RKE do not drain  the k8s nodes according to that this can cause down time .
+
+Regarding to that I have added pod eviction option for rke . I want to test and improve these PR maybe we can improve all together. 
+
+I will expect your feedbacks :D 
+
+Thanks
+Hi all,
+The approach that RKE offers is really nice, and what would be really interesting would be to be able to store the rke cluster state file remotely to facilitate collaboration as terraform allows it on the same basis of state management.
+Also, because it stores secrets, we would like to be able to store it on a secure storage space.
+Does it make sense as a feature request ?
+This PR corrects the log output during `rke up`.
+The output still contains the legacy configmap name `cluster-state`. The new cluster state is saved in `full-cluster-state`.
+Can Kubernetes initialized by rke decide which node a pod runs on based on the node's memory footprint?
+
+rke version v0.2.8
+docker  Version: 18.09.2
+OS:  ubuntu 18.04
+cat  cluster.yml 
+nodes:
+    - address: 172.16.10.20
+      hostname_override: pre-k8s-master1
+      user: app
+      role:
+        - controlplane
+        - etcd
+    - address: 172.16.10.21
+      hostname_override: pre-k8s-node1
+      user: app
+      role:
+        - worker
+        - address: 172.16.10.22
+      hostname_override: pre-k8s-node2
+      user: app
+      role:
+        - worker
+cluster_name: precluster
+ssh_key_path: /root/rke-pre/id_rsa_rke
+kubernetes_version: v1.14.6-rancher1-1
+ingress:
+    provider: nginx
+services:
+  etcd:
+    extra_args:
+      election-timeout: "5000"
+      heartbeat-interval: "500"
+      quota-backend-bytes: "4294967296"
+    snapshot: true
+    creation: 10m0s
+    retention: 48h
+  kube-api:
+    service_cluster_ip_range: 10.243.0.0/16
+    service_node_port_range: 1000-20000
+    pod_security_policy: false
+  kube-controller:
+    cluster_cidr: 10.242.0.0/16
+    service_cluster_ip_range: 10.243.0.0/16
+  kubelet:
+    cluster_domain: clusterpre.local
+    cluster_dns_server: 10.243.0.10
+network:
+    plugin: canal
+dns:
+  provider: coredns
+![image](https://user-images.githubusercontent.com/15685376/71565776-f63c0b00-2aec-11ea-9607-687af7f9356c.png)
+
+![image](https://user-images.githubusercontent.com/15685376/71565780-ffc57300-2aec-11ea-900d-f1caf936a27c.png)
+
+rke 0.3.2, tried add secondary scheduler, but the pods with second scheduler  is always in pendding status.
+follow [the guide in offical kubernetes page] (https://kubernetes.io/docs/tasks/administer-cluster/configure-multiple-schedulers/)
+rke website give none document how to apply multiple scheudler, I guess this is no supported?
+
+[lab@k8s-demo-slave1 kubernetes]$ kubectl get pods 
+NAME                                 READY   STATUS    RESTARTS   AGE
+annotation-second-scheduler          0/1     Pending   0          16h

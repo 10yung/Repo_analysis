@@ -1,0 +1,267 @@
+
+I couldn't add the 2.13 target because kafka itself has no binary
+yet. I figured this out later when I already upgraded the other
+dependencies. Maybe this is still useful to have.
+I want to test if an offset is committed or not (because only commit in some situations). I have not found any way to test that.
+
+I'm very newbie at this, so probably there's something I just don't get.
+
+I'm using akka kafka streams. Here's an example of a test that is working.
+
+```
+  "KafkaSource" should {
+    "consume from a kafka topic and pass the message " in {
+      val commitToKafka = true
+      val key = "key".getBytes
+      val message = "message".getBytes
+
+      withRunningKafka {
+
+        val source = getKafkaSource(commitToKafka)
+        val (_, sub) = source
+          .toMat(TestSink.probe[CommittableMessage[Array[Byte], Array[Byte], ConsumerMessage.CommittableOffset]])(Keep.both)
+          .run()
+
+        val messageOpt = publishAndRequestRetry(topic, key, message, sub, retries)
+        messageOpt should not be empty
+        messageOpt.get.value shouldBe message
+      }
+    }
+```
+```publishAndRequestRetry``` uses ```publishToKafka``` to put a message and wait for the source to get it.
+
+I want to add a test to know if the offset has been commited or not. Is this possible with EmbeddedKafka?
+I am running tests over the same Kafka Streams topology.
+I have different suites extending EmbeddedKafkaStreamsAllInOne.
+Each suite uses different ZK and Kafka ports, application name and topic names (same names with appName prefixed). 
+Each suite contains several tests, which use `withRunningKafka` and custom consumers, to test different parts of a KafkaStreams application that has several output topics.
+
+When running tests sequentially they're fine, but in parallel starts showing errors of non-existent topics, dangling threads trying to connect to ZK, etc. 
+
+I've updated to 1.1.1 to no avail. I've seen this issue has been raised before [here](https://github.com/manub/scalatest-embedded-kafka/pull/101), and some [fixes](https://github.com/manub/scalatest-embedded-kafka/pull/105) have been merged. Are they in 1.1.1 already? 
+
+First failure, when executing two suites with appNames "customer-test" and "order-test": 
+```
+[2018-08-02 13:20:41,446] INFO Create topic: customer-test-sessionz (com.divvit.dp.streams.testing.KafkaStreamsTestUtils$)
+[2018-08-02 13:20:41,448] INFO Create topic: order-test-sessionz (com.divvit.dp.streams.testing.KafkaStreamsTestUtils$)
+[2018-08-02 13:20:41,452] WARN Error registering AppInfo mbean (org.apache.kafka.common.utils.AppInfoParser)
+javax.management.InstanceAlreadyExistsException: kafka.admin.client:type=app-info,id=embedded-kafka-admin-client
+	at com.sun.jmx.mbeanserver.Repository.addMBean(Repository.java:437)
+	at com.sun.jmx.interceptor.DefaultMBeanServerInterceptor.registerWithRepository(DefaultMBeanServerInterceptor.java:1898)
+	at com.sun.jmx.interceptor.DefaultMBeanServerInterceptor.registerDynamicMBean(DefaultMBeanServerInterceptor.java:966)
+	at com.sun.jmx.interceptor.DefaultMBeanServerInterceptor.registerObject(DefaultMBeanServerInterceptor.java:900)
+	at com.sun.jmx.interceptor.DefaultMBeanServerInterceptor.registerMBean(DefaultMBeanServerInterceptor.java:324)
+	at com.sun.jmx.mbeanserver.JmxMBeanServer.registerMBean(JmxMBeanServer.java:522)
+	at org.apache.kafka.common.utils.AppInfoParser.registerAppInfo(AppInfoParser.java:62)
+	at org.apache.kafka.clients.admin.KafkaAdminClient.<init>(KafkaAdminClient.java:380)
+	at org.apache.kafka.clients.admin.KafkaAdminClient.createInternal(KafkaAdminClient.java:331)
+	at org.apache.kafka.clients.admin.AdminClient.create(AdminClient.java:62)
+	at net.manub.embeddedkafka.EmbeddedKafkaSupport.createCustomTopic(EmbeddedKafka.scala:716)
+
+```
+I understand here "winner takes it all", in this case "customers" Suite seems to enter first, then "orders" Suite is trying to use the same Kafka but it can't. Is it the client ID: "id=embedded-kafka-admin-client" of any importance here? It is hardcoded [here](https://github.com/manub/scalatest-embedded-kafka/blob/master/embedded-kafka/src/main/scala/net/manub/embeddedkafka/EmbeddedKafka.scala), so I suppose it shouldn't be a matter of conflict.
+
+Then I can find these errors later which seem to show second Suite complaining about its topics: 
+```
+java.lang.IllegalArgumentException: Assigned partition order-test-customerOrderIntermediate-2 for non-subscribed topic regex pattern; subscription pattern is customer-test-customerOrderIntermediate|customer-test-customerz|customer-test-eventz|customer-test-visitorz
+	at org.apache.kafka.clients.consumer.internals.SubscriptionState.assignFromSubscribed(SubscriptionState.java:187)
+	at org.apache.kafka.clients.consumer.internals.ConsumerCoordinator.onJoinComplete(ConsumerCoordinator.java:220)
+	at org.apache.kafka.clients.consumer.internals.AbstractCoordinator.joinGroupIfNeeded(AbstractCoordinator.java:367)
+	at org.apache.kafka.clients.consumer.internals.AbstractCoordinator.ensureActiveGroup(AbstractCoordinator.java:316)
+	at org.apache.kafka.clients.consumer.internals.ConsumerCoordinator.poll(ConsumerCoordinator.java:290)
+	at org.apache.kafka.clients.consumer.KafkaConsumer.pollOnce(KafkaConsumer.java:1149)
+	at org.apache.kafka.clients.consumer.KafkaConsumer.poll(KafkaConsumer.java:1115)
+	at org.apache.kafka.streams.processor.internals.StreamThread.pollRequests(StreamThread.java:831)
+	at org.apache.kafka.streams.processor.internals.StreamThread.runOnce(StreamThread.java:788)
+	at org.apache.kafka.streams.processor.internals.StreamThread.runLoop(StreamThread.java:749)
+	at org.apache.kafka.streams.processor.internals.StreamThread.run(StreamThread.java:719)
+
+```
+Using `"net.manub" %% "scalatest-embedded-kafka" % "1.1.1"` I'm seeing an issue with stopping the embedded servers if the servers have been started individually.  When I start the servers by calling `start()` the subsequent call to `stop()` works as expected.  However, when starting each server individually, a call to `stop()` results in repeated `Connection refused` ZooKeeper errors .
+
+Looking at the code, the discrepancy can be explained by the fact that `start()` does not add the `EmbeddedZ` instance to `servers` and is thus never stopped by a call to `stop()` while `startZooKeeper()` adds the instance to `servers`.
+
+This is best demonstrated in the REPL (I canceled the session after two errors but they repeat indefinitely):
+
+    [info] Starting scala interpreter...
+    Welcome to Scala 2.12.6 (OpenJDK 64-Bit Server VM, Java 1.8.0_172).
+    Type in expressions for evaluation. Or try :help.
+ 
+    scala> :paste
+    // Entering paste mode (ctrl-D to finish)
+ 
+    import net.manub.embeddedkafka.EmbeddedKafka
+    import scala.reflect.io.Directory
+    import org.slf4j.LoggerFactory
+ 
+    val log = LoggerFactory.getLogger("REPL-logger")
+ 
+    log.info("EmbeddedKafka.start()")
+    EmbeddedKafka.start()
+    Thread.sleep(500)
+    EmbeddedKafka.stop()
+    Thread.sleep(500)
+ 
+    log.info("EmbeddedKafka.startZooKeeper()")
+    EmbeddedKafka.startZooKeeper(Directory.makeTemp("zookeeper-logs"))
+    Thread.sleep(500)
+ 
+    log.info("EmbeddedKafka.startKafka()")
+    EmbeddedKafka.startKafka(Directory.makeTemp("kafka-logs"))
+    Thread.sleep(500)
+ 
+    log.info("Stopping servers")
+    EmbeddedKafka.stop()
+    log.info("Servers stopped")
+ 
+    // Exiting paste mode, now interpreting.
+ 
+    INFO  REPL-logger - EmbeddedKafka.start()
+    ERROR o.a.z.s.ZooKeeperServer - ZKShutdownHandler is not registered, so ZooKeeper server won't take any action on ERROR or SHUTDOWN server state changes
+    WARN  k.s.BrokerMetadataCheckpoint - No meta.properties file under dir /tmp/kafka-logs3439956962492633719.tmp/meta.properties
+    WARN  k.s.BrokerMetadataCheckpoint - No meta.properties file under dir /tmp/kafka-logs3439956962492633719.tmp/meta.properties
+    ERROR o.a.z.s.ZooKeeperServer - ZKShutdownHandler is not registered, so ZooKeeper server won't take any action on ERROR or SHUTDOWN server state changes
+    INFO  REPL-logger - EmbeddedKafka.startZooKeeper()
+    ERROR o.a.z.s.ZooKeeperServer - ZKShutdownHandler is not registered, so ZooKeeper server won't take any action on ERROR or SHUTDOWN server state changes
+    INFO  REPL-logger - EmbeddedKafka.startKafka()
+    WARN  o.a.z.ClientCnxn - Session 0x0 for server null, unexpected error, closing socket connection and attempting reconnect
+    java.net.ConnectException: Connection refused
+      at sun.nio.ch.SocketChannelImpl.checkConnect(Native Method)
+      at sun.nio.ch.SocketChannelImpl.finishConnect(SocketChannelImpl.java:717)
+      at org.apache.zookeeper.ClientCnxnSocketNIO.doTransport(ClientCnxnSocketNIO.java:361)
+      at org.apache.zookeeper.ClientCnxn$SendThread.run(ClientCnxn.java:1141)
+    WARN  k.s.BrokerMetadataCheckpoint - No meta.properties file under dir /tmp/kafka-logs5375698435158631498.tmp/meta.properties
+    WARN  k.s.BrokerMetadataCheckpoint - No meta.properties file under dir /tmp/kafka-logs5375698435158631498.tmp/meta.properties
+    INFO  REPL-logger - Stopping servers
+    ERROR o.a.z.s.ZooKeeperServer - ZKShutdownHandler is not registered, so ZooKeeper server won't take any action on ERROR or SHUTDOWN server state changes
+    WARN  o.a.z.ClientCnxn - Session 0x164d250d4e10000 for server null, unexpected error, closing socket connection and attempting reconnect
+    java.net.ConnectException: Connection refused
+      at sun.nio.ch.SocketChannelImpl.checkConnect(Native Method)
+      at sun.nio.ch.SocketChannelImpl.finishConnect(SocketChannelImpl.java:717)
+      at org.apache.zookeeper.ClientCnxnSocketNIO.doTransport(ClientCnxnSocketNIO.java:361)
+      at org.apache.zookeeper.ClientCnxn$SendThread.run(ClientCnxn.java:1141)
+    WARN  o.a.z.ClientCnxn - Session 0x164d250d4e10000 for server null, unexpected error, closing socket connection and attempting reconnect
+    java.net.ConnectException: Connection refused
+      at sun.nio.ch.SocketChannelImpl.checkConnect(Native Method)
+      at sun.nio.ch.SocketChannelImpl.finishConnect(SocketChannelImpl.java:717)
+      at org.apache.zookeeper.ClientCnxnSocketNIO.doTransport(ClientCnxnSocketNIO.java:361)
+      at org.apache.zookeeper.ClientCnxn$SendThread.run(ClientCnxn.java:1141)
+
+A release for 2.13.0-M3 would be great as a first step before releasing for 2.13.0-M4 which has new scala collections.
+I recently wrote #143 and #144 to address some needs I had for running embedded Kafka in TestNG+Java tests.  As it turns out, I actually need to run embedded Kafka version 0.10.2.1 with the changes I've made for those issues (e.g. #145) . 
+
+Should I start with the code in [this tag](https://github.com/manub/scalatest-embedded-kafka/blob/6ea07bc95ada83544baa529021ba9a08c90ca2ed/build.sbt#L5) or should I start with `master` and try to use the correct properties for 0.10.2.0?  I've been doing the former, but I'm having some issues.
+
+I'm also not sure what version to use.  Working off that tag, I have set the version to `0.13.0-1-SNAPSHOT`.
+
+Anyhow, any thoughts in this area are appreciated.  I've tried various approaches and keep hitting roadblocks.
+
+Thanks!
+Kafka fails to start with embedded schema registry with the following error. Running the same code with EmbeddedKafkaConfig instead of EmbeddedKafkaConfigWithSchemaRegistry allows Kafka to start normally.
+
+```
+09:35:52.238 [ScalaTest-run-running-AvroSerdeTest] ERROR o.a.zookeeper.server.ZooKeeperServer - ZKShutdownHandler is not registered, so ZooKeeper server won't take any action on ERROR or SHUTDOWN server state changes
+09:35:52.787 [ScalaTest-run-running-AvroSerdeTest] WARN  k.server.BrokerMetadataCheckpoint - No meta.properties file under dir /var/folders/gv/xmthgtn10ld6c4zntpyfhx700000gn/T/kafka5424540063163778361.tmp/meta.properties
+09:35:53.286 [ScalaTest-run-running-AvroSerdeTest] WARN  k.server.BrokerMetadataCheckpoint - No meta.properties file under dir /var/folders/gv/xmthgtn10ld6c4zntpyfhx700000gn/T/kafka5424540063163778361.tmp/meta.properties
+09:35:53.580 [ScalaTest-run-running-AvroSerdeTest] WARN  io.confluent.rest.Application - DEPRECATION warning: `listeners` configuration is not configured. Falling back to the deprecated `port` configuration.
+09:35:53.737 [ScalaTest-run-running-AvroSerdeTest] WARN  io.confluent.rest.Application - DEPRECATION warning: `listeners` configuration is not configured. Falling back to the deprecated `port` configuration.
+09:35:53.754 [ScalaTest-run-running-AvroSerdeTest-SendThread(localhost:57670)] WARN  org.apache.zookeeper.ClientCnxn - Session 0x0 for server null, unexpected error, closing socket connection and attempting reconnect
+java.net.ConnectException: Connection refused
+	at sun.nio.ch.SocketChannelImpl.checkConnect(Native Method)
+	at sun.nio.ch.SocketChannelImpl.finishConnect(SocketChannelImpl.java:717)
+	at org.apache.zookeeper.ClientCnxnSocketNIO.doTransport(ClientCnxnSocketNIO.java:361)
+	at org.apache.zookeeper.ClientCnxn$SendThread.run(ClientCnxn.java:1141)
+09:35:53.892 [ScalaTest-run-running-AvroSerdeTest] WARN  o.a.k.c.admin.AdminClientConfig - The configuration 'topic' was supplied but isn't a known config.
+09:35:53.893 [ScalaTest-run-running-AvroSerdeTest] WARN  o.a.k.c.admin.AdminClientConfig - The configuration 'connection.url' was supplied but isn't a known config.
+09:35:54.016 [ScalaTest-run-running-AvroSerdeTest] WARN  i.c.k.s.storage.KafkaStore - Creating the schema topic _schemas using a replication factor of 1, which is less than the desired one of 3. If this is a production environment, it's crucial to add more brokers and increase the replication factor of the topic.
+09:35:54.222 [ScalaTest-run-running-AvroSerdeTest] WARN  o.a.k.c.producer.ProducerConfig - The configuration 'topic' was supplied but isn't a known config.
+09:35:54.222 [ScalaTest-run-running-AvroSerdeTest] WARN  o.a.k.c.producer.ProducerConfig - The configuration 'connection.url' was supplied but isn't a known config.
+09:35:54.254 [ScalaTest-run-running-AvroSerdeTest] WARN  o.a.k.c.consumer.ConsumerConfig - The configuration 'topic' was supplied but isn't a known config.
+09:35:54.255 [ScalaTest-run-running-AvroSerdeTest] WARN  o.a.k.c.consumer.ConsumerConfig - The configuration 'connection.url' was supplied but isn't a known config.
+09:35:54.423 [ScalaTest-run-running-AvroSerdeTest-SendThread(localhost:57670)] WARN  org.apache.zookeeper.ClientCnxn - Session 0x0 for server null, unexpected error, closing socket connection and attempting reconnect
+java.net.ConnectException: Connection refused
+	at sun.nio.ch.SocketChannelImpl.checkConnect(Native Method)
+	at sun.nio.ch.SocketChannelImpl.finishConnect(SocketChannelImpl.java:717)
+	at org.apache.zookeeper.ClientCnxnSocketNIO.doTransport(ClientCnxnSocketNIO.java:361)
+	at org.apache.zookeeper.ClientCnxn$SendThread.run(ClientCnxn.java:1141)
+09:35:54.639 [ScalaTest-run-running-AvroSerdeTest] WARN  io.confluent.rest.Application - DEPRECATION warning: `listeners` configuration is not configured. Falling back to the deprecated `port` configuration.
+09:35:54.685 [ScalaTest-run-running-AvroSerdeTest] ERROR o.a.zookeeper.server.ZooKeeperServer - ZKShutdownHandler is not registered, so ZooKeeper server won't take any action on ERROR or SHUTDOWN server state changes
+
+A needed class was not found. This could be due to an error in your runpath. Missing class: org/eclipse/jetty/server/handler/ContextHandler$NoContext
+java.lang.NoClassDefFoundError: org/eclipse/jetty/server/handler/ContextHandler$NoContext
+	at org.eclipse.jetty.servlet.ServletContextHandler.newServletHandler(ServletContextHandler.java:260)
+	at org.eclipse.jetty.servlet.ServletContextHandler.getServletHandler(ServletContextHandler.java:322)
+	at org.eclipse.jetty.servlet.ServletContextHandler.relinkHandlers(ServletContextHandler.java:198)
+	at org.eclipse.jetty.servlet.ServletContextHandler.<init>(ServletContextHandler.java:157)
+	at org.eclipse.jetty.servlet.ServletContextHandler.<init>(ServletContextHandler.java:117)
+	at org.eclipse.jetty.servlet.ServletContextHandler.<init>(ServletContextHandler.java:105)
+	at io.confluent.rest.Application.createServer(Application.java:267)
+	at io.confluent.kafka.schemaregistry.RestApp.start(RestApp.java:76)
+	at net.manub.embeddedkafka.schemaregistry.EmbeddedKafkaWithSchemaRegistrySupport.startSchemaRegistry(embeddedKafkaWithSchemaRegistry.scala:122)
+	at net.manub.embeddedkafka.schemaregistry.EmbeddedKafkaWithSchemaRegistrySupport.startSchemaRegistry$(embeddedKafkaWithSchemaRegistry.scala:111)
+	at net.manub.embeddedkafka.schemaregistry.EmbeddedKafkaWithSchemaRegistrySupport.$anonfun$withRunningKafkaOnFoundPort$2(embeddedKafkaWithSchemaRegistry.scala:88)
+	at net.manub.embeddedkafka.EmbeddedKafkaSupport.withTempDir(EmbeddedKafka.scala:265)
+	at net.manub.embeddedkafka.EmbeddedKafkaSupport.withTempDir$(EmbeddedKafka.scala:261)
+```
+
+
+sbt dependency entry
+
+
+```"net.manub"              %% "scalatest-embedded-schema-registry" % "1.1.0-kafka1.1-nosr" % Test,```
+Hello, 
+
+I'm trying to use the version 0.9.0 because I'm using Spark Streaming 2.0.2 and it seems the most compatible version.  But this version has some bugs (Java heap problem...) and I need a newer version.
+
+When I try to use a newer version I get some dependencies errors when I start Kafka embedded. 
+The reason seem that my spark-streaming library use kafka-client 0.10.0.1 and if I try to use a newer version from kafka embedded it uses the version 0.10.2.1. If I add this last dependency the code doesn't work because some functions doesn't exist in this new version from kafka client. Is there any way to resolve this issue?
+The spark version I use: https://mvnrepository.com/artifact/org.apache.spark/spark-streaming-kafka-0-10_2.11/2.0.2
+ I have tried with many differents versions from kafka embedded and only works te version 0.9.0
+
+23:01:05.805 [main] ERROR o.a.z.server.NIOServerCnxnFactory - Thread Thread[main,5,main] died
+java.lang.reflect.InvocationTargetException: null
+	at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method) ~[na:1.8.0_161]
+	at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62) ~[na:1.8.0_161]
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43) ~[na:1.8.0_161]
+	at java.lang.reflect.Method.invoke(Method.java:498) ~[na:1.8.0_161]
+	at com.intellij.rt.execution.CommandLineWrapper.main(CommandLineWrapper.java:65) ~[idea_rt.jar:na]
+Caused by: java.lang.NoSuchMethodError: kafka.server.KafkaServer$.$lessinit$greater$default$2()Lorg/apache/kafka/common/utils/Time;
+	at net.manub.embeddedkafka.EmbeddedKafkaSupport$class.startKafka(EmbeddedKafka.scala:467) ~[scalatest-embedded-kafka_2.11-0.14.0.jar:0.14.0]
+	at net.manub.embeddedkafka.EmbeddedKafka$.startKafka(EmbeddedKafka.scala:38) ~[scalatest-embedded-kafka_2.11-0.14.0.jar:0.14.0]
+	at net.manub.embeddedkafka.EmbeddedKafka$.start(EmbeddedKafka.scala:55) ~[scalatest-embedded-kafka_2.11-0.14.0.jar:0.14.0]
+	
+Hi ManuB,
+I included scalatest-embedded-kafka in the test scope in my project.
+but when I compile the code it gives the following errors.
+
+> [info]  [SUCCESSFUL ] net.manub#scalatest-embedded-kafka_2.11;0.11.1!scalatest-embedded-kafka_2.11.jar (2546ms)
+[warn]  [FAILED     ] com.sun.jdmk#jmxtools;1.2.1!jmxtools.jar:  (0ms)
+[warn] ==== local: tried
+[warn]   C:\Users\Yayati\.ivy2\local\com.sun.jdmk\jmxtools\1.2.1\jars\jmxtools.jar
+[warn] ==== public: tried
+[warn]   https://repo1.maven.org/maven2/com/sun/jdmk/jmxtools/1.2.1/jmxtools-1.2.1.jar
+[warn] ==== local-preloaded-ivy: tried
+[warn]   C:\Users\Yayati\.sbt\preloaded\com.sun.jdmk\jmxtools\1.2.1\jars\jmxtools.jar
+[warn] ==== local-preloaded: tried
+[warn]   file:/C:/Users/Yayati/.sbt/preloaded/com/sun/jdmk/jmxtools/1.2.1/jmxtools-1.2.1.jar
+[warn]  [FAILED     ] com.sun.jmx#jmxri;1.2.1!jmxri.jar:  (0ms)
+[warn] ==== local: tried
+[warn]   C:\Users\Yayati\.ivy2\local\com.sun.jmx\jmxri\1.2.1\jars\jmxri.jar
+[warn] ==== public: tried
+[warn]   https://repo1.maven.org/maven2/com/sun/jmx/jmxri/1.2.1/jmxri-1.2.1.jar
+[warn] ==== local-preloaded-ivy: tried
+[warn]   C:\Users\Yayati\.sbt\preloaded\com.sun.jmx\jmxri\1.2.1\jars\jmxri.jar
+[warn] ==== local-preloaded: tried
+[warn]   file:/C:/Users/Yayati/.sbt/preloaded/com/sun/jmx/jmxri/1.2.1/jmxri-1.2.1.jar
+[warn]  ::::::::::::::::::::::::::::::::::::::::::::::
+[warn]  ::              FAILED DOWNLOADS            ::
+[warn]  :: ^ see resolution messages for details  ^ ::
+[warn]  ::::::::::::::::::::::::::::::::::::::::::::::
+[warn]  :: com.sun.jdmk#jmxtools;1.2.1!jmxtools.jar
+[warn]  :: com.sun.jmx#jmxri;1.2.1!jmxri.jar
+[warn]  ::::::::::::::::::::::::::::::::::::::::::::::
+
+The moment I remove the dependency from my build file the compilation becomes successfull.
+
+could you suggest a solution
+

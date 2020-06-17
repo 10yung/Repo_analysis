@@ -1,0 +1,129 @@
+Hi,
+
+I am trying to reproduce the example [here](https://github.com/facebookincubator/katran/blob/master/EXAMPLE.md) using virtual machines (i.e., client, server, router, katran). And the below diagram illustrates my environment:
+
+I am using ubuntu 18.04 with the kernel 4.15.0-55-generic for the virtual machines.
+```
+client --(net1)-- router --(net2)-- katran
+                    |
+                 (net3)
+                    |
+                 server
+
+net1: 192.168.150.0/24
+net2: 10.10.10.0/24
+net3: 50.10.10.0/24
+
+client ip: 192.168.150.10
+katran ip: 10.10.10.10
+server ip: 50.10.10.10
+router ip:
+    net1-if: 192.168.150.1
+    net2-if: 10.10.10.1
+    net3-if: 50.10.10.1
+```
+
+The routing table of the router is as below:
+```
+10.10.10.0/24 dev ens5 proto kernel scope link src 10.10.10.1
+20.200.200.1 via 10.10.10.1 dev ens5
+30.10.10.0/24 dev ens7 proto kernel scope link src 30.10.10.12
+50.10.10.0/24 dev ens6 proto kernel scope link src 50.10.10.1
+192.168.150.0/24 dev ens2 proto kernel scope link src 192.168.150.1
+```
+
+It seems the katran sends ipip packet correctly to the router after resolving VIP (i.e., 20.200.200.1). Here is a tcpdump from the router
+```
+15:51:55.996433 52:54:00:23:97:ef > 52:54:00:12:e8:4c, ethertype IPv4 (0x0800), length 94: (tos 0x0, ttl 64, id 0, offset 0, flags [none], proto IPIP (4), length 80)
+    172.16.242.206 > 50.10.10.10: (tos 0x0, ttl 63, id 21090, offset 0, flags [DF], proto TCP (6), length 60)
+    192.168.150.10.50276 > 20.200.200.1.22: Flags [S], cksum 0x7ddd (correct), seq 1289943810, win 29200, options [mss 1460,sackOK,TS val 2434696983 ecr 0,nop,wscale 7], length 0
+15:51:57.017960 52:54:00:23:97:ef > 52:54:00:12:e8:4c, ethertype IPv4 (0x0800), length 94: (tos 0x0, ttl 64, id 0, offset 0, flags [none], proto IPIP (4), length 80)
+    172.16.242.206 > 50.10.10.10: (tos 0x0, ttl 63, id 21091, offset 0, flags [DF], proto TCP (6), length 60)
+    192.168.150.10.50276 > 20.200.200.1.22: Flags [S], cksum 0x79df (correct), seq 1289943810, win 29200, options [mss 1460,sackOK,TS val 2434698005 ecr 0,nop,wscale 7], length 0
+```
+
+But the problem is the router can't forward ipip packets to the server. It drops the packets before it calls the ip_recv() as shown the below kernel trace log. I expect the networking stack of the router calls the ip_recv() function to handle ipip packet.
+
+This is the log of kernel call trace from the router when it receives ipip packets:
+```
+swapper     0 [003]  2339.377884: skb:kfree_skb: skbaddr=0xffff913f34574600 protocol=4 location=0xffffffffa6e5371f
+            7fffa6e40696 kfree_skb ([kernel.kallsyms])
+            7fffa6e5571f __netif_receive_skb_core ([kernel.kallsyms])
+            7fffa6e55c08 __netif_receive_skb ([kernel.kallsyms])
+            7fffa6e57f55 netif_receive_skb_internal ([kernel.kallsyms])
+            7fffa6e58c55 napi_gro_receive ([kernel.kallsyms])
+            7fffc004145a cp_rx_poll ([kernel.kallsyms])
+            7fffa6e58380 net_rx_action ([kernel.kallsyms])
+            7fffa72020e4 __softirqentry_text_start ([kernel.kallsyms])
+            7fffa66969b8 irq_exit ([kernel.kallsyms])
+            7fffa700462a do_IRQ ([kernel.kallsyms])
+            7fffa7002904 ret_from_intr ([kernel.kallsyms])
+            7fffa6fa3672 native_safe_halt ([kernel.kallsyms])
+            7fffa6fa3330 default_idle ([kernel.kallsyms])
+            7fffa663b035 arch_cpu_idle ([kernel.kallsyms])
+            7fffa6fa3803 default_idle_call ([kernel.kallsyms])
+            7fffa66d6db2 do_idle ([kernel.kallsyms])
+            7fffa66d7013 cpu_startup_entry ([kernel.kallsyms])
+            7fffa665b37b start_secondary ([kernel.kallsyms])
+            7fffa66020d5 secondary_startup_64 ([kernel.kallsyms])
+```
+
+Am I missing something to config the router?
+
+thx~
+Junho
+
+Hi, and sorry in advance for being naive. I have an interesting application for Katran and was wondering if you could let me know whether you think Katran would be a good fit.
+
+I need to collect and encapsulate packets relating to TCP sessions which may be received at any of a number of distinct geographically distributed egress points from a large IP network. Packets returning from the internet relating to a particular TCP session may appear at any of a number of different edge routers.
+
+I'm wondering if I could install Katran in each egress data center and configure it to encapsulate each TCP session and route it to a consistent server within a centralized cluster of processing servers somewhere inside the network. In reality, the centralized cluster is itself a TCP-to-TCP proxy that understands the relevant L7 protocol; however, we only need Katran to help with marshalling the packets from the edge. Once we're inside the network, the network's fabric can route packets properly to their destination from the filtering servers.
+
+It seems like this should be possible because from Katran's point of view, whether Katran is literally at the "top of the rack" or in a completely different rack somewhere else in the world should make no difference. Note that latency here is not a real concern given the underlying protocol we are proxying.
+Big diff. Major changes:
+- renaming XdpTester to BpfTester + adding features to unittest
+BPF_PROG_TYPE_SCHED_CLS (TC bpf).
+- adding into katran tester fixtures for healthchecking bpf program
+(right now input and output are exactly the same. for now it is
+being used either to make sure that prog is loaded and running +
+somark in bpf program could be manually changed to some static value
+instead of somark=skb->mark (this is till
+https://www.spinics.net/lists/netdev/msg620553.html would be available
+in vanila kernel)
+- adding new healthchecking bpf program (this one forced to reshuffle
+some existing code, so existing helpers would be bpf program agnostic
+(e.g. before they were including balancer_maps etc)). the new
+healthchecking program allow to directly create encapsulation
+of the healthcheck packet instead of relying on ip4 and ipv6 tunnel
+interfaces w/ external flag set.
+
+Tested-By: katran_tester. for healthchecking somark were manually set to
+2 and 3 (to force ipip and ip(4)ip6 healthchecks generation).
+
+ipip:
+```
+23:12:37.392524 01:00:00:00:00:00 > 02:00:00:00:00:00, ethertype IPv4 (0x0800), length 57: (tos 0x0, ttl 64, id 1, offset 0, flags [none], proto UDP (17), length 43)
+    192.168.1.1.31337 > 10.200.1.1.80: [udp sum ok] UDP, length 15
+23:12:37.392535 00:ff:de:ad:be:af > 00:00:de:ad:be:af, ethertype IPv4 (0x0800), length 77: (tos 0x0, ttl 64, id 0, offset 0, flags [none], proto IPIP (4), length 63)
+    10.0.13.37 > 10.0.0.2: (tos 0x0, ttl 64, id 1, offset 0, flags [none], proto UDP (17), length 43)
+    192.168.1.1.31337 > 10.200.1.1.80: [udp sum ok] UDP, length 15
+23:12:37.392655 01:00:00:00:00:00 > 02:00:00:00:00:00, ethertype IPv4 (0x0800), length 69: (tos 0x0, ttl 64, id 1, offset 0, flags [none], proto TCP (6), length 55)
+    192.168.1.1.31337 > 10.200.1.1.80: Flags [.], cksum 0x27e4 (correct), seq 0:15, ack 1, win 8192, length 15: HTTP
+23:12:37.392664 00:ff:de:ad:be:af > 00:00:de:ad:be:af, ethertype IPv4 (0x0800), length 89: (tos 0x0, ttl 64, id 0, offset 0, flags [none], proto IPIP (4), length 75)
+    10.0.13.37 > 10.0.0.2: (tos 0x0, ttl 64, id 1, offset 0, flags [none], proto TCP (6), length 55)
+    192.168.1.1.31337 > 10.200.1.1.80: Flags [.], cksum 0x27e4 (correct), seq 0:15, ack 1, win 8192, length 15: HTTP
+```
+
+ip(4)ip6
+```
+23:17:54.987396 01:00:00:00:00:00 > 02:00:00:00:00:00, ethertype IPv4 (0x0800), length 57: (tos 0x0, ttl 64, id 1, offset 0, flags [none], proto UDP (17), length 43)
+    192.168.1.1.31337 > 10.200.1.1.80: [udp sum ok] UDP, length 15
+23:17:54.987408 00:ff:de:ad:be:af > 00:00:de:ad:be:af, ethertype IPv6 (0x86dd), length 97: (hlim 64, next-header IPIP (4) payload length: 43) fc00:2307::1337 > fc00::1: (tos 0x0, ttl 64, id 1, offset 0, flags [none], proto UDP (17), length 43)
+    192.168.1.1.31337 > 10.200.1.1.80: [udp sum ok] UDP, length 15
+23:17:54.987422 01:00:00:00:00:00 > 02:00:00:00:00:00, ethertype IPv4 (0x0800), length 69: (tos 0x0, ttl 64, id 1, offset 0, flags [none], proto TCP (6), length 55)
+    192.168.1.1.31337 > 10.200.1.1.80: Flags [.], cksum 0x27e4 (correct), seq 0:15, ack 1, win 8192, length 15: HTTP
+23:17:54.987426 00:ff:de:ad:be:af > 00:00:de:ad:be:af, ethertype IPv6 (0x86dd), length 109: (hlim 64, next-header IPIP (4) payload length: 55) fc00:2307::1337 > fc00::1: (tos 0x0, ttl 64, id 1, offset 0, flags [none], proto TCP (6), length 55)
+    192.168.1.1.31337 > 10.200.1.1.80: Flags [.], cksum 0x27e4 (correct), seq 0:15, ack 1, win 8192, length 15: HTTP
+23:17:54.987439 01:00:00:00:00:00 > 02:00:00:00:00:00, ethertype IPv6 (0x86dd), length 89: (hlim 64, next-header TCP (6) payload length: 35) fc00:2::1.31337 > fc00:1::1.80: Flags [.], cksum 0xfd4f (correct), seq 0:15, ack 1, win 8192, length 15: HTTP
+23:17:54.987443 00:ff:de:ad:be:af > 00:00:de:ad:be:af, ethertype IPv6 (0x86dd), length 129: (hlim 64, next-header IPv6 (41) payload length: 75) fc00:2307::1337 > fc00::1: (hlim 64, next-header TCP (6) payload length: 35) fc00:2::1.31337 > fc00:1::1.80: Flags [.], cksum 0xfd4f (correct), seq 0:15, ack 1, win 8192, length 15: HTTP
+```

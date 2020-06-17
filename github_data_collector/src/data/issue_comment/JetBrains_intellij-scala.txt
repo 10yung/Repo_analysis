@@ -1,0 +1,106 @@
+While opening a project, the ScalaCompilerReferenceService
+decides whether to enable bytecode indexing. It is done via
+CompilerIndicesSettings::isBytecodeIndexingActive
+
+One of the requirements is that there must exist a ProjectTaskRunner
+that can run project's modules and is either an SBT runner or a JPS
+runner.
+
+Unfortunately, the `hasCompatibleRunner` indices function loooks only
+for the first runner that can run all the modules and then checks if
+it is ans SBT or JPS runner. If the first runner can run the modules,
+or the module list is empty, the lookup will stop. Then, if it's
+neither a JPS or an SBT runner, the result of `hasCompatibleRunners`
+will be false, even if there is a good runner further on the list.
+
+With this change, we search through the whole list for a good runner.
+
+YouTrack: #SCL-16768 fixed
+Adresses  https://youtrack.jetbrains.com/issue/SCL-16630
+
+This is really hacky implementation but I managed it to work. Not sure if this is correct direction since this is generally big hack but we can make it production-ready.
+
+The problem was that auto-tests listen for messages on COMPILATION_STATUS topic that standard compiler produce. This PR adds skeleton implementaion for bsp to publish required messages.
+
+
+![auto-test](https://user-images.githubusercontent.com/3967938/71127128-b7ec4500-21ea-11ea-9bee-ca9222a1d002.gif)
+
+On linux some choose to mount /tmp with noexec, and redirect a list of
+apps known to require temporary executables onto another mount. For java
+this can be done via -Djava.io.tmpdir
+
+Forward this property to the sbt downloader process to avoid sbt hanging
+when trying to use the default noexec temporary dir
+
+Such a setup causes this error in idea.log:
+
+```
+2019-11-28 18:26:33,565 [ 167309]   WARN - n.process.BaseOSProcessHandler - Process hasn't generated any output for a long time.
+If it's a long-running mostly idle daemon process, consider overriding OSProcessHandler#readerOptions with 'BaseOutputReader.Options.forMostlySilentProcess()' to reduce CPU usage.
+Command line: sbt-based downloader 
+java.lang.Throwable: Process creation:
+        at com.intellij.execution.process.BaseOSProcessHandler.<init>(BaseOSProcessHandler.java:33)
+        at com.intellij.execution.process.OSProcessHandler.<init>(OSProcessHandler.java:151)
+        at org.jetbrains.plugins.scala.project.template.package$.$anonfun$createTempSbtProject$2(package.scala:58)
+        at org.jetbrains.plugins.scala.project.template.package$.usingTempDirectory(package.scala:94)
+        at org.jetbrains.plugins.scala.project.template.package$.$anonfun$createTempSbtProject$1(package.scala:49)
+        at org.jetbrains.plugins.scala.project.template.package$.usingTempFile(package.scala:85)
+        at org.jetbrains.plugins.scala.project.template.package$.createTempSbtProject(package.scala:43)
+        at org.jetbrains.plugins.scala.project.template.VersionDialog.$anonfun$showAndGetSelected$1(VersionDialog.scala:35)
+        at org.jetbrains.plugins.scala.project.template.VersionDialog.$anonfun$showAndGetSelected$1$adapted(VersionDialog.scala:34)
+        at org.jetbrains.plugins.scala.extensions.package$$anon$4.compute(package.scala:1081)
+        at com.intellij.openapi.progress.impl.CoreProgressManager$1.run(CoreProgressManager.java:225)
+        at com.intellij.openapi.progress.impl.CoreProgressManager$TaskRunnable.run(CoreProgressManager.java:894)
+        at com.intellij.openapi.progress.impl.CoreProgressManager$5.run(CoreProgressManager.java:447)
+        at com.intellij.openapi.progress.impl.CoreProgressManager.lambda$runProcess$2(CoreProgressManager.java:169)
+        at com.intellij.openapi.progress.impl.CoreProgressManager.registerIndicatorAndRun(CoreProgressManager.java:591)
+        at com.intellij.openapi.progress.impl.CoreProgressManager.executeProcessUnderProgress(CoreProgressManager.java:537)
+        at com.intellij.openapi.progress.impl.ProgressManagerImpl.executeProcessUnderProgress(ProgressManagerImpl.java:59)
+        at com.intellij.openapi.progress.impl.CoreProgressManager.runProcess(CoreProgressManager.java:156)
+        at com.intellij.openapi.application.impl.ApplicationImpl.lambda$null$9(ApplicationImpl.java:552)
+        at com.intellij.openapi.application.impl.ApplicationImpl$1.run(ApplicationImpl.java:294)
+        at java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:511)
+        at java.util.concurrent.FutureTask.run(FutureTask.java:266)
+        at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+        at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+        at java.lang.Thread.run(Thread.java:748)
+```
+
+This causes the following
+Currently, any `include` added to .scalafmt.conf is not resolved. This limits our options for enforcing uniform style across our projects.
+
+This PR changes how .scalafmt.conf is loaded. Instead of reading file contents then parsing it as text once, a typesafe-config `ConfigIncluder` is used to resolve includes over `VirtualFile`. The loaded `Config` is then rendered to text (`_.root.render()`).
+
+Still missing is change detection—only changes to the main configuration file `.scalafmt.conf` trigger configuration reload.
+
+Note that even though `include "my-defaults.conf"` resolves files relative to the including file when using `ConfigFactory.parseFile`, this behavior is currently broken for scalafmt (both cli and sbt plugin) due to similar reasons (single file read once, includes left unresolved). I'm pursuing PR's against scalafmt as well.
+This PR integrates new zinc and 2 features it introduced: compiling to jar file https://github.com/sbt/zinc/pull/597 and specifying ignored scalac options https://github.com/sbt/zinc/pull/548. It also has multiple smaller improvements mostly related to general build performance.
+
+Note that I opened this PR now to allow review, suggesting changes, etc. It is not ready to merge because zinc is not yet released (the available version 1.3.0-M1 has a bug, that is already fixed and merged, but we will need wait for the release). I may add some more independent peformance improvements, but potentially on a different PR. I don't plan to change the code that is here, unless required by the review.
+
+## Compile to jar
+Most of the details are in the zinc PR. Basically zinc was adjusted to be able to call scalac with output specified as `.jar` file, which means that classes are written directly to a jar file instead of multiple class files. This can give notable performance improvements, mostly on windows, that has poor performance wrt  e.g. creating multiple small files.
+The current integration is not full and perfect, but it works. Before invoking zinc, the `output directory` is replaced with `<output directory>.jar`. Resources are still copied to the output directory. To allow running apps, the `.jar` file has to be added to the classpath of the module, which is handled by `CompileToJarComponent`.
+There are 2 known problems:
+* If the output jar does not exist at all and user runs the app (which triggers build) the application will fail with class not found. This is because intellij's file system doesn't seem to realize fast enough that the jar appeared before running app, and it is not included in the classpath. Second and further runs work as expected.
+* Switching between compile to jar and to classes back and forth is not seamless. If project was compiled with zinc to classes and then users tries to compile it to jar, zinc will pick up analysis files from regular compilation and fail with error on them. This means that the switch should be followed by cleaning output directories (rebuild does not seem to remove zinc analysis files). But in general this is one time operation, users shouldn't switch too often between those modes.
+
+## Ignored scalac options
+Normally if a scalac option is changed (added, removed) this means that zinc would trigger full compilation (not incremental). Some of the options though do not impact the bytecode. This integration allows to specify which option changes should be ignored. For example `-Xprint:typer`.
+Both this and compile to jar features were put in a new settings panel under `Build, Execution, Deployment > Compiler > Scala Compiler > Zinc` (right next to Scala Compile Server), as those are currently related to zinc only and tbh there is no room for them anywhere else.
+
+---
+
+```
+THIS PROGRAM IS SUBJECT TO THE TERMS OF THE BSD 3-CLAUSE LICENSE.
+
+THE FOLLOWING DISCLAIMER APPLIES TO ALL SOFTWARE CODE AND OTHER MATERIALS CONTRIBUTED IN CONNECTION WITH THIS SOFTWARE:
+THIS SOFTWARE IS LICENSED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE AND ANY WARRANTY OF NON-INFRINGEMENT, ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA,
+OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
+IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. THIS SOFTWARE MAY BE REDISTRIBUTED TO OTHERS ONLY BY EFFECTIVELY USING THIS OR
+ANOTHER EQUIVALENT DISCLAIMER IN ADDITION TO ANY OTHER REQUIRED LICENSE TERMS.
+ONLY THE SOFTWARE CODE AND OTHER MATERIALS CONTRIBUTED IN CONNECTION WITH THIS SOFTWARE, IF ANY, THAT ARE ATTACHED TO (OR OTHERWISE ACCOMPANY) THIS SUBMISSION (AND ORDINARY
+COURSE CONTRIBUTIONS OF FUTURES PATCHES THERETO) ARE TO BE CONSIDERED A CONTRIBUTION. NO OTHER SOFTWARE CODE OR MATERIALS ARE A CONTRIBUTION.
+```

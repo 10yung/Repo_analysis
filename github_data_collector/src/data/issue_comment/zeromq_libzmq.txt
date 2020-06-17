@@ -1,0 +1,499 @@
+Solution: update it
+I'd like to ask whether there will be a release soon? We would like to use communication via websocket, which is available on master.
+
+Regards,
+Matthias
+*Please use this template for reporting suspected bugs or requests for help.*
+
+# Issue description
+The router socket cannot receive messages from itself
+
+
+# Environment
+
+* libzmq version (commit hash if unreleased): 4.3.1
+* OS: linux
+gcc 4.8.5
+
+# Minimal test code / Steps to reproduce the issue
+[router_self.cpp](https://github.com/zeromq/libzmq/files/4053638/router_self.txt)
+[router_self2.cpp](https://github.com/zeromq/libzmq/files/4053639/router_self2.txt)
+[zhelpers.h](https://github.com/booksbyus/zguide/blob/master/examples/C/zhelpers.h)
+
+
+# What's the actual result? (include assertion message & call stack if applicable)
+Compile and run router_self.cpp will get the result below, no message is received.
+In router_self.cpp, only one socket is used.
+![image](https://user-images.githubusercontent.com/15306919/72258439-102b3100-3649-11ea-95d8-48e1dc23b8b5.png)
+
+
+
+# What's the expected result?
+If use two router socket like router_self2.cpp, will get the expected result
+![image](https://user-images.githubusercontent.com/15306919/72258494-30f38680-3649-11ea-9b32-fa6923b81b55.png)
+
+
+
+# I used "open in Visual Studio"  to clone the code to local, but I can't build the project.
+# Environment
+* libzmq version 4.3.2: 
+* OS: win 10
+
+
+
+# Issue description
+
+In a production environment running Windows Server 2016, we have found a short-lived PUSH socket fails to send a single message most of the time.  In most environments it is reliable and we've had a hard time reproducing, but I do have some test code now that shows a problem on both Windows 10 and MacOS Sierra.  We were using `ZMQ_LINGER` set to `10000` and `ZMQ_IMMEDIATE` was not enabled.  The socket is created, configured, the message sent non-blocking, and destructed immediately.  The thread where this happens also ends very shortly after that.  The context is a singleton and is not destructed while the process is running.
+
+The message is unreliably delivered to the `PULL` socket.  When it is not delivered we observe both cases where no TCP connection is ever made, as well as a cases where the server starts the handshake and the client suddenly aborts it with a TCP `RST` packet, as in this Wireshark trace:
+
+![wireshark_zeromq](https://user-images.githubusercontent.com/987576/72194064-326b4780-33da-11ea-8137-d7d61a5d2024.png)
+
+
+The documentation of `ZMQ_LINGER` leads me to believe the message should be delivered despite closing the socket:
+
+> Positive values specify an upper bound for the linger period in milliseconds. Pending messages shall not be discarded after a call to zmq_close(); attempting to terminate the socket's context with zmq_term() shall block until either all pending messages have been sent to a peer, or the linger period expires, after which any pending messages shall be discarded.
+
+The documentation of `ZMQ_IMMEDIATE` makes me wonder if this is expected behavior:
+
+> By default queues will fill on outgoing connections even if the connection has not completed. This can lead to "lost" messages on sockets with round-robin routing (REQ, PUSH, DEALER). If this option is set to 1, messages shall be queued only to completed connections. This will cause the socket to block if there are no other connections, but will prevent queues from filling on pipes awaiting connection.
+
+Although the `PUSH` socket here is only connected to one `PULL` socket so it's not really round-robin.  I have not found any documentation on the interaction between `ZMQ_LINGER` and `ZMQ_IMMEDIATE`.
+
+# Possibly Related Issues
+
+Issue #1264 may be related in seeing dropped messages even with linger on a short-lived socket.  [JeroMQ Issue 624](https://github.com/zeromq/jeromq/issues/624) seems to have the same TCP-level behavior we observe.
+
+# Environment
+
+* libzmq version (commit hash if unreleased): 4.3.2
+* OS: Windows 10, Windows Server 2016, MacOS Sierra
+* Compiler: Visual Studio 2015, clang/Xcode
+
+# Minimal test code / Steps to reproduce the issue
+
+The following test code reproduces the issue on both Windows and MacOS, although it fails more often on my Windows machine.  There are defines to allow you control 1) blocking vs non-blocking, 2) enabled `ZMQ_IMMEDIATE`, 3) having the short-lived socket in a loop or in a thread, and 4) optional sleep between each send.  This code assumes C++14 or higher.
+
+```cpp
+// #define BLOCKING
+// #define IMMEDIATE
+#define THREADED
+// #define SLEEP_EACH 20ms
+
+#include <atomic>
+#include <cassert>
+#include <chrono>
+#include <iostream>
+#include <memory>
+#include <thread>
+#include <vector>
+
+#include <zmq.h>
+
+int main()
+{
+  using namespace std::chrono_literals;
+  using std::chrono::steady_clock;
+
+  std::atomic<bool> stopped{false};
+  std::atomic<steady_clock::time_point> lastReceived{steady_clock::now()};
+  std::atomic<unsigned long long>
+    messagesReceived{0ull},
+    messagesSent{0ull};
+  constexpr unsigned long long TOTAL_MESSAGES = 1'000;
+  unsigned long long lastMessage = std::numeric_limits<unsigned long long>::max();
+  std::vector<unsigned long long> messageNumbers;
+
+  auto ctx = zmq_ctx_new();
+
+  // pull socket reading numbers
+  std::thread receiver([&]() {
+    auto socket = zmq_socket(ctx, ZMQ_PULL);
+    int opt = 100'000;
+    zmq_setsockopt(socket, ZMQ_RCVHWM, &opt, sizeof opt);
+    zmq_bind(socket, "tcp://127.0.0.1:20000");
+
+    char buf[256];
+    while (!stopped) {
+      int len = zmq_recv(socket, &buf, sizeof buf, 0);
+      if (len > 0) {
+        buf[len] = '\0';
+        int number = std::atoi(buf);
+        messageNumbers.push_back(number);
+        lastMessage = number;
+        if (++messagesReceived == TOTAL_MESSAGES)
+          stopped.store(true);
+        lastReceived.store(steady_clock::now());
+      }
+    }
+
+    zmq_close(socket);
+  });
+
+  // time for socket to get ready
+  std::this_thread::sleep_for(2s);
+
+  int rc = 0;
+  for (unsigned long long i = 0ull; i < TOTAL_MESSAGES && rc != -1; ++i)
+  {
+#ifdef THREADED
+    std::thread t([&]()
+#endif
+    {
+#ifdef SLEEP_EACH
+      std::this_thread::sleep_for(SLEEP_EACH);
+#endif
+      auto socket = zmq_socket(ctx, ZMQ_PUSH);
+      int opt = 10'000;
+      zmq_setsockopt(socket, ZMQ_SNDTIMEO, &opt, sizeof opt);
+      opt = 30'000;
+      zmq_setsockopt(socket, ZMQ_LINGER, &opt, sizeof opt);
+#ifdef IMMEDIATE
+      opt = 1;
+      zmq_setsockopt(socket, ZMQ_IMMEDIATE, &opt, sizeof opt);
+#endif
+      zmq_connect(socket, "tcp://127.0.0.1:20000");
+
+      std::string msg = std::to_string(i);
+
+#ifdef BLOCKING
+      int blocking = 0;
+#else
+      int blocking = ZMQ_NOBLOCK;
+#endif
+      rc = zmq_send(socket, msg.c_str(), msg.length(), blocking);
+      if (rc == -1) {
+        std::cerr << "Send failed: [" << zmq_errno() << "] " << zmq_strerror(zmq_errno()) << std::endl;
+      }
+      assert(rc != -1);
+      ++messagesSent;
+      zmq_close(socket);
+    }
+#ifdef THREADED
+    );
+    t.join();
+#endif
+  }
+
+  while (!stopped && receiver.joinable()) {
+    // if we haven't got a new message in 5 seconds, assume no more are coming
+    if (steady_clock::now() - lastReceived.load() > 5s) {
+      if (!stopped) {
+        std::cerr << "No message in 5 seconds, stopping test early..." << std::endl;
+      }
+      stopped.store(true);
+    }
+    std::this_thread::sleep_for(100ms);
+  }
+
+
+  std::cout << "Sent " << messagesSent.load() << ", read " << messagesReceived.load() << ", lost " << (messagesSent - messagesReceived);
+  //assert(messagesReceived.load() == TOTAL_MESSAGES);
+  zmq_term(ctx);
+  return 0;
+}
+```
+
+# What's the actual result? (include assertion message & call stack if applicable)
+
+Basically, non-immediate and non-sleeping tests drop a few messages often.  Blocking and immediate never drop in the test case, but in the production environment blocking and immediate still drops *unless* we add something like `std::cout` after the send then it never drops (maybe due to a syscall occurring?).  Using a thread makes the dropping worse but is not necessary to get some drops.  Adding a 20ms sleep seems to fix the issue regardless of the other settings.  Even a 1ms sleep seems to fix the issue (syscall?).
+
+I ran three runs of each of these configurations, here are the results for Windows 10 (1000 indicates a pass, anything lower is a failure with dropped messages):
+
+| Blocking | Immediate | Threaded | Sleep | Received Messages (out of 1000) |
+|----------|-----------|----------|-------|---------------------------------|
+| N        | N         | N        | N     | 997, 1000, 1000                 |
+| Y        | N         | N        | N     | 1000, 999, 999                  |
+| N        | N         | Y        | N     | 995, 978, 996                   |
+| Y        | N         | Y        | N     | 992, 980, 993                   |
+| Y        | Y         | N        | N     | 1000, 1000, 1000                |
+| Y        | Y         | Y        | N     | 1000, 1000, 1000                |
+| N        | N         | N        | 20ms  | 1000, 1000, 1000                |
+| N        | Y         | NA       | NA    | send always fails               |
+| N        | N         | Y        | 20ms  | 1000, 1000, 1000                |
+| N        | N         | Y        | 1ms     | 1000, 1000, 1000               |
+
+# What's the expected result?
+
+Message is sent reliably every time.
+# Issue description
+
+Can't build RPM package because of failing tests.
+
+# Environment
+
+* libzmq version (commit hash if unreleased): 73eb1eac053b14b6953
+* OS: CentOS 8
+
+# Minimal test code / Steps to reproduce the issue
+
+1.  Run the following command:
+
+```
+mkdir -p /root/rpmbuild/SOURCES/ && git archive -o /root/rpmbuild/SOURCES/zeromq-4.3.3.tar.gz --prefix=zeromq-4.3.3/ HEAD && yum install -y yum-utils && yum-builddep -y packaging/redhat/zeromq.spec && rpmbuild -ba packaging/redhat/zeromq.spec --with drafts
+```
+
+
+# What's the actual result?
+
+```
+FAIL: tests/test_radio_dish
+===========================
+
+FAIL tests/test_radio_dish (exit status: 142)
+
+============================================================================
+Testsuite summary for zeromq 4.3.3
+============================================================================
+# TOTAL: 111
+# PASS:  103
+# SKIP:  7
+# XFAIL: 0
+# FAIL:  1
+# XPASS: 0
+# ERROR: 0
+```
+
+# What's the expected result?
+
+All tests pass
+
+# Additional information
+
+Running the test command manually produces the following output:
+
+```
+]# time ./test_radio_dish
+tests/test_radio_dish.cpp:506:test_leave_unjoined_fails:PASS
+tests/test_radio_dish.cpp:507:test_join_too_long_fails:PASS
+tests/test_radio_dish.cpp:508:test_join_twice_fails:PASS
+tests/test_radio_dish.cpp:509:test_radio_bind_fails_ipv4:PASS
+tests/test_radio_dish.cpp:510:test_radio_bind_fails_ipv6:PASS
+tests/test_radio_dish.cpp:511:test_dish_connect_fails_ipv4:PASS
+tests/test_radio_dish.cpp:512:test_dish_connect_fails_ipv6:PASS
+tests/test_radio_dish.cpp:513:test_radio_dish_tcp_poll_ipv4:PASS
+tests/test_radio_dish.cpp:514:test_radio_dish_tcp_poll_ipv6:PASS
+tests/test_radio_dish.cpp:515:test_radio_dish_udp_ipv4:PASS
+tests/test_radio_dish.cpp:516:test_radio_dish_udp_ipv6:PASS
+Alarm clock
+
+real	1m0.031s
+user	0m0.015s
+sys	0m0.035s
+```
+# Issue description
+
+With DEALER clients explicitly setting their ZMQ_ROUTING_ID, a ROUTER sometimes sees an internally generated routing ID instead of the value set by the clients during handover.
+
+# Environment
+
+* Centos 7
+* Tested both libzmq 4.3.2 and master at 73eb1eac053b14b6
+
+Additional test environments reported in my posting to the mailing list: https://lists.zeromq.org/pipermail/zeromq-dev/2019-December/033227.html
+
+# Minimal test code / Steps to reproduce the issue
+
+1.  Start server: `./serv`
+2. Start clients: `./client_wrapper.sh`
+
+serv.c
+```c
+#include <stdio.h>
+#include <assert.h>
+#include <unistd.h>
+#include <string.h>
+#include <zmq.h>
+
+#define BUFSIZE (4096)
+
+int main()
+{
+        void *ctx = zmq_init(1);
+        assert(zmq_ctx_set(ctx, ZMQ_BLOCKY, 1) == 0);
+        void *sock = zmq_socket(ctx, ZMQ_ROUTER);
+        assert(sock);
+        int val = 0;
+        assert(zmq_setsockopt(sock, ZMQ_LINGER, &val, sizeof(val)) == 0);
+        val = 1;
+        assert(zmq_setsockopt(sock, ZMQ_ROUTER_MANDATORY, &val, sizeof(val)) == 0);
+        assert(zmq_setsockopt(sock, ZMQ_ROUTER_HANDOVER, &val, sizeof(val)) == 0);
+        assert(zmq_bind(sock, "tcp://0.0.0.0:9999") == 0);
+        printf("bound to 9999\n");
+
+        while (1) {
+                usleep(600000);
+                int more = 1;
+                for (int part = 0; more; part++) {
+                        char buf[BUFSIZE];
+                        memset(buf, 0, sizeof(buf));
+                        int bytes = zmq_recv(sock, buf, BUFSIZE, 0);
+                        assert(bytes >= 0);
+                        size_t morelen = sizeof(more);
+                        assert(zmq_getsockopt(sock, ZMQ_RCVMORE, &more, &morelen) == 0);
+                        // First part should be routing id
+                        if (part == 0) {
+                                printf("RAW MSG: ");
+                                for (int i = 0; i < bytes; i++) {
+                                        printf("%02hhx ", buf[i]);
+                                }
+                                printf("\n");
+                                printf("MSG: %s\n", buf);
+                        }
+                }
+        }
+}
+```
+client.c
+```c
+#include <stdio.h>
+#include <assert.h>
+#include <unistd.h>
+#include <string.h>
+#include <zmq.h>
+
+int main(int argc, char *argv[])
+{
+        assert(argc == 2);
+        const char *tag = argv[1];
+
+        void *ctx = zmq_init(1);
+        assert(zmq_ctx_set(ctx, ZMQ_BLOCKY, 1) == 0);
+        void *sock = zmq_socket(ctx, ZMQ_DEALER);
+        assert(sock);
+        int val = 0;
+        assert(zmq_setsockopt(sock, ZMQ_LINGER, &val, sizeof(val)) == 0);
+
+        char routing_id[128];
+        snprintf(routing_id, sizeof(routing_id), "myroutingid%s", tag);
+        assert(zmq_setsockopt(sock, ZMQ_ROUTING_ID, routing_id, strlen(routing_id)) == 0);
+
+        assert(zmq_connect(sock, "tcp://localhost:9999") == 0);
+        printf("sending first\n");
+        char data[512] = { 'x' };
+        int bytes = zmq_send(sock, data, sizeof(data), 0);
+        assert(bytes == sizeof(data));
+        sleep(1);
+        printf("sending second\n");
+        bytes = zmq_send(sock, data, sizeof(data), 0);
+        assert(bytes == sizeof(data));
+        zmq_close(sock);
+        zmq_term(ctx);
+}                                                                                                
+```
+
+client_wrapper.sh
+```sh
+#!/bin/sh
+
+for i in $(seq 1 4); do
+        ./client $i &
+done
+sleep 3
+for i in $(seq 1 4); do
+        ./client $i &
+done      
+wait
+```
+
+# What's the actual result? (include assertion message & call stack if applicable)
+Usually, the ROUTER sees the routing ID as set by the client, e.g.:
+```
+RAW MSG: 6d 79 72 6f 75 74 69 6e 67 69 64 32 
+MSG: myroutingid2
+```
+
+But sometimes, it sees a generated routing ID:
+```
+RAW MSG: 00 6b 8b 45 68 
+MSG: 
+```
+
+# What's the expected result?
+
+I would expect to see only the routing IDs as set by the clients.
+
+
+*Please use this template for reporting suspected bugs or requests for help.*
+
+# Issue description
+In using PGM(pub/sub pattern), when the data size has more than some extent(from hundreds of kb and mb), the following problems happen.
+1. From some point, messages are not received anymore in "zmq_msg_recv" though the packets of messages are monitored to keep being received through Wireshark. 
+2. Each message is composed of 2 parts. The first part has fixed size of 2 bytes. The last part has variable size. 
+Sometimes a part of a message is lost and only a part of a message is received. 
+The receiver side of my program makes output in normal case like this:
+49: first message part of size 2 received, second message part of size 196604 received
+50: first message part of size 2 received, second message part of size 199747 received
+51: first message part of size 2 received, second message part of size 110503 received
+But In some abnormal case,
+49: first message part of size 2 received, second message part of size 196604 received
+50: first message part of size 2 received, second message part of size 2 received
+51: first message part of size 110503 received, second message part of size 2 received
+
+# Environment
+4 PCs with Intel CPUs, each has differenct specs(CPU, RAM, GPU) 
+Each PC is connected to switch hub with 1Gbps with Category 6 cable.  
+
+* libzmq version (commit hash if unreleased): 4.25, cppzmq
+* OS: Linux Ubuntu 18.04
+
+# Minimal test code / Steps to reproduce the issue
+I append the test project.
+You will see the problems following my instructions below.
+Basically the test program runs in two different mode, sender and receiver mode.
+In both mode, we give the time argument value (in nanoseconds) to control sending/receiving rate.
+For sender mode, the arguments given to the program execution is the following.
+"TestBasicPublishGroupMessaging(program name) y(indicating sender mode), 100(total sending count), 1000000(sending rate in nanoseconds)"
+For receiver mode, the arguments given to the program execution is the following.
+"TestBasicPublishGroupMessaging(program name) n(indicating receiver mode),  1000(receiving rate in nanoseconds)"
+
+I have tweaked the relevant setting values such as ZMQ_RCV/SNDHWM, ZMQ_RATE, ZMQ_RCV/SNDBUF into the maximum values.
+
+# What's the actual result? (include assertion message & call stack if applicable)
+For 100kb ~ 300kb message size, when receiver rate is per 1,000 nanoseconds and the sender rate is per 1,000,000 nanoseconds, the first problem happens so frequently.
+For 100kb ~ 300kb message size, when receiver rate is per 1,000 nanoseconds and the sender rate is per 10,000,000 nanoseconds, the first problem happens so rarely.
+For 1MB ~ 3MB, when receiver rate is per 1,000 nanoseconds and the sender rate is per 1,000,000 or 10,000,000 nanoseconds, the first problem happens so frequently.
+
+I debugged zeromq code and it was seen that "pgm_recvmsgv" in "receive" method of "pgm_socket_t" does not get all packets of a message normally even if all packets had been monitored to be received normally in Wireshark. 
+
+For the second problem, it happens in irregular and rare pattern. So it is difficult to reproduce this problem. 
+But when I run in debug mode with the above message sizes, I found that sparsely the data receipt is done in burst pattern:
+I added a breakpoint on send method("networkDistribution.getPublishService().tryPublish()" in "TestBasicPublishGroupMessaging.cpp") in sender side and repeated to resume the code with the breakpoint in sender side and watch what happens in receiver side step by step.
+Sometimes, after a message is sent in a sender side,  "receive" method of "pgm_socket_t" does not get all packets with 1428 byte unit size(only some parts received) composing a message in receiver side.  Not yet received parts of the previous message are retrieved later together with the following messages in "receive" method of "pgm_socket_t". The second problem is frequently seen in this case.
+ 
+
+# How to build the project
+1. set the ZMQ_BASE_DIR, ZMQ_USED_VER variable in CMakeLists.txt depending on your environment.
+2. move to the build/Debug or Release directory.
+3. execute "cmake -DCMAKE_BUILD_TYPE=Debug or Release ../.."
+4. the binary files are produced in the bin/Debug or Release
+
+[TestGroupMessaging.zip](https://github.com/zeromq/libzmq/files/4008149/TestGroupMessaging.zip)
+
+`strtok` is not thread-safe. The uses of `strtok` in `src/ws_engine.cpp` must be replaced by `strtok_r`.
+*Please use this template for reporting suspected bugs or requests for help.*
+
+# Issue description
+
+The official script for Android is outdated: it breaks when building for arm64.
+The CMakeLists.txt does not have clear clue how to build for Android (on macOS).
+
+# Environment
+
+* libzmq version (commit hash if unreleased): 4.3.2
+* OS: Android on macOS
+
+# Minimal test code / Steps to reproduce the issue
+
+1. Install the latest Android Studio 3.5.x with its bundled NDK r20/r21
+2. Run zmq build scripts for Android
+
+
+
+# What's the actual result? (include assertion message & call stack if applicable)
+
+3. Compiler tests won't pass for ./configure
+
+# What's the expected result?
+
+The project should build and generate Android libs.

@@ -1,0 +1,347 @@
+There are redundant codes for initializing `JSONBodyParameters`.
+I make it possible to initialize simply from Dictionary Literal.
+
+## Before
+```swift
+let object = ["foo": 1, "bar": 2, "baz": 3]
+let parameters = JSONBodyParameters(JSONObject: object)
+```
+
+## After
+```swift
+let parameters: JSONBodyParameters = ["foo": 1, "bar": 2, "baz": 3]
+```
+or
+```swift
+let parameters = ["foo": 1, "bar": 2, "baz": 3] as JSONBodyParameters
+```
+This problem occurred on `MultipartFormDataBodyParameters.Part(data: Data)`.
+
+The declaration code was like below:
+```
+struct MyFormRequest: Request {
+    let baseURL = URL(string: "https://example.com/")!
+
+    let method: HTTPMethod = .get
+
+    let path = "/"
+
+    typealias Response = Void
+
+    private let parts: [MultipartFormDataBodyParameters.Part]
+
+    init(images: [UIImage]) throws {
+        parts = try images.map {
+            guard let data = $0.jpegData() else { throw AppError.invalidSession }
+            return data
+            }.enumerated().map { (i, data) in
+                MultipartFormDataBodyParameters.Part(
+                    data: data,
+                    name: "images[]",
+                    mimeType: "image/jpeg",
+                    fileName: "imagae\(i).jpg")
+        }
+    }
+    var bodyParameters: BodyParameters? {
+        return MultipartFormDataBodyParameters(
+            parts: parts,
+            boundary: "0123456789abcdef")
+    }
+
+    func response(from object: Any, urlResponse: HTTPURLResponse) throws {
+    }
+}
+```
+
+Then, call it like below:
+```
+func execute(images: [UIImage]) {
+   let request = MyFormRequest(images: images)
+   Session.send(request: request) { result in
+    if case .success = result { return }
+    // retry the request. (with the same instance)
+    Session.send(request: request) { result2 in
+       // it will be never success or failure!!!
+    }
+   }
+}
+```
+
+I noticed this problem occured because of the class MultipartFormDataBodyParameters reads InputStream without rewinding or renewing stream.
+
+```
+# MultipartFormDataBodyParameters.swift:
+
+                case bodyRange:
+                    if bodyPart.inputStream.streamStatus == .notOpen {
+                        bodyPart.inputStream.open()
+                    }
+
+                    // this line never finished when calling `read` twice on same instance.
+                    let readLength = bodyPart.inputStream.read(offsetBuffer, maxLength: availableLength) 
+
+                    sentLength += readLength
+                    totalSentLength += readLength
+``` 
+
+So I resolved it by changing Request class like below  finally.
+
+```
+struct MyFormRequest: Request {
+    let baseURL = URL(string: "https://example.com/")!
+
+    let method: HTTPMethod = .get
+
+    let path = "/"
+
+    typealias Response = Void
+
+    private let images: [Data] 
+
+    init(images: [UIImage]) throws {
+        images = try images.map {
+            guard let data = $0.jpegData() else { throw AppError.invalidSession }
+            return data
+            }
+        // Do not create Part instance while initialization.
+    }
+    var bodyParameters: BodyParameters? {
+       // Recreate part instance for each request.
+       let parts = images.enumerated().map { (i, data) in
+                MultipartFormDataBodyParameters.Part(
+                    data: data,
+                    name: "images[]",
+                    mimeType: "image/jpeg",
+                    fileName: "imagae\(i).jpg")
+        }
+        return MultipartFormDataBodyParameters(
+            parts: parts,
+            boundary: "0123456789abcdef")
+    }
+
+    func response(from object: Any, urlResponse: HTTPURLResponse) throws {
+    }
+}
+```
+
+To begin with, I think the request instance should not be reuse.
+But in our project, we have to reuse it. (We wrap APIKit with RxSwift. When the retryable error (network connection error or somethink) occurred, to retry the request, we have to re-subscribe the same stream(Observable) with same request instance)
+
+I hope this post can help someone.
+
+Environment:
+APIKit version 4.0.0, iOS 12.1.4, Xcode 10.2.1(10E1001)
+
+I'm trying to update an app that depended on APIKit [4.0.0-beta.1](https://github.com/ishkawa/APIKit/releases/tag/4.0.0-beta.1) (swift 3) to current swift version. The app is using progressHandler.
+However, `4.0.0-beta.1` tag is on [develop/4.0 branch](https://github.com/ishkawa/APIKit/tree/develop/4.0). It seems that the branch is not merged into master and latest release tag 5.0.0.
+
+Currently if user calls `Session.send(request)` without setting the callback queue, it will use main thread for processing the callback.
+
+But APIKit, in layered architecture designing, should be in the infrastructure layer or persistence layer; And on the other side, main queue in iOS, since it mainly handles UI process, is usually considered in the **UI layer**.
+
+Therefore, it's probably not a good idea to let APIKit know about the main queue. it's a UI world thing, which an infrastructure world thing probably should not know.
+
+And by using main queue, which may also be used by any object in the program, as the default queue, it's very easy to cause a deadlock if a user tries to use a semaphore to stop current thread until the response received.
+
+So my opinion is that in `Session`'s initializer, maybe it's better to set the default value of `callbackQueue` to `DispatchQueue.global()` or `DispatchQueue(label: someLabel)`
+
+Thanks for considering this issue.
+JSONSerialization.data scapes slashes and when used in HTTP body, this creates a whole lot of issues. We can fix it in buildEntity(). For example when we have the request with 
+```
+ var bodyParameters: BodyParameters? {
+            
+            return JSONBodyParameters(JSONObject: [
+                "bodyParam1: "base64With/a"
+                ])
+        }
+```
+after call buildEntity we will get a request with body pararam: 
+```
+"bodyParam1: "base64With\/a"
+```
+
+Trying to fix #250 
+
+Similar case
+https://github.com/xamarin/xamarin-macios/commit/77a92500a5e20884e64eb853204bf24b579f4e91
+```json
+{
+  "lang": "EN",
+  "countryLiteralCode": "string",
+  "mobileNumber": "string",
+  "password": "string",
+  "deviceId": "string",
+  "model": "string",
+  "deviceTechInfo": {
+            "model": "string",
+            "osVersion": "string",,
+            "userAgent": "string",
+            "deviceOS": "string"
+   }
+}
+```
+
+I have this json object, and I need to put it on body parameters.
+Here below my code
+
+```swift
+struct doActivation: AllpayAPIRequest {
+        typealias Response = CommonResult
+        
+        let phone: String
+        let password: String
+        let countryLiteralCode: String
+        
+        init(phoneNumber: String, password: String, countryLiteralCode: String) {
+            self.phone = phoneNumber
+            self.password = password
+            self.countryLiteralCode = countryLiteralCode
+        }
+        
+        var method: HTTPMethod {
+            return .post
+        }
+        
+        var path: String {
+            return "/v2/registration/doActivationOnly"
+        }
+        
+        var bodyParameters: BodyParameters? {
+            
+            return JSONBodyParameters(JSONObject: [
+                "model":        Constants.model,
+                "mobileNumber": phone,
+                "password":     password,
+                "deviceId":     Constants.device,
+                "countryLiteralCode": countryLiteralCode,
+                "lang":         Constants.lang.uppercased(),
+                "deviceTechInfo": [
+                           "model": "string",
+                           "osVersion": "string",,
+                           "userAgent": "string",
+                           "deviceOS": "string"
+               ]
+            ])
+        }
+ func response(from object: Any, urlResponse: HTTPURLResponse) throws -> CommonResult {
+            return try CommonResult(object: object)
+        }
+    }
+```
+
+But im getting error:
+responseError(Error Domain=NSCocoaErrorDomain Code=3840 "JSON text did not start with array or object and option to allow fragments not set." UserInfo={NSDebugDescription=JSON text did not 
+start with array or object and option to allow fragments not set.})
+
+I think its because of format. So has APIKIT some solution for this issue?
+Hi
+
+I found this exception in Crashlytics crash logs from my production app.
+I can reproduce and paste it bellow. But I cannot find how to fix it.
+So, I just report this.
+
+```
+*** Terminating app due to uncaught exception 'NSInvalidArgumentException', reason: '*** -propertyForKey: only defined for abstract class.  Define -[_TtCV6APIKit31MultipartFormDataBodyParameters20MultipartInputStream propertyForKey:]!'
+```
+
+- Xcode 8.3.3
+- iOS 10.3 SDK
+- iPhone Plus (iOS 10.3 simulator)
+
+```swift
+import UIKit
+import APIKit
+
+protocol HttpBinRequest: Request {
+
+}
+
+extension HttpBinRequest {
+    var baseURL: URL {
+        return URL(string: "https://httpbin.org")!
+    }
+}
+
+struct PostRequest: HttpBinRequest {
+    typealias Response = Any
+
+    var method: HTTPMethod {
+        return .post
+    }
+
+    var path: String {
+        return "/post"
+    }
+
+    var bodyParameters: BodyParameters? {
+        let p = try! MultipartFormDataBodyParameters.Part(
+            value: "value",
+            name: "name"
+        )
+
+        return MultipartFormDataBodyParameters(parts: [p], entityType: .inputStream)
+    }
+
+    func response(from object: Any, urlResponse: HTTPURLResponse) throws -> Response {
+        return object
+    }
+}
+
+class ViewController: UIViewController {
+    override func viewDidLoad() {
+        super.viewDidLoad()
+
+        let request = PostRequest()
+
+        Session.send(request) { result in
+            print(result)
+            switch result {
+            case .success(let response):
+                print(response)
+            case .failure(let error):
+                print("error: \(error)")
+            }
+        }
+    }
+}
+```
+
+Hi @ishkawa,
+
+I've been reading your outstanding project, and I have 2 question about your code. 
+Could you please answer below questions if it's convenience.
+
+### In Session.swift Line:105, I've noticed you use a `return`, I don't understand what's the purpose of that. Could you explain?
+
+```swift
+open func cancelRequests<Request: APIKit.Request>(with requestType: Request.Type, passingTest test: @escaping (Request) -> Bool = { _ in true }) {
+        adapter.getTasks { [weak self] tasks in
+            return tasks
+                .filter { task in
+                    if let request = self?.requestForTask(task) as Request? {
+                        return test(request)
+                    } else {
+                        return false
+                    }
+                }
+                .forEach { $0.cancel() }
+        }
+    }
+```
+
+### In URLSessionAdapter.swift Line:44, I've noticed you use a `allTasks.map { $0 }`, is it necessary to `map` it? 
+
+```swift
+open func getTasks(with handler: @escaping ([SessionTask]) -> Void) {
+    urlSession.getTasksWithCompletionHandler { dataTasks, uploadTasks, downloadTasks in
+        let allTasks = dataTasks as [URLSessionTask]
+            + uploadTasks as [URLSessionTask]
+            + downloadTasks as [URLSessionTask]
+
+        handler(allTasks.map { $0 })
+    }
+}
+```
+
+Thank you in advance.
+Are there any plan to support Reactive/RxSwift for APIKit?

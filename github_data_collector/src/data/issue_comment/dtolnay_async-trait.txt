@@ -1,0 +1,245 @@
+I'm trying to implement trait with `async fn` for all `async fn`s. Simplified example:
+```rust
+#[async_trait]
+trait Trait {
+    async fn run(&self);
+}
+
+#[async_trait]
+impl<F, Fut> Trait for F
+where
+    F: Fn() -> Fut + Sync,
+    Fut: Future<Output = ()> + Send,
+{
+    async fn run(&self) {
+        self().await
+    }
+}
+```
+<details> 
+  <summary>simplified `cargo expand`</summary>
+
+  ```rust
+  trait Trait {
+      fn run<'s, 'async_trait>(&'s self) -> Pin<Box<dyn Future<Output = ()> + Send + 'async_trait>>
+      where
+          's: 'async_trait,
+          Self: 'async_trait;
+  }
+
+  impl<F, Fut> Trait for F
+  where
+      F: Fn() -> Fut + Sync,
+      Fut: Future<Output = ()> + Send,
+  {
+      fn run<'s, 'async_trait>(&'s self) -> Pin<Box<dyn Future<Output = ()> + Send + 'async_trait>>
+      where
+          's: 'async_trait,
+          Self: 'async_trait,
+      {
+          #[allow(clippy::used_underscore_binding)]
+          async fn __run<F, Fut>(_self: &F)
+          where
+              F: Fn() -> Fut + Sync,
+              Fut: Future<Output = ()> + Send,
+          {
+              _self().await
+          }
+          Box::pin(__run::<F, Fut>(self))
+      }
+  }
+  ```
+</details>
+
+But sadly, this doesn't work:
+```
+error[E0309]: the parameter type `Fut` may not live long enough
+  --> src/lib.rs:16:1
+   |
+16 | #[async_trait]
+   | ^^^^^^^^^^^^^^
+17 | impl<F, Fut> Trait for F
+   |         --- help: consider adding an explicit lifetime bound `Fut: 'async_trait`...
+   |
+note: ...so that the type `impl std::future::Future` will meet its required lifetime bounds
+  --> src/lib.rs:16:1
+   |
+16 | #[async_trait]
+   | ^^^^^^^^^^^^^^
+
+error: aborting due to previous error
+```
+(adding `Fut: 'async_trait` is impossible because it leads to `impl has stricter requirements than trait` errors)
+
+**But** with by-hand desugaring this implementation **is** possible:
+```rust
+impl<F, Fut> Trait for F
+where
+    F: Fn() -> Fut + Sync,
+    Fut: Future<Output = ()> + Send,
+{
+    fn run<'s, 'async_trait>(&'s self) -> Pin<Box<dyn Future<Output = ()> + Send + 'async_trait>>
+    where
+        's: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { self().await })
+    }
+}
+
+#[test]
+fn test() {
+    let closure = || async { () };
+    Trait::run(&closure);
+}
+```
+
+So, my questions are:
+1. Why the first implementation doesn't work, but the second does?
+2. Is it possible to remove `async move {}` from the last example? (`Box::pin(self())` leads to the same error `the parameter type `Fut` may not live long enough`)
+3. Is it possible to write implementation like this, but without so much boilerplate?
+4. Can `async_trait` to accept implementations like in the first example? (after some changes in how macro works)
+Minimal reproduction
+
+```
+macro_rules! implement_commands {
+    (
+        $tyargs:ident : $ty:ident
+    ) => {
+        #[async_trait]
+        pub trait AsyncCommands: Sized {
+            async fn f<$tyargs: $ty>(&mut self, x: $tyargs) {
+                self.f(x).await
+            }
+        }
+    };
+}
+
+implement_commands! { K: Send }
+```
+
+```
+error[E0424]: expected value, found module `self`
+   --> tests/test.rs:434:9
+    |
+434 |         #[async_trait]
+    |         ^^^^^^^^^^^^^^ `self` value is a keyword only available in methods with `self` parameter
+...
+443 | implement_commands! { K: Send }
+    | ------------------------------- in this macro invocation
+```
+The combination of macros results in the `instrument` macro thinking the instrumented function is not in fact async and generating the wrong code.
+
+see full writeup [here](https://github.com/tokio-rs/tracing/issues/399), cross-posting b/c someone on the tonic/tracing/etc discord suggested it. Thanks for providing this crate!
+Hi, me again. I found using `type` in trait will cause some problems...
+
+1. mismatched types
+2. cannot infer an appropriate lifetime for lifetime parameter `'a` due to conflicting requirements
+
+``` rust
+extern crate async_trait;
+
+use async_trait::async_trait;
+use futures::executor::block_on;
+
+#[async_trait]
+pub trait State<'a> {
+    type Command: 'a + Send;
+
+    async fn add_comm(mut self, more_str: Self::Command) -> Self where Self: Sized;
+    async fn add_more_comm(mut self, str1: Self::Command, str2: Self::Command) -> Self where Self: Sized {
+        let self1 = self.add_comm(str1).await;
+        let self2 = self1.add_comm(str2).await;
+        self2
+    }
+}
+
+#[derive(Debug)]
+pub struct RealState(String);
+#[async_trait]
+impl <'a> State<'a> for RealState {
+    type Command = String;
+
+    async fn add_comm(mut self, more_str: Self::Command) -> Self {
+        self.0 = self.0.clone() + more_str.as_ref();
+        self
+    }
+}
+
+fn main() {
+    let state = RealState(Default::default());
+    let state1 = block_on(state.add_more_str("hello", " world"));
+    println!("{:?}", state1);
+}
+```
+
+Error:
+```
+error[E0308]: mismatched types
+ --> src/lifetime-error.rs:6:1
+  |
+6 | #[async_trait]
+  | ^^^^^^^^^^^^^^ one type is more general than the other
+  |
+  = note: expected type `std::marker::Send`
+             found type `std::marker::Send`
+
+error[E0495]: cannot infer an appropriate lifetime for lifetime parameter `'a` due to conflicting requirements
+ --> src/lifetime-error.rs:6:1
+  |
+6 | #[async_trait]
+  | ^^^^^^^^^^^^^^
+  |
+note: first, the lifetime cannot outlive the lifetime 'a as defined on the trait at 7:17...
+ --> src/lifetime-error.rs:7:17
+  |
+7 | pub trait State<'a> {
+  |                 ^^
+  = note: ...so that the expression is assignable:
+          expected <Self as State<'_>>::Command
+             found <Self as State<'a>>::Command
+note: but, the lifetime must be valid for the lifetime 'async_trait as defined on the method body at 6:1...
+ --> src/lifetime-error.rs:6:1
+  |
+6 | #[async_trait]
+  | ^^^^^^^^^^^^^^
+  = note: ...so that the expression is assignable:
+          expected std::pin::Pin<std::boxed::Box<(dyn core::future::future::Future<Output = Self> + std::marker::Send + 'async_trait)>>
+             found std::pin::Pin<std::boxed::Box<dyn core::future::future::Future<Output = Self> + std::marker::Send>>
+
+```
+I tried to produce a MRE:
+
+```
+#[async_trait]
+pub trait MapInto<T>: Future {
+    async fn map_into(self) -> T
+        where Self: Sized;
+}
+
+#[async_trait]
+impl<F, T> MapInto<T> for F
+    where F: ?Sized,
+          F: Future + Send,
+          T: From<F::Output>,
+{
+    async fn map_into(self) -> T
+        where Self: Sized,
+    {
+        self.await.into()
+    }
+}
+
+error:
+
+error[E0309]: the parameter type `T` may not live long enough
+   --> src/future.rs:116:1
+    |
+116 | #[async_trait]
+    | ^^^^^^^^^^^^^^
+117 | impl<F, T> MapInto<T> for F
+    |         - help: consider adding an explicit lifetime bound `T: 'async_trait`...
+    |
+```
+
+A fix for me: `T: 'static,` in impl block. Is it a bug?

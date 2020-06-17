@@ -1,0 +1,179 @@
+Hi,
+
+We've been seeing new connection spikes after applying the fix for handling Remove() for SingleConnPool: #1112 . Please correct me if I'm wrong: I think the client will issue one READONLY command per connection if ReadOnly option is set to true, but this command might become a bottleneck when server is under heavy load and many requests time out causing lots of new connections to be created. 
+
+I'm not sure what would be the best way to fix this, but: 
+1) Do we really need to issue READONLY command given that we always slot slave node if ReadOnly option is enabled and it's a ReadOnly command? https://github.com/go-redis/redis/blob/master/cluster.go#L1570
+2) Is it possible to change the READONLY setting to just be set once instead of per connection? E.g., issue a CONFIG SET command when init the ClusterClient? 
+
+Thank you and I look forward to your advice!
+For newcomers would be nice to have some guide about the differences between the versions of this library. If they are related to their redis version counterpart or the features each version has than the previous one had not, if it follows semVer, etc.
+Hi -
+
+Is there a way to turn off the healthchecks that remove hosts from the ring? Each host in my ring has its own high-availability setup (GCP Memorystore) and I'm using them together as a consistent database so I don't want the key->host membership changing at all.
+
+Alternatively, the readme hints that ClusterClient can use a bunch of non-Cluster Redis hosts. Is this true? It seems like the code depends on `MOVED` etc messages coming from cluster-mode hosts.
+
+Thanks!
+The read timeout seems to be globally used in most of the commands. However, some commands require more time than others, such as `FlushAll()`, `BgSave()`, `FlushDB()`, In the mean time, we don't want to increase the general read timeout to make all processes hang for a long time when redis is in a dead status.
+
+It would be better if it could set read timeout dynamically. e.g.,
+```go
+client.WithTimeout(30 * time.Second).FlushAll()
+```
+maybe KeepAlive param is 5minutes
+close connect operate is  not doing well
+I need to calculate the total cost of time of **get requeset**, And I found that if I set the value bigger than 5MB, it will timeout. 
+![image](https://user-images.githubusercontent.com/27262951/71650856-03a6fe80-2d54-11ea-9c0e-acaf03c78e9b.png)
+
+![image](https://user-images.githubusercontent.com/27262951/71650877-2d602580-2d54-11ea-9c07-b59aa511910d.png)
+
+I'm using `WrapProcess` to add logging instrumentation in go-redis v6 and noticed that commands run within `Watch` aren't intercepted. This is because `Client.newTx` creates a new `baseClient` with default process functions. So I'm forced to use the following workaround whenever I create a watch transaction:
+
+```go
+err := rds.Watch(func(tx *redis.Tx) error {
+	// workaround: process wrappers not automatically applied to watch transactions
+	if log {
+		tx.WrapProcess(...)
+	}
+	...
+}
+```
+
+I'm not fluent with this library but I assume there's a good reason to create a new `baseClient` internally. So I guess the only way to support this would be to store the wrapper functions internally and re-apply them when watch transactions are created, something like (ignoring pipeline for brevity):
+
+```go
+type baseClient struct {
+	...
+	wrappers []func(unc(Cmder) error) func(Cmder) error
+	...
+}
+
+func (c *baseClient) WrapProcess(
+	fn func(oldProcess func(cmd Cmder) error) func(cmd Cmder) error,
+) {
+	c.process = fn(c.process)
+	c.wrappers = append(c.wrappers, fn)
+}
+
+func (c *Client) newTx() *Tx {
+	...
+	tx.baseClient.init()
+	tx.statefulCmdable.setProcessor(tx.Process)
+	for _, fn := range c.wrappers {
+		tx.WrapProcess(fn)
+	}
+	return &tx
+}
+```
+
+Happy to send a PR.
+
+This scenario looks even trickier in v7 with the switch to instrumentation hooks because not only are they not passed to watch transactions but they can't be added manually. What are my options for reliable command logging in v7?
+
+Looks like `Tx` should inherit the hooks from the original `Client`. Again, happy to provide a simple PR that passes this unit test:
+
+```go
+func ExampleWatch_instrumentation() {
+	rdb := redis.NewClient(&redis.Options{
+		Addr: ":6379",
+	})
+	rdb.AddHook(redisHook{})
+
+	rdb.Watch(func(tx *redis.Tx) error {
+		tx.Ping()
+		tx.Ping()
+		return nil
+	}, "foo")
+	// Output:
+	// starting processing: <watch foo: >
+	// finished processing: <watch foo: OK>
+	// starting processing: <ping: >
+	// finished processing: <ping: PONG>
+	// starting processing: <ping: >
+	// finished processing: <ping: PONG>
+	// starting processing: <unwatch: >
+	// finished processing: <unwatch: OK>
+}
+```
+
+I want to customize whether the current command should be retried，some commands i do not want to try
+like `not idempotent` (likes LPOP)  or which uses too many redis server's resources  likes `hgetall` command 。
+
+With  V6 sdk i can use WrapProcess like this:
+
+```
+client.WrapProcess(RetryWrapper(haOptions))
+func RetryWrapper(haOpt *haOptions) func(oldProcess func(cmd redis.Cmder) error) func(redis.Cmder) error {
+	host, _ := os.Hostname()
+	ip := GetIP()
+	return func(fn func(cmd redis.Cmder) error) func(redis.Cmder) error {
+		return func(cmd redis.Cmder) error {
+			var err error
+			for attempt := 0; attempt <= haOpt.MaxRetries; attempt++ {
+				if attempt > 0 {
+					if attempt > 0 {
+						time.Sleep(retryBackoff(attempt, haOpt.MinRetryBackoff, haOpt.MaxRetryBackoff))
+					}
+				}
+				err = fn(cmd)
+				if err != nil {
+					requestTotalFail.WithLabelValues(host, ip).Inc()
+				}
+				if err == nil || !isRetryableError(err) || !isRetryableCmd(cmd) {
+					return err
+				}
+				requestTotalRetry.WithLabelValues(host, ip).Inc()
+			}
+			return err
+		}
+	}
+}
+```
+
+But V7 uses `Hook` Instead of `WrapProcess`,how can i implement the feature in V7. or can I
+pr the feature uses isRetryableCmd func
+
+
+
+
+
+Hi, this is not really an issue. It is more a request of help. 
+
+I am trying to do this 4 redis calls in one transaction : 
+
+```
+        func getHost(key) host, score, error{
+         numberOfHosts, err := rdb.ZCard(key).Result()
+	if err != nil {
+		return nil, 0, err
+	}
+	host, err := rdb.ZRangeByScoreWithScores(key, redis.ZRangeBy{
+		Min:    "0",
+		Max:    strconv.Itoa(maxScore),
+		Offset: numberOfHosts - 1,
+		Count:  1,
+	}).Result()
+	if err != nil {
+		return nil, 0, err
+	}
+	score := host[0].Score
+	member, err := json.Marshal(host[0].Member)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	if int(score) < maxCapacity {
+		rdb.ZIncrBy(key, score+1, string(member))
+	}
+
+	host, err := rdb.GetHost(string(member))
+	if err != nil {
+		return nil, 0, err
+	}
+	return host, int(score), nil
+}
+```
+I found this https://godoc.org/github.com/go-redis/redis#Client.Watch in the doc and I am trying to do something with it but it is a bit difficult at the moment. 
+
+Is anybody already done this and provide advice ?

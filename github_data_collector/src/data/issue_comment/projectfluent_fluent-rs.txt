@@ -1,0 +1,138 @@
+What is the correct way to format values with currencies with fluent-rs?
+Is there an equivalent to Fluent.NumberArgument?
+
+```
+// main.js:
+data = {
+  amount: Fluent.NumberArgument(value, { currency: "USD" })
+}
+
+// main.ftl:
+amount-owed = You owe { $amount }
+```
+
+1. https://github.com/projectfluent/fluent/wiki/Fluent-and-ICU-MessageFormat#developer-driven
+As we integrate fluent into Gecko, one of the last items to be resolved is how to plug a formatter into the resolver from outside.
+
+In JS model, we have `FluentNumber` and `FluentDateTime` [0] which is a bit arbitrary and not very extendible. In Rust we have only `FluentNumber`, so adding a datetime type is challenging. That inflexibility is being addressed in #146.
+
+But the other issue is that even for types that we do have in Rust (`FluentNumber`) we don't have a formatter baked into the API. In JS, we use `Intl.NumberFormat` and expect the environment to polyfill it in case its missing.
+In Rust, I'm not sure how to address it.
+
+I have an equivalent of `Intl.NumberFormat`, but it is provided by the Gecko, and not part of `fluent-bundle` crate, so I need some way to register the formatter and the resolver to know to use it for the given variant of the `FluentValue`.
+
+@stasm, @Pike - any recommendations?
+
+[0] https://github.com/projectfluent/fluent.js/blob/master/fluent-bundle/src/types.js
+Is it feasible to compile down this project as a web assembly module to use for example in Go projects using https://github.com/perlin-network/life or https://github.com/wasmerio/go-ext-wasm ?
+@Manishearth - here's how I'd use the memoizer. One challenge I see is that there's no easy way to have a `Default` if I need to allocate an `IntlMemoizer` externally.
+
+I'm wondering if it would be possible to have `FluentBundle` either take an external one or allocate its own if not provided, but I'm not sure how to design such a generic.
+As I [posted on discourse](https://discourse.mozilla.org/t/what-is-the-most-functional-cli-option-for-using-fluent/45011?u=alerque) I'm looking for a basic CLI to query a message from `*.ftl` files. I finally figured out how to at least compile the `parser` and `resolver` binaries. The former was somewhat self-explanitory as it responded to a `--help` flag, and seems to do what it says on the tin. Pass it a single argument of at FTL file name and get an parsed AST representation back on STDOUT. Okay, but what do I do with resolver? It doesn't show any help messages, clearly is waiting for something on STDIN, but crashes no matter what I pass it.
+
+* [ ] The link in the Readme should be fixed as it currently links to something on crates.io that doesn't exist.
+* [ ] A help message of some kind should be added that explains the usage, what input it expects and what output can be achieved.
+* [ ] CLI tool usage should be mentioned somewhere, maybe in the [main rust docs](https://docs.rs/fluent)? I don't know where actually, but I don't see it anywhere the project is talked about.
+We should try to make `fluent-bundle` release size as small as possible.
+
+@cmyr pointed out in https://github.com/zbraniecki/unic-locale/issues/10 that at the moment the size increase is ~300kb.
+
+I'd like to look for ways to make it smaller.
+
+According to the analysis the bulk of the size increase goes into `rental` and `syn` (used for langid macro).
+
+I think that first low hanging fruit would be to stop using the macro in `fluent-bundle`, and investigate the `rental`.
+not really related to #94, but thinking along related lines.
+
+Thinking about the sort of API I would like to expose to application developers, I have a few guiding principles:
+
+- localization should not fail at runtime
+- as much as possible, messages should be validated at compile time
+- the type system should encode as much as possible (types and counts of message arguments, e.g.)
+- Adoption should be as close to trivial as possible; application code should be easy to read.
+
+
+With those goals in mind, I've been sketching out some possible ways to use a `derive` macro to encode the number and type of arguments alongside the message key.
+
+```rust
+trait FluentMessage {
+    const KEY: &'static str;
+    fn localize<R: Borrow<FluentResource>>(&self, ctx: &FluentBundle<R>) -> String;
+}
+
+#[derive(FluentMessage)]
+struct MacosMenuAboutApp {
+    app_name: String,
+}
+```
+
+This generates approximately the following code:
+
+```rust
+
+impl MacosMenuAboutApp {
+    pub fn new(app_name: impl Into<String>) -> Self {
+        MacosMenuAboutApp { app_name }
+    }
+}
+
+impl FluentMessage for MacosMenuAboutApp {
+    const KEY: &'static str = "macos-menu-about-app";
+
+    fn localize<R: Borrow<FluentResource>>(&self, ctx: &FluentBundle<R>) -> String {
+        let args = fluent_args![
+            "app_name" => self.app_name.as_str()
+        ];
+        let msg = ctx.get_message(Self::KEY).expect("missing localization key");
+        let value = msg.value.as_ref().expect("missing value");
+        let mut errs = Vec::new();
+        let result = ctx.format_pattern(value, Some(&args), &mut errs);
+        for err in errs {
+            eprintln!("localization error {:?}", err);
+        }
+        result.to_string()
+    }
+}
+```
+
+Which when used would look something like:
+
+```rust
+fn some_function() {
+    let bundle: &FluentBundle<_> = get_fluent_bundle();
+    let title = MacosMenuAboutApp::new("MyApp").localize(bundle);
+    assert_eq!(&title, "About MyApp");
+}
+```
+
+Again, this is just a sketch, and I'm not yet very familiar with all of fluent's features; it's very possible that this won't work for some cases, but I thought I would share the idea.
+
+The thing I would really like, here, is some way to verify messages at compile time. This might involve something like,
+
+```rust
+// main.rs
+
+ verify_localization_with_bundles!("../resources/l20n{locale}/{res_id}");
+```
+
+which would compile down to something like:
+
+```rust
+lazy_static! {
+    static ref FLUENT_VERIFIER: Arc<Mutex<FluentVerifier>> = {
+        let mgr = ::fluent::ResourceManager::new("../resources/l20n{locale}/{res_id}");
+        ::fluent::FluentVerifier(mgr, ..)
+    };
+}
+
+fn _fluent_static_verify(msg: &str, args: Option<FluentArgs>) -> Result<(), VerificationError> {
+    FLUENT_VERIFIER.lock().unwrap().verify(msg, args)
+}
+```
+
+And then each time the `derive` runs for our trait, before we generate our type we would check that the provided message and args work for some set of specified locales.
+
+This is definitely a half-baked idea, right now, and there are lots of details that would need to be shared, but wanted to at least get my initial thoughts out.
+Now that PGO landed in stable, I think it may be generally useful, especially to speed up the parser.
+Fixes #121.
+Fixes #125

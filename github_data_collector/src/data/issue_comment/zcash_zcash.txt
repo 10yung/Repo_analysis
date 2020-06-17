@@ -1,0 +1,180 @@
+The release height for this is roughly Tuesday.
+This is a replacement of https://github.com/zcash/zcash/pull/3749 for https://github.com/zcash/zcash/issues/3687
+
+It takes the commit from @dagurval where a new test case `rpc_wallet_z_getnewaddress` is added and it adds a check for too many arguments which was the original post issue but it was missing in https://github.com/zcash/zcash/pull/3749
+
+It uses `CheckRPCThrows()` to test the error message of invalid argument however for too many arguments the full help message is displayed so i am just testing there is an runtime exception.
+
+If this is merged #3749 and https://github.com/zcash/zcash/issues/3687 can be closed.
+While running a debug build (`CONFIGURE_FLAGS='--enable-debug'`) on testnet, recent `master` branch (latest commit 2f8cf61a2a0407f4d6232e82f3a9b5ddbea25832 Jan 9 2020) zcashd crashed while starting up (but it was recently synced) with the following assert message:
+```
+(...)
+[Press Ctrl+C to exit] [Set 'showmetrics=0' to hide]
+zcashd: wallet/wallet.cpp:1065: void CopyPreviousWitnesses(NoteDataMap&, int, int64_t) [with NoteDataMap = std::map<JSOutPoint, SproutNoteData>; int64_t = long int]: Assertion `(nd->witnessHeight == -1) || (nd->witnessHeight == indexHeight - 1)' failed.
+```
+The assertion is 100% reproducible. Before this crash, the zcashd had asserted with a lock ordering potential deadlock assert (I no longer have the exact assertion text), so it may be that this assertion left the data directory in an inconsistent state (lack of clean shutdown), causing zcashd to fail on startup every time. I had never seen this failure before. I think the lock ordering assertion is a known (non-critical) problem; this ticket is not about that failure.
+
+I started zcashd again using `gdb`, and here are the most recent set of stack frames, and then the variables involved in the assertion:
+```
+(gdb) bt
+#0  __GI_raise (sig=sig@entry=6) at ../sysdeps/unix/sysv/linux/raise.c:51
+#1  0x00007ffff68b6801 in __GI_abort () at abort.c:79
+#2  0x00007ffff68a639a in __assert_fail_base (fmt=0x7ffff6a2d7d8 "%s%s%s:%u: %s%sAssertion `%s' failed.\n%n", 
+    assertion=assertion@entry=0x55555631f3e0 "(nd->witnessHeight == -1) || (nd->witnessHeight == indexHeight - 1)", 
+    file=file@entry=0x55555631d427 "wallet/wallet.cpp", line=line@entry=1065, 
+    function=function@entry=0x55555632cec0 <void CopyPreviousWitnesses<std::map<JSOutPoint, SproutNoteData, std::less<JSOutPoint>, std::allocator<std::pair<JSOutPoint const, SproutNoteData> > > >(std::map<JSOutPoint, SproutNoteData, std::less<JSOutPoint>, std::allocator<std::pair<JSOutPoint const, SproutNoteData> > >&, int, long)::__PRETTY_FUNCTION__> "void CopyPreviousWitnesses(NoteDataMap&, int, int64_t) [with NoteDataMap = std::map<JSOutPoint, SproutNoteData>; int64_t = long int]") at assert.c:92
+#3  0x00007ffff68a6412 in __GI___assert_fail (
+    assertion=0x55555631f3e0 "(nd->witnessHeight == -1) || (nd->witnessHeight == indexHeight - 1)", 
+    file=0x55555631d427 "wallet/wallet.cpp", line=1065, 
+    function=0x55555632cec0 <void CopyPreviousWitnesses<std::map<JSOutPoint, SproutNoteData, std::less<JSOutPoint>, std::allocator<std::pair<JSOutPoint const, SproutNoteData> > > >(std::map<JSOutPoint, SproutNoteData, std::less<JSOutPoint>, std::allocator<std::pair<JSOutPoint const, SproutNoteData> > >&, int, long)::__PRETTY_FUNCTION__> "void CopyPreviousWitnesses(NoteDataMap&, int, int64_t) [with NoteDataMap = std::map<JSOutPoint, SproutNoteData>; int64_t = long int]")
+    at assert.c:101
+#4  0x0000555555ad7ef0 in CopyPreviousWitnesses<std::map<JSOutPoint, SproutNoteData, std::less<JSOutPoint>, std::allocator<std::pair<JSOutPoint const, SproutNoteData> > > > (noteDataMap=std::map with 1 element = {...}, indexHeight=763309, 
+    nWitnessCacheSize=100) at wallet/wallet.cpp:1065
+#5  0x0000555555aac3f6 in CWallet::IncrementNoteWitnesses (this=0x5555ab39ccd0, pindex=0x7fff8c013c30, 
+    pblockIn=0x7fffb32414e0, sproutTree=..., saplingTree=...) at wallet/wallet.cpp:1143
+#6  0x0000555555aa9062 in CWallet::ChainTipAdded (this=0x5555ab39ccd0, pindex=0x7fff8c013c30, pblock=0x7fffb32414e0, 
+    sproutTree=..., saplingTree=...) at wallet/wallet.cpp:571
+#7  0x0000555555aa915c in CWallet::ChainTip (this=0x5555ab39ccd0, pindex=0x7fff8c013c30, pblock=0x7fffb32414e0, 
+    added=...) at wallet/wallet.cpp:580
+#8  0x00005555559c0fd4 in boost::_mfi::mf3<void, CValidationInterface, CBlockIndex const*, CBlock const*, boost::optional<std::pair<libzcash::IncrementalMerkleTree<29ul, libzcash::SHA256Compress>, libzcash::IncrementalMerkleTree<32ul, libzcash::PedersenHash> > > >::operator() (this=0x5555a96ea700, p=0x5555ab39cff8, a1=0x7fff8c013c30, a2=0x7fffb32414e0, 
+    a3=...) at /home/larry/zcash/depends/x86_64-unknown-linux-gnu/share/../include/boost/bind/mem_fn_template.hpp:393
+(...)
+(gdb) p nd->witnessHeight
+$2 = 763278
+(gdb) p nd->witnessHeight
+$3 = 763278
+(gdb) p indexHeight
+$4 = 763309
+(gdb) 
+```
+(I can add more stack frames if needed.) The testnet block height at the time was approximately 763684. I uploaded the full `debug.log` file since startup here: https://gist.github.com/LarryRuane/ed4f4e5c061b3407e9bf8c736b8f033f
+
+I also saved a copy of the entire `testnet3` directory (3.0 gb) and can provide that if needed. In my view, it's likely that anyone can reproduce the problem using this data directory and a debug build. Here are the relevant lines from the `zcash.conf` file (I started `zcashd` with no command-line arguments):
+```
+testnet=1
+addnode=testnet.z.cash
+txindex=1
+experimentalfeatures=1
+insightexplorer=1
+addressindex=1
+spentindex=1
+timestampindex=1
+migration=1
+```
+This is a possible implementation for https://github.com/zcash/zcash/issues/3939
+
+It is based in the following definitions, please correct if my understanding is not the right one. Under current blockchain conditions:
+
+- Unconfirmed balance are shielded or transparent(z or t) balances with 0 confirmations.
+- Immature balance are z or t balances that have between 1 and COINBASE_MATURITY(100) confirmations.
+- Just balance are confirmed and mature z or t balances, this is more confirmations than COINBASE_MATURITY.
+
+Implementation:
+
+1- Function `getBalanceZaddr` is moved to the top of `getwalletinfo` as we are going to use it.
+2- `getBalanceZaddr` uses one version of `GetFilteredNotes`, we want to use the other version that allow us to get balances inside min and max confirmations.
+3- `z_balance`, `z_unconfirmed_balance`, and `z_immature_balance` are obtained by calling `getBalanceZaddr` with different min and max confirmations according to the definitions from above.
+
+according #4297 
+
+### release notes:
+
+https://github.com/RustCrypto/hashes/releases/tag/sha2-v0.8.1 
+
+
+## references
+https://github.com/RustCrypto/hashes/tree/master/sha2  
+https://docs.rs/sha2/0.8.1/sha2/ 
+
+<!--- Remove text and sections that do not apply -->
+
+please check depends: 
+
+https://github.com/zcash/zcash/blob/master/depends/packages/crate_sha2.mk
+
+### Description
+Version 0.8.1 is now available. This updates AArch64 support.
+
+#### references:
+https://crates.io/crates/sha2/0.8.1 
+
+The `getblockchaininfo` RPC output currently has a "valuePools" key that gives information about the total value in the Sprout and Sapling value pools:
+```
+  "valuePools": [
+    {
+      "id": "sprout",
+      "monitored": true,
+      "chainValue": 142961.23820218,
+      "chainValueZat": 14296123820218
+    },
+    {
+      "id": "sapling",
+      "monitored": true,
+      "chainValue": 258439.66179030,
+      "chainValueZat": 25843966179030
+    }
+  ],
+```
+
+These are independently computed by the node (see #2795 for when this was originally added for Sprout). I propose adding a "transparent" value pool computed in a similar way, and with a similar fallback mechanism for when the node has not been synced from scratch (see #3885).
+
+This is partly motivated by the observation that several third-party sites are incorrectly calculating the total issuance after Blossom (because they are computing it based on the block height and the pre-Blossom issuance rules).
+https://github.com/zcash/zcash/issues/2671
+
+Adds new rpc call `getexperimentalfeatures` and also adds experimental features to `getblockchaininfo` output.
+
+Note: This will add some duplicated code and a new place to maintain when experimental features are updated: https://github.com/zcash/zcash/blob/master/src/init.cpp#L652-L660 .
+Open to suggestions to change implementation if needed.
+### Describe the issue
+`contrib/devtools/symbol-check.py` is supposed to check a binary (given as an argument) for unexpected symbols and dynamically linked libraries.
+
+### Can you reliably reproduce the issue?
+#### If so, please list the steps to reproduce below:
+1. Build zcashd from source.
+2. Run `contrib/devtools/symbol-check.py src/zcashd`
+
+### Expected behaviour
+No output.
+
+### Actual behaviour + errors
+Many false positives of the form:
+```
+src/zcashd: symbol std::... from unsupported version GLIBCXX_{3.4.15, 3.4.21, 3.4.22}
+src/zcashd: symbol __... from unsupported version CXXABI_{1.3.5, 1.3.8, 1.3.9, 1.3.11}
+src/zcashd: symbol __... from unsupported version GLIBC_{2.17, 2.18, 2.25}
+src/zcashd: export of symbol ... not allowed
+```
+
+### The version of Zcash you were using:
+```
+Zcash Daemon version v2.1.1-rc1-2f8cf61a2
+```
+
+### Machine specs:
+Debian Buster
+```
+$ uname -a
+Linux katava 4.19.0-6-amd64 #1 SMP Debian 4.19.67-2+deb10u2 (2019-11-11) x86_64 GNU/Linux
+$ gcc --version
+gcc (Debian 8.3.0-6) 8.3.0
+[...]
+$ ld -v
+GNU ld (GNU Binutils for Debian) 2.31.1
+$ as --version
+GNU assembler (GNU Binutils for Debian) 2.31.1
+```
+
+Steps I followed to reproduce:
+
+1. Clone zcash
+2. git checkout v2.1.0
+3. `ENABLE_PROTON=1 ./qa/pull-tester/rpc-tests.sh proton_test`
+
+Result:
+
+```
+=== Running testscript proton_test.py ===
+Initializing test directory /tmp/testuyK_bc
+Proton listening on: 127.0.0.1:25672
+[... apparently nothing happens ...]
+```

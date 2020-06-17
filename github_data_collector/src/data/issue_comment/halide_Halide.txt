@@ -1,0 +1,219 @@
+Halide is available as a port in vcpkg, a C++ library manager that simplifies installation for Halide and other project dependencies. Documenting the install process here will help users get started by providing a single set of commands to build Halide, ready to be included in their projects.
+
+We also test whether our library ports build in various configurations (dynamic, static) on various platforms (OSX, Linux, Windows: x86, x64, UWP, ARM) to keep a wide coverage for users.
+
+I'm a maintainer for vcpkg, and here is what the port script looks like. We try to keep the library maintained as close as possible to the original library.
+Hi,
+
+I was able to fix make test_apps under Ubuntu 18.04.
+Here are the things I did:
+- I fixed the parameter passed to protoc in apps/onnx/Makefile. It looks that --proto_path option is required under ubuntu.
+- I fixed the compilation issues on apps/onnx/onnx_converter.cc. Mainly, I replaced std::vector<std::pair<Halide::Expr, Halide::Expr>> extents;
+with 
+Halide::Region extents;
+
+Since  #4390 has not been yet solved I've commented this line in src/Dimension.h
+//HALIDE_ATTRIBUTE_DEPRECATED("extent_estimate() will be removed soon, do not use")
+
+Before going for a pull request and since #4390 still creates problems, I'm just sending a patch in this way. Maybe it could be of some help to someone.
+
+[halide.txt](https://github.com/halide/Halide/files/4080875/halide.txt)
+
+My setup is using Ubuntu 18.04,
+g++ 7.4.0
+export LLVM_CONFIG=/usr/bin/llvm-config-8
+these apt packages: libatlas-base-dev libopenblas-dev libeigen3-dev
+pybind11 cloned from https://github.com/pybind/pybind11 revision 07e225932235ccb0db5271b0874d00f086f28423
+
+The halide code used is the one in master: a7e2fd6021ecd1dcc0e927ef554f371e70ee8af0
+
+Cheers,
+
+Fabrizio
+
+
+Currently, Halide codegen for CPUs doesn't take much of a position on whether fused-multiply-add ops are used are not; generally, we rely on whatever LLVM does for a given target. Do we want to revisit this to give more control to the pipeline author?
+
+In theory, FMA is nothing but a win (faster and more accurate, whee), but has some subtle gotchas. For instance: if you are compiling a pipeline for the multitarget `x86-64-avx2,x86-64-sse41`, you'll get code that runs with FMA (if you happen to be on an AVX2+ machine) but without on older chips; this means that results (and test goldens, etc) need to specialize not just by compiled-arch but also by actual-runtime-microarchitecture in some cases.
+
+Currently, the only way to disable FMA operations is by using `strict_float`, which is a bigger hammer than we really need; it disables all of -ffast-math, but also effectively disables most simplification of FP code. 
+
+(Adding more fun to this situation is that AFAICT, there isn't a way in LLVM to disable just the FMA-style ops; it seems that enabling any of UnsafeMath, FpContract, AllowReassoc for LLVM will allow if to emit FMA ops.)
+
+Not sure if there is a right way is to address this. Some thoughts:
+- If there was a reliable way to disable just FMA in LLVM, I'd argue the best thing would be to disable that by default, then allow opt-in on either a global basis (via a Feature flag) or via a per-Expr wrapper (a la strict_float), or perhaps by an explicit `fma()` suite of operators.
+    - Alternately, for better backwards compatibility, invert the logic, *enable* FMA by default, allow disabling via feature and/or wrapper
+- Add a Target::Feature that is just "disable fast-math" but that doesn't disable all the FP simplifications (as does strict_float)
+- Do nothing and continue the status quo.
+- Something else I haven't thought of.
+
+
+
+
+Calls to halide_msan_check_buffer_is_initialized() now emit the name of the buffer that failed msan check; this is useful in complex pipelines with many inputs.
+I tried the following code:
+```cpp
+  Halide::ImageParam input_a(Halide::type_of<float>(), 3, "input_a");
+  input_a.dim(0).set_bounds(0, 1);
+  Halide::ImageParam input_b(Halide::type_of<float>(), 3, "input_b");
+
+  Halide::Func f("out_a"), g("out_b");
+  Halide::Var i, j, k;
+  f(i, j, k) = input_a(i, j, k) * 2;
+  g(i, j, k) = input_b(i, j, k) / 2;
+
+  std::vector<Halide::Func> fs;
+  fs.push_back(f);
+  fs.push_back(g);
+
+  Halide::Pipeline p(fs);
+  p.add_requirement(input_a.dim(0).extent() == input_b.dim(0).extent());
+  p.add_requirement(input_a.dim(1).extent() == input_b.dim(1).extent());
+  p.add_requirement(input_a.dim(2).extent() == 5);
+  p.add_requirement(input_b.dim(2).extent() == 6);
+  f.output_buffer().dim(1).set_bounds(0, 3);
+
+  Halide::Target target("x86-64-linux-sse41-avx-avx2");
+
+  std::vector<Halide::Argument> inputs;
+  inputs.push_back(input_a);
+  inputs.push_back(input_b);
+
+ p.compile_to_lowered_stmt(std::string("/tmp/example.stmt"), inputs, Halide::Text, target);
+```
+
+I expected that all the extents of f and g be fully known. For f, the first extent would come from the bounds specification on input_a, the second from the explicit specification of the bounds of the output buffer, and the third from the pipeline requirement. For g, I was hoping that the pipeline requirements would also be leveraged to derive the bounds. However, in practice, the only known extent in example.stmt is the one specified through `f.output_buffer().dim(1).set_bounds(0, 3)`. All the other extents remain symbolic.
+
+Of course in this trivial example I could directly set the bounds on f and g, but there are cases where this is difficult. Is there any way to improve the simplifier to start taking pipeline requirements and input extents into account ? 
+
+
+I'm having trouble building the latest master recently.
+The latest working version I found was built several days ago before the `LICENSE` only contains 24 lines.
+
+```
+#7 2675. [1909/2221] ccache /usr/local/bin/clang++   -I../src -I../tools -Iinclude -fdebug-prefix-map='/tmp/scratch'='/usr/local/src' -g -O3    -Wall -Wno-unused-function -Wcast-qual -Woverloaded-virtual -Wignored-qualifiers -Werror -DWITH_EXCEPTIONS -std=c++11 -MD -MT util/CMakeFiles/HalideTraceDump.dir/HalideTraceUtils.cpp.o -MF util/CMakeFiles/HalideTraceDump.dir/HalideTraceUtils.cpp.o.d -o util/CMakeFiles/HalideTraceDump.dir/HalideTraceUtils.cpp.o -c ../util/HalideTraceUtils.cpp
+#7 2675. [1910/2221] : && /usr/local/bin/cmake -E remove lib/libuser_context_insanity.generator_library.a && /usr/bin/ar qc lib/libuser_context_insanity.generator_library.a  test/CMakeFiles/user_context_insanity.generator_library.dir/generator/user_context_insanity_generator.cpp.o && /usr/bin/ranlib lib/libuser_context_insanity.generator_library.a && :
+#7 2675. [1911/2221] : && /usr/local/bin/cmake -E remove lib/libtiled_blur.generator_library.a && /usr/bin/ar qc lib/libtiled_blur.generator_library.a  test/CMakeFiles/tiled_blur.generator_library.dir/generator/tiled_blur_generator.cpp.o && /usr/bin/ranlib lib/libtiled_blur.generator_library.a && :
+#7 2675. [1912/2221] : && /usr/local/bin/cmake -E remove lib/librdom_input.generator_library.a && /usr/bin/ar qc lib/librdom_input.generator_library.a  test/CMakeFiles/rdom_input.generator_library.dir/generator/rdom_input_generator.cpp.o && /usr/bin/ranlib lib/librdom_input.generator_library.a && :
+#7 2675. [1913/2221] : && /usr/local/bin/clang++  -fdebug-prefix-map='/tmp/scratch'='/usr/local/src' -g -O3  -fuse-ld=lld   -rdynamic test/CMakeFiles/halide_library_runtime.generator_binary.dir/__/tools/GenGen.cpp.o  -o bin/halide_library_runtime.generator_binary  -Wl,-rpath,/tmp/scratch/Halide/build/lib  -lz  -lrt  -ldl  -ltinfo  -lpthread  -lm  -lxml2  -ldl  -lpthread  lib/libHalide.so  -lm  -lxml2  -ldl && :
+#7 2675. FAILED: bin/halide_library_runtime.generator_binary 
+#7 2675. : && /usr/local/bin/clang++  -fdebug-prefix-map='/tmp/scratch'='/usr/local/src' -g -O3  -fuse-ld=lld   -rdynamic test/CMakeFiles/halide_library_runtime.generator_binary.dir/__/tools/GenGen.cpp.o  -o bin/halide_library_runtime.generator_binary  -Wl,-rpath,/tmp/scratch/Halide/build/lib  -lz  -lrt  -ldl  -ltinfo  -lpthread  -lm  -lxml2  -ldl  -lpthread  lib/libHalide.so  -lm  -lxml2  -ldl && :
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::TargetRegistry::lookupTarget(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> > const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >&)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::WriteBitcodeToFile(llvm::Module const&, llvm::raw_ostream&, bool, llvm::ModuleSummaryIndex const*, bool, std::__1::array<unsigned int, 5ul>*)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::PassManagerBuilder::addExtension(llvm::PassManagerBuilder::ExtensionPointTy, std::__1::function<void (llvm::PassManagerBuilder const&, llvm::legacy::PassManagerBase&)>)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::EngineBuilder::setMCJITMemoryManager(std::__1::unique_ptr<llvm::RTDyldMemoryManager, std::__1::default_delete<llvm::RTDyldMemoryManager> >)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::EngineBuilder::EngineBuilder(std::__1::unique_ptr<llvm::Module, std::__1::default_delete<llvm::Module> >)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::RTDyldMemoryManager::getPointerToNamedFunction(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> > const&, bool)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::RTDyldMemoryManager::getSymbolAddressInProcess(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> > const&)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::SectionMemoryManager::finalizeMemory(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >*)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::LegacyJITSymbolResolver::getResponsibilitySet(std::__1::set<llvm::StringRef, std::__1::less<llvm::StringRef>, std::__1::allocator<llvm::StringRef> > const&)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::LegacyJITSymbolResolver::lookup(std::__1::set<llvm::StringRef, std::__1::less<llvm::StringRef>, std::__1::allocator<llvm::StringRef> > const&, std::__1::function<void (llvm::Expected<std::__1::map<llvm::StringRef, llvm::JITEvaluatedSymbol, std::__1::less<llvm::StringRef>, std::__1::allocator<std::__1::pair<llvm::StringRef const, llvm::JITEvaluatedSymbol> > > >)>)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::sys::DynamicLibrary::getPermanentLibrary(char const*, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >*)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::writeArchive(llvm::StringRef, llvm::ArrayRef<llvm::NewArchiveMember>, bool, llvm::object::Archive::Kind, bool, bool, std::__1::unique_ptr<llvm::MemoryBuffer, std::__1::default_delete<llvm::MemoryBuffer> >)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::raw_fd_ostream::raw_fd_ostream(llvm::StringRef, std::__1::error_code&, llvm::sys::fs::OpenFlags)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::Linker::linkModules(llvm::Module&, std::__1::unique_ptr<llvm::Module, std::__1::default_delete<llvm::Module> >, unsigned int, std::__1::function<void (llvm::Module&, llvm::StringSet<llvm::MallocAllocator> const&)>)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to std::string::_Rep::_M_destroy(std::allocator<char> const&)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to std::string::_Rep::_S_empty_rep_storage
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to std::string::assign(std::string const&)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to std::basic_string<char, std::char_traits<char>, std::allocator<char> >::basic_string(char const*, unsigned long, std::allocator<char> const&)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to std::__throw_bad_function_call()
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to std::basic_string<char, std::char_traits<char>, std::allocator<char> >::basic_string(char const*, std::allocator<char> const&)
+#7 2675. ld.lld: error: too many errors emitted, stopping now (use -error-limit=0 to see all errors)
+#7 2675. clang-9: error: linker command failed with exit code 1 (use -v to see invocation)
+#7 2675. [1914/2221] : && /usr/local/bin/clang++  -fdebug-prefix-map='/tmp/scratch'='/usr/local/src' -g -O3  -fuse-ld=lld   -rdynamic test/CMakeFiles/user_context_insanity.generator_binary.dir/__/tools/GenGen.cpp.o  -o bin/user_context_insanity.generator_binary  -Wl,-rpath,/tmp/scratch/Halide/build/lib  -lz  -lrt  -ldl  -ltinfo  -lpthread  -lm  -lxml2  -ldl  -lpthread  -Wl,--whole-archive  lib/libuser_context_insanity.generator_library.a  -Wl,-no-whole-archive  lib/libHalide.so  -lm  -lxml2  -ldl && :
+#7 2675. FAILED: bin/user_context_insanity.generator_binary 
+#7 2675. : && /usr/local/bin/clang++  -fdebug-prefix-map='/tmp/scratch'='/usr/local/src' -g -O3  -fuse-ld=lld   -rdynamic test/CMakeFiles/user_context_insanity.generator_binary.dir/__/tools/GenGen.cpp.o  -o bin/user_context_insanity.generator_binary  -Wl,-rpath,/tmp/scratch/Halide/build/lib  -lz  -lrt  -ldl  -ltinfo  -lpthread  -lm  -lxml2  -ldl  -lpthread  -Wl,--whole-archive  lib/libuser_context_insanity.generator_library.a  -Wl,-no-whole-archive  lib/libHalide.so  -lm  -lxml2  -ldl && :
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::TargetRegistry::lookupTarget(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> > const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >&)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::WriteBitcodeToFile(llvm::Module const&, llvm::raw_ostream&, bool, llvm::ModuleSummaryIndex const*, bool, std::__1::array<unsigned int, 5ul>*)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::PassManagerBuilder::addExtension(llvm::PassManagerBuilder::ExtensionPointTy, std::__1::function<void (llvm::PassManagerBuilder const&, llvm::legacy::PassManagerBase&)>)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::EngineBuilder::setMCJITMemoryManager(std::__1::unique_ptr<llvm::RTDyldMemoryManager, std::__1::default_delete<llvm::RTDyldMemoryManager> >)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::EngineBuilder::EngineBuilder(std::__1::unique_ptr<llvm::Module, std::__1::default_delete<llvm::Module> >)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::RTDyldMemoryManager::getPointerToNamedFunction(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> > const&, bool)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::RTDyldMemoryManager::getSymbolAddressInProcess(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> > const&)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::SectionMemoryManager::finalizeMemory(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >*)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::LegacyJITSymbolResolver::getResponsibilitySet(std::__1::set<llvm::StringRef, std::__1::less<llvm::StringRef>, std::__1::allocator<llvm::StringRef> > const&)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::LegacyJITSymbolResolver::lookup(std::__1::set<llvm::StringRef, std::__1::less<llvm::StringRef>, std::__1::allocator<llvm::StringRef> > const&, std::__1::function<void (llvm::Expected<std::__1::map<llvm::StringRef, llvm::JITEvaluatedSymbol, std::__1::less<llvm::StringRef>, std::__1::allocator<std::__1::pair<llvm::StringRef const, llvm::JITEvaluatedSymbol> > > >)>)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::sys::DynamicLibrary::getPermanentLibrary(char const*, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >*)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::writeArchive(llvm::StringRef, llvm::ArrayRef<llvm::NewArchiveMember>, bool, llvm::object::Archive::Kind, bool, bool, std::__1::unique_ptr<llvm::MemoryBuffer, std::__1::default_delete<llvm::MemoryBuffer> >)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::raw_fd_ostream::raw_fd_ostream(llvm::StringRef, std::__1::error_code&, llvm::sys::fs::OpenFlags)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to llvm::Linker::linkModules(llvm::Module&, std::__1::unique_ptr<llvm::Module, std::__1::default_delete<llvm::Module> >, unsigned int, std::__1::function<void (llvm::Module&, llvm::StringSet<llvm::MallocAllocator> const&)>)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to std::string::_Rep::_M_destroy(std::allocator<char> const&)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to std::string::_Rep::_S_empty_rep_storage
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to std::string::assign(std::string const&)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to std::basic_string<char, std::char_traits<char>, std::allocator<char> >::basic_string(char const*, unsigned long, std::allocator<char> const&)
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to std::__throw_bad_function_call()
+#7 2675. ld.lld: error: lib/libHalide.so: undefined reference to std::basic_string<char, std::char_traits<char>, std::allocator<char> >::basic_string(char const*, std::allocator<char> const&)
+#7 2675. ld.lld: error: too many errors emitted, stopping now (use -error-limit=0 to see all errors)
+#7 2675. clang-9: error: linker command failed with exit code 1 (use -v to see invocation)
+#7 2675. [1915/2221] : && /usr/local/bin/cmake -E remove lib/libpyramid.generator_library.a && /usr/bin/ar qc lib/libpyramid.generator_library.a  test/CMakeFiles/pyramid.generator_library.dir/generator/pyramid_generator.cpp.o && /usr/bin/ranlib lib/libpyramid.generator_library.a && :
+#7 2675. [1916/2221] : && /usr/local/bin/cmake -E remove lib/libold_buffer_t.generator_library.a && /usr/bin/ar qc lib/libold_buffer_t.generator_library.a  test/CMakeFiles/old_buffer_t.generator_library.dir/generator/old_buffer_t_generator.cpp.o && /usr/bin/ranlib lib/libold_buffer_t.generator_library.a && :
+#7 2676. [1917/2221] ccache /usr/local/bin/clang++   -Iinclude -I../tools -fdebug-prefix-map='/tmp/scratch'='/usr/local/src' -g -O3    -Wall -Wno-unused-function -Wcast-qual -Woverloaded-virtual -Wignored-qualifiers -Werror -DWITH_EXCEPTIONS -fno-rtti -std=c++11 -MD -MT apps/linear_algebra/src/CMakeFiles/ddot.generator_binary.dir/__/__/__/tools/GenGen.cpp.o -MF apps/linear_algebra/src/CMakeFiles/ddot.generator_binary.dir/__/__/__/tools/GenGen.cpp.o.d -o apps/linear_algebra/src/CMakeFiles/ddot.generator_binary.dir/__/__/__/tools/GenGen.cpp.o -c ../tools/GenGen.cpp
+#7 2676. [1918/2221] ccache /usr/local/bin/clang++   -Iinclude -I../tools -fdebug-prefix-map='/tmp/scratch'='/usr/local/src' -g -O3    -Wall -Wno-unused-function -Wcast-qual -Woverloaded-virtual -Wignored-qualifiers -Werror -DWITH_EXCEPTIONS -fno-rtti -std=c++11 -MD -MT apps/linear_blur/CMakeFiles/srgb_to_linear.generator_binary.dir/__/__/tools/GenGen.cpp.o -MF apps/linear_blur/CMakeFiles/srgb_to_linear.generator_binary.dir/__/__/tools/GenGen.cpp.o.d -o apps/linear_blur/CMakeFiles/srgb_to_linear.generator_binary.dir/__/__/tools/GenGen.cpp.o -c ../tools/GenGen.cpp
+#7 2677. [1919/2221] ccache /usr/local/bin/clang++   -Iinclude -I../tools -fdebug-prefix-map='/tmp/scratch'='/usr/local/src' -g -O3    -Wall -Wno-unused-function -Wcast-qual -Woverloaded-virtual -Wignored-qualifiers -Werror -DWITH_EXCEPTIONS -fno-rtti -std=c++11 -MD -MT test/CMakeFiles/metadata_tester.generator_library.dir/generator/metadata_tester_generator.cpp.o -MF test/CMakeFiles/metadata_tester.generator_library.dir/generator/metadata_tester_generator.cpp.o.d -o test/CMakeFiles/metadata_tester.generator_library.dir/generator/metadata_tester_generator.cpp.o -c ../test/generator/metadata_tester_generator.cpp
+```
+specialize() lets you schedule a func in different ways. To some extent you can schedule things it calls differently too by having them specialize in the same way, but this is limited. You can't change Func-level scheduling choices on them, e.g. inlined vs not, or different storage layouts, or different memory types. This would be a useful feature. Currently I have a GPU pipeline that uses an amount of shared memory that depends on some parameters. I would like it to switch to using global memory for that Func if the parameters are large enough to need it.
+The autoscheduler seems to assume that the bound estimates can always be relied upon, and generate out of bounds memory access in the example below, which simply tries to compute `f(x, y, z, t) = in(0, z, 0)`, where `in` is a [1, 3, 1] buffer, and the estimate for the size of `f` is [100, 100, 100, 100], but the requested size for `f` is [3, 3, 3, 3].
+
+```cpp
+  std::uniform_real_distribution<float> dis(-1.0, 1.0);
+  std::mt19937 rnd;
+
+  Halide::Buffer<float> in(1, 3, 1);
+  in.for_each_value([&](float& f) { f = dis(rnd); });
+
+  Halide::Func f;
+  std::vector<Halide::Var> vars(4);
+  std::vector<Halide::Expr> indices(3);
+  indices[0] = 0;
+  indices[1] = vars[2];
+  indices[2] = 0;
+
+  f(vars) = in(indices);
+
+  std::vector<Halide::Func> fs;
+  fs.push_back(f);
+  Halide::Pipeline p(fs);
+
+  Halide::MachineParams params(32, 16000000, 40);
+  Halide::Target target("x86-64-linux-sse41-avx-avx2");
+
+// When autoscheduling is disabled, the code works correctly.
+#if 1
+  std::cout << "RUNNING WITH ADAMS2019 SCHEDULE" << std::endl;
+  f.set_estimates({{0, 100}, {0, 100}, {0, 100}, {0, 100}});
+
+  std::vector<Halide::Internal::Function> funcs;
+  funcs.push_back(f.function());
+  Halide::Internal::Autoscheduler::FunctionDAG dag(funcs, params, target);
+  Halide::DefaultCostModel cost_model("", "", false);
+  Halide::Internal::Autoscheduler::StageMapOfScheduleFeatures schedule_features;
+  Halide::Internal::Autoscheduler::find_and_apply_schedule(
+      dag,
+      funcs,
+      params,
+      &cost_model,
+      32,
+      &schedule_features);
+#else
+  std::cout << "RUNNING WITH DEFAULT SCHEDULE" << std::endl;
+#endif
+
+    for (int i = 3; i >= 0; --i) {
+      f.output_buffer().dim(i).set_bounds(0, 3);
+    }
+
+  Halide::Buffer<float> output_values({3,3,3,3});
+  Halide::Realization r(output_values);
+  p.realize(r, target);
+
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < 3; ++j) {
+      for (int k = 0; k < 3; ++k) {
+        for (int l = 0; l < 3; ++l) {
+          float expected = in(0, k, 0);
+          EXPECT_EQ(output_values(i, j, k, l), expected);
+        }
+      }
+    }
+  }
+```

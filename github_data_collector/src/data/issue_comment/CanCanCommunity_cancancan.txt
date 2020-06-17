@@ -1,0 +1,355 @@
+context: https://github.com/CanCanCommunity/cancancan/pull/204#issuecomment-356425195
+
+`Kernel.#Array` calls not only `Object#to_ary` but also `Object#to_a` but some classes which represent cluster may implement `to_a`.
+
+https://api.rubyonrails.org/classes/Array.html#method-c-wrap
+
+I think that's why ActiveSupport has `Array.wrap`.
+
+https://api.rubyonrails.org/classes/Array.html#method-c-wrap
+
+I confirmed there's no performance regression via the following snippet:
+
+```ruby
+require "bundler/inline"
+
+gemfile(true) do
+  source "https://rubygems.org"
+
+  gem "benchmark-ips", "2.7.2"
+  gem "cancancan", "2.3.0"
+  gem "allocation_tracer", "0.6.3"
+end
+
+module CanCan
+  class Rule
+    def initialize(base_behavior, action, subject, conditions, block, __flag__:)
+      both_block_and_hash_error = 'You are not able to supply a block with a hash of conditions in '\
+                                  "#{action} #{subject} ability. Use either one."
+      raise Error, both_block_and_hash_error if conditions.is_a?(Hash) && block
+
+      @match_all = action.nil? && subject.nil?
+      @base_behavior = base_behavior
+      case __flag__
+      when :array
+        @actions = Array(action)
+        @subjects = Array(subject)
+      when :flatten
+        @actions = [action].flatten
+        @subjects = [subject].flatten
+      when :wrap
+        @actions = wrap(action)
+        @subjects = wrap(subject)
+      else
+        raise
+      end
+      @conditions = conditions || {}
+      @block = block
+    end
+
+    def wrap(object)
+      if object.nil?
+        []
+      elsif object.respond_to?(:to_ary)
+        object.to_ary || [object]
+      else
+        [object]
+      end
+    end
+  end
+end
+
+def memprof(name)
+  GC.disable
+  before = `ps -o rss -p #{Process.pid}`.split("\n").last.to_i
+  ObjectSpace::AllocationTracer.trace do
+    10_000.times do
+      yield
+    end
+  end
+  after = `ps -o rss -p #{Process.pid}`.split("\n").last.to_i
+
+  puts "[#{name}] Mem diff: #{(after - before).to_f/1024.0} MB"
+  GC.enable
+  GC.start
+end
+
+puts "Ruby #{RUBY_VERSION}"
+
+memprof("Kernel.#Array") { CanCan::Rule.new(nil, [:read, :write], [:foo, :bar], nil, nil, __flag__: :array) }
+memprof("Array#flatten") { CanCan::Rule.new(nil, [:read, :write], [:foo, :bar], nil, nil, __flag__: :flatten) }
+memprof("Array.wrap")    { CanCan::Rule.new(nil, [:read, :write], [:foo, :bar], nil, nil, __flag__: :wrap) }
+
+Benchmark.ips do |b|
+  b.report("Kernel.#Array") { CanCan::Rule.new(nil, [:read, :write], [:foo, :bar], nil, nil, __flag__: :array) }
+  b.report("Array#flatten") { CanCan::Rule.new(nil, [:read, :write], [:foo, :bar], nil, nil, __flag__: :flatten) }
+  b.report("Array.wrap")    { CanCan::Rule.new(nil, [:read, :write], [:foo, :bar], nil, nil, __flag__: :wrap) }
+
+  b.compare!
+end
+
+__END__
+Ruby 2.6.1
+[Kernel.#Array] Mem diff: 21.59765625 MB
+[Array#flatten] Mem diff: 2.21484375 MB
+[Array.wrap] Mem diff: 0.02734375 MB
+Warming up --------------------------------------
+       Kernel.#Array     5.024k i/100ms
+       Array#flatten     3.863k i/100ms
+          Array.wrap     5.217k i/100ms
+Calculating -------------------------------------
+       Kernel.#Array    204.954k (±21.6%) i/s -    964.608k in   5.003037s
+       Array#flatten    143.892k (±17.3%) i/s -    695.340k in   5.005342s
+          Array.wrap    195.569k (±18.5%) i/s -    933.843k in   5.003945s
+
+Comparison:
+       Kernel.#Array:   204954.3 i/s
+          Array.wrap:   195569.0 i/s - same-ish: difference falls within error
+       Array#flatten:   143892.4 i/s - same-ish: difference falls within error
+
+Ruby 2.5.3
+[Kernel.#Array] Mem diff: 21.98046875 MB
+[Array#flatten] Mem diff: 0.93359375 MB
+[Array.wrap] Mem diff: 0.0 MB
+Warming up --------------------------------------
+       Kernel.#Array     4.816k i/100ms
+       Array#flatten     4.235k i/100ms
+          Array.wrap     4.610k i/100ms
+Calculating -------------------------------------
+       Kernel.#Array    166.440k (±30.7%) i/s -    722.400k in   5.010362s
+       Array#flatten    136.055k (±23.3%) i/s -    639.485k in   5.009729s
+          Array.wrap    173.409k (±18.6%) i/s -    820.580k in   5.019846s
+
+Comparison:
+          Array.wrap:   173408.7 i/s
+       Kernel.#Array:   166439.5 i/s - same-ish: difference falls within error
+       Array#flatten:   136054.8 i/s - same-ish: difference falls within error
+
+Ruby 2.4.5
+[Kernel.#Array] Mem diff: 17.0859375 MB
+[Array#flatten] Mem diff: 0.0234375 MB
+[Array.wrap] Mem diff: 0.0 MB
+Warming up --------------------------------------
+      Kernel.#Array     4.746k i/100ms
+      Array#flatten     4.019k i/100ms
+          Array.wrap     4.347k i/100ms
+Calculating -------------------------------------
+      Kernel.#Array    195.099k (±17.4%) i/s -    939.708k in   4.994105s
+      Array#flatten    117.881k (±19.3%) i/s -    562.660k in   5.012299s
+          Array.wrap    160.679k (±13.9%) i/s -    782.460k in   5.005515s
+
+Comparison:
+      Kernel.#Array:   195099.4 i/s
+         Array.wrap:   160678.6 i/s - same-ish: difference falls within error
+      Array#flatten:   117881.1 i/s - 1.66x  slower
+```
+Hi, consider the following ability:
+
+```
+class MyAbility
+  include CanCan::Ability
+
+  def initialize
+    can %i[index show], Product, count_on_hand: [1..Float::INFINITY, nil]
+  end
+end
+
+ability = MyAbility.new
+```
+
+The user should have access to products that have `count_on_hand` set to `nil` or at least `1`. This works when using `accessible_by`:
+
+```
+puts Product.accessible_by(ability).to_sql
+# => SELECT `products`.* FROM `products` WHERE (`products`.`count_on_hand` IS NULL OR `products`.`count_on_hand` >= 1)
+```
+
+However, when using it via `can?` it doesn't work:
+
+```
+puts ability.can?(:show, Product.new(count_on_hand: 1))
+# => false # WRONG
+```
+
+I digged into the source code and found out, that it simply uses a `value.include?(attribute)` when an `Enumerable` is used for a matcher
+
+```
+def condition_match?(attribute, value)
+  case value
+  when Hash
+    hash_condition_match?(attribute, value)
+  when Range
+    value.cover?(attribute)
+  when Enumerable
+    value.include?(attribute) # <---- her it asks [1..Float::INFINITY, nil].include?(1) which is false
+  else
+    attribute == value
+  end
+end
+```
+
+It would be great, if the behaviour for hash conditions used for scopes and on a per object basis would be the same.
+
+Unfortunately, I can't use
+
+```
+cannot %i[index show], Product, count_on_hand: 0
+```
+
+because this would exclude rows where `count_on_hand` is `NULL`
+
+For now, I'm using a monkeypatch like this
+
+```
+def condition_match?(attribute, value)
+  case value
+  when Hash
+    hash_condition_match?(attribute, value)
+  when Range
+    value.cover?(attribute)
+  when Enumerable
+    value.any? { |v| condition_match?(attribute, v) }
+  else
+    attribute == value
+  end
+end
+```
+
+But I'm unsure if this is a good / the right solution.
+Hiya!  So Ive implemented [slugs](https://rubygems.org/gems/slug) on the pokemon model in [this app](https://github.com/dwyn/pokemonfun). 
+
+In the routes file I have `resources :pokemons, param: :slug`
+
+In the `pokemons_controller.rb` I am attempting to utilize `load_and_authorize_resource`, but unfortunately it isn't working. Im fairly certain it has something to do with my routes using `:slug` in params instead of `:id`
+
+FWIW, I also tried  `load_and_authorize_resource :find_by => :slug` and that didn't work either. I am open to any suggestions!
+undefined method `defined_enums' for #<Class:0x0055b914f8d8d8>
+
+Getting error on this line:
+
+`- if can? :update, @campaign`
+Starting https://github.com/CanCanCommunity/cancancan/commit/4d1f0d49bbe013a013efd95bbc50cfbd4ff2f697 `.distinct` used in `build_relation` (if joins present).
+
+DISTINCT would fail when used on tables with json columns (PostgreSQL have no equality operator for type json).
+Example: `ERROR: could not identify an equality operator for type json LINE 1: SELECT DISTINCT "users".* FROM ...`
+
+Looks like this is regression, so added spec to cover this case.
+This PR intentionally fails (TravisCI) on develop branch for postgresql adapter (due to regression).
+### What is the problem?
+Looks like there is no ability for non-callorators to edit the wiki pages. See here for example: https://github.com/CanCanCommunity/cancancan/wiki/Nested-Resources - I am unable to amend the wiki documentation.
+
+### What's wrong with that?
+
+It places additional burdens on the maintainers of the gem to update the documentation. A lot of people can assist in fixing small issues here and there if they can edit the wiki.
+
+### How to fix:
+
+Please change access permissions for wiki pages. See here: https://help.github.com/en/github/building-a-strong-community/changing-access-permissions-for-wikis
+
+
+
+
+### Steps to reproduce
+
+Define two rules:
+
+```
+      can :manage, :all
+
+      cannot(
+        %i[index retrieve],
+        Model, Model.from_sandbox
+      ) do ||
+        m.sandbox?
+      end
+```
+
+When accessing the index action, I receive the following error 
+
+```
+Unable to merge an Active Record scope with other conditions. Instead use a hash or SQL for index Model ability.
+```
+from following method
+```
+    91:       def override_scope
+    92:         conditions = @compressed_rules.map(&:conditions).compact
+    93:         return unless conditions.any? { |c| c.is_a?(ActiveRecord::Relation) }
+    94:         return conditions.first if conditions.size == 1
+    95: 
+    96:         raise_override_scope_error
+    97:       end
+```
+Because `@compressed_rules` in ActiveRecord5Adapter is set as follows: 
+```
+[5] pry(#<CanCan::ModelAdapters::ActiveRecord5Adapter>)> @compressed_rules
+=> [#<CanCan::Rulecannot [:index, :retrieve], [Model(<attributes>)], [], {"type"=>["Model"]}>,
+ #<CanCan::Rulecan [:manage], [:all], [], {}>]
+```
+the override_scope method would succeed, if only one condition exists. But the rules defined above are not merged?
+
+### Expected behavior
+`cannot` with scope should overwrite `can :manage, :all` for a specific model for the index action.
+
+### Actual behavior
+It raises the error mentioned above
+
+### System configuration
+**Rails version**:
+5.2.3
+**Ruby version**:
+2.6.4p104 (2019-08-28 revision 67798) [x86_64-linux]
+**CanCanCan version**
+3.0.1
+
+Thanks in advance!
+Best regards,
+Lukas
+When applying filters with related entities, CanCan used to generate a LEFT JOIN plus
+a DISTINCT clause to avoid repeated records. This is problematic for a number of reasons:
+
+1. Postgres is picky about setting ORDER BY with a column not on the DISTINCT clause, because it applies the ORDER after the DISTINCT so it cannot 'see' the referenced column.
+2. Groups and Counts become more difficult to do because `foo.distinct.count` is not the same as `foo.count`.
+
+The way to avoid this problem is to use inner queries that don't multiply the number of returned records. We do this by running the query we were previously using inside a WHERE IN block.
+
+This is a different approach than #600. 
+
+cc @ghiculescu
+
+Fixes #596
+https://github.com/CanCanCommunity/cancancan/blob/6d0e62bf0c475964a0533608e7e7221be45de28c/lib/cancan/controller_resource_finder.rb#L8
+
+Just ran into an issue here. If I pass `:through_association` and `:singleton` things don't work.
+It should check and send `@options[:through_association]` if set, I guess?
+The [original issue](https://github.com/CanCanCommunity/cancancan/issues/505) has already been closed. Please see my [rationale](#rationale) below.
+
+- [x] Add tests
+- [x] Changelog entry
+
+---
+
+Updates `be_able_to` matcher with a negative expectation handler. 
+
+Now, if you pass an array of abilities while using `not_to`, the expectation will fail if **any** of the specified abilities turn out to be permitted.
+
+Previously, the following test would pass, despite the user only being able to `:read` posts.
+
+```ruby
+it { is_expected.not_to be_able_to [:create, :read], Post }
+
+...
+
+class Ability
+  include CanCan::Ability
+
+  def initialize(_user)
+    can :read, Post
+  end
+end
+```
+
+# Rationale
+The matcher's current behavior when handling negative expectations is unlikely to be useful in many situations. Because its behavior is unexpected, it is easy to accidentally write tests that _look_ like they'll work, but then unexpectedly pass. This can be very dangerous if a developer doesn't realize how the matcher actually behaves when initially implementing the test.
+
+The next best approach to confirm that an ability cannot be used would be to iterate over an array of abilities and test them individually. This is a bit verbose and difficult to read - especially compared to the awesome one-liner already provided.
+

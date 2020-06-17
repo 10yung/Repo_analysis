@@ -1,0 +1,336 @@
+When I try and parse a nullable enum, I get TypeCastException:
+
+```
+import com.beust.klaxon.Klaxon
+import org.junit.jupiter.api.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
+
+enum class MyEnum { FIRST, SECOND, THIRD }
+
+class WithEnum {
+    var myVal: MyEnum? = null
+}
+
+class EnumTest {
+    @Test
+    fun `should deserialize null enum`() {
+        val parsed = Klaxon().parse<WithEnum>("{ \"myVal\":null}")
+        assertNotNull(parsed)
+        assertNull(parsed.myVal)
+    }
+
+    @Test
+    fun `should deserialize proper enum`() {
+        val parsed = Klaxon().parse<WithEnum>("{ \"myVal\":\"FIRST\"}")
+        assertNotNull(parsed)
+        assertEquals(MyEnum.FIRST, parsed.myVal)
+    }
+}
+```
+
+
+This code:
+```kotlin
+    @Test
+    fun `test parsing string of single double quote`() {
+        Klaxon().let {
+            it.parse<String>(it.toJsonString("\""))
+        }
+    }
+```
+
+Result in this exception: https://pastebin.com/R9b52J9J
+
+The main problem seems to be that the parser can't handle the `""` at the end of the input.
+In `classFor(type: Any)` method, on casting the type to any Object type (other than primitive types) result in exception `class com.beust.klaxon.JsonObject cannot be cast to class <Object we cast to>`
+
+**Steps to reproduce:**
+Write the following code and run
+```kotlin
+class PacketWrapper(
+    @TypeFor(field = "packet", adapter = WebSocketModelTypeAdapter::class)
+    val header: PacketHeader,
+    val packet: WebSocketModel
+)
+
+class WebSocketModelTypeAdapter : TypeAdapter<WebSocketModel>
+{
+    override fun classFor(type: Any): KClass<out WebSocketModel> {
+        val header = type as PacketWrapper.PacketHeader // <- error here
+        return when (header.op)
+        {
+            ...
+        }
+    }
+}
+
+interface WebSocketModel
+```
+
+**Expected behavior:**
+The type should be casted to given class. #
+Tried the most basic example:
+
+                    class Person (val name: String, var age: Int = 23)
+                    val startTime = System.currentTimeMillis()
+                    val jsonString = """
+                            {
+                              "name": "John Smith",
+                            }
+                        """
+                    val klaxon = Klaxon()
+                    val parsed = klaxon.parse<Person>(jsonString)
+                    val endTime = System.currentTimeMillis()
+                    Timber.i("Endtime - Starttime: ${endTime - startTime}")
+
+This example would print:
+Endtime - Starttime: 3019
+
+This cannot be right.
+This is more a question than an issue. Not sure if this is possible in the current Klaxon version.
+
+I am trying to deserialize a polymorphic class using an enum and not a string. 
+
+This is what I want.
+
+```kotlin
+@TypeFor(field = "type", adapter = ResponseTypeAdapter::class)
+open class Response(val type: ResponseType, platform: MessagingPlatform? = null)
+
+data class TextResponse(
+    val platform: MessagingPlatform,
+    val options: List<String>
+) : Response(ResponseType.TEXT, platform)
+
+data class CarouselResponse(
+    val platform: MessagingPlatform,
+    val cardsArray: List<Any>
+) : Response(ResponseType.CAROUSEL, platform)
+```
+
+where `ResponseType` is an enum constant like
+
+```koltin
+enum class ResponseType {
+    TEXT,
+    VIDEO,
+    QUICKANSWERS,
+    CAROUSEL,
+    IMAGE,
+    SHARE,
+    HANDOVER,
+    // ...
+}
+```
+
+Of course, I cannot create a `TypeAdapter` like the one below because I think Klaxon will still use the original string in the `Response` initialization. (In fact, I get the error: `java.lang.IllegalArgumentException: Could not find enum value for text`. Note that `text` is lower case like in the JSON).
+
+```kotlin
+class ResponseTypeAdapter: TypeAdapter<Response> {
+    override fun classFor(type: Any): KClass<out Response> {
+        val responseType = ResponseType.valueOf((type as String).toUpperCase())
+        return when(responseType) {
+            ResponseType.TEXT -> TextResponse::class
+            ResponseType.CAROUSEL -> CarouselResponse::class
+           // all the other cases
+        }
+    }
+}
+```
+
+This works only if the enum and the string in the JSON are represented by the same string constant. For instance, if my enum is defined in lower case like the string in the JSON, the deserialization works fine.
+
+```kotlin
+enum class ResponseType {
+    text,
+    image,
+    carousel,
+    // ... 
+} // This enum works.
+```
+
+So, in conclusion, I am asking if there is a way to discriminate using the `TypeAdapter` but returning also a converted discriminant `type`.
+I've boiled it down to a pretty simple example, and can't see what I'm doing wrong:
+
+```
+  val downcase = object: FieldRenamer {
+    override fun fromJson(fieldName: String): String {
+      return fieldName.toLowerCase()
+    }
+    override fun toJson(fieldName: String): String {
+      return fieldName.toLowerCase()
+    }
+  }
+
+  val klaxon = Klaxon()
+    .fieldRenamer(downcase)
+
+  class Thing {
+    var uniqueid : String? = null
+    var name : String? = null
+    var description : String? = null
+    @Json(name="@form") var form : String? = null
+    var type : String? = null
+    var status : String? = null
+    var iot : String? = null
+    var imt : String? = null
+    var region : String? = null
+  }
+
+  val json = """
+  {
+    "@created":"2015-07-02T14:21:24Z",
+    "@modified":"2018-05-23T20:31:45Z",
+    "@form":"Location",
+    "IOT":"Value goes here",
+    "Created":"2008-03-05T14:26:32Z",
+    "UniqueID":"LAMG-7XZJXM",
+    "IMT":"ASEAN",
+    "Name":"Bangkok - Thailand",
+    "Description":"Bangkok - Thailand",
+    "Type":"A",
+    "Modified":"2013-11-07T03:56:53Z",
+    "Region":"AP - ASEAN",
+    "Status":"Open"
+  }
+  """.trimIndent()
+  val doc = klaxon.parse<Thing>(json)
+  println(doc?.uniqueid)
+```
+
+I just get `null` as output.
+Problem:
+Currently JSON AST (abstract syntaxt tree, i.e. abstract json representation) is not exposed when converting objects to json. This is a design issue inherently leading to lack of flexibility and capability. An example: no support for pretty printing json of an object.
+
+Related issues/concepts, which would benefit from this:
+- https://github.com/cbeust/klaxon/issues/217
+- simple Converters: COnverter would be able to leverage json DSL, which would be pretty awesome
+Each of JsonReader's public functions do not accept null values anymore. I used to use nextString(), but now even that doesn't work. consumeValue<String?>() would work, however consumeValue is private.
+
+For example, I don't know how to parse this in the streaming API:
+```json
+{
+"key": null
+}
+```
+Trying to deserialize the following JSON:
+```
+{
+    "breakfast": { "file" : "some/path/breakfast-1-light.svg" },
+    "star": { "file" : "some/path/star-2-bold.svg" }
+}
+```
+
+Please find bellow the complete test set. 
+Note, that if the map is nested, parser works fine (`testNestedHashMap`).
+
+If the map is the top object, parser either 
+- produces an empty `HashMap` (`testTopLevelHashMap1`) 
+or 
+- fails with exception: `Unable to instantiate HashMap with parameters []` (`testTopLevelHashMap2`) .
+
+```
+class ParseHashMapTest {
+
+    data class Data(val file: String)
+    data class NestedHashMap(val icons: HashMap<String, Data>)
+    class TopLevelHashMap : HashMap<String, Data>()
+
+    private val json = """
+        {
+            "breakfast": { "file" : "some/path/breakfast-1-light.svg" },
+            "star": { "file" : "some/path/star-2-bold.svg" }
+        } """
+    
+
+    @Test   // Works
+    fun testNestedHashMap() {
+        val result = Klaxon().parse<NestedHashMap>("{ \"icons\": $json}")
+
+        assert(result!!.icons.size == 2)
+        assert(result.icons["breakfast"]?.file == "some/path/breakfast-1-light.svg")
+        assert(result.icons["star"]?.file == "some/path/star-2-bold.svg")
+    }
+
+    @Test   // Produces empty map, fails on `assert(result!!.size == 2)`
+    fun testTopLevelHashMap1() {
+        val result = Klaxon().parse<TopLevelHashMap>(json)
+
+        assert(result!!.size == 2)
+        assert(result["breakfast"]?.file == "some/path/breakfast-1-light.svg")
+        assert(result["star"]?.file == "some/path/star-2-bold.svg")
+    }
+
+    @Test   // Fails with exception: Unable to instantiate HashMap with parameters []
+    fun testTopLevelHashMap2() {
+        val result  = Klaxon().parse<HashMap<String, Data>>(json)
+
+        assert(result!!.size == 2)
+        assert(result["breakfast"]?.file == "some/path/breakfast-1-light.svg")
+        assert(result["star"]?.file == "some/path/star-2-bold.svg")
+    }
+}
+```
+I am using `lookup` and `obj` to get the `meetingId` value of the JSON below but I get a `null` value.
+
+The code I have
+
+```kotlin
+val parser: Parser = Parser.default()
+val stringBuilder: StringBuilder = java.lang.StringBuilder(message)
+val json: JsonObject = parser.parse(stringBuilder) as JsonObject
+val meetingId = json.lookup<String?>("core.header.meetingId").get(0)
+log.info("The meeting ID is : ${meetingId}")
+```
+
+I get `The meeting ID is : null` displayed
+
+The json string
+
+```json
+{
+   "envelope":{  
+      "name":"PresentationConversionCompletedSysPubMsg",
+      "routing":{  
+         "sender":"bbb-web"
+      }
+   },
+   "core":{  
+      "header":{  
+         "name":"PresentationConversionCompletedSysPubMsg",
+         "meetingId":"183f0bf3a0982a127bdb8161e0c44eb696b3e75c-1560235915389",
+         "userId":"notUsedYet"
+      },
+      "body":{  
+         "podId":"DEFAULT_PRESENTATION_POD",
+         "messageKey":"CONVERSION_COMPLETED",
+         "code":"CONVERSION_COMPLETED",
+         "presentation":{  
+            "id":"8666e65c35146aa1039938cd39c9aa302c64e1cc-1560235915824",
+            "name":"presentation.pdf",
+            "current":true,
+            "pages":[  
+               {  
+                  "id":"8666e65c35146aa1039938cd39c9aa302c64e1cc-1560235915824/1",
+                  "num":1,
+                  "thumbUri":"https://bbb-dev.com/bigbluebutton/presentation/183f0bf3a0982a127bdb8161e0c44eb696b3e75c-1560235915389/183f0bf3a0982a127bdb8161e0c44eb696b3e75c-1560235915389/8666e65c35146aa1039938cd39c9aa302c64e1cc-1560235915824/thumbnail/1",
+                  "swfUri":"https://bbb-dev.com/bigbluebutton/presentation/183f0bf3a0982a127bdb8161e0c44eb696b3e75c-1560235915389/183f0bf3a0982a127bdb8161e0c44eb696b3e75c-1560235915389/8666e65c35146aa1039938cd39c9aa302c64e1cc-1560235915824/slide/1",
+                  "txtUri":"https://bbb-dev.com/bigbluebutton/presentation/183f0bf3a0982a127bdb8161e0c44eb696b3e75c-1560235915389/183f0bf3a0982a127bdb8161e0c44eb696b3e75c-1560235915389/8666e65c35146aa1039938cd39c9aa302c64e1cc-1560235915824/textfiles/1",
+                  "svgUri":"https://bbb-dev.com/bigbluebutton/presentation/183f0bf3a0982a127bdb8161e0c44eb696b3e75c-1560235915389/183f0bf3a0982a127bdb8161e0c44eb696b3e75c-1560235915389/8666e65c35146aa1039938cd39c9aa302c64e1cc-1560235915824/svg/1",
+                  "current":true,
+                  "xOffset":0.0,
+                  "yOffset":0.0,
+                  "widthRatio":100.0,
+                  "heightRatio":100.0
+               }
+            ],
+            "downloadable":false
+         }
+      }
+   }
+}
+```
+
+What is wrong with my code?

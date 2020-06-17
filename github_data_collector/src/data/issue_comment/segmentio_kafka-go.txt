@@ -1,0 +1,291 @@
+I want to get the last offset for each partition in a topic. That requires me to dial every single partition, which is extremely slow. For example, before parallelizing it, it takes over 2 seconds for a 8-partition topic in my setup. 
+
+It should be possible to use a connection to a broker to get the last offset for every partition that it leads. 
+
+Here is an extract from my program of the current code I'm using
+
+```go
+import "golang.org/x/sync/errgroup"
+
+var (
+  Dialer  kafka.Dialer
+  Brokers []string
+)
+
+func LastOffsets(ctx context.Context, topic string) ([]int64, error) {
+	conn, err = dial(ctx, Dialer, Brokers)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	partitions, err := conn.ReadPartitions(topic)
+	if err != nil {
+		return nil, err
+	}
+
+	var lastOffsets = make([]int64, len(partitions))
+	var group, ctx = errgroup.WithContext(ctx)
+	for i, partition := range partitions {
+		p := partition
+		group.Go(func () error {
+			conn, err := Dialer.DialPartition(ctx, "tcp", "", p)
+			if err != nil {
+				return err
+			}
+			defer conn.Close()
+			lastOffsets[i], err = conn.ReadLastOffset()
+			if err != nil {
+				return err
+			}
+		})
+	}
+	group.Wait()
+	return lastOffsets, nil
+}
+
+
+// dial connects to a Kafka broker.
+func dial(ctx context.Context, dialer *kafka.Dialer, brokers []string) (*kafka.Conn, error) {
+	var (
+		conn *kafka.Conn
+		errs error
+	)
+	for _, broker := range brokers {
+		var err error
+		conn, err = dialer.DialContext(ctx, "tcp", broker)
+		if err != nil {
+			errs = multierr.Append(errs, xerrors.Errorf("dialing %q: %w", broker, err))
+			continue
+		}
+		return conn, nil
+	}
+	return nil, errs
+}
+
+The `address` parameter is ignored in Dialer.DialPartition, since the address is provided in the Partition struct. I think it is confusing and should be removed. 
+https://github.com/segmentio/kafka-go/blob/master/dialer.go#L140
+Follow-up on stale #303 with full use of the streaming API from @klauspost.
+
+Decompression is slower while the (default) compression ratio went down from 5 to 3.
+
+```
+name                           old time/op    new time/op    delta
+Compression/zstd/compress-4      5.64ms ± 2%    3.02ms ± 2%   -46.42%  (p=0.000 n=10+10)
+Compression/zstd/decompress-4     911µs ± 2%    2386µs ± 2%  +162.10%  (p=0.000 n=10+10)
+
+name                           old speed      new speed      delta
+Compression/zstd/compress-4    21.0MB/s ± 2%  44.3MB/s ± 2%  +111.39%  (p=0.000 n=10+10)
+Compression/zstd/decompress-4  2.13GB/s ± 2%  0.81GB/s ± 2%   -61.85%  (p=0.000 n=10+10)
+```
+Hi,
+
+Currently the default RetentionTime for ConsumerGroup is 24 hours:
+https://github.com/segmentio/kafka-go/blob/master/consumergroup.go#L51-L53
+
+By taking a look at Sarama you can see this to 0. I think it's a better way if it would be 0.
+
+![image](https://user-images.githubusercontent.com/8195958/71926761-52112e80-3194-11ea-93f5-97deec3d7fa5.png)
+
+In my case, I set `offsets.retention.minutes` on the brokers so all offsets are kept for a long period. But didn't know the `kafka-go` could override this behavior. Some of my consumers got crazy by restarting from the beginning, and made some "mess" in my data 😢 .
+
+Maybe I'm wrong it would be the better default case, any thought welcome 👍 
+
+Thank you,
+**Describe the bug**
+A clear and concise description of what the bug is.
+ReadMessage in group model,the speed blow 1w/s 
+**Kafka Version**
+What version(s) of Kafka are you testing against?
+kafka 2.3.1
+**To Reproduce**
+Steps to reproduce the behavior.  Bonus points for a code sample.
+consumer code
+`consumer := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:  	strings.Split(hosts,";"),
+		GroupID:	topic,
+		Topic:     	topic,
+		QueueCapacity: queueCap,
+		MinBytes:  	1e3,
+		MaxBytes:	10e6,
+	})
+
+	fmt.Println("Begin to consume topic. ")
+	start := time.Now()
+	for i:=0;i<consumeNum;i++{
+		_, err := consumer.ReadMessage(context.Background())
+		if err != nil {
+			fmt.Printf("consume falied, err is %s\n ", err)
+			break
+		}
+		//fmt.Printf("message at offset %d: %s = %s\n",m.Offset, string(m.Key), string(m.Value))
+	}
+	coast := time.Now().Sub(start)
+	fmt.Printf("read %d msgs,coast %s, %fw qps/s\n",consumeNum,coast.String(),float64(consumeNum)/coast.Second())`
+**Expected behavior**
+A clear and concise description of what you expected to happen.
+
+**Additional context**
+Add any other context about the problem here.
+
+**Describe the bug**
+A clear and concise description of what the bug is.
+when i produce msgs to an unknow host,ti don't report any error.
+**Kafka Version**
+What version(s) of Kafka are you testing against?
+2.3.1
+**To Reproduce**
+Steps to reproduce the behavior.  Bonus points for a code sample.
+```go
+	brokers := strings.Split(hosts,";")
+	producer := kafka.NewWriter(kafka.WriterConfig{
+		Brokers: brokers,
+		Topic:   topic,
+		QueueCapacity: queueCap,
+		BatchBytes: batchBytes,
+		BatchSize:  batchSize,
+		BatchTimeout:  time.Duration(batchTimeout)*time.Millisecond,
+		Async:	true,
+		RequiredAcks: 1,
+		CompressionCodec: lz4.CompressionCodec{},
+		Balancer: kafka.Murmur2Balancer{},
+	})
+
+	producedMsg := kafka.Message{
+		Value: msg,
+	}
+
+	fmt.Println("start to produce msgs.")
+	start := time.Now()
+	for i := 0; i < produceNum ; i++ {
+		err := producer.WriteMessages(context.Background(), producedMsg)
+		if err != nil {
+			fmt.Printf("Produce %d msg falied.",i)
+		}
+	}
+```
+**Expected behavior**
+A clear and concise description of what you expected to happen.
+
+**Additional context**
+Add any other context about the problem here.
+
+Hi, I am using `kafka-go` for reading binary messages and writing to a remote endpoint. I was looking at function and it seems that the `commitLoop` is started in a goroutine. 
+```
+func (r *Reader) run(cg *ConsumerGroup) {
+.
+.
+gen.Start(func(ctx context.Context) {
+  r.commitLoop(ctx, gen)
+```
+When `close()` is called by the reader, it does wait for `r.done` to be closed but that it seems will be done by the third goroutine and it won't wait for commitLoop to end(this is what I am unsure of). I wanted to know if I can assume if `close()` returns it will flush all pending commit messages?
+First of all I would like to thank you for sharing this library. 
+
+I'm writing a service that uses this library to connect to kafka. Now I want to expose a url to check the readiness and liveness of the service. In order to check the liveness I have to check the status of the connections to the infrastructure services used by the service instance.
+
+The question is: how to check the connection status to ensure it's alive? 
+This PR revolves around giving the Reader capabilities to read from wildcard topics
+
+There is a singleton routine called the topic scanner that gets triggered by the first reader that wants to use a wildcard topic evaluation. Those readers that want to use the wildcard topics will subscribe to the topic scanner and receive periodic updates from the scanner that keeps track of them and their wildcard pattern. The scanner also allows readers to unsubscribe when they close. The scanner will run each subscriber's regex against the list of all the topics in that broker to send it only matching topics (regex matching is based off of the golang regex.MatchString()). The scanner will cache the list of topics for a broker while its updating each subscriber to reduce the amount of calls made to kafka.
+
+One decision I made was that if the reader is not associated with a consumer group and has wildcards enabled, it will ignore the partition field as there is no guarantee you'll find a specific partition across several topics, though that can be changed based on your input.
+**Describe the bug**
+I know we should set number of consumers <= partitions.
+This happens when I am doing some testing with number of consumers > partitions. So I am not sure it's a bug or not.
+A reader with group id, consumes from a topic with multiple partitions. After Kafka Server restart, "FetchMessage" is not getting any new messages.
+
+**Kafka Version**
+2.2.1
+
+**To Reproduce**
+version: v0.3.4
+partitions: 2 (each with 1 replica)
+consumers: 3
+
+**Additional context**
+partition 0 offset = 397
+After Kafka Server restart, Kafka reader keeps seeking to the latest offset (398, 399 etc.) without sending data to consumers.
+
+2019/12/18 11:16:32 no messages received from kafka within the allocated time for partition 1 of history at offset 51
+2019/12/18 11:16:37 no messages received from kafka within the allocated time for partition 0 of history at offset 397
+2019/12/18 11:16:39 failed to read from current broker for partition 1 of history at offset 51, not the leader
+2019/12/18 11:16:39 initializing kafka reader for partition 1 of history starting at offset 51
+2019/12/18 11:16:39 failed to read from current broker for partition 0 of history at offset 397, not the leader
+2019/12/18 11:16:39 initializing kafka reader for partition 0 of history starting at offset 397
+2019/12/18 11:16:39 error initializing the kafka reader for partition 0 of history: [6] Not Leader For Partition: the client attempted to send messages to a replica that is not the leader for some partition, the client's metadata are likely out of date
+2019/12/18 11:16:39 error initializing the kafka reader for partition 1 of history: [6] Not Leader For Partition: the client attempted to send messages to a replica that is not the leader for some partition, the client's metadata are likely out of date
+2019/12/18 11:16:39 initializing kafka reader for partition 0 of history starting at offset 397
+2019/12/18 11:16:39 initializing kafka reader for partition 1 of history starting at offset 51
+2019/12/18 11:16:39 error initializing the kafka reader for partition 0 of history: write tcp 192.168.1.14:63409->192.168.1.14:9093: use of closed network connection
+2019/12/18 11:16:39 error initializing the kafka reader for partition 1 of history: write tcp 192.168.1.14:63408->192.168.1.14:9093: use of closed network connection
+2019/12/18 11:16:39 initializing kafka reader for partition 1 of history starting at offset 51
+2019/12/18 11:16:39 initializing kafka reader for partition 0 of history starting at offset 397
+2019/12/18 11:16:56 stopped heartbeat for group history
+2019/12/18 11:16:56 stopped heartbeat for group history
+2019/12/18 11:16:56 stopped commit for group history
+2019/12/18 11:16:56 stopped commit for group history
+2019/12/18 11:16:56 Unable to establish connection to consumer group coordinator for group history: dial tcp 127.0.0.1:9093: connect: connection refused
+2019/12/18 11:16:56 Leaving group history, member main@localhost (github.com/segmentio/kafka-go)-cba0c063-6e2e-4a74-9b44-192cecd849dd
+2019/12/18 11:16:56 Unable to establish connection to consumer group coordinator for group history: dial tcp 127.0.0.1:9093: connect: connection refused
+2019/12/18 11:16:56 Leaving group history, member main@localhost (github.com/segmentio/kafka-go)-2bdf3cd7-07f7-447d-8f22-34bf2a77e0bf
+2019/12/18 11:16:56 dial tcp 127.0.0.1:9093: connect: connection refused
+2019/12/18 11:16:56 dial tcp 127.0.0.1:9093: connect: connection refused
+2019/12/18 11:16:56 stopped heartbeat for group history
+2019/12/18 11:16:56 stopped commit for group history
+2019/12/18 11:16:56 Unable to establish connection to consumer group coordinator for group history: dial tcp 127.0.0.1:9093: connect: connection refused
+2019/12/18 11:16:56 Leaving group history, member main@localhost (github.com/segmentio/kafka-go)-397dcdbd-9042-463c-90e7-85bda8f21cd9
+2019/12/18 11:16:56 dial tcp 127.0.0.1:9093: connect: connection refused
+2019/12/18 11:17:01 Unable to establish connection to consumer group coordinator for group history: dial tcp 127.0.0.1:9093: connect: connection refused
+2019/12/18 11:17:01 Unable to establish connection to consumer group coordinator for group history: dial tcp 127.0.0.1:9093: connect: connection refused
+2019/12/18 11:17:16 dial tcp 127.0.0.1:9093: connect: connection refused
+2019/12/18 11:17:16 Unable to establish connection to consumer group coordinator for group history: dial tcp 127.0.0.1:9093: connect: connection refused
+2019/12/18 11:17:16 dial tcp 127.0.0.1:9093: connect: connection refused
+2019/12/18 11:17:21 Unable to establish connection to consumer group coordinator for group history: [15] Group Coordinator Not Available: the broker returns this error code for group coordinator requests, offset commits, and most group management requests if the offsets topic has not yet been created, or if the group coordinator is not active
+2019/12/18 11:17:21 Unable to establish connection to consumer group coordinator for group history: [15] Group Coordinator Not Available: the broker returns this error code for group coordinator requests, offset commits, and most group management requests if the offsets topic has not yet been created, or if the group coordinator is not active
+2019/12/18 11:17:21 [15] Group Coordinator Not Available: the broker returns this error code for group coordinator requests, offset commits, and most group management requests if the offsets topic has not yet been created, or if the group coordinator is not active
+2019/12/18 11:17:21 [15] Group Coordinator Not Available: the broker returns this error code for group coordinator requests, offset commits, and most group management requests if the offsets topic has not yet been created, or if the group coordinator is not active
+2019/12/18 11:17:21 Unable to establish connection to consumer group coordinator for group history: [15] Group Coordinator Not Available: the broker returns this error code for group coordinator requests, offset commits, and most group management requests if the offsets topic has not yet been created, or if the group coordinator is not active
+2019/12/18 11:17:21 [15] Group Coordinator Not Available: the broker returns this error code for group coordinator requests, offset commits, and most group management requests if the offsets topic has not yet been created, or if the group coordinator is not active
+2019/12/18 11:17:56 joined group history as member main@localhost (github.com/segmentio/kafka-go)-df420a73-f158-4ddf-afaf-ecaff92c9da5 in generation 17
+2019/12/18 11:17:56 joinGroup succeeded for response, history.  generationID=17, memberID=main@localhost (github.com/segmentio/kafka-go)-df420a73-f158-4ddf-afaf-ecaff92c9da5
+2019/12/18 11:17:56 Joined group history as member main@localhost (github.com/segmentio/kafka-go)-df420a73-f158-4ddf-afaf-ecaff92c9da5 in generation 17
+2019/12/18 11:17:56 joined group history as member main@localhost (github.com/segmentio/kafka-go)-6759ea39-46fd-45b3-bba3-228985cb96d3 in generation 17
+2019/12/18 11:17:56 selected as leader for group, history
+2019/12/18 11:17:56 joined group history as member main@localhost (github.com/segmentio/kafka-go)-a6cc7bef-5784-46e1-baf6-05a741858cfc in generation 17
+2019/12/18 11:17:56 joinGroup succeeded for response, history.  generationID=17, memberID=main@localhost (github.com/segmentio/kafka-go)-a6cc7bef-5784-46e1-baf6-05a741858cfc
+2019/12/18 11:17:56 Joined group history as member main@localhost (github.com/segmentio/kafka-go)-a6cc7bef-5784-46e1-baf6-05a741858cfc in generation 17
+2019/12/18 11:17:56 using 'range' balancer to assign group, history
+2019/12/18 11:17:56 found member: main@localhost (github.com/segmentio/kafka-go)-6759ea39-46fd-45b3-bba3-228985cb96d3/[]byte(nil)
+2019/12/18 11:17:56 found member: main@localhost (github.com/segmentio/kafka-go)-df420a73-f158-4ddf-afaf-ecaff92c9da5/[]byte(nil)
+2019/12/18 11:17:56 found member: main@localhost (github.com/segmentio/kafka-go)-a6cc7bef-5784-46e1-baf6-05a741858cfc/[]byte(nil)
+2019/12/18 11:17:56 found topic/partition: history/0
+2019/12/18 11:17:56 found topic/partition: history/1
+2019/12/18 11:17:56 assigned member/topic/partitions main@localhost (github.com/segmentio/kafka-go)-a6cc7bef-5784-46e1-baf6-05a741858cfc/history/[0]
+2019/12/18 11:17:56 assigned member/topic/partitions main@localhost (github.com/segmentio/kafka-go)-df420a73-f158-4ddf-afaf-ecaff92c9da5/history/[1]
+2019/12/18 11:17:56 joinGroup succeeded for response, history.  generationID=17, memberID=main@localhost (github.com/segmentio/kafka-go)-6759ea39-46fd-45b3-bba3-228985cb96d3
+2019/12/18 11:17:56 Joined group history as member main@localhost (github.com/segmentio/kafka-go)-6759ea39-46fd-45b3-bba3-228985cb96d3 in generation 17
+2019/12/18 11:17:56 Syncing 3 assignments for generation 17 as member main@localhost (github.com/segmentio/kafka-go)-6759ea39-46fd-45b3-bba3-228985cb96d3
+2019/12/18 11:17:56 received empty assignments for group, history as member main@localhost (github.com/segmentio/kafka-go)-6759ea39-46fd-45b3-bba3-228985cb96d3 for generation 17
+2019/12/18 11:17:56 sync group finished for group, history
+2019/12/18 11:17:56 sync group finished for group, history
+2019/12/18 11:17:56 sync group finished for group, history
+2019/12/18 11:17:56 subscribed to partitions: map[]
+2019/12/18 11:17:56 started commit for group history
+2019/12/18 11:17:56 subscribed to partitions: map[0:397]
+2019/12/18 11:17:56 initializing kafka reader for partition 0 of history starting at offset 397
+2019/12/18 11:17:56 started heartbeat for group, history [3s]
+2019/12/18 11:17:56 started commit for group history
+2019/12/18 11:17:56 started heartbeat for group, history [3s]
+2019/12/18 11:17:56 subscribed to partitions: map[1:-1]
+2019/12/18 11:17:56 started commit for group history
+2019/12/18 11:17:56 started heartbeat for group, history [3s]
+2019/12/18 11:17:56 initializing kafka reader for partition 1 of history starting at offset -1
+2019/12/18 11:17:56 the kafka reader for partition 0 of history is seeking to offset 397
+2019/12/18 11:17:56 the kafka reader for partition 1 of history is seeking to offset 51
+2019/12/18 11:18:05 no messages received from kafka within the allocated time for partition 1 of history at offset 51
+2019/12/18 11:18:05 no messages received from kafka within the allocated time for partition 0 of history at offset 397
+2019/12/18 11:18:14 no messages received from kafka within the allocated time for partition 0 of history at offset 397
+2019/12/18 11:18:14 no messages received from kafka within the allocated time for partition 1 of history at offset 51
+2019/12/18 11:18:15 initializing kafka reader for partition 0 of history starting at offset 398
+2019/12/18 11:18:15 the kafka reader for partition 0 of history is seeking to offset 398
+2019/12/18 11:18:23 initializing kafka reader for partition 0 of history starting at offset 399
+2019/12/18 11:18:23 the kafka reader for partition 0 of history is seeking to offset 399

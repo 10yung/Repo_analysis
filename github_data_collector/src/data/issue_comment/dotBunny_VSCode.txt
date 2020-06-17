@@ -1,0 +1,183 @@
+The project folder includes a 'Packages' subfolder now to see the contents of installed packages.
+
+The path it reports with AssetDatabase.GetAssetPath isn't where the actual package items are stored, so when doubleclicking a script in a package VSCode opens a new blank file with unsaved changes instead of viewing the actual contents of the script.
+
+To get the path where the item exists (the one that opens when you right click and choose 'Show in Explorer'), the Path.GetFullPath() method can be used as per https://docs.unity3d.com/Manual/upm-assets.html#GetFullPath
+
+To get it working for me, I've replaced
+`string completeFilepath = appPath + Path.DirectorySeparatorChar + AssetDatabase.GetAssetPath(selected);`
+with
+`string completeFilepath = Path.GetFullPath(selectedFilePath);`
+in the OnOpenedAsset callback.
+When using this plugin and VSCode as my editor instead of Visual Studio, I noticed OnGeneratedCSProjectFiles was no longer being called.
+
+Traced it to a change in source of unity 2019.3 where it now branches in PostprocessAllAssets of AssetPostprocessor.cs
+
+
+Incase anyone else needs it, workaround I'm using for now is to have "monodevelop" somewhere in a folder name leading to my vscode install, which makes unity see it as ScriptEditor.MonoDevelop instead of ScriptEditor.Other so it runs the SyncVS version of PostprocessSyncProject and does the callbacks again.
+Which in turn lets me change the framework version/CPU type so omnisharp 1.18 actually loads it properly with .net 4.6.1 (as 4.7.1+ won't install on my system)
+
+
+Also, the asset store version of this plugin is listed as from august 2019, but it's 2.7 which seems to be several years old.  Pressing 'Force Update' works, but some people won't try that if they have a version listed as being the current.
+
+Probably minor, but noticed the header of my .sln was tagged as # Visual Studio 2010 not 08 so tweaked the ScrubSolutionContent part to account for that (and added another newline or it'd end up without one).
+I have Unity 2019.2.9.f1 x64 and official **portable** VS Code 1.39.2 x64 on Win 10 x64.
+
+After installing the [VSCode](https://assetstore.unity.com/packages/tools/utilities/vscode-45320) , ther is no  VSCode tab in Unity Preferences menu.
+https://github.com/dotBunny/VSCode/blob/94e5a9b436cf70e85bc230247b288e8297fcc001/Plugins/Editor/VSCode.cs#L814
+
+I got a warning in Unity 2019.1.12f1 saying that
+Assets\VSCode\Plugins\Editor\VSCode.cs(814,10): warning CS0618: 'PreferenceItem' is obsolete: '[PreferenceItem] is deprecated. Use [SettingsProvider] instead.'
+I'm seeing this error in the logs when closing Unity (both batch mode and editor mode)
+
+```
+[Package Manager] Server::Kill -- Server was shutdown
+Cleanup mono
+GetBool is not allowed to be called while application is terminating.
+ 
+(Filename: /Users/builduser/buildslave/unity/build/Runtime/Scripting/ScriptingThreadAndSerializationSafeCheck.cpp Line: 85)
+
+
+Unhandled Exception: UnityEngine.UnityException: GetBool is not allowed to be called while application is terminating.
+  at <0x00000> <unknown method>
+  at <0x00000> <unknown method>
+  at <0x00000> <unknown method>
+  at <0x00000> <unknown method>
+```
+
+This comes from hooking into `System.AppDomain.CurrentDomain.DomainUnload` in order to act upon `RevertExternalScriptEditorOnExit` preference setting. When the callback is triggered, the `Enabled` property is queried, which results in this issue.
+
+I don't know what the solution is, but this needs to be reworked to allow Unity to exit cleanly.
+
+## Environment data
+`dotnet --info` output:
+
+.NET Command Line Tools (1.0.0-preview2-003131)
+
+Product Information:
+ Version:            1.0.0-preview2-003131
+ Commit SHA-1 hash:  635cf40e58
+
+Runtime Environment:
+ OS Name:     Windows
+ OS Version:  10.0.16299
+ OS Platform: Windows
+ RID:         win10-x64
+
+VS Code version:
+
+Version 1.23.1
+Commit d0182c3417d225529c6d5ad24b7572815d0de9ac
+Datum 2018-05-10T17:11:17.614Z
+Shell 1.7.12
+Renderer 58.0.3029.110
+Node 7.9.0
+Architektur x64
+
+C# Extension version:
+
+1.15.2
+
+## Steps to reproduce
+
+- deinstall VS Community if you have it on your machine
+- install Unity 2018.1.f2 without VS Community and without the VS integration.
+- install code and and the unity vs code extension. 
+- there is no way to create the solution and assembly files needed by omnisharp  (_Assembly-CSharp.csproj, Assembly-CSharp-Editor.csproj, Assembly-CSharp-Editor-firstpass.csproj, Assembly-CSharp-firstpass.csproj, projectname.sln_)
+- Assets -> Open C# Project does not do anything
+
+## Expected  behavior
+
+- always up-to-date solution and assembly files
+
+## Actual behavior
+
+- no solution and assembly files at all, or only outdated ones (if they were generated before)
+- omnisharp will not find any (new) references
+
+## How I fixed it dirty
+
+- install VS Community with the unity intergration. 
+- disable vs code  and switch to VS Community in the unity preferences
+- click Assets -> Open C# Project to create the solution and assembly files (which only works with VS Community)
+- switch back to vs code
+- vs code with omnisharp  is working again as expected
+
+You have to do this all the time something changed, so this solution is really not practically!
+
+## How I fixed it less dirty
+
+First I still need to have visual studio community with the unity plugin installed.
+
+Second, I changed the constructor (line 284) to this:
+```
+        static VSCode()
+        {
+            if (Enabled)
+            {
+                UpdateUnityPreferences(true);
+                
+                // disable vs code and reset vs community as the default external editor
+                EditorPrefs.SetString("kScriptsDefaultApp", EditorPrefs.GetString("VSCode_PreviousApp"));
+                
+                // sync will now successfully create or update the solution and project files
+                SyncSolution();  
+                
+                UpdateLaunchFile();
+
+                // UpdateSolution is not needed anymore because it is called over the OnGeneratedCSProjectFiles callback which gets triggered by SyncSolution()
+                // UpdateSolution(); 
+                
+                // reenable vscode
+                EditorPrefs.SetString("kScriptsDefaultApp", CodePath);
+                
+                // Add Update Check
+                DateTime targetDate = LastUpdate.AddDays(UpdateTime);
+                if (DateTime.Now >= targetDate && AutomaticUpdates)
+                {
+                    CheckForUpdate();
+                }
+            }
+            
+            // Event for when script is reloaded 
+            System.AppDomain.CurrentDomain.DomainUnload += System_AppDomain_CurrentDomain_DomainUnload;
+        }
+```
+
+## Related Issues ??
+
+Maybe this problem is also the reason for these releated issues:
+
+https://github.com/OmniSharp/omnisharp-vscode/issues/1867
+https://github.com/OmniSharp/omnisharp-vscode/issues/1676
+https://github.com/OmniSharp/omnisharp-vscode/issues/2209
+My session gets overwritten each time I close VSCode and open a file from Unity (or double click on a debug output line).  This means I lose track of the files I had open.  If I do 
+"Edit->Open C# Project in Code", it opens the previous session.
+
+The problem is probably with Unity itself, not this plugin, but is there a workaround for now?
+I get this error when I put the VSCode.cs File into Assets/Plugins/Editor folder
+
+> Assets/Plugins/Editor/VSCode.cs(970,56): error CS0234: The type or namespace name `PlayModeStateChange' does not exist in the namespace `UnityEditor'. Are you missing an assembly reference?
+
+Unity Editor 5.6.3xf1 Linux Personal on Ubuntu 16.04 and Visual Studio Code 1.20.1
+I have been trying for a long time now and I cannot get intellisense to work, and I figured maybe you'd like to know this is a problem so you can help me and others to identify and hopefully fix the issue.  
+
+When I open vs code in any way (double click file, Assets->open c# project in code, Assets->open c# project, or even actually just opening the vs code application) after 6 seconds, a little pop-up box appears that looks like this:
+<img width="1389" alt="screen shot 2018-01-07 at 11 28 46 am" src="https://user-images.githubusercontent.com/7661207/34651993-07b0af40-f39e-11e7-8053-a2b340e9a1b9.png">
+
+When I click "Show output" I get [a bunch of output](https://pastebin.com/6vFie2kb) in a console.
+
+It looks like the problem is that I'm missing some sort of assembly or something. I'm not exactly sure what it means, but I have tried installing a bunch of stuff to try to fix it.
+
+I have tried, all to no avail:
+- Assets -> Reimport all
+- Assets -> Open c# project
+- Assets -> open c# project in code
+- checking / unchecking "enable integration" in the vscode preferences pane (there were no errors in the console)
+- installing [.net core sdk](https://www.microsoft.com/net/download/macos). Not sure if I should have, but I wanted to see if that fixed it.
+- deleting .sln file and .csproj files to let unity regenerate them
+
+One thing to note is I don't know if [this documentation](https://code.visualstudio.com/docs/other/unity#_common-questions) is out of date or if mine is wrong, but my unity (2017.3) doesn't generate a -csharp.sln file.
+
+If you can help me figure out a fix for this, and add a check in the preferences pane to auto-fix it, that would be magnificent and I'm sure you would help other people with the same problem. There is at least one other dude on reddit with the same issue as me. Thanks!
+the same as title. but other files extension is worked

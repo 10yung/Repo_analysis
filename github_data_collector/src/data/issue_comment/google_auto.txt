@@ -1,0 +1,158 @@
+The recommended way to [accumulate items into an immutable collection](https://github.com/google/auto/blob/master/value/userguide/builders-howto.md#-accumulate-values-for-a-collection-valued-property-without-breaking-the-chain) shows examples using Guava.
+
+Some libraries use AutoValue but don't want to force the user to use Guava because Guava is known to cause headaches when different libraries require/provide different versions of Guava.
+
+So it would be nice to have collection builders present directly in AutoValue, like a ListBuilder, a SetBuilder, a MapBuilder. Those builders would then return Collection.unmodifiable***-wrapped collections.
+Kotlin has a nice singleton system thanks to [kotlin objects](https://kotlinlang.org/docs/reference/object-declarations.html), it creates a class that works automatically as a singleton, which from the perspective of Java looks like [a class with a static field `INSTANCE`](https://kotlinlang.org/docs/reference/java-to-kotlin-interop.html#static-methods) which contains the only instance of the class.
+
+This is particularly helpful in the context of service loaders as it gives more control over the instance used as a service.
+
+Unfortunately, the way `ServiceLoader` works currently requires classes that can be instantiated using their default constructor, which objects do not have.
+
+But thanks to the magic of annotation processing this is actually fixable.
+Without any processing this is what someone could write to make "their object" work with `ServiceLoader`:
+
+```kotlin
+interface MyInterface {
+    fun myMethod() : String
+}
+
+object MyObject : MyInterface {
+    override fun myMethod() : String = "hello"
+}
+
+@AutoService(MyInterface::class)
+class MyObjectServiceLoaderProxy : MyInterface by MyObject
+```
+
+This uses the [delegation mechanism](https://kotlinlang.org/docs/reference/delegation.html) also provided in Kotlin; in short, if you are implementing an **interface**, using `by anImplementationOfSaidInterface`, instances of the class will delegate the non-explicitely implemented functions to `anImplementationOfSaidInterface`.
+Note, this does not work with abstract classes, too bad but not the end of the world.
+
+There, now we can use `ServiceLoader` "with objects", we just need to tidy it up a bit, having the annotation on the object and generating the class automatically should be doable and would provide all the benefits without requiring user intervention (as long as the "service" is represented by an interface). We can also give a non standard name to the class to avoid people using it by mistake, after all this is only meant to be for the eyes of the ServiceLoader.
+
+Thoughts?
+@eamonnmcmanus @saturnism
+AutoFactory 1.0-beta6 has a compile-scoped dependency on AutoValue 1.5.3:
+https://github.com/google/auto/blob/2a52c553c69d353f65fdabc2f28cd46c2a31ccdf/factory/pom.xml#L74-L78
+which adds the following annotation processors to classpath:
+
+```
+com.google.auto.value.extension.memoized.MemoizedValidator
+com.google.auto.value.processor.AutoAnnotationProcessor
+com.google.auto.value.processor.AutoValueBuilderProcessor
+com.google.auto.value.processor.AutoValueProcessor
+```
+
+This is problematic for two reasons:
+1. AutoValue 1.5.3 doesn't support incap thus incap has to be disabled for the whole Gradle module.
+2. Consumers of AutoFactory don't expect any additional APs besides AutoFactory itself.
+
+cc @ronshapiro 
+I believe #718 may be happening for AutoService as well. I have these dependencies listed in my `build.gradle`:
+
+```
+    implementation 'com.google.dagger:dagger:2.22.1'
+    implementation "com.google.dagger:dagger-spi:2.23.1"
+    implementation "com.google.auto.service:auto-service:1.0-rc5"
+    annotationProcessor "com.google.auto.service:auto-service:1.0-rc5"
+```
+
+If I build with `./gradlew --stop && ./gradlew build`, then I don't see the error (adding `org.gradle.daemon=false` to `gradle.properties` also works). Running `./gradlew build` twice yields the following error:
+
+```
+$ ./gradlew build 
+> Task :app:compileJava FAILED
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':app:compileJava'.
+> java.util.ServiceConfigurationError: dagger.spi.BindingGraphPlugin: Error reading configuration file
+
+* Try:
+Run with --stacktrace option to get the stack trace. Run with --info or --debug option to get more log output. Run with --scan to get full insights.
+
+* Get more help at https://help.gradle.org
+
+BUILD FAILED in 1s
+4 actionable tasks: 4 executed
+```
+Fixes google/auto#660
+
+This change adds recursive validation for supertypes and superinterfaces to `SuperficialValidation`.
+Consider the following example:
+
+```java
+@Target({ElementType.TYPE_USE, ElementType.TYPE_PARAMETER})
+public @interface TypeUseTest {
+  String[] value() default {};
+}
+```
+
+```java
+import com.google.auto.value.AutoValue;
+
+@AutoValue
+abstract class Animal {
+  abstract String name();
+  abstract int numberOfLegs();
+
+  static Builder builder() {
+    return new AutoValue_Animal.Builder();
+  }
+
+  @AutoValue.Builder
+  abstract static class Builder {
+    abstract Builder setName(@TypeUseTest({"hi"}) String value);
+    abstract Builder setNumberOfLegs(int value);
+    abstract Animal build(@TypeUseTest({"hi", "bye"}) Builder this);
+  }
+}
+```
+
+In `AutoValue_Animal.Builder`, I see the `@TypeUseTest` annotation copied down to the implementation of `setName`.  But, I do not see the `@TypeUseTest` annotation on `this` copied down for the implementation of `build`.
+
+This may be a bit of a corner case, but it would be great if it were supported!  If the maintainers are interested and can point me roughly where the code should go, I can look into opening a PR.
+One of the things we did in Truth a while back was to print values differently if they contain newlines. So, for example, you would see:
+
+```
+expected: foo
+but was : bar
+````
+
+But you'd see:
+
+```
+expected:
+    public class Foo {
+      Foo() {}
+    }
+but was:
+    public class Bar {
+      Bar() {}
+    }
+````
+
+I would speculate (but it's just speculation) that this might be a nice feature for AutoValue `toString()` implementations, too.
+
+(Even in the case in which fields _aren't_ multiline, a multiline `toString()` can be nice in some cases: I think Truth has gotten reports that AutoValue `toString()` (like, to be fair, almost all `toString()` implementations) makes it hard to see which field differs when there are a lot of fields. But of course one-line `toString()` is nice in plenty of cases, too, so I wouldn't advocate for _always_ going multiline (nor, probably, for making it configurable). It's just a nice additional advantage in the cases in which multiline is already justified.)
+
+(It's also possible that Truth should have more special handling of AutoValue types in some cases.)
+I recently started using auto-service in a Gradle project. I noticed that while there was documentation on how to get started using auto-service with Maven, there was no documentation for Gradle. In my experience, having simple how-to guides for getting started lowers the barrier of entry for using this project. I wasn't sure if I should include a note that it appears that the `auto-service-annotations` artifact did not exist prior to version `1.0-rc5`. Any feedback is appreciated 
+Not sure where to file this issue but i thought to start here.
+
+Using Android Studio 3.3.1 with androidx, databinding enabled, AutoValue and Glide i faced the Error 
+
+```
+cannot find symbol DataBindingComponent
+```
+
+it was all over the place of all generated databinding classes. Also there were Glide errors but i was already used to know that they are always present, if the project does not compile. However, there were no AutoValue errors present.
+
+Now if i declare an empty interface for the DataBindingComponent to make the data binding compiler happy the root error from AutoValue gets revealed
+
+```
+error: Parameter type java.lang.Boolean of setter method should be boolean to match getter
+```
+
+fixing that and then removing the dummy interface i am happy to be able to compile the project again. The sad thing is, whenever i introduce an AutoValue error i have to repeat the process.

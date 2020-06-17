@@ -1,0 +1,375 @@
+This helps in situations where you are creating or updating views from within a Rails engine. By adding the `root_path` to the statement it will be able to correctly find the file.
+
+The `, root_path: Database::Engine.root` is the part that is manually added. I didn't find any method of autodetecting the rails engine so this would have to be manually added after generating the migration.
+
+Solves the issue I brought up in #261
+
+# create_view
+```
+create_view :product_stats, version: 2, root_path: Database::Engine.root
+```
+
+# update_view
+```
+update_view :product_stats, version: 2, revert_to_version: 1, root_path: Database::Engine.root
+```
+
+# replace_view
+```
+replace_view :product_stats, version: 2, revert_to_version: 1, root_path: Database::Engine.root
+```
+585ff85c5f5aee7e5ba0f5b13d806ed9fc109f20 - Fixes an issue where the generated migration for a schema qualified view name is not properly camelized.
+
+```
+$ rails g scenic:view non_public.search
+      create  db/views/non_public_searches_v01.sql
+      create  db/migrate/20190830220558_create_non_public_searches.rb
+$ head db/migrate/20190830220558_create_non_public_searches.rb
+class CreateNonPublicsearches < ActiveRecord::Migration[5.1]
+  def change
+    create_view "non_public.searches"
+  end
+end
+```
+
+The generated class name should be `CreateNonPublicSearches` instead of `CreateNonPublicsearches`.
+
+585ff85c5f5aee7e5ba0f5b13d806ed9fc109f20 - Fixes an issue where, having generated a scenic view for a schema qualified view and editing its view definition, running `rake db:migrate` fails to find the view definition.
+
+```
+$ rails g scenic:view non_public.search
+      create  db/views/non_public_searches_v01.sql
+      create  db/migrate/20190830220558_create_non_public_searches.rb
+$ vim db/views/non_public_searches_v01.sql
+$ bundle exec rake db:migrate
+== 20190830220558 CreateNonPublicSearches: migrating ==========================
+-- create_view("non_public.searches")
+rake aborted!
+StandardError: An error has occurred, this and all later migrations canceled:
+
+No such file or directory @ rb_sysopen - /Users/brianchhun/.../db/views/non_public.searches_v01.sql
+/Users/brianchhun/.../db/migrate/20190830220558_create_non_public_searches.rb:3:in `change'
+/Users/brianchhun/.rbenv/versions/2.4.3/bin/bundle:23:in `load'
+/Users/brianchhun/.rbenv/versions/2.4.3/bin/bundle:23:in `<main>'
+
+Caused by:
+Errno::ENOENT: No such file or directory @ rb_sysopen - /Users/brianchhun/.../db/views/non_public.searches_v01.sql
+/Users/brianchhun/.../db/migrate/20190830220558_create_non_public_searches.rb:3:in `change'
+/Users/brianchhun/.rbenv/versions/2.4.3/bin/bundle:23:in `load'
+/Users/brianchhun/.rbenv/versions/2.4.3/bin/bundle:23:in `<main>'
+Tasks: TOP => db:migrate
+(See full trace by running task with --trace)
+```
+I'm working on a project where we're using Postgres multi-schema with views, which would lead to views that would theoretically be created with a call like this one:
+
+```
+create_view 'schema_name.view_name'
+```
+
+However, because Scenic requires the view name to be the same as the definition file's name, the dot in the view name when specifying the target schema means that I can't really use schema definition files.
+
+This PR adds a `defined_as` flag to allow users to override the definition file name.
+Hi,
+
+concurrently:true is not passed down to refresh_dependencies_for which results in depending mat views being refreshed without concurrency.
+
+```
+def refresh_materialized_view(name, concurrently: false, cascade: false)
+  raise_unless_materialized_views_supported
+  if cascade
+    refresh_dependencies_for(name)
+  end
+  .
+  .
+end
+```
+
+Hi,
+
+There is a flaw in the Postgres Adapter DependencyParser class to find out which mat views are dependencies of the mat view that is being refreshed. It results in unrelated mat views being refreshed.
+The reason is tsort(dependency_hash) puts all mat views in the db linearly in an array including ones that have no relation to the mat view being refreshed.
+
+Take this example:
+A depends on B which depends on C
+E depends on D which depends on C
+
+No matter what you do, A will either be before E in the array or after it:
+ example #1 [C,B,A,D,E]
+ example #2 [C,D,E,B,A]
+
+If I refresh (cascade: true) mat view E it will also unnecessarily refresh B then A in example #1.
+If I refresh (cascade: true) mat view A it will also unnecessarily refresh E then D in example #2.
+
+TL;DR - Forcing all mat views in the db into a single linear dependency array will cause unnecessary (and costly) refreshes of unrelated mat views.
+
+*EDIT*: This problem is not only about mat views having a common 'ancestry'. It also applies to situations with no common 'ancestry':
+
+A depends on B which depends on C
+F depends on E which depends on D
+
+tsort(dependency_hash) might put all mat views in a single array that will look like the following:
+
+[C,B,A,D,E,F]
+
+Refreshing F with cascade:true will result in all mat views being refreshed.
+
+
+I'm finding that with each migration we do, the view definitions get moved around in my schema file. This leads to unnecessary schema.rb changes that make it pretty difficult to track the _actual_ changes to the file. 
+
+Does anyone else have this issue?
+We would like to use scenic from within a rails engine. However, the path to the view is not coming up correctly. In my example I have this.
+
+```
+- app
+- db
+- components
+    - products
+    - db
+      - views
+```
+
+The `products` is the rails engine that is referenced by the main app by this.
+
+```ruby
+path 'components' do
+  gem 'products'
+end
+```
+
+and to get rails to recognize regular migrations this is put in the `engine.rb`
+
+```ruby
+module Products
+  class Engine < ::Rails::Engine
+    isolate_namespace Pipedrive
+
+    initializer :append_migrations do |app|
+      unless app.root.to_s.match root.to_s+File::SEPARATOR
+        app.config.paths["db/migrate"].concat config.paths["db/migrate"].expanded
+      end
+    end
+
+    config.generators do |g|
+    end
+  end
+end
+```
+
+# Failing in the component directory
+
+From inside the `components/products` directory when I run a `rake db:migrate` it seems to be looking for the view in `test/dummy/db/views` instead of `db/views`.
+
+<details>
+   <summary>20181206151701 CreateExpandedDeals: migrating</summary>
+
+```
+== 20181206151701 CreateExpandedDeals: migrating ==============================
+-- create_view(:expanded_deals)
+rake aborted!
+StandardError: An error has occurred, this and all later migrations canceled:
+
+No such file or directory @ rb_sysopen - /Users/nathan/Source/test_app/components/products/test/dummy/db/views/expanded_deals_v01.sql
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/scenic-1.4.1/lib/scenic/definition.rb:10:in `read'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/scenic-1.4.1/lib/scenic/definition.rb:10:in `to_sql'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/scenic-1.4.1/lib/scenic/statements.rb:142:in `definition'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/scenic-1.4.1/lib/scenic/statements.rb:36:in `create_view'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/migration.rb:849:in `block in method_missing'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/migration.rb:818:in `block in say_with_time'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/migration.rb:818:in `say_with_time'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/migration.rb:838:in `method_missing'
+/Users/nathan/Source/test_app/components/products/db/migrate/20181206151701_create_expanded_deals.rb:3:in `change'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/migration.rb:792:in `exec_migration'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/migration.rb:776:in `block (2 levels) in migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/migration.rb:775:in `block in migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/connection_adapters/abstract/connection_pool.rb:408:in `with_connection'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/migration.rb:774:in `migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/migration.rb:953:in `migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/migration.rb:1230:in `block in execute_migration_in_transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/migration.rb:1298:in `block in ddl_transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/connection_adapters/abstract/database_statements.rb:235:in `block in transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/connection_adapters/abstract/transaction.rb:194:in `block in within_new_transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/connection_adapters/abstract/transaction.rb:191:in `within_new_transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/connection_adapters/abstract/database_statements.rb:235:in `transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/transactions.rb:210:in `transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/migration.rb:1298:in `ddl_transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/migration.rb:1229:in `execute_migration_in_transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/migration.rb:1201:in `block in migrate_without_lock'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/migration.rb:1200:in `each'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/migration.rb:1200:in `migrate_without_lock'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/migration.rb:1148:in `block in migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/migration.rb:1317:in `with_advisory_lock'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/migration.rb:1148:in `migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/migration.rb:1007:in `up'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/migration.rb:985:in `migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/tasks/database_tasks.rb:171:in `migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.6.1/lib/active_record/railties/databases.rake:58:in `block (2 levels) in <top (required)>'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/rake-12.3.1/exe/rake:27:in `<top (required)>'
+/Users/nathan/.rvm/gems/ruby-2.3.4/bin/ruby_executable_hooks:15:in `eval'
+/Users/nathan/.rvm/gems/ruby-2.3.4/bin/ruby_executable_hooks:15:in `<main>'
+```
+
+</details>
+
+# Failing in the main app
+
+And if I try to run the migration from the main app itself it's looking for it in `db/views` instead of `components/products/db/views`. 
+
+<details>
+   <summary>20181206151701 CreateExpandedDeals: migrating</summary>
+
+```
+== 20181206151701 CreateExpandedDeals: migrating ==============================
+-- create_view(:expanded_deals)
+rake aborted!
+StandardError: An error has occurred, this and all later migrations canceled:
+
+No such file or directory @ rb_sysopen - /Users/nathan/Source/test_app/db/views/expanded_deals_v01.sql
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/scenic-1.4.1/lib/scenic/definition.rb:10:in `read'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/scenic-1.4.1/lib/scenic/definition.rb:10:in `to_sql'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/scenic-1.4.1/lib/scenic/statements.rb:142:in `definition'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/scenic-1.4.1/lib/scenic/statements.rb:36:in `create_view'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:849:in `block in method_missing'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:818:in `block in say_with_time'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:818:in `say_with_time'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:838:in `method_missing'
+/Users/nathan/Source/test_app/components/products/db/migrate/20181206151701_create_expanded_deals.rb:3:in `change'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:792:in `exec_migration'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:776:in `block (2 levels) in migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:775:in `block in migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/connection_adapters/abstract/connection_pool.rb:408:in `with_connection'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:774:in `migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:953:in `migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:1230:in `block in execute_migration_in_transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:1298:in `block in ddl_transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/connection_adapters/abstract/database_statements.rb:225:in `block in transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/connection_adapters/abstract/transaction.rb:194:in `block in within_new_transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/connection_adapters/abstract/transaction.rb:191:in `within_new_transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/connection_adapters/abstract/database_statements.rb:225:in `transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/transactions.rb:210:in `transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:1298:in `ddl_transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:1229:in `execute_migration_in_transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:1201:in `block in migrate_without_lock'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:1200:in `each'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:1200:in `migrate_without_lock'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:1148:in `block in migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:1317:in `with_advisory_lock'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:1148:in `migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:1007:in `up'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:985:in `migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/tasks/database_tasks.rb:171:in `migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/railties/databases.rake:58:in `block (2 levels) in <top (required)>'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/rake-12.0.0/exe/rake:27:in `<top (required)>'
+/Users/nathan/.rvm/gems/ruby-2.3.4/bin/ruby_executable_hooks:15:in `eval'
+/Users/nathan/.rvm/gems/ruby-2.3.4/bin/ruby_executable_hooks:15:in `<main>'
+Errno::ENOENT: No such file or directory @ rb_sysopen - /Users/nathan/Source/test_app/db/views/expanded_deals_v01.sql
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/scenic-1.4.1/lib/scenic/definition.rb:10:in `read'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/scenic-1.4.1/lib/scenic/definition.rb:10:in `to_sql'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/scenic-1.4.1/lib/scenic/statements.rb:142:in `definition'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/scenic-1.4.1/lib/scenic/statements.rb:36:in `create_view'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:849:in `block in method_missing'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:818:in `block in say_with_time'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:818:in `say_with_time'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:838:in `method_missing'
+/Users/nathan/Source/test_app/components/products/db/migrate/20181206151701_create_expanded_deals.rb:3:in `change'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:792:in `exec_migration'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:776:in `block (2 levels) in migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:775:in `block in migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/connection_adapters/abstract/connection_pool.rb:408:in `with_connection'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:774:in `migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:953:in `migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:1230:in `block in execute_migration_in_transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:1298:in `block in ddl_transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/connection_adapters/abstract/database_statements.rb:225:in `block in transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/connection_adapters/abstract/transaction.rb:194:in `block in within_new_transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/connection_adapters/abstract/transaction.rb:191:in `within_new_transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/connection_adapters/abstract/database_statements.rb:225:in `transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/transactions.rb:210:in `transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:1298:in `ddl_transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:1229:in `execute_migration_in_transaction'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:1201:in `block in migrate_without_lock'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:1200:in `each'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:1200:in `migrate_without_lock'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:1148:in `block in migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:1317:in `with_advisory_lock'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:1148:in `migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:1007:in `up'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/migration.rb:985:in `migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/tasks/database_tasks.rb:171:in `migrate'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/activerecord-5.1.2/lib/active_record/railties/databases.rake:58:in `block (2 levels) in <top (required)>'
+/Users/nathan/.rvm/gems/ruby-2.3.4/gems/rake-12.0.0/exe/rake:27:in `<top (required)>'
+/Users/nathan/.rvm/gems/ruby-2.3.4/bin/ruby_executable_hooks:15:in `eval'
+/Users/nathan/.rvm/gems/ruby-2.3.4/bin/ruby_executable_hooks:15:in `<main>'
+Tasks: TOP => db:migrate
+(See full trace by running task with --trace)
+```
+
+</details>
+
+# Possible fixes?
+
+From looking around PR #237 might fix this, but since that was submitted in February I wasn't sure if it would be merged in any time soon. I haven't seen any feedback from the original author, though @calebthompson did comment on it a day or so ago.
+
+
+Added a method which return the view is populated or not.
+
+`REFRESH MATERIALIZED VIEW CONCURRENTLY` doesn't work for a view which is not populated, even it has unique index. This method is useful to perform concurrent refresh if it's possible.
+
+Real use case in Rails will be like this:
+
+- Database is loaded from structure.sql to run specs, but the view isn't populated yet so concurrent refresh is not possible. We want to fallback to normal(non-concurrent) refresh in this case.
+- After initial population, views are expected to be refreshed concurrently. It's possible because the view is already populated.
+
+Our team is using a concern below to cope with the case. This pull request is extracted from this.
+
+```
+module MaterializedView
+  extend ActiveSupport::Concern
+
+  included do
+    class << self
+      def materialized_view_populated?
+        connection.execute("SELECT relispopulated FROM pg_class WHERE relname = '#{table_name}'").first['relispopulated']
+      end
+
+      def refresh_materialized_view(concurrently = true)
+        Scenic.database.refresh_materialized_view(table_name, concurrently: materialized_view_populated? && concurrently, cascade: false)
+      end
+    end
+  end
+end
+```
+I needed to use this in a rails engine and didn't want to have to copy db_views over for every rails app. 
+
+This makes it so the the definition is searched for in multiple paths when trying to call `to_sql`. Generator paths aren't affected. I leveraged Rails' `config.paths` for configuring additional `db/views` paths. I could change it so that the paths are apart of `Scenic::Configuration`, I just thought putting it in `Rails.config.paths['db/views']` would pair nicely with `Rails.config.paths['db/migrations']` works.
+
+I'm able to make this work with a rails engine by using the following in `engine.rb`
+
+```ruby
+    initializer :append_migrations do |app|
+      app.config.paths["db/views"] << root.join("db/views")
+
+      unless app.root.to_s.match? root.to_s
+        config.paths["db/migrate"].expanded.each do |expanded_path|
+          app.config.paths["db/migrate"] << expanded_path
+        end
+      end
+    end
+```
+
+ 
+@pixielabs <3 Scenic!
+
+We use lots of materialized views with dependencies and it can be quite painful to update them in a migration, especially remembering to recreate indexes.
+
+This PR:
+
+1. Adds an optional `cascade: true` to `drop_view` and `update_view`.
+2. Makes `update_view` recreate any views that are lost during the view being updated, including any indexes on those views.
+3. Stops the user from rolling back `drop_view` if they use `cascade: true`, because you can't tell what might've been lost. I've made the necessary change in `CommandRecorder`.
+
+Things of note / bits I'm unsure about:
+
+1. I don't know how this impacts the sqlite adapter, if at all.
+2. I made `try_index_create` public because I'm using it to recreate indexes, but I'm not using it via the `on()` method. This is a new use of `IndexReapplication` and I'm conscious of that; perhaps some bigger API changes could be done here, but I didn't want to mess around too much!
+
+If there's anything that needs changing, or any questions, let me know!

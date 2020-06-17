@@ -1,0 +1,590 @@
+Fix underscores in S3 object metadata keys - fixes #1790
+We're using an old version of `boto` (through `moto`) to detect the available regions for Lambda (and other APIs). We should switch from `boto` to the newer `boto3` library, which includes the up-to-date endpoints.
+
+```
+code/localstack/localstack/services/cloudformation/cloudformation_starter.py", line 502, in Lambda_create_from_cloudformation_json
+    return Lambda_create_from_cloudformation_json_orig(resource_name, cloudformation_json, region_name)
+  File "/opt/code/localstack/.venv/lib/python3.7/site-packages/moto/awslambda/models.py", line 519, in create_from_cloudformation_json
+    backend = lambda_backends[region_name]
+KeyError: 'eu-west-2'
+```
+While trying to trigger a lambda written in Java using DynamoDB stream, I am receiving the following error.
+
+localstack_1  | Exception in thread "main" java.lang.NoSuchMethodError: com.amazonaws.services.lambda.runtime.events.DynamodbEvent$DynamodbStreamRecord.setUserIdentity(Lcom/amazonaws/services/dynamodbv2/model/Identity;)V
+localstack_1  |         at cloud.localstack.lambda.DDBEventParser.parse(DDBEventParser.java:29)
+localstack_1  |         at cloud.localstack.LambdaExecutor.main(LambdaExecutor.java:103)
+
+In the cloud formation template, this is how the DynamoDB table has been configured.
+  MyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${Env}-${mytablename}"
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: N
+        - AttributeName: version
+          AttributeType: N
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+        - AttributeName: version
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: TRUE
+
+And the event source is configured as given below.
+
+  FunctionEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: true
+      StartingPosition: LATEST
+      EventSourceArn: !GetAtt MyTable.StreamArn
+      FunctionName: !Ref JavaFunction
+
+
+And the java function is configured as:
+
+  JavaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Service}-${Env}"
+      AutoPublishAlias: LIVE
+      DeploymentPreference:
+        Type: Globals.DEPLOY_STRATEGY
+      Handler: com.xyz.EventLocalHandler
+      Runtime: java8
+      Timeout: 240
+      MemorySize: 1024
+      Tracing: Active
+      CodeUri:
+        Bucket: my-bucket
+        Key: my-lambda.zip
+      Environment:
+        Variables:
+          ENV: !Sub "${Env}"
+
+All the services are up and running in Localstack. I can see the table, put value into the DB and this in turn triggers the lambda without any errors. One warning that appears in the log is given below.
+localstack_1  | 2020-01-17T10:57:49:WARNING:localstack.services.cloudformation.cloudformation_starter: Unable to determine physical_resource_id for resource <class 'moto.dynamodb2.models.Table'>
+
+I am not sure whether this will cause any problem.
+
+After searching online, I found that Localstack is trying read userIdentity attribute present in Record.java object.
+https://docs.aws.amazon.com/AWSJavaSDK/latest/javadoc/com/amazonaws/services/dynamodbv2/model/Record.html
+
+However I am not sure how we can explicitly set this value. In the real AWS world it is not necessary to set this value in the cloud formation script. Still the event in DynamoDB stream triggers the lambda and get's processed successfully. This only happens in Localstack.
+
+Request your advice on this.
+
+Edited: I am using 1.11 version of aws sdk. Localstack is using 2.x versions. That could be why this problem is occurring. I will troubleshoot this.
+
+We're using localstack `0.10.6` and are running into issues when creating a Cloudwatch event rule using the AWS terraform provider (`2.44.0`).
+
+We have the following event rule defined in terraform:
+```
+resource "aws_cloudwatch_event_rule" "every_five_seconds" {
+    name = "every-five-seconds"
+    description = "Fires every five seconds"
+    schedule_expression = "rate(5 seconds)"
+}
+```
+
+When we run terraform apply against our local Cloudwatch Events it just hangs with `Still creating...`.  On inspecting the localstack logs we can see the following `NotImplementedError`:
+
+```
+localstack_1           | 2020-01-16 17:23:07,572:API: Error on request:
+localstack_1           | Traceback (most recent call last):
+localstack_1           |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/werkzeug/serving.py", line 304, in run_wsgi
+localstack_1           |     execute(self.server.app)
+localstack_1           |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/werkzeug/serving.py", line 292, in execute
+localstack_1           |     application_iter = app(environ, start_response)
+localstack_1           |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/moto/server.py", line 135, in __call__
+localstack_1           |     return backend_app(environ, start_response)
+localstack_1           |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 2309, in __call__
+localstack_1           |     return self.wsgi_app(environ, start_response)
+localstack_1           |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 2295, in wsgi_app
+localstack_1           |     response = self.handle_exception(e)
+localstack_1           |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask_cors/extension.py", line 161, in wrapped_function
+localstack_1           |     return cors_after_request(app.make_response(f(*args, **kwargs)))
+localstack_1           |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 1741, in handle_exception
+localstack_1           |     reraise(exc_type, exc_value, tb)
+localstack_1           |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/_compat.py", line 35, in reraise
+localstack_1           |     raise value
+localstack_1           |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 2292, in wsgi_app
+localstack_1           |     response = self.full_dispatch_request()
+localstack_1           |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 1815, in full_dispatch_request
+localstack_1           |     rv = self.handle_user_exception(e)
+localstack_1           |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask_cors/extension.py", line 161, in wrapped_function
+localstack_1           |     return cors_after_request(app.make_response(f(*args, **kwargs)))
+localstack_1           |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 1718, in handle_user_exception
+localstack_1           |     reraise(exc_type, exc_value, tb)
+localstack_1           |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/_compat.py", line 35, in reraise
+localstack_1           |     raise value
+localstack_1           |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 1813, in full_dispatch_request
+localstack_1           |     rv = self.dispatch_request()
+localstack_1           |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 1799, in dispatch_request
+localstack_1           |     return self.view_functions[rule.endpoint](**req.view_args)
+localstack_1           |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/moto/core/utils.py", line 146, in __call__
+localstack_1           |     result = self.callback(request, request.url, {})
+localstack_1           |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/moto/core/responses.py", line 197, in dispatch
+localstack_1           |     return cls()._dispatch(*args, **kwargs)
+localstack_1           |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/moto/core/responses.py", line 295, in _dispatch
+localstack_1           |     return self.call_action()
+localstack_1           |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/moto/core/responses.py", line 393, in call_action
+localstack_1           |     "The {0} action has not been implemented".format(action)
+localstack_1           | NotImplementedError: The list_tags_for_resource action has not been implemented
+```
+
+Using the AWS CLI to create the event rule works fine, just not when using a Terraform `aws_cloudwatch_event_rule` resource.
+Hi guys, consistently getting 500 error responses when trying to update a new API Gateway Rest API with a Swagger spec.
+
+I'm orchestrating with Pulumi, using the `@pulumi/awsx` package to build out a test API gateway with no routes. The package constructs an API Gateway with a Swagger spec, and performs aws api calls via terraform providers underneath.
+
+Here's the call sequence to replicate the issue, captured via proxying with mitmproxy:
+
+1. Create a RestAPI:
+
+```
+curl -H 'User-Agent:aws-sdk-go/1.27.0 (go1.13.6; darwin; amd64) APN/1.0 HashiCorp/1.0 Terraform/0.11+compatible (+https://www.terraform.io)' -H 'Content-Length:73' -H 'Accept:application/json' -H 'Authorization:AWS4-HMAC-SHA256 Credential=mockAccessKey/20200117/us-east-1/apigateway/aws4_request, SignedHeaders=accept;content-length;content-type;host;x-amz-date;x-amz-security-token, Signature=0ee091e679dc60847871c4b3ccc1eb7cefe8064285a5d9d82229b41dd2b72d1c' -H 'Content-Type:application/json' -H 'X-Amz-Date:20200117T080847Z' -H 'X-Amz-Security-Token:nothing' -H 'Accept-Encoding:gzip' -H 'Connection:close' -X POST 'http://localhost:4567/restapis' --data-binary '{"apiKeySource":"HEADER","binaryMediaTypes":["*/*"],"name":"hello-world"}'
+
+```
+
+2. Update API with Swagger definition body:
+
+```
+# note: replace the rest api id `bmtiorrlv3` below with the id of the api created in first call (1)
+curl -i -H 'User-Agent:aws-sdk-go/1.27.0 (go1.13.6; darwin; amd64) APN/1.0 HashiCorp/1.0 Terraform/0.11+compatible (+https://www.terraform.io)' -H 'Content-Length:451' -H 'Accept:application/json' -H 'Authorization:AWS4-HMAC-SHA256 Credential=mockAccessKey/20200117/us-east-1/apigateway/aws4_request, SignedHeaders=accept;content-length;host;x-amz-date;x-amz-security-token, Signature=e976099157b754cf1555592075737b3c4e2dde70931a02d53a8009e5cee6ac25' -H 'X-Amz-Date:20200117T080847Z' -H 'X-Amz-Security-Token:nothing' -H 'Accept-Encoding:gzip' -H 'Connection:close' -X PUT 'http://localhost:4567/restapis/bmtiorrlv3?mode=overwrite' --data-binary '{"swagger":"2.0","info":{"title":"hello-world","version":"1.0"},"paths":{},"x-amazon-apigateway-binary-media-types":["*/*"],"x-amazon-apigateway-gateway-responses":{"MISSING_AUTHENTICATION_TOKEN":{"statusCode":404,"responseTemplates":{"application/json":"{\\"message\\": \\"404 Not found\\" }"}},"ACCESS_DENIED":{"statusCode":404,"responseTemplates":{"application/json":"{\\"message\\": \\"404 Not found\\" }"}}},"x-amazon-apigateway-api-key-source":"HEADER"}'
+```
+
+Response:
+```
+HTTP/1.1 500 Internal Server Error
+Server: BaseHTTP/0.6 Python/3.7.5
+Date: Fri, 17 Jan 2020 08:40:48 GMT
+Content-Type: text/html
+Content-Length: 290
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: HEAD,GET,PUT,POST,DELETE,OPTIONS,PATCH
+Access-Control-Allow-Headers: authorization,content-type,content-md5,cache-control,x-amz-content-sha256,x-amz-date,x-amz-security-token,x-amz-user-agent,x-amz-target,x-amz-acl,x-amz-version-id,x-localstack-target,x-amz-tagging
+Access-Control-Expose-Headers: x-amz-version-id
+
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<title>500 Internal Server Error</title>
+<h1>Internal Server Error</h1>
+<p>The server encountered an internal error and was unable to complete your request. Either the server is overloaded or there is an error in the application.</p>
+```
+
+Localstack container logs (started via docker-compose):
+
+```
+localstack_main | 2020-01-17 08:43:22,967:API: Error on request:
+localstack_main | Traceback (most recent call last):
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/werkzeug/serving.py", line 304, in run_wsgi
+localstack_main |     execute(self.server.app)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/werkzeug/serving.py", line 292, in execute
+localstack_main |     application_iter = app(environ, start_response)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/moto/server.py", line 135, in __call__
+localstack_main |     return backend_app(environ, start_response)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 2309, in __call__
+localstack_main |     return self.wsgi_app(environ, start_response)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 2295, in wsgi_app
+localstack_main |     response = self.handle_exception(e)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask_cors/extension.py", line 161, in wrapped_function
+localstack_main |     return cors_after_request(app.make_response(f(*args, **kwargs)))
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 1741, in handle_exception
+localstack_main |     reraise(exc_type, exc_value, tb)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/_compat.py", line 35, in reraise
+localstack_main |     raise value
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 2292, in wsgi_app
+localstack_main |     response = self.full_dispatch_request()
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 1815, in full_dispatch_request
+localstack_main |     rv = self.handle_user_exception(e)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask_cors/extension.py", line 161, in wrapped_function
+localstack_main |     return cors_after_request(app.make_response(f(*args, **kwargs)))
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 1718, in handle_user_exception
+localstack_main |     reraise(exc_type, exc_value, tb)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/_compat.py", line 35, in reraise
+localstack_main |     raise value
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 1813, in full_dispatch_request
+localstack_main |     rv = self.dispatch_request()
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 1799, in dispatch_request
+localstack_main |     return self.view_functions[rule.endpoint](**req.view_args)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/moto/core/utils.py", line 150, in __call__
+localstack_main |     if len(result) == 3:
+localstack_main | TypeError: object of type 'NoneType' has no len()
+localstack_main | 2020-01-17 08:43:22,967:API: Error on request:
+localstack_main | Traceback (most recent call last):
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/werkzeug/serving.py", line 304, in run_wsgi
+localstack_main |     execute(self.server.app)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/werkzeug/serving.py", line 292, in execute
+localstack_main |     application_iter = app(environ, start_response)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/moto/server.py", line 135, in __call__
+localstack_main |     return backend_app(environ, start_response)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 2309, in __call__
+localstack_main |     return self.wsgi_app(environ, start_response)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 2295, in wsgi_app
+localstack_main |     response = self.handle_exception(e)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask_cors/extension.py", line 161, in wrapped_function
+localstack_main |     return cors_after_request(app.make_response(f(*args, **kwargs)))
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 1741, in handle_exception
+localstack_main |     reraise(exc_type, exc_value, tb)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/_compat.py", line 35, in reraise
+localstack_main |     raise value
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 2292, in wsgi_app
+localstack_main |     response = self.full_dispatch_request()
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 1815, in full_dispatch_request
+localstack_main |     rv = self.handle_user_exception(e)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask_cors/extension.py", line 161, in wrapped_function
+localstack_main |     return cors_after_request(app.make_response(f(*args, **kwargs)))
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 1718, in handle_user_exception
+localstack_main |     reraise(exc_type, exc_value, tb)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/_compat.py", line 35, in reraise
+localstack_main |     raise value
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 1813, in full_dispatch_request
+localstack_main |     rv = self.dispatch_request()
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 1799, in dispatch_request
+localstack_main |     return self.view_functions[rule.endpoint](**req.view_args)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/moto/core/utils.py", line 150, in __call__
+localstack_main |     if len(result) == 3:
+localstack_main | TypeError: object of type 'NoneType' has no len()
+localstack_main | 2020-01-17 08:43:22,967:API: Error on request:
+localstack_main | Traceback (most recent call last):
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/werkzeug/serving.py", line 304, in run_wsgi
+localstack_main |     execute(self.server.app)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/werkzeug/serving.py", line 292, in execute
+localstack_main |     application_iter = app(environ, start_response)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/moto/server.py", line 135, in __call__
+localstack_main |     return backend_app(environ, start_response)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 2309, in __call__
+localstack_main |     return self.wsgi_app(environ, start_response)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 2295, in wsgi_app
+localstack_main |     response = self.handle_exception(e)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask_cors/extension.py", line 161, in wrapped_function
+localstack_main |     return cors_after_request(app.make_response(f(*args, **kwargs)))
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 1741, in handle_exception
+localstack_main |     reraise(exc_type, exc_value, tb)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/_compat.py", line 35, in reraise
+localstack_main |     raise value
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 2292, in wsgi_app
+localstack_main |     response = self.full_dispatch_request()
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 1815, in full_dispatch_request
+localstack_main |     rv = self.handle_user_exception(e)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask_cors/extension.py", line 161, in wrapped_function
+localstack_main |     return cors_after_request(app.make_response(f(*args, **kwargs)))
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 1718, in handle_user_exception
+localstack_main |     reraise(exc_type, exc_value, tb)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/_compat.py", line 35, in reraise
+localstack_main |     raise value
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 1813, in full_dispatch_request
+localstack_main |     rv = self.dispatch_request()
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/flask/app.py", line 1799, in dispatch_request
+localstack_main |     return self.view_functions[rule.endpoint](**req.view_args)
+localstack_main |   File "/opt/code/localstack/.venv/lib/python3.7/site-packages/moto/core/utils.py", line 150, in __call__
+localstack_main |     if len(result) == 3:
+localstack_main | TypeError: object of type 'NoneType' has no len()
+```
+
+Localstack docker image `latest` (2020-01-17):
+Digest: `sha256:15cece3343cd14df99b4637962536c51191134c47ffb5198694bb9a8140e2840`
+
+`docker-compose.yml`:
+```
+version: "2.1"
+
+services:
+  localstack:
+    container_name: "${LOCALSTACK_DOCKER_NAME-localstack_main}"
+    image: localstack/localstack:latest
+    ports:
+      - "4567-4597:4567-4597"
+    environment:
+      - START_WEB=0
+      - SERVICES=${SERVICES- }
+      - DEBUG=1
+      - DATA_DIR=${DATA_DIR- }
+      - LAMBDA_EXECUTOR=${LAMBDA_EXECUTOR- docker}
+      - LAMBDA_REMOTE_DOCKER=${LAMBDA_REMOTE_DOCKER- 0}
+      - KINESIS_ERROR_PROBABILITY=${KINESIS_ERROR_PROBABILITY- }
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    volumes:
+      - "${TMPDIR:-/tmp/localstack}:/tmp/localstack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+```
+
+Thanks guys! Let me know if you need any more info on anything.
+While trying to subscribe to a SNS topic via Java AWS client, localstack throws 502 error. Even though exception is thrown, it is actually creating the subscription. Please find below the stacktrace I received for the issue
+
+>  2020-01-16T14:33:26:ERROR:localstack.services.generic_proxy: Error forwarding request: 'arn:aws:sns:us-east-1:000000000000:proxy-local' Traceback (most recent call last):
+localstack_demo |   File "/opt/code/localstack/localstack/services/generic_proxy.py", line 300, in forward
+localstack_demo |     updated_response = self.proxy.update_listener.return_response(**kwargs)
+localstack_demo |   File "/opt/code/localstack/localstack/services/sns/sns_listener.py", line 158, in return_response
+localstack_demo |     filter_policy
+localstack_demo |   File "/opt/code/localstack/localstack/services/sns/sns_listener.py", line 263, in do_subscribe
+localstack_demo |     SNS_SUBSCRIPTIONS[topic_arn].append(subscription)
+localstack_demo | KeyError: 'arn:aws:sns:us-east-1:000000000000:proxy-local'
+
+I tried with version 0.9.1 and it is working fine. 
+
+Basically, this issue happen in latest versions when request is sent as a POST and the parameters/commands are sent as request body(as opposed to query parameters) which is what the Java AWS client does. If commands are sent as query parameters using GET/POST, it works fine.
+
+Off the back of https://github.com/localstack/localstack/issues/1953 - I've dug a little deeper and believe this might be related to how the tags are being handled.
+
+This gist demonstrates the awscli commands working as expected when using the upstream local-kms docker image directly: https://gist.github.com/SinFulNard/7394cb9151840980a4a36de43f42ca93
+
+Below shows my results when using the localstack endpoint:
+installed versions:
+```
+Package           Version
+----------------- ----------
+awscli            1.17.2
+awscli-local      0.5
+localstack        0.10.7
+localstack-client 0.17
+localstack-ext    0.10.95
+```
+```
+# localstack seems to start with one key already created
+➜ aws kms list-keys --endpoint-url http://localhost:4599
+{
+    "Keys": [
+        {
+            "KeyArn": "arn:aws:kms:us-east-1:000000000000:key/7f6c39a2-6408-4c50-8c4f-2441cb05eea9",
+            "KeyId": "7f6c39a2-6408-4c50-8c4f-2441cb05eea9"
+        }
+    ]
+}
+# create a basic key to show key creation works as intended
+➜ aws kms create-key --endpoint=http://localhost:4599
+{
+    "KeyMetadata": {
+        "Origin": "AWS_KMS",
+        "KeyId": "d1403f81-ed9d-4bac-b572-a8bf7ee0950d",
+        "Description": "",
+        "KeyManager": "CUSTOMER",
+        "Enabled": true,
+        "KeyUsage": "ENCRYPT_DECRYPT",
+        "KeyState": "Enabled",
+        "CreationDate": 1579061878,
+        "Arn": "arn:aws:kms:us-east-1:000000000000:key/d1403f81-ed9d-4bac-b572-a8bf7ee0950d",
+        "AWSAccountId": "000000000000"
+    }
+}
+# list keys to confirm new key exists
+➜ aws kms list-keys --endpoint-url http://localhost:4599
+{
+    "Keys": [
+        {
+            "KeyArn": "arn:aws:kms:us-east-1:000000000000:key/7f6c39a2-6408-4c50-8c4f-2441cb05eea9",
+            "KeyId": "7f6c39a2-6408-4c50-8c4f-2441cb05eea9"
+        },
+        {
+            "KeyArn": "arn:aws:kms:us-east-1:000000000000:key/d1403f81-ed9d-4bac-b572-a8bf7ee0950d",
+            "KeyId": "d1403f81-ed9d-4bac-b572-a8bf7ee0950d"
+        }
+    ]
+}
+# create a key with two tags
+➜ aws kms create-key --tags TagKey=Tag1,TagValue=Test TagKey=Tag2,TagValue=Two --endpoint=http://localhost:4599
+{
+    "KeyMetadata": {
+        "Origin": "AWS_KMS",
+        "KeyId": "b550728c-91b8-46a6-a9ad-8e58f0ada9c5",
+        "Description": "",
+        "KeyManager": "CUSTOMER",
+        "Enabled": true,
+        "KeyUsage": "ENCRYPT_DECRYPT",
+        "KeyState": "Enabled",
+        "CreationDate": 1579061926,
+        "Arn": "arn:aws:kms:us-east-1:000000000000:key/b550728c-91b8-46a6-a9ad-8e58f0ada9c5",
+        "AWSAccountId": "000000000000"
+    }
+}
+# list keys to show resulting keys which includes two phantom entries
+➜ aws kms list-keys --endpoint-url http://localhost:4599
+{
+    "Keys": [
+        {
+            "KeyArn": "arn:aws:kms:us-east-1:000000000000:key/7f6c39a2-6408-4c50-8c4f-2441cb05eea9",
+            "KeyId": "7f6c39a2-6408-4c50-8c4f-2441cb05eea9"
+        },
+        {
+            "KeyArn": "arn:aws:kms:us-east-1:000000000000:key/b550728c-91b8-46a6-a9ad-8e58f0ada9c5",
+            "KeyId": "b550728c-91b8-46a6-a9ad-8e58f0ada9c5"
+        },
+        {
+            "KeyArn": "",
+            "KeyId": ""
+        },
+        {
+            "KeyArn": "",
+            "KeyId": ""
+        },
+        {
+            "KeyArn": "arn:aws:kms:us-east-1:000000000000:key/d1403f81-ed9d-4bac-b572-a8bf7ee0950d",
+            "KeyId": "d1403f81-ed9d-4bac-b572-a8bf7ee0950d"
+        }
+    ]
+}
+```
+
+Below are logs taken from localstack running in debug mode during the above operations:
+```
+INFO[2020-01-15 04:17:17.016] 1 keys listed
+INFO[2020-01-15 04:17:58.318] New key created: arn:aws:kms:us-east-1:000000000000:key/d1403f81-ed9d-4bac-b572-a8bf7ee0950d
+INFO[2020-01-15 04:18:03.495] 2 keys listed
+INFO[2020-01-15 04:18:46.736] New key created: arn:aws:kms:us-east-1:000000000000:key/b550728c-91b8-46a6-a9ad-8e58f0ada9c5
+INFO[2020-01-15 04:18:46.736] New tag created: Tag1 / Test
+INFO[2020-01-15 04:18:46.736] New tag created: Tag2 / Two
+INFO[2020-01-15 04:19:06.624] 5 keys listed
+```
+As shown in the logs above, I start with one key, create a second, then create a third with two tags - the resulting total should be 3, but I end up with 5?
+
+I'm not sure how to dig deeper to determine why these two additional key entries are being created - I am dubbing them 👻 🔑's and while they don't harm normal operations, they do seem to mess up the pagination.
+
+The same results are seen when using awslocal.
+Including the `Range` header on S3 requests triggers a `502 Bad Gateway` when localstack is run with SSL.
+
+Sample test that demonstrates the issue:
+```python
+import logging
+import io
+import os
+
+import boto3
+
+logging.basicConfig(level=logging.INFO)
+
+
+def test_range_s3():
+    s3 = boto3.client('s3', endpoint_url='https://localhost:4572', use_ssl=True, verify=False)
+
+    bucket = 'localstack-s3-range'
+    obj_name = 'sample.bin'
+    s3.create_bucket(Bucket=bucket)
+
+    chunk_size = 1024
+
+    with io.BytesIO() as data:
+        data.write(os.urandom(chunk_size * 2))
+        logging.info('Uploading object (size=%d)', data.getbuffer().nbytes)
+        data.seek(0)
+        s3.upload_fileobj(data, bucket, obj_name)
+
+    range_header = f'bytes=0-{chunk_size - 1}'
+    logging.info('Downloading using Range header: %s', range_header)
+    
+    # this will raise an exception
+    # botocore.exceptions.ClientError: An error occurred (502) when calling the GetObject operation (reached max retries: 4): Bad Gateway
+    resp = s3.get_object(Bucket=bucket, Key=obj_name, Range=range_header)
+    
+    content = resp['Body'].read()
+    assert len(content) == chunk_size
+```
+
+This is a fairly recent regression:
+
+Running against `localstack/localstack:latest` will fail using SSL but pass without SSL. 
+Running against `localstack/localstack:0.10.6` will pass using SSL as well as without SSL.
+
+I am guessing changes from either #1887 or #1906 broke this since those were related to `Range` functionality, but have not bisected to be sure.
+I'm attempting to connect using aws-cli to the localstack SSM but it throws 
+
+```An error occurred (500) when calling the ListDocuments operation (reached max retries: 4): <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
+<title>500 Internal Server Error</title>
+<h1>Internal Server Error</h1>
+<p>The server encountered an internal error and was unable to complete your request. Either the server is overloaded or there is an error in the application.</p>
+```
+
+My env uses docker-compose 
+
+```version: '2.1'
+services:
+  localstack:
+    image: localstack/localstack
+    container_name: localstack-aoms
+    hostname: localstack
+    ports:
+      - "4567-4597:4567-4597"
+      - "${PORT_WEB_UI-8080}:${PORT_WEB_UI-8080}"
+    expose:
+      - 4572
+      - 4567
+      - 4574
+      - 4564
+      - 4575
+      - 4576
+      - 4593
+      - 4583
+    environment:
+      - SERVICES= sqs, sns, dynamodb, apigateway, s3, cloudformation, iam, ssm
+      - DEFAULT_REGION=us-east-1
+      - AWS_XRAY_SDK_ENABLED=true
+      - DEBUG=1
+      - DATA_DIR=/tmp/localstack/data
+      - PORT_WEB_UI=${PORT_WEB_UI-8080 }
+      - LAMBDA_EXECUTOR=local
+      - LAMBDA_REMOTE_DOCKER=false
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - HOSTNAME_EXTERNAL=localstack
+        # These are your alks creds.  We're going to fake it with them.
+      - AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+      - AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN
+    volumes:
+      - './.localstack:/tmp/localstack'
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    privileged: true
+    user: localstack
+    networks:
+      - net
+      - host
+
+  node:
+    build: .
+    container_name: node
+   working_dir: /src/
+    privileged: true
+    volumes:
+      - ./:/src/
+    tty: true
+    # user: "node"
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
+      - GEM_HOME="/usr/local/bundle"
+      - PATH=$GEM_HOME/bin:$GEM_HOME/gems/bin:$PATH
+      - TF_LOG=trace
+      - TF_LOG_PATH=log.log
+      - NVM_DIR="~/.nvm" [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+      - NODE_VERSION=12.14.0
+      - PROFILE=~/.bash_profile
+    env_file:
+      - .env
+    networks:
+      - net
+      - host
+networks:
+  net:
+    driver: bridge
+  host:
+```
+
+I attempt to connect to the service from the node container using 
+
+`aws --endpoint-url="http://localstack:4583" ssm list-documents`
+
+My other localstack services run just fine.  This is only one giving me issue. 
+
+> Note:  Novice localstack level
+Hello,
+
+Is support for MediaStore on the current roadmap?
+
+Cheers

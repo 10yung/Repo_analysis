@@ -1,0 +1,244 @@
+When doing an incremental build, the build targets file generates a hash of the CodeGenInputs files and checks whether it has changed, only rebuilding the .orleans.g.cs file if it hash.  Unfortunately, these lines:
+```
+
+    <Hash ItemsToHash="@(Orleans_CodeGenInputs)">
+      <Output TaskParameter="HashResult" PropertyName="Orleans_UpdatedInputCacheContents" />
+    </Hash>
+```
+
+generate a hash of the filenames, not the contents.  So changing a content doesn't cause a regeneration of the .orleans.g.cs file and a subsequent likely failed build.
+https://github.com/dotnet/orleans/blob/77c5eba05f87d602e248b4ab174301b584d32e6b/src/Orleans.EventSourcing/Common/PrimaryBasedLogViewAdaptor.cs#L654-L688
+
+
+in UpdatePrimary() method (PrimaryBasedLogViewAdaptor.cs line 658) 
+there is NotifyViewChanges(ref version, writeResult) private method(line 675).
+this method will call Host.OnViewChanged(tentativeChanged, confirmedChanged) and it will trigger OnStateChanged() method
+then ,Host.OnViewChanged(false, true)(line 683),it will trigger OnStateChanged() method again.
+
+What's the meaning of this design?
+If I want to trigger only one notification for an event, what should I do?
+
+In Release build.
+Rebuild, Run,
+Make a chain in (say) my interfaces assembly, 
+Run.  OK.
+Switch to debug.
+Run.  Build errors as other assemblies aren't seeing the change in the interfaces assembly
+Rebuild.
+Run. OK.
+
+I just migrated a project from Orleans 1.5.10 to Orleans 3.0.2.
+
+In a grain I branch off some tasks and await them later which produces myriads of log messages. I simply can reproduce this issue by changing the _Hello World_ project located here: https://github.com/dotnet/orleans/tree/ca20a57c2a4b3a491468708b2e797006a36a01eb/Samples/3.0/HelloWorld
+
+Just replace the code of `HelloGrain.cs` in project `HelloWorld.Grains` with the following snippet:
+
+```csharp
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using HelloWorld.Interfaces;
+using Microsoft.Extensions.Logging;
+using Orleans;
+using Orleans.Concurrency;
+
+namespace HelloWorld.Grains
+{
+  /// <summary>
+  ///   Orleans grain implementation class HelloGrain.
+  /// </summary>
+  [Reentrant]
+  public class HelloGrain : Grain, IHello
+  {
+    private readonly ILogger logger;
+
+    public HelloGrain(ILogger<HelloGrain> logger)
+    {
+      this.logger = logger;
+    }
+
+    public async Task<string> SayHello(string greeting)
+    {
+      this.logger.LogInformation($"SayHello message received: greeting = '{greeting}'");
+
+      var anotherGrain = this.GrainFactory.GetGrain<IAnotherGrain>(0);
+      var tasks = new List<Task>();
+
+      for (int i = 0; i < 200; i++)
+      {
+        tasks.Add(anotherGrain.DoSomething());
+      }
+
+      await Task.WhenAll(tasks);
+
+      this.logger.LogInformation($"SayHello message processed: greeting = '{greeting}'");
+      return $"You said: '{greeting}', I say: Hello!";
+    }
+  }
+
+  public interface IAnotherGrain : IGrainWithIntegerKey
+  {
+    Task DoSomething();
+  }
+
+  [Reentrant]
+  public class AnotherGrain : Grain, IAnotherGrain
+  {
+    public Task DoSomething()
+    {
+      return Task.CompletedTask;
+    }
+  }
+}
+```
+
+Then run the silo and the client.
+
+Here is an extract of the log that is written to the console window:
+
+```text
+info: Orleans.Runtime.Catalog[100520]
+      Tried to create a duplicate activation S127.0.0.1:11111:316809145*grn/BE06DD3E/00000000@33f07e81, but we'll use S127.0.0.1:11111:316809145*grn/BE06DD3E/00
+000000@9a9b54b2 instead. GrainInstanceType is HelloWorld.Grains.AnotherGrain. Primary Directory partition for this grain is S127.0.0.1:11111:316809145. Full
+activation address is [ActivationAddress: S127.0.0.1:11111:316809145*grn/BE06DD3E/00000000@33f07e81, Full GrainId:
+[GrainId: *grn/BE06DD3E/0000000000000000000000000000000003ffffffbe06dd3e-0xE76C0D1B, IdCategory: Grain, BaseTypeCode: -1106846402 (xBE06DD3E), PrimaryKey: 0 (x0),
+UniformHashCode: 3882618139 (0xE76C0D1B)], Full ActivationId: @4339ec016c26f19d7a7a17f533f07e810000000000000000]. We have 1 messages to forward.
+
+info: Orleans.Runtime.Dispatcher[101033]
+      Forwarding 1 requests destined for address S127.0.0.1:11111:316809145*grn/BE06DD3E/00000000@33f07e81 to address
+S127.0.0.1:11111:316809145*grn/BE06DD3E/00000000@9a9b54b2 after Duplicate activation.
+
+info: Orleans.Runtime.Dispatcher[101031]
+      Trying to forward after Duplicate activation, ForwardCount = 0. OldAddress = S127.0.0.1:11111:316809145*grn/BE06DD3E/00000000@33f07e81, ForwardingAddress=
+S127.0.0.1:11111:316809145*grn/BE06DD3E/00000000@9a9b54b2, Message NewPlacement Request
+S127.0.0.1:11111:316809145*grn/F057335D/00000000@1a5e4297->S127.0.0.1:11111:316809145*grn/BE06DD3E/00000000@33f07e81 #93: , Exception: (null).
+
+info: Orleans.Runtime.Catalog[100520]
+      Tried to create a duplicate activation S127.0.0.1:11111:316809145*grn/BE06DD3E/00000000@75c6a8af, but we'll use
+S127.0.0.1:11111:316809145*grn/BE06DD3E/00000000@9a9b54b2 instead. GrainInstanceType is HelloWorld.Grains.AnotherGrain. Primary Directory partition for this
+grain is S127.0.0.1:11111:316809145. Full activation address is [ActivationAddress: S127.0.0.1:11111:316809145*grn/BE06DD3E/00000000@75c6a8af, Full GrainId:
+[GrainId: *grn/BE06DD3E/0000000000000000000000000000000003ffffffbe06dd3e-0xE76C0D1B, IdCategory: Grain, BaseTypeCode: -1106846402 (xBE06DD3E), PrimaryKey: 0 (x0),
+UniformHashCode: 3882618139 (0xE76C0D1B)], Full ActivationId: @42b6c4ba4c0bc37662dc068575c6a8af0000000000000000]. We have 1 messages to forward.
+
+info: Orleans.Runtime.Dispatcher[101033]
+      Forwarding 1 requests destined for address S127.0.0.1:11111:316809145*grn/BE06DD3E/00000000@75c6a8af to address
+S127.0.0.1:11111:316809145*grn/BE06DD3E/00000000@9a9b54b2 after Duplicate activation.
+
+info: Orleans.Runtime.Dispatcher[101031]
+      Trying to forward after Duplicate activation, ForwardCount = 0. OldAddress = S127.0.0.1:11111:316809145*grn/BE06DD3E/00000000@75c6a8af, ForwardingAddress=
+S127.0.0.1:11111:316809145*grn/BE06DD3E/00000000@9a9b54b2, Message NewPlacement Request
+S127.0.0.1:11111:316809145*grn/F057335D/00000000@1a5e4297->S127.0.0.1:11111:316809145*grn/BE06DD3E/00000000@75c6a8af #92: , Exception: (null).
+
+info: Orleans.Runtime.Catalog[100520]
+      Tried to create a duplicate activation S127.0.0.1:11111:316809145*grn/BE06DD3E/00000000@4b3b5381, but we'll use
+S127.0.0.1:11111:316809145*grn/BE06DD3E/00000000@9a9b54b2 instead. GrainInstanceType is HelloWorld.Grains.AnotherGrain. Primary Directory partition for this grain
+is S127.0.0.1:11111:316809145. Full activation address is [ActivationAddress: S127.0.0.1:11111:316809145*grn/BE06DD3E/00000000@4b3b5381, Full GrainId:
+[GrainId: *grn/BE06DD3E/0000000000000000000000000000000003ffffffbe06dd3e-0xE76C0D1B, IdCategory: Grain, BaseTypeCode: -1106846402 (xBE06DD3E), PrimaryKey: 0 (x0),
+UniformHashCode: 3882618139 (0xE76C0D1B)], Full ActivationId: @4ed243b0011955307ce908e64b3b53810000000000000000]. We have 1 messages to forward.
+
+info: Orleans.Runtime.Dispatcher[101033]
+      Forwarding 1 requests destined for address S127.0.0.1:11111:316809145*grn/BE06DD3E/00000000@4b3b5381 to address
+S127.0.0.1:11111:316809145*grn/BE06DD3E/00000000@9a9b54b2 after Duplicate activation.
+```
+
+What is happening here? Is there something wrong with my _task branch off_ approach?
+
+Orleans 1.5.10 did not write those log messages.
+
+#### Requirement 
+
+- Single instance of grain available locally on every node. 
+- Single instance of grain for given *key* locally. Let's say if there are 4 tenants then there should be 4 different instances of this grain and each of them addressable using the GUID\string key of te tenant.
+- This grain has a Timer to do some work.
+- Also, registers itself as a Subscriber (IGrainObserver) for changes from other grain.
+
+**Can you suggest if there is already a placement strategy that I can use as-is for above requirement?**
+
+#### What I have tried so far?
+
+After searching through documentation and code for the correct placement strategy for above grain, I thought StatelessWorker(1) or PreferLocalPlacement would work for my case. Later  I realized PreferLocalPlacement  might not *always* have a local instance of grain on every node.  
+
+#### Issue with StatelessWorker
+I can see that StatelessWorker(1) creates one local instance of the grain. When I used made grain as StatelessWroker, it ran into LongRunning task issue. 
+
+````cs
+
+fail: Orleans.Threading.ThreadPoolExecutor[101212]
+Work item WorkItem=WorkItemGroup:Name=[Activation: S127.0.0.1:11111:316653458*grn/BDB9242C/0edd30a9@f162738e 
+
+#GrainType=Common.Telemetry.Tracing.Tracer Placement=StatelessWorkerPlacement],WorkGroupStatus=Running Executing for 00:00:24.0630592 WorkItemGroup Details: WorkItemGroup:Name=[Activation: S127.0.0.1:11111:316653458*grn/BDB9242C/0edd30a9@f162738e 
+
+#GrainType=Common.Telemetry.Tracing.Tracer Placement=StatelessWorkerPlacement],WorkGroupStatus=Running. Currently QueuedWorkItems=2; Total EnQueued=12; Total processed=9; Quantum expirations=0;  Executing Task Id=20876 Status=Running for 00:00:24.0641348.TaskRunner=ActivationTaskScheduler-22:Queued=2; Detailed SchedulingContext=<[Activation: S127.0.0.1:11111:316653458*grn/BDB9242C/4fca1ce75f7666f8b45cbded0edd30a903ffffffbdb9242c-0xC296A8A1@f162738e 
+
+_#GrainType=Common.Telemetry.Tracing.Tracer Placement=StatelessWorkerPlacement State=Valid NonReentrancyQueueSize=0 EnqueuedOnDispatcher=0 InFlightCount=0 NumRunning=0 IdlenessTimeSpan=00:00:24.0651795 CollectionAgeLimit=02:00:00]> has been executing for long time._
+````
+unity client throw execption "Cannot find generated GrainReference class for interface 'Orleans.Runtime.IClusterTypeManager"
+Would it be possible for the next release to add the [MySQLConnector](https://github.com/mysql-net/MySqlConnector) ADO.NET Driver support to Orleans? 
+
+MySQLConnector Provider is a drop in replacement for Oracle's MySQL Provider, but provides true async support (rather than the "sync over async" that Oracle's MySQL Provider implements). 
+
+While the namespaces are unchanged to `MySql.Data.MySqlClient`, using `InvariantNameMySql` is not working, because the provider is [hard-coded](https://github.com/dotnet/orleans/blob/dad62cc16d4d6de671563f6b1e54196f617926a5/src/AdoNet/Shared/Storage/DbConnectionFactory.cs#L30) to look for `MySql.Data` assembly, but MySqlConnector assembly is called `MySqlConnector` and hence can't be accessed when using the `AdoNetInvariants.InvariantNameMySql`.
+
+Due to true lack of async support, Oracle's MySQL Provider is 6 times slower than similarly setup MSSQL Provider (a load test on MSSQL Server does run in 22 Seconds where Oracle's MySQL Provider takes 5 minutes and 30 seconds)
+Thrown System.Collections.Generic.KeyNotFoundException: 'The given key 'Microsoft.Data.SqlClient' was not present in the dictionary.'
+
+Stack trace
+```
+   at System.ThrowHelper.ThrowKeyNotFoundException[T](T key)
+   at System.Collections.Generic.Dictionary`2.get_Item(TKey key)
+   at Orleans.Clustering.AdoNet.Storage.DbConstantsStore.GetDbConstants(String invariantName)
+   at Orleans.Clustering.AdoNet.Storage.DbConstantsStore.SupportsCommandCancellation(String adoNetProvider)
+   at Orleans.Clustering.AdoNet.Storage.RelationalStorage..ctor(String invariantName, String connectionString)
+   at Orleans.Clustering.AdoNet.Storage.RelationalStorage.CreateInstance(String invariantName, String connectionString)
+   at Orleans.Clustering.AdoNet.Storage.RelationalOrleansQueries.<CreateInstance>d__5.MoveNext()
+   at System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw()
+   at System.Runtime.CompilerServices.TaskAwaiter.ThrowForNonSuccess(Task task)
+   at System.Runtime.CompilerServices.TaskAwaiter.HandleNonSuccessAndDebuggerNotification(Task task)
+   at System.Runtime.CompilerServices.TaskAwaiter`1.GetResult()
+   at Orleans.Runtime.MembershipService.AdoNetClusteringTable.<InitializeMembershipTable>d__6.MoveNext()
+   at System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw()
+   at System.Runtime.CompilerServices.TaskAwaiter.ThrowForNonSuccess(Task task)
+   at System.Runtime.CompilerServices.TaskAwaiter.HandleNonSuccessAndDebuggerNotification(Task task)
+   at System.Runtime.CompilerServices.TaskAwaiter.GetResult()
+   at Orleans.Runtime.MembershipService.MembershipTableManager.<Start>d__35.MoveNext()
+   at System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw()
+   at System.Runtime.CompilerServices.TaskAwaiter.ThrowForNonSuccess(Task task)
+   at System.Runtime.CompilerServices.TaskAwaiter.HandleNonSuccessAndDebuggerNotification(Task task)
+   at System.Runtime.CompilerServices.TaskAwaiter.GetResult()
+   at Orleans.Runtime.MembershipService.MembershipTableManager.<>c__DisplayClass53_0.<<Orleans-ILifecycleParticipant<Orleans-Runtime-ISiloLifecycle>-Participate>g__OnRuntimeGrainServicesStart|0>d.MoveNext()
+   at System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw()
+   at System.Runtime.CompilerServices.TaskAwaiter.ThrowForNonSuccess(Task task)
+   at System.Runtime.CompilerServices.TaskAwaiter.HandleNonSuccessAndDebuggerNotification(Task task)
+   at System.Runtime.CompilerServices.TaskAwaiter.GetResult()
+   at Orleans.Runtime.SiloLifecycleSubject.MonitoredObserver.<OnStart>d__12.MoveNext()
+   at System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw()
+   at System.Runtime.CompilerServices.TaskAwaiter.ThrowForNonSuccess(Task task)
+   at System.Runtime.CompilerServices.TaskAwaiter.HandleNonSuccessAndDebuggerNotification(Task task)
+   at System.Runtime.CompilerServices.TaskAwaiter.GetResult()
+   at Orleans.LifecycleSubject.<<OnStart>g__CallOnStart|7_0>d.MoveNext()
+   at System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw()
+   at System.Runtime.CompilerServices.TaskAwaiter.ThrowForNonSuccess(Task task)
+   at Orleans.LifecycleSubject.<OnStart>d__7.MoveNext()
+   at System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw()
+   at System.Runtime.CompilerServices.TaskAwaiter.ThrowForNonSuccess(Task task)
+   at System.Runtime.CompilerServices.TaskAwaiter.HandleNonSuccessAndDebuggerNotification(Task task)
+   at System.Runtime.CompilerServices.TaskAwaiter.GetResult()
+   at Orleans.Runtime.Scheduler.AsyncClosureWorkItem.<Execute>d__8.MoveNext()
+   at System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw()
+   at System.Runtime.CompilerServices.TaskAwaiter.ThrowForNonSuccess(Task task)
+   at System.Runtime.CompilerServices.TaskAwaiter.HandleNonSuccessAndDebuggerNotification(Task task)
+   at System.Runtime.CompilerServices.TaskAwaiter.GetResult()
+   at Orleans.Runtime.Silo.<StartAsync>d__65.MoveNext()
+   at System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw()
+   at System.Runtime.CompilerServices.TaskAwaiter.ThrowForNonSuccess(Task task)
+   at System.Runtime.CompilerServices.TaskAwaiter.HandleNonSuccessAndDebuggerNotification(Task task)
+   at System.Runtime.CompilerServices.ConfiguredTaskAwaitable.ConfiguredTaskAwaiter.GetResult()
+   at Orleans.Hosting.SiloWrapper.<StartAsync>d__10.MoveNext()
+   at System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw()
+   at System.Runtime.CompilerServices.TaskAwaiter.ThrowForNonSuccess(Task task)
+   at System.Runtime.CompilerServices.TaskAwaiter.HandleNonSuccessAndDebuggerNotification(Task task)
+   at System.Runtime.CompilerServices.TaskAwaiter.GetResult()
+   at Host.Program.<Main>d__0.MoveNext() in C:\git\Test\Host\Program.cs:line 35
+```
+
+"Microsoft.Orleans.Core" Version="3.0.2"
+dotnet version 3.1.100

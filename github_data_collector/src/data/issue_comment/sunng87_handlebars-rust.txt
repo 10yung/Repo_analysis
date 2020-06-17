@@ -1,0 +1,124 @@
+Using the default example for registering a custom helper:
+
+~~~
+handlebars_helper!(hex: |v: i64| format!("0x{:x}", v));
+~~~
+
+Results in the following error for handlebars version `3.0.0-beta.5` and `3.0.0-beta.4` for me:
+
+~~~
+error[E0107]: wrong number of type arguments: expected 1, found 2
+  --> src\main.rs:19:1
+   |
+19 | handlebars_helper!(hex: |v: i64| format!("0x{:x}", v));
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unexpected type argument
+   |
+   = note: this error originates in a macro outside of the current crate (in Nightly builds, run with -Z external-macro-backtrace for more info)
+
+~~~
+In addition to templates, we should allow dynamic helper and directive definition by a scripting language. Fortunately we have [rhai](https://github.com/jonathandturner/rhai), a JavaScript like scripting language with great interop-bility with Rust.
+
+As from https://www.vincentprouillet.com/blog/tera-v1-is-here/ handlebars had an unreasonable performance loss in large loop. 
+
+Before looking into very detail of this, there are some know reason may affect the perf:
+
+* Json path are parsed several times when accessing data
+* ~~Local variable like `@index` can be generated lazily~~
+* Parameter can be parsed during template parsing instead of render time 
+
+At the moment, we only support index access for Array. String is also accessible via number index. Given `s = "hello"`, the expression `s.[0]` should output `h`. 
+Handlebars is awesome. We're using it to generate services and mock services from service-model. However, generating code interactively requires a feature which seems to be missing in the library. In short, it'd be great to have a feature like the following:
+
+```rust
+// template for protobuf definitions
+let template = r#"
+    import "{{service_name}}_data_model.proto";
+    package {{service_name}}.stub_models;
+
+    {{#each methods ~}}
+    message {{this.proto_name}}Stub {
+        {{this.input_proto_type}} request = 1;
+        {{this.output_proto_type}} response = 2;
+    }
+    {{/each}}
+"#
+
+let mut reg = Handlebars::new();
+let schema = reg.infer_schema(template)?;  # missing feature!
+println!("schema: {:#?}", schema); 
+```
+
+Output: 
+
+```JavaScript
+{
+   "service_name" :  "string",
+   "methods" : [{
+         "proto_name" : "string",
+         "input_proto_type" : "string",
+         "output_proto_type" : "string"
+    }],
+}
+```
+which can be interpreted as: the schema that is required to render the given `template`, must be a `map` with (at least) two keys:
+   - `service_name` .. whose value is a string.
+   - `methods` .. whose value must be an `array of map` with (at least) 3 keys:
+      - `proto_name` .. whose value is a string
+      - `input_proto_type` .. whose value is a string
+      - `output_proto_type` .. whose value is a string
+
+If we have such a feature, then a rendering engine can be written in such a way that it'll take _any_ template from users (e.g a template-file on command-line) and then the engine will infer the schema  and then asks users to enter the values for each key/field in the schema (recursively).
+
+_(I'd be happy to implement this if the idea seems interesting and useful. It's going to be pretty challenging though.)_
+Fixes #258 
+In the handlebars.js docs the following is described (https://handlebarsjs.com/expressions.html):
+```
+This expands the default behavior of stripping lines that are "standalone" helpers (only a block helper, comment, or partial and whitespace).
+```
+They give the example:
+```
+{{#each nav}}
+  <a href="{{url}}">
+    {{#if test}}
+      {{title}}
+    {{^}}
+      Empty
+    {{/if}}
+  </a>
+{{~/each}}
+```
+That will render as
+```
+<a href="foo">
+    bar
+</a>
+<a href="bar">
+    Empty
+</a>
+```
+
+Thus rendering the line `{{#if test}}` as nothing. Currenly on handlebars.rs:
+```
+----------
+{{#if body}}
+{{ body }}
+{{/if}}
+```
+renders as
+```
+----------
+
+body here
+```
+(notice the newline between '---' and 'body here'.) Is it possible to ignore those lines?
+The original idea of `Output` API over `Write` based one, is to support for use case like generating rust code , instead of writing data to buffer directly.
+
+However, current `Output` API is still based on `Write` and can hardly deal with scenario like looping over a data structure at render time. So it's still impossible to use handlebars in procedure macro to generate rust function. 
+
+In the new `Output` API I will seek solution to support helpers, like `if` and `each`, to be defined once, and can be used in both runtime rendering and compile time render function generation.
+
+Based on our profiling result, setting local variables like `@index`/`@first`/`@last` takes about 1/7 time when rendering each helper. This can be skipped when inner template doesn't use these variables.
+
+Finally we have (wasm-bindgen)[https://github.com/alexcrichton/wasm-bindgen] to expose Rust struct to JavaScript, so we should be able to create `Handlebars` instance from JavaScript, and call any API from it.
+
+This has made it possible to create a JavaScript interface for handlebars-rust. The next step will be allowing JavaScript implemented helpers and directives being registered in handlebars-rust. 

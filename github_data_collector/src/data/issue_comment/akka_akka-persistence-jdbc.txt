@@ -1,0 +1,127 @@
+Events and Snapshots are wrapped in some Akka classe. The goal is to unwrap because those classes were never intended to serialized and saved to DB.
+
+There is a [branch](https://github.com/akka/akka-persistence-jdbc/tree/akka-serialization) in which this was fixed by James (original PR: [#180]( https://github.com/akka/akka-persistence-jdbc/pull/180)). 
+
+However, we may not integrate it into master and start over again. The main reason is that the PR is done as such that allows users to keep the old column and have mixed mode in which old data is kept around using the wrappers and new data is saved unwrapped. 
+
+This strategy amounts to the complexity of the code, plus the functionality is enabled/disabled by flags. 
+
+Instead, our current goal is to provide a new schema and a migration tool to allow previous journals to be migrated. That means that users moving to 4.0.0 will have to shutdown the system, run the migration and restarting using the new version. 
+
+This is broken down in a three main tasks:
+
+* Journal Store refactoring - #315 
+* Snapshot Store refactoring - #316 
+* Migration tool - #317
+
+The initial goal is to provide a tool based on FlyWay. Enno has done some initial experiments and we are confident that its flexible and powerful enough to run all the migrations we need.
+
+This will be a one-shot tool that will execute all the migration steps from 3.5.x to 4.0.0.
+
+We are not using FlyWay because we want to keep around a table with all applied migrations. Users may delete the table if they want. The reason is to use its migration functions.
+
+The current migrations are:
+
+* The first migration is the creation of the new tables: `journal_messages`, `tags` and `snapshots`. Users should be able to tweak the name of those tables. This is an existing feature in the plugin and we need to keep it.
+  Note: This is for users coming from 3.5.x. New users create the tables by themselves.
+* Migrate Snapshots to new table (ie: `snapshots`) and unwrap the payload.
+* Migrate Events to new table (ie: `journal_messages`) and unwrap payload. When migrating the date, the `timestamp` column must be filled with 0 (begin of epoch). 
+* Move tags to its own table (ie: `tags`) (one-to-many with Events table) and split content (currently comma-separated values).
+
+Ideally, we should be able to run the migration tool without adding custom serializers. We should be able to read the byte array, remove the current header and save only the snapshot/event payload back. This need to be confirmed though. 
+
+
+Like the journal store, the new snapshot will have a few more fields:
+
+* `ser_id` (Int)
+* `ser_manifest` (String)
+* `snapshot_payload` (String)
+
+We need to refactor the Snapshot DAO for that new format.
+
+The current table is `snapshot`. Because we don't want destructive migrations, we can add a new schema table called `snapshots`. New users can just start using it from version 4.0.0 onward. Existing users will need to run the [migration procedure](https://github.com/akka/akka-persistence-jdbc/issues/317) to copy their data from `snapshot` to `snapshots`. 
+
+`ByteArraySnapshotSerializer` should be moved to the [migration module](https://github.com/akka/akka-persistence-jdbc/issues/317) as we will need it for running migrations (reading old data from `snapshot` table).
+The new journal store table will have a few more fields: 
+
+* `ser_id` (Int)
+* `ser_manifest` (String)
+* `event_manifest` (String)
+* `event_payload` (String)
+* `writer_uuid` (String)
+* `timestamp` column (see [#28383](https://github.com/akka/akka/pull/28383)). Useful for metrics about read-side processors lagging. The timestamp will be addes as Long and defaulting to 0.
+
+We need to refactor the Journal DAO for that new format.
+
+The current table is called `journal`. Instead of altering it, we will design a new table structure and call it `journal_messages`. New users can just start using it from version 4.0.0 onward. Existing users will need to run the [migration procedure](https://github.com/akka/akka-persistence-jdbc/issues/317) to copy their data from `journal` to `journal_messages`. 
+
+`ByteArrayJournalSerializer` should be moved to the [migration module](https://github.com/akka/akka-persistence-jdbc/issues/317) as we will need it for running migrations (reading old data from the `journal` table).
+
+Next to the journal table, we need a `tags` table. There is a one-to-many relation between the two tables. One event can have zero or more tags.
+
+The Journal DAO must take this into account and execute inserts on both tables atomically. 
+
+Events by tag queries need to be refactored to consider the new `tags` table.
+<!--
+If you have a [Lightbend Subscription](https://www.lightbend.com/lightbend-platform-subscription), please reach out via the [Lightbend Portal](https://portal.lightbend.com/).
+
+Otherwise, please use the [discuss.akka.io forum](https://discuss.akka.io/) for questions instead of posting them to the issue tracker.
+-->
+
+Akka is introducing a timestamp in the EventEnvelope
+https://github.com/akka/akka/pull/28383
+
+This will be very useful to calculate lags when consuming events. 
+
+We should add a migration that introduces a new column to safe the timestamp. 
+
+The default in Akka is being set to 0L (begin of epoch). 
+
+@ignasi35 @pvlugter @ygree
+
+<!--
+
+If you have a [Lightbend Subscription](https://www.lightbend.com/lightbend-platform-subscription), please reach out via the [Lightbend Portal](https://portal.lightbend.com/).
+
+-->
+### Short description
+
+The Oracle JDBC driver is now available from [Maven Central](https://search.maven.org/artifact/com.oracle.ojdbc/ojdbc8/19.3.0.0/jar) and can be used instead of the jar from `lib/`.
+### Short description
+
+Detect if this plugin of the old 3.5.x series is on the classpath and make it fail if so.
+
+### Details
+
+As the group ID changes to "com.lightbend.akka" users may end up with two versions of this plugin on their classpath.
+Find a way to detect that and fail.
+
+Updates [org.scalatest:scalatest](https://github.com/scalatest/scalatest) [from 3.0.8 to 3.1.0](https://github.com/scalatest/scalatest/compare/release-3.0.8...release-3.1.0).
+[Release Notes/Changelog](https://github.com/scalatest/scalatest/releases/tag/release-3.1.0)
+
+I'll automatically update this PR to resolve conflicts as long as you don't change it yourself.
+
+If you'd like to skip this version, you can just close this PR. If you have any feedback, just mention me in the comments below.
+
+Have a fantastic day writing Scala!
+
+<details>
+<summary>Ignore future updates</summary>
+
+Add this to your `.scala-steward.conf` file to ignore future updates of this dependency:
+```
+updates.ignore = [ { groupId = "org.scalatest", artifactId = "scalatest" } ]
+```
+</details>
+<details>
+<summary>Applied Migrations</summary>
+
+* https://raw.githubusercontent.com/scalatest/autofix/e4de53fa40fac423bd64d165ff36bde38ce52388/3.0.x/rules/src/main/scala/org/scalatest/autofix/v3_0_x/RenameDeprecatedPackage.scala
+* https://raw.githubusercontent.com/scalatest/autofix/e4de53fa40fac423bd64d165ff36bde38ce52388/3.1.x/rules/src/main/scala/org/scalatest/autofix/v3_1_x/RewriteDeprecatedNames.scala
+</details>
+
+labels: semver-minor, scalafix-migrations
+### Short description
+
+By tagging the tests with the database they use the jobs could be split per database type. 
+I'm not sure if that would be any faster.

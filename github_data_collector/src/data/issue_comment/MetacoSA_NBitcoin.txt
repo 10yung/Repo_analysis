@@ -1,0 +1,106 @@
+Also tweaked some altcoin tests to allow them to pass more consistently on multiple networks.
+When I tried below, I got `false`
+```C#
+Script.FromHex("16001449f70dd267edea7c6f565e937fac356033397003").IsScriptType(ScriptType.P2SH);
+```
+
+Infact no matter what ScriptType have been chosen, it always return `false`. It's odd.
+This is the initial request to add Terracoin.  I made this fork a while ago and tested it but got side tracked, I just merged in all the upstream changes but haven't tested it since.  I wanted to make the request before I forgot, I'll be testing this week but looking at the PR I can't see things breaking.
+I've performed a simple benchmark to compare NBitcoin Hash256 vs my (dotnetcore 3.1) double hash implementation
+
+the result are pretty cool so I'm sharing in case you want to improve your performance
+![image](https://user-images.githubusercontent.com/5107375/71550926-a7528080-29db-11ea-967f-a608441c0af3.png)
+
+Code is pretty simple, just make use of span and stackallock
+https://github.com/MithrilMan/MithrilShards/blob/9c38e4316e508a0bc69b4307a03f8f4cc9c97319/src/MithrilShards.Core/Crypto/HashGenerator.cs#L14-L20
+
+benchmark is here:
+https://github.com/MithrilMan/MithrilShards/blob/9c38e4316e508a0bc69b4307a03f8f4cc9c97319/MithrilShards.P2P.Benchmark/Benchmarks/SHA256.cs
+
+note how I even used wrapped my result in a call to `new NBitcoin.uint256(` in order to have the same output (I didn't implemented yet a uint256 type and I'm not sure if I'll do or stick with a byte array internally, in case I'll implement a new one I can share compare then both implementations like I'm doing now
+
+as you can see from the result, my implementation take half of garbage collector space (probably just because of uint256) and allocate 40% less
+https://github.com/MetacoSA/NBitcoin/blob/a615d201aff38b55e954fa3a184a0a439f202b12/NBitcoin/IpExtensions.cs#L123-L127
+
+this code is awkward (`bytes[15 - 15]` ==> `bytes[0]`, probably the result of a typo long time ago?
+compare it to bitcoin one
+https://github.com/bitcoin/bitcoin/blob/47d981e8273804a040d71665a4cb16038d6717e1/src/netaddress.cpp#L191-L194
+
+bitcoin uses there a GetByte method probably to deal with endianness but ended up being just a
+```
+unsigned int CNetAddr::GetByte(int n) const
+{
+    return ip[15-n];
+}
+```
+since you didn't implemented that call, why don't remove all these 15-x from code?
+
+
+another think I'd want to point out is 
+```
+public static bool IsRFC4862(this IPAddress address)
+{
+	var bytes = address.GetAddressBytes();
+	byte[] pchRFC4862 = new byte[] { 0xFE, 0x80, 0, 0, 0, 0, 0, 0 };
+	return ((Utils.ArrayEqual(bytes, 0, pchRFC4862, 0, pchRFC4862.Length) ? 0 : 1) == 0);
+}
+```
+
+everytime IsRFC4862 is called there is a new allocation of pchRFC4862, I'd suggest to put it as static
+
+using Span it may seems like this (not tested)
+```
+private static readonly byte[] pchRFC4862 = new byte[] { 0xFE, 0x80, 0, 0, 0, 0, 0, 0 };
+public static bool IsRFC4862(this IPAddress address) {
+   var bytes = address.GetAddressBytes();
+   Span<byte> span = bytes.Length > pchRFC4862.Length ? bytes.AsSpan(0, pchRFC4862.Length) : bytes;
+   return span.SequenceEqual(pchRFC4862);
+}
+```
+Why does a same transaction signed separately have different witness values?
+
+I signed a bitcoin testnet transaction using nbitcoin library and got an output:
+
+02000000000101853b6bcbc78cf4cd621abb7edca78383ce15a34b6617347258d72d13ecb8fcbc000000001716001487463af228c128aad9371c3df1236d0518c32f44ffffffff01604898000000000017a9141b16cfd66b7f084bf95baf36d14df67f03ef23048702473044022015499aee1e03fc9dd853abf3a9307ebd19dfd9e4f5209a7810be48dfed1c698002205d6c0da0a26918ca38d5aaf9629f7dd71119334e168aafd9f3363f05cb06c967012102739a2f893507714c7e1b37510dede5aad15862b018f6ad9e9402e0b7290a133300000000
+
+Then I signed the same transaction with bitcoin-core and it returned an output :
+
+02000000000101853b6bcbc78cf4cd621abb7edca78383ce15a34b6617347258d72d13ecb8fcbc000000001716001487463af228c128aad9371c3df1236d0518c32f44ffffffff01604898000000000017a9141b16cfd66b7f084bf95baf36d14df67f03ef23048702473044022015499aee1e03fc9dd853abf3a9307ebd19dfd9e4f5209a7810be48dfed1c698002205d6c0da0a26918ca38d5aaf9629f7dd71119334e168aafd9f3363f05cb06c967012102739a2f893507714c7e1b37510dede5aad15862b018f6ad9e9402e0b7290a133300000000
+
+On comparing the outputs, the txwitness stack value differs.
+
+Bitcoin-core witness data :-
+
+"txinwitness": [
+                "3044022015499aee1e03fc9dd853abf3a9307ebd19dfd9e4f5209a7810be48dfed1c698002205d6c0da0a26918ca38d5aaf9629f7dd71119334e168aafd9f3363f05cb06c96701",
+                "02739a2f893507714c7e1b37510dede5aad15862b018f6ad9e9402e0b7290a1333"
+            ]
+
+nBitcoin witness data :-
+
+"txinwitness": [
+                "30440220376c73ba8bacbc791fc45ed596c8f973fe79ef0c1bb37a16fb2043dc0998ea62022027c7135359a103f243d865d89eb913e180ea751669b7a2f910b08eb3edcc76f501",
+                "02739a2f893507714c7e1b37510dede5aad15862b018f6ad9e9402e0b7290a1333"
+            ]
+
+But still, I'm able to send the transaction signed by nBitcoin.
+
+So my questions are:
+1) what are the values in witness stack?
+2) why the same transaction have different txwitness value?
+While trying to spend the below coin.. Live BTC
+4c4b7d7cd0ab2c05e735d280901ac808f5eedc9deb09c300a3f98fd4b0754153
+
+we get this error : 
+Script error on input 0 (InvalidStackOperation)
+
+Hi,
+
+Any reason why I have no problems making a TransactionBuilder object in c# but VB.net keeps refusing building a new object? always reports no "new" overload accessible but I can use it no problem under c#.
+
+I would like to have a Bip32 address delegated so that it can send payments to services it depends on. (A cloud service that invokes sub-subscriptions)
+
+I don't want the sub-subscriptions to be able to collude and determine they are on the same account and would like to prevent the sub sub accounts from seeing the "delegated master"?
+
+Can I neuter an HD wallet at different levels of the hierarchy?
+https://programmingblockchain.gitbook.io/programmingblockchain/key_generation/bip_32

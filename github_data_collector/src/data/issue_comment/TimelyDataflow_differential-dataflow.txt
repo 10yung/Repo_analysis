@@ -1,0 +1,97 @@
+https://github.com/TimelyDataflow/differential-dataflow/blob/fbea6a8ec599c6173642bf5b40a19ea3024d537d/src/trace/implementations/spine_fueled.rs#L410
+
+I think this is wrong: it should be the other way around.
+
+Consider the case in which:
+* `through_frontier (TF) = {(1,1)}`
+* `pending[0].upper() (UP) = {(0,2), (1,0)}`
+
+We should not move `pending[0]` to `merging` because its frontier is not dominated by `TF`,
+and as such we should not allow it to be merged with other batches.
+However, the expression evaluates to `true`, since `(1,0) <= (1,1)`.
+
+Moreover, we should also enter the loop in the case of empty `TF` (as it dominates every other frontier).
+
+I think the correct check should be 
+```
+(self.through_frontier.is_empty()  
+  || self.pending[0].upper().iter().all(|t1| self.through_frontier.iter().any(|t2| t1.less_equal(t2))))
+```
+
+Some uses of differential dataflow aim to observe an output at a specific time and then walk away from the dataflow. Such a case must currently start a streaming dataflow, await the visibility of results, and then pro-actively shut down the input source.
+
+It seems that an `import` operator should be able to take instruction about when to drop its capability and cease propagating batches. For example, one could supply a vector of timestamps with the intended semantics that the output must be correct for any time less or equal an element of the vector. Once the trace's upper frontier is not less or equal to any element of the vector it can drop its capability. Batches can also be filtered, unless this breaks everything horribly, by looking at the differences between its upper and lower frontiers and seeing if any timestamps are greater or lower than this bound.
+This might be just another manifestation of #234, but submitting anyway in case it's not. Using the same dataflow graph, I insert a single graph edge and two nodes and then remove them at the next epoch in a loop. All is fine with one worker, but with `-w 3` I observe that the memory footprint of the program keep growing monotonically.  The repro is in the `dogs_leak` (no pun intended) branch of my DD fork:
+
+https://github.com/ryzhyk/differential-dataflow/tree/dogs_leak
+Hi,
+
+This is just a usability hint. I am trying to work with custom structs in differential dataflow and I spent some hours figuring out why I cannot invoke `count` on collections using my struct. It turned out I just forgot implement `Hashable` but the error message during compilation makes it  very hard to arrive at that insight:
+
+```
+error[E0599]: no method named `count` found for type `differential::itembased::differential_dataflow::Collection<differential::itembased::timely::dataflow::scopes::Child<'_, differential::itembased::timely::worker::Worker<differential::itembased::timely::communication::Allocator>, T>, differential::lsh::Sample>` in the current scope
+  --> src/differential/lsh.rs:74:14
+   |
+74 |             .count()
+   |              ^^^^^ method not found in `differential::itembased::differential_dataflow::Collection<differential::itembased::timely::dataflow::scopes::Child<'_, differential::itembased::timely::worker::Worker<differential::itembased::timely::communication::Allocator>, T>, differential::lsh::Sample>`
+   |
+   = note: the method `count` exists but the following trait bounds were not satisfied:
+           `&mut differential::itembased::differential_dataflow::Collection<differential::itembased::timely::dataflow::scopes::Child<'_, differential::itembased::timely::worker::Worker<differential::itembased::timely::communication::Allocator>, T>, differential::lsh::Sample> : std::iter::Iterator`
+           `differential::itembased::differential_dataflow::Collection<differential::itembased::timely::dataflow::scopes::Child<'_, differential::itembased::timely::worker::Worker<differential::itembased::timely::communication::Allocator>, T>, differential::lsh::Sample> : differential::itembased::differential_dataflow::operators::Count<_, _, _>`
+
+warning: unused import: `self::differential_dataflow::operators::Count`
+  --> src/differential/lsh.rs:17:5
+   |
+17 | use self::differential_dataflow::operators::Count;
+
+```
+Hi!
+
+I have a question on how DD decides which batches to compact? Specifically, when using the `UnorderedInput` interface to insert data into DD, consider the following pseudo code and 2 scenarios, both using the `Pair` timestamp:
+
+```rust
+for i in 0..m {
+    if (i+1) != m { let edge_cap_next = edge_cap.delayed((i+1, 0)); }        (i)
+    for j in 0..n {
+        edge_input.session(edge_cap.clone()).give(edge, (i, j), diff)
+        edge_cap.downgrade((i, j+1));
+    }
+    if (i+1) != m { edge_cap = edge_cap_next;  }                            (ii)
+}
+```
+
+* When there are only one dimensional timestamps: [(0,0), (0,1), (0,2), ...(0,25)] (`m=1` and `n=25`), there will no call to `edge_cap.delayed(Pair(1,0))` in (i) above. Does that mean DD assumes there will be no data coming in at (1,*) or higher timestamps and starts compacting the batches as the timestamps move forward? Specifically, when computing at (0,25), will DD compact all data from (0,0) to (0,24) into a single batch, which would mean the computation at (0,25) will only be accessing diffs at one earlier timestamps (0,24) instead of all 24 earlier timestamps separately?
+
+Experimentally, by adding the if condition at lines (i) and (ii) above (which then prevents creating the capability at (1,0)), runtime for `wcc` for 90 1D timestamps (`m=1` and `n=90`) get better by 2.4X.
+
+* Now consider the case when data is inserted at timestamps that can be organized in a 5x5 2D grid (`m=5` and `n=5`). My question is, after statement (ii) above executes, does DD reason that there will be no more inputs at (i, *) (because we drop that capability) and hence can start compacting earlier rows?
+
+Consider the computation at timestamp (3, 3), does DD compact the rows from 0 to 2 in any way? For example, DD can potentially compact all data from (0,0) to (2,3), which would mean the computation at (3,3) will only need to compute earlier diffs from 4 earlier batches: (2,3), (3,0), (3,1) and (3,2). Or does DD keep the diff data separate at all timestamps from (0,0) to (3,3)? In that case, the computation at (3,3) will need to sum the earlier diffs at each of the 16 batches with timestamps less than (3,3)? Or maybe DD does some compaction in between?
+`an_array.into_iter()` currently just works because of the autoref
+feature, which then calls `<[T] as IntoIterator>::into_iter`. But
+in the future, arrays will implement `IntoIterator`, too. In order
+to avoid problems in the future, the call is replaced by `iter()`
+which is shorter and more explicit.
+
+See https://github.com/rust-lang/rust/pull/65819 for more information
+I wonder if there is a way to attach an `inspect()` operator to a collection after the dataflow graph has been created. This would be helpful in situations where I do not know ahead of time which collections I will need to inspect, and I do not want to pay even the small price of attaching `inspect()` to all collections ahead of time.
+
+Thanks!
+I might be missing something, but going directly from a top-level scope into an `AltNeu` sub-scope is a bit unergonomic at the moment, because `enter_at` assumes a `Product` timestamp. I'm haven't had the time to check where this specialisation is enforced.
+
+In any case, it's not a big deal, I'm working around this by simply breaking out all of the stuff that `enter_at` is doing under the hood.
+
+``` rust
+scope.scoped::<AltNeu<S::Timestamp>, _, _>("AltNeu", |subgraph| {
+    let proposals = propose
+        .as_collection(|e: &Value, _v| e.clone())
+        .inner
+        .enter(subgraph)
+        .delay(move |_datum, t| AltNeu { neu: true, ..t.clone() })
+        .map(move |(data, t, diff)| {
+            let new_time = AltNeu { time: t.clone(), neu: true }
+            (data, new_time, diff)
+        });
+});
+``` 
+From @quodlibetor: When collections have primary keys, we should be able to perform key-wise actions through a cursor by traversing new-to-old batches and looking for the first positive accumulation. Once identified, this should be the only record, under the hypothesis that each prior collection accumulated to something non-negative. This seems like an eminently plausible case, and the optimization of avoiding seeks into the large batches is appealing.

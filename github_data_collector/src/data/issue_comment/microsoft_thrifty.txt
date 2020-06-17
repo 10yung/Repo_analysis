@@ -1,0 +1,309 @@
+We should add a Gradle plugin to allow compilation of Thrift as part of a regular build.
+
+We'd need to:
+- Design an extension API for use in gradle files
+- Register one or more source sets (defaulting to `src/main/thrift`)
+- Possibly refactor schema/codegen to provide a configure-time link between .thrift input and .kt outputs (maybe not part of the MVP)
+I'm writing a TypeProcessor that adds a method in generated code for a thrift union type. 
+Since the processor only gets the generated class as input parameter, it's rather hard to figure out if the generated Thrifty code reflects a union in thrift. 
+
+I came up with the following which seems rather fragile to me:
+```java
+boolean isUnion = type.typeSpecs.stream()
+        .filter(e -> "Builder".equals(e.name))
+        .findFirst()
+        .flatMap(t -> t.methodSpecs.stream().filter(m -> "build".equals(m.name)).findFirst())
+        .map(m -> m.code.toString().contains("Invalid union;"))
+        .orElse(false);
+```
+
+Would it be a good idea to add the `userType` as a second argument in the process method? It would make code generation in general a lot easier since generated code can be based upon the thrift schema AST instead of the generated code.
+
+I can draft a PR if this seems a good idea. Changing the method will break the TypeProcessor api.
+We would instead use the default value specified in thrift (if the field has one), or null for optional/unrequired fields.  We'd still have to throw for required fields without a default, but I'm OK with that - the design of enums in thrift isn't forward-compatible as is, and required fields doubly so.
+
+See #84 for the conversation sparking this feature.
+Hi there, this is my first time contributing to this project, but I hope I can add some value 👋 
+
+### Introduction
+
+Here at The Guardian we have a tool called Ophan to which we send analytics data using Thrift. I've recently been working on a research-heavy project where I've been trying to write a cross-platform client library for this tool, Ophan, using [Kotlin Multiplatform](https://kotlinlang.org/docs/tutorials/multiplatform-library.html).
+
+I have been able to do this 👉 [multiplatform-ophan](https://github.com/guardian/multiplatform-ophan) 👈 and Thrifty, with some important modifications, was an important part of the solution. I'd like to investigate whether there's a way we can incorporate those modifications back into this repo so that Thrifty can be used in other Kotlin Multiplatform projects.
+
+### Requirements
+
+Briefly, Kotlin Multiplatform projects consist of some "common" code which can be compiled for, and run on, any of the supported platforms, as well as platform-specific portions of code which are only used on a single platform. Common code is Kotlin, but with only acces to the "common" parts of Kotlin's standard library and none of the Java standard library (for example there is no `java.util.LinkedList`) because it must be able to run in non-JVM environments. This obviously limits not only the code you can write yourself, but what your common code can depend upon.
+
+If we consider Thrifty specifically, there are two key requirements for making it usable in this situation:
+
+1. The Thrifty **compiler** must output Kotlin code which does not import any classes which are not available in the common Kotlin standard library, and
+2. The Thrifty **runtime** must abide by the same restrictions.
+
+### Proposed solutions
+
+#### Requirement 1
+
+This is actually really easy to solve with the existing compiler options!
+
+```
+java -jar thrifty-compiler.jar
+    --lang kotlin
+    --omit-generated-annotations
+    --list-type=kotlin.collections.ArrayList
+    --set-type=kotlin.collections.LinkedHashSet
+    <other options/params>
+```
+
+I've used this successfully in `multiplatform-ophan` here:
+
+https://github.com/guardian/multiplatform-ophan/blob/master/build.gradle.kts#L86
+
+My only question here is whether it's worth adding a new `--lang kotlin-multiplatform` option which sets some of those other values automatically?
+
+#### Requirement 2 
+
+This is trickier. Essentially you have to take the existing `thrifty-runtime` source and modify it to first of all be Kotlin and secondly, use only valid common Kotlin dependencies.
+
+I have done this, here:
+
+https://github.com/guardian/multiplatform-ophan/tree/master/src/commonMain/kotlin/com/microsoft/thrifty
+
+but I have only included the `CompactProtocol` and I have not created tests for this code. However, I hope this does provide a solid basis for a `thrifty-runtime-ktx-multiplatform` module in this repo.
+
+### Next steps
+
+Really up to you as the project maintainers to decide the best way to proceed. I hope this can be of some use to this project and I look forward to hearing from you.
+Talked offline, here's a dump of reflective extensions we currently employ because 🙃 
+
+```kotlin
+package com.uber.thriftyextensions
+
+import com.microsoft.thrifty.schema.Field
+import com.microsoft.thrifty.schema.Location
+import com.microsoft.thrifty.schema.Requiredness
+import com.microsoft.thrifty.schema.UserElement
+import com.microsoft.thrifty.schema.UserType
+import com.microsoft.thrifty.schema.parser.ConstValueElement
+import com.microsoft.thrifty.schema.parser.FieldElement
+import java.lang.reflect.Modifier
+import java.util.UUID
+
+/*
+ * Unsafe reflection-based extensions to Thrifty's APIs. Necessary because there's no APIs available
+ * for adjusting [FieldElement] APIs.
+ */
+
+/**
+ * Creates a new copy of this [Field] with `required` [Field.required]ness reflectively set via its
+ * internal [FieldElement] field.
+ *
+ * @receiver the source [Field] to use. A defensive copy will be made.
+ * @return the new [Field] instance.
+ */
+fun Field.makeRequired(): Field {
+  val newElement = (elementField.get(this) as FieldElement).copy(requiredness = Requiredness.REQUIRED)
+  return toBuilder().build()
+      .apply {
+        elementField.set(this, newElement)
+      }
+}
+
+/**
+ * Creates a new copy of this [Field] with `optional` [Field.required]ness reflectively set via its
+ * internal [FieldElement] field.
+ *
+ * @receiver the source [Field] to use. A defensive copy will be made.
+ * @return the new [Field] instance.
+ */
+fun Field.makeOptional(): Field {
+  val newElement = (elementField.get(this) as FieldElement).copy(requiredness = Requiredness.OPTIONAL)
+  return toBuilder().build()
+      .apply {
+        elementField.set(this, newElement)
+      }
+}
+
+/**
+ * Creates a new copy of this [Field] with the specified [value] default value reflectively set via
+ * its internal [FieldElement] field.
+ *
+ * @receiver the source [Field] to use. A defensive copy will be made.
+ * @return the new [Field] instance.
+ */
+fun Field.withDefaultValue(value: ConstValueElement): Field {
+  val newElement = (elementField.get(this) as FieldElement).copy(constValue = value)
+  return toBuilder().build()
+      .apply {
+        elementField.set(this, newElement)
+      }
+}
+
+/**
+ * Creates a new copy of this [Field] with the specified [newId] reflectively set via its internal
+ * [FieldElement] field.
+ *
+ * @param newId the new id to set.
+ * @receiver the source [Field] to use. A defensive copy will be made.
+ * @return the new [Field] instance.
+ */
+fun Field.newId(newId: Int): Field {
+  val newElement = (elementField.get(this) as FieldElement).copy(fieldId = newId)
+  return toBuilder().build()
+      .apply {
+        elementField.set(this, newElement)
+      }
+}
+
+/**
+ * Ensures [this] list of [Field]s are valid (such as ensuring they've got unique field IDs).
+ *
+ * @param ensuredLocation the [Location] of the element holding this list to ensure fields match it.
+ * @receiver the source list to check. A defensive new copy will be made.
+ * @return the new fields list with the new field appended to the end.
+ */
+fun List<Field>.asSafeFields(ensuredLocation: Location): List<Field> {
+  if (distinctBy { it.id }.size == size) {
+    // They're all distinct, just return them with locations ensured
+    return map {
+      it.toBuilder()
+          .location(it.location.matchTo(ensuredLocation))
+          .build()
+    }
+  }
+  val safeFields = fold(emptyList<Field>()) { cur, next ->
+    cur.safeAddField(next, ensuredLocation)
+  }
+  check(safeFields.size == size) {
+    "Data lost!"
+  }
+  return safeFields
+}
+
+/**
+ * Safely adds a new [Field] to this collection while ensuring that it does not conflict with the
+ * existing field ids.
+ *
+ * @param newField the new [Field] to add.
+ * @param ensuredLocation the [Location] of the element holding this list to ensure fields match it.
+ * @receiver the source list to add this to. A defensive new copy will be made.
+ * @return the new fields list with the new field appended to the end.
+ */
+fun List<Field>.safeAddField(newField: Field, ensuredLocation: Location): List<Field> {
+  val defensiveCopy = newField.toBuilder()
+      .location(newField.location.matchTo(ensuredLocation))
+      .build()
+  if (none { it.id == newField.id }) {
+    return plus(defensiveCopy)
+  }
+  val finalField = map(Field::id).max()?.let { maxId ->
+    defensiveCopy.newId(maxId + 1)
+  } ?: defensiveCopy
+  return plus(finalField)
+}
+
+private fun Location.matchTo(source: Location): Location {
+  return if (base == source.base && path == source.path) {
+    this
+  } else {
+    Location.get(source.base, source.path)
+  }
+}
+
+/**
+ * Creates a new copy of this [Field] with the specified [newUUID] reflectively set via its internal
+ * [FieldElement] field.
+ *
+ * @param newUUID the new UUID to use. Defaults to a randomly generated one.
+ * @receiver the source [Field] to use. A defensive copy will be made.
+ * @return the new [Field] instance.
+ */
+fun <T : UserElement> T.newUuid(newUUID: UUID = UUID.randomUUID()): T {
+  if (this is UserType) {
+    UserType::class.java.getDeclaredField("mixin")
+  } else {
+    javaClass.getDeclaredField("mixin")
+  }
+      .apply {
+        isAccessible = true
+        val modifiersField = java.lang.reflect.Field::class.java
+            .getDeclaredField("modifiers")
+        modifiersField.isAccessible = true
+        modifiersField.setInt(this, modifiers and Modifier.FINAL.inv())
+      }
+      .get(this)
+      .let { mixin ->
+        // UserElementMixin
+        mixin.javaClass.getDeclaredField("uuid")
+            .apply {
+              isAccessible = true
+              val modifiersField = java.lang.reflect.Field::class.java
+                  .getDeclaredField("modifiers")
+              modifiersField.isAccessible = true
+              modifiersField.setInt(this, modifiers and Modifier.FINAL.inv())
+            }
+            .apply {
+              val olduuid = uuid
+              set(mixin, newUUID)
+              check(olduuid != uuid) {
+                "New UUID setting failed!"
+              }
+            }
+      }
+  return this
+}
+
+/**
+ * Sets a new default value for a given [Field].
+ *
+ * @param const the new [ConstValueElement] to set
+ * @return this same [Field] instance.
+ */
+fun Field.setDefaultValue(const: ConstValueElement): Field {
+  val newElement = (elementField.get(this) as FieldElement).copy(constValue = const)
+  elementField.set(this, newElement)
+  return this
+}
+
+private val elementField = Field::class.java.getDeclaredField("element")
+    .apply {
+      isAccessible = true
+      val modifiersField = java.lang.reflect.Field::class.java
+          .getDeclaredField("modifiers")
+      modifiersField.isAccessible = true
+      modifiersField.setInt(this, modifiers and Modifier.FINAL.inv())
+    }
+
+```
+They're apparently legal thrift! https://github.com/Microsoft/thrifty/pull/274/files
+
+Not sure if there's much to do here though since they're not user elements
+They're apparently legal thrift! https://github.com/Microsoft/thrifty/pull/274/files
+They're apparently legal thrift! https://github.com/Microsoft/thrifty/pull/274/files
+Added binary literals to grammar and code. Did it best to my knowledge however I probably got things wrong at places. Thank you in advance for reviewing :)
+Will solve #185 .
+As I convert more and more (Java) code from Apache Thrift to Thrifty, I've started to run into a pattern where I start with an existing struct object that _might_ be `null` and then "extends" that struct by setting some existing values. The most direct way to do this is by conditionally calling the correct Builder constructor:
+
+```java
+public Struct updateStruct(Struct struct) {
+    Struct.Builder builder = (struct == null)
+        ? new Struct.Builder()
+        : new Struct.Builder(struct);
+
+    builder.foo(True);
+
+    return builder.build();
+}
+```
+
+It would be much more convenient if `Struct.Builder` accepted a nullable argument and added a `if (struct != null)` guard to the generated code so the above could just become:
+
+```java
+public Struct updateStruct(Struct struct) {
+    return new Struct.Builder(struct)
+        .foo(True)
+        .build();
+}
+```
+
+That would detract a bit from the purity of the existing Builder interface, but this could be a case where caller convenience could take precedence.

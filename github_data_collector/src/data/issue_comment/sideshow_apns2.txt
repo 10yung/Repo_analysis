@@ -1,0 +1,204 @@
+1. What version of Go are you using? `go version`
+go version go1.13.1 linux/amd64
+
+2. What OS and processor architecture are you using? `go env`
+GOHOSTARCH="amd64"
+GOHOSTOS="linux"
+
+3. What did you do?
+Using the Channel example https://github.com/sideshow/apns2/blob/master/_example/channel/main.go, I am trying to push upwards of 100,000 notifications, each with a payload of circa 1500 bytes (APNS limit is 4KB).
+
+4. What did you expect to see?
+Using 1 connection, and 1000 workers, I expected to see 1000 notifications being sent in parallel, multiplexed over the H2 connection, and for the workers to process all notifications. (APNS reporting 1000 Max Concurrent Streams).
+
+5. What did you see instead?
+I see 54 notifications sent initially, but then nothing is transferred until ACKs are received, at which time another 23 notifications are sent. Again nothing more is transferred until ACKs are received. This continues to repeat.
+
+**Further Information**
+APNS RTT is ~150ms (Server in London), so this takes a long time to process with a ~150ms delay after every 23 pushes.
+
+Looking in WireShark, it appears that APNS are allowing TCP window scaling 7 (128), yet bytes in flight seem to stay below 64KB at all times.
+
+If I open two connections (from the same server) and share the 1,000 workers (so 500 each, alternating), the speed is much quicker. If I create 3 connections, and spread the 1,000 workers over the 3 connections evenly then this is quicker again.
+
+Of course in the multi connection scenarios the 1,000 stream limit on each connection is not fully utilised.
+
+As mentioned above, it appears that the in-flight bytes are staying below 64KB at all times on each connection, despite APNS advertising a wscale of 7 (128). I see that the Receive Window starts at 28KB, but rapidly increases. According to Wireshark, the receive window on the APNS side is quickly growing to over 150KB, but looking at the in flight traffic, there appears to be a ceiling below 64KB that is being hit, with generally circa 40KB in flight.
+
+It doesn't appear to be a CWND issue (usually around 308).
+
+**Current Thoughts**
+My feeling right now is that I am coming up against some sort of buffer limit, be that a default within my networking stack, or something in the GOLANG NET code perhaps? Alternatively, is there some sort of limit related to H2 PUSH (again, perhaps configurable?).
+
+I have already reached out to @sideshow about this, who has confirmed that using multiple connections achieved much higher throughput. 
+
+Whilst I can create multiple connections (I have created 40 without any issue, and this reduced the delivery time to acceptable levels), I would really like to get to the bottom of this, and feel that with the upcoming depreciation of the older APNS API, that many of us would like to get this sorted.
+
+I should note that I do have a DTS ticket open with Apple around this, and whilst that hasn't uncovered anything of significant interest, I could use it in conjunction with any feedback here if needed.
+
+**Wireshark graph**
+Here is a Wireshark window scaling graph showing how the traffic is not approaching the receive window.
+<img width="1424" alt="apns2_tcpdump_limited" src="https://user-images.githubusercontent.com/10706434/72525570-5efce480-385c-11ea-8b55-7fa333c5d877.png">
+
+Thanks.
+Fixes https://github.com/sideshow/apns2/issues/98
+When I call apns2, it sometimes returns a timeout and the process will shut down.
+I am using go version go1.12.5 darwin/amd64
+I have seen #24 and #21, I understand that they have solved it,but there will still be problems.
+My code
+```
+func ApplePushNotificationService(deviceToken string, parameters string) {
+	fmt.Println("开始推送", deviceToken, parameters)
+	cert, err := certificate.FromP12File("./hookupAPNS.p12", "******") //filename 为服务器上的p12文件地址
+	if err != nil {
+		log.Fatal("Cert Error:", err)
+	}
+	notification := &apns2.Notification{}
+	notification.DeviceToken = deviceToken
+	notification.Topic = "com.preferme.hookup"
+	payload := payload.NewPayload().Alert(parameters).AlertBody(parameters).Badge(1).Sound("sound.wav").Custom("key", "val")
+	notification.Payload = payload
+	client := apns2.NewClient(cert).Production()
+	res, err := client.Push(notification)
+	if err != nil {
+		log.Fatal("push Error:", err)
+	}
+	fmt.Printf("%v %v %v\n", res.StatusCode, res.ApnsID, res.Reason)
+}
+```
+
+error log
+```
+push Error:Post https://api.development.push.apple.com/3/device/4dc8efa9c46b0206c2e6e0dda6a1314c457704f897747ae1f7dffe4ef31a443b: dial tcp: lookup api.development.push.apple.com on 10.143.22.116:53: read udp 10.116.213.185:38055->10.143.22.116:53: i/o timeout
+```
+Go standard crypto package only support unencrypted PKCS#8 private keys
+so this function cannot parse encrypted PKCS#8 private keys .
+
+```
+func parsePrivateKey(bytes []byte, password string) (crypto.PrivateKey, error) {
+	var key crypto.PrivateKey
+	key, err := x509.ParsePKCS1PrivateKey(bytes)
+	if err == nil {
+		return key, nil
+	}
+        //x509.ParsePKCS8PrivateKey not support parse encrypted PKCS#8 private keys
+	key, err = x509.ParsePKCS8PrivateKey(bytes, []byte(password))  
+	if err == nil {
+		return key, nil
+	}
+	return nil, ErrFailedToParsePrivateKey
+}
+```
+
+I tried another resposity [https://github.com/youmark/pkcs8](https://github.com/youmark/pkcs8) , it works. maybe you can merge into your project 
+Hi~
+   I read the code of client_manager.go, and I have a question about mutex. For example:
+
+one part:
+
+func (m *ClientManager) Add(client *Client)
+```go
+...
+m.mu.Unlock()
+m.removeOldest()
+m.mu.Lock()
+```
+
+two part:
+```go
+func (m *ClientManager) removeOldest() {
+	m.mu.Lock()
+	ele := m.ll.Back()
+	m.mu.Unlock()
+	if ele != nil {
+		m.removeElement(ele)
+	}
+}
+
+func (m *ClientManager) removeElement(e *list.Element) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ll.Remove(e)
+	delete(m.cache, e.Value.(*managerItem).key)
+}
+```
+
+It seems that it can not need "two" m.mu.Lock ?
+
+The below codes are right?
+func (m *ClientManager) Add(client *Client)
+```go
+...
+m.removeOldest()
+```
+
+If I just use m.mu.Lock once, it is not good for high concurrency?
+
+Can you answer me about this question?
+
+I appreciate it
+
+
+Please ensure that you are using the latest version of the master branch before filing an issue.
+
+Also make sure to include logs (if applicable) to help reproduce the issue by setting the `GODEBUG=http2debug=2` env var.
+
+1. What version of Go are you using? `go version`
+1.9.2
+
+2. What OS and processor architecture are you using? `go env`
+linux amd64
+
+3. What did you do?
+Here's my code simulate the situation which reach the `MaxAge`:
+
+``` go
+cert, _ := certificate.FromPemFile("cert.pem", "")
+manager := apns2.NewClientManager()
+manager.MaxAge = time.Second * 5
+for {
+    resp, err := manager.Get(cert).Production().Push(&apns2.Notification{Topic: apnsTopic, DeviceToken: deviceToken, Payload: payload})
+    fmt.Println(resp, err)
+    time.Sleep(time.Second * 6)
+}
+```
+
+4. What did you expect to see?
+ClientManager create a new client, and the underlying connections of old client should be closed by GC or call client.CloseIdleConnections().
+
+5. What did you see instead?
+`netstat` and `lsof` shows that number of open connections keep increasing. 
+
+Maybe ClientManager should close idle connections on removing old client?
+If do this so, what if another goroutine using the same client while we call client.CloseIdleConnections()?
+`ClientManager` is a great class, it would be nice to have a version of this class (`TokenClientManager`?) which works for JWT/Auth token based clients. It looks like this could be done without too much effort (make the `Get` method take a `*token.Token`, change `cacheKey` to be based on `*token.Token` instead of `tls.Certificate`, make `Factory` take a `*token.Token` instead of a `tls.Certificate`).
+When you try to send data with an invalid certificate, you get this error:
+> Post https://api.push.apple.com/3/device/_token_goes_here_: http2: Transport: peer server initiated graceful shutdown after some of Request.Body was written; define Request.GetBody to avoid this error
+
+This makes it look like a connection or implementation issue, while it is not.
+
+When looking at the http2 logs, you can see that the gateway is explicitly telling you why they are cutting connection, the certificate is wrong: [APNsConnectionCut.txt](https://github.com/sideshow/apns2/files/1310411/APNsConnectionCut.txt). The interesting part is: _http2: Transport received GOAWAY len=46 LastStreamID=0 ErrCode=NO_ERROR Debug="{\"reason\":\"BadCertificateEnvironment\"}"_
+While it would have been nice from the Gateway to use the usual status error code to tell that the certificate is wrong, it does not. If there is an easy way to read GOAWAY frames to return an error that includes the eventual Debug field from Transport, it would be great to use it. If not, you may archive this report.
+
+1. Version: go1.7.4
+2. Env: running on darwin/amd64, same issue with a static binary on linux
+3. How-To-Reproduce: posting one silent push notification with an invalid certificate (observed on prod gateway)
+4. Observed: client.Push returns a connection/implementation error.
+5. Expected: client.Push returns a error that includes the Debug field of the associated Transport when available.
+
+The default golang http2 connection pool is good but lacks some important features which would be useful for the apns2 library:
+
+- There is currently no way to have a minimum amount of TLS connections open (throughput) 
+- There is currently no way to have a maximum amount of TLS connections open (avoids exhausing resources). Similarly there is no way to control when connections are opened or closed.
+- Connections are currently not opened until the first request is sent - There is currently no way to connect before the first push is sent. 
+- There is no visibility/stats into how many tcp connections and requests are currently active.
+- There is no ability to control pings an keep connections alive from the pool - See issues https://github.com/sideshow/apns2/issues/19, https://github.com/sideshow/apns2/pull/45, https://github.com/sideshow/apns2/pull/51
+
+Ideally we want to write a custom connection pool to address the above issues. It should have reasonable defaults so that no configuration is needed out of the box, but provide the correct settings to customize for those that are using apns2 at scale.
+
+- [ ] Document common APNs gotchas and errors (dev/prod gateway etc)
+- [x] Examples of how to use with go channels and go routines
+- [ ] Document Client timeout behaviour (issue #24)
+- [ ] Document ClientManager and concurrent access safety (issue #44)
+- [ ] Document Generating correct .pem/p12 certificates (issue #33 and issue #46)
+

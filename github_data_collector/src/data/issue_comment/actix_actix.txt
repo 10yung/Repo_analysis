@@ -1,0 +1,211 @@
+The `TryFutureExt` extension trait offers functions like `and_then` and `map_err` for futures that return `Result` types. It would be great to have these functions available on `ActorFuture` as well.
+Allow the use of any type inside a ResponseFuture, like Option<> instead of Result<>.
+See doc test for details.
+
+Also see #312 
+This example works with actix 0.8.
+It stoped working with 0.9 and I found no mention of this in changes.
+Also nothing about this in the docs, or my googling didn't turn up the right doc.
+Is this a regression?
+
+```rust
+pub struct MyActorAsync {}
+impl Actor for MyActorAsync {
+    type Context = actix::Context<Self>;
+    fn started(&mut self, _ctx: &mut Self::Context) {
+        debug!("MyActorAsync alive.");
+    }
+}
+
+#[derive(Debug)]
+pub struct MyError{}
+impl std::fmt::Display for MyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DunnoWhat")
+    }
+}
+impl std::error::Error for MyError{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        None
+    }
+}
+pub struct MyQuestion{}
+impl Message for MyQuestion {
+    type Result = Result<Vec<String>, MyError>;
+}
+impl Handler<MyQuestion> for MyActorAsync {
+    type Result = Box<dyn Future<Item = Vec<String>, Error = MyError>>;
+    fn handle(&mut self, question: MyQuestion, _ctx: &mut Context<Self>) -> Self::Result {
+        let fut = futures::future::ok(vec!("".to_owned()));
+        Box::new(fut)
+    }
+}
+```
+
+This is the error with 0.9:
+
+```rust
+error[E0277]: the trait bound `std::boxed::Box<(dyn futures::future::Future<Error = actor::MyError, Item = std::vec::Vec<std::string::String>> + 'static)>: actix::handler::MessageResponse<actor::MyActorAsync, actor::MyQuestion>` is not satisfied
+   --> src/actor.rs:140:5
+    |
+139 | impl Handler<MyQuestion> for MyActorAsync {
+    | ----------------------------------------- in this `impl` item
+140 |     type Result = Box<dyn Future<Item = Vec<String>, Error = MyError>>;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `actix::handler::MessageResponse<actor::MyActorAsync, actor::MyQuestion>` is not implemented for `std::boxed::Box<(dyn futures::future::Future<Error = actor::MyError, Item = std::vec::Vec<std::string::String>> + 'static)>`
+    |
+    = help: the following implementations were found:
+              <std::boxed::Box<(dyn actix::fut::ActorFuture<Actor = A, Output = std::result::Result<I, E>> + 'static)> as actix::handler::MessageResponse<A, M>>
+
+error: aborting due to previous error
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `arangoq`.
+
+To learn more, run the command again with --verbose.
+```
+I noticed that there is `actix::io::FramedWrite` but there is no corresponding `actix::io::FramedRead`. Is there a reason for this?
+Since Futures doesn't require a Ok and an Err type anymore, I see no reason for the `MessageResponse<A, M>` for a `ResponseActFuture<A, T>` to require that `T` is a `Result`.
+
+The current code also doesn't add any constrains to the `I` and `E` used on the `Result<I, E>`, so using any static type `T` for the `ResponseActFuture` here does seam more appropriated since it's more generic.
+I'm trying implement some asynchronous actor response that uses the Actor's self reference on _actix v0.9_ but I can't get it to work on the account of some lifetime bounds error. I've separated a small example that contains the error:
+
+```Rust
+use actix::prelude::*;
+
+#[derive(Message)]
+#[rtype(result = "Result<usize, ()>")]
+struct Msg;
+
+struct MyActor;
+
+impl Actor for MyActor {
+    type Context = Context<Self>;
+}
+
+impl Handler<Msg> for MyActor {
+    type Result = ResponseActFuture<Self, Result<usize, ()>>;
+
+    fn handle(&mut self, _msg: Msg, _: &mut Context<Self>) -> Self::Result {
+        Box::new(self.reply().into_actor(self))
+    }
+}
+
+impl MyActor {
+    async fn reply(&self) -> Result<usize, ()> {
+        Ok(42)
+    }
+}
+```
+But this gives me the following error:
+```
+error[E0495]: cannot infer an appropriate lifetime for autoref due to conflicting requirements
+  --> src/main.rs:17:23
+   |
+17 |         Box::new(self.reply().into_actor(self))
+   |                       ^^^^^
+   |
+note: first, the lifetime cannot outlive the anonymous lifetime #1 defined on the method body at 16:5...
+  --> src/main.rs:16:5
+   |
+16 | /     fn handle(&mut self, _msg: Msg, _: &mut Context<Self>) -> Self::Result {
+17 | |         Box::new(self.reply().into_actor(self))
+18 | |     }
+   | |_____^
+note: ...so that reference does not outlive borrowed content
+  --> src/main.rs:17:18
+   |
+17 |         Box::new(self.reply().into_actor(self))
+   |                  ^^^^
+   = note: but, the lifetime must be valid for the static lifetime...
+note: ...so that the expression is assignable
+  --> src/main.rs:17:9
+   |
+17 |         Box::new(self.reply().into_actor(self))
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: expected  `std::boxed::Box<(dyn actix::fut::ActorFuture<Actor = MyActor, Output = std::result::Result<usize, ()>> + 'static)>`
+              found  `std::boxed::Box<dyn actix::fut::ActorFuture<Actor = MyActor, Output = std::result::Result<usize, ()>>>`
+```
+
+I've tried to implement this using the `ActorFuture` and the `them` combinator but I get similar errors, this is what I tried:
+```Rust
+    fn handle(&mut self, _msg: Msg, _: &mut Context<Self>) -> Self::Result {
+        Box::new(
+            async {}
+                .into_actor(self)
+                .then(|_, act, _| actix::fut::wrap_future(act.reply())),
+        )
+    }
+```
+
+The problem seams to be that I can only have static references for the future I return, but since the future will be handled by the Actor itself shouldn't it be able to use it's own  reference?
+
+
+
+Are there examples for asynchronously handling messages? I have only been able to find the doc example on `ActorFuture`, witch is even a little bit outdated; but it's a bit of a different context since that doesn't use a reference to the actor on the futures it chains.
+This PR fixes the ring example, which terminates after just a few tens of messages is sent, instead of waiting for all messages to flow through the ring, which makes for a very misleading benchmark (which is why I noticed.)
+
+Also adds some more informative output, such as messages sent per second.
+
+I know very little of actix, as I started playing around with it today, and I expect someone who knows actix to be able to do better, but this is at least an improvement over the current state.
+I have a actix-web API project, and if the code inside the SyncArbiter crash, the API get in a limbo state. I start with:
+
+```rust
+pub fn run_server() -> Result<(), DbErr> {
+    let sys = actix_rt::System::new("Api");
+    let pool = Db::open_server(None)?;
+    let address: Addr<DbExecutor> = SyncArbiter::start(4, move || DbExecutor(pool.clone()));
+
+    let mut server = HttpServer::new(move || {
+        App::new()
+            .data(address.clone())
+
+impl From<actix::MailboxError> for ServiceError {
+    fn from(error: actix::MailboxError) -> ServiceError {
+        ServiceError::InternalServerError(format!("{}", error))
+    }
+}
+```
+Now, maybe a .unwrap fail. Then I get LATER i get:
+
+`InternalServerError("Mailbox has closed")
+`
+When this error show up, is unclear what cause it (I wish the MailboxError have attached the cause). And from it ALL THE REQUESTS WILL FAIL with the same error.
+
+I wish the error only be for the request that cause it only, not for all. Exist a way to catch, handle or restart it? 
+
+Attempting to create an alpine docker container with a rust program I faced with the following error:
+```
+error: cannot produce proc-macro for `actix-web-codegen v0.1.3` as the target `x86_64-unknown-linux-musl` does not support these crate types
+```
+Is there a way to solve it ?
+Something seems to take out the `std::fmt::Display` derive (my bet is on `derive-more`, most probably by `use actix::prelude::*` because it's actually the only actix use line I have in the code):
+
+```
+error: cannot find derive macro `Display` in this scope
+  --> src/controller.rs:47:17
+   |
+47 | #[derive(Debug, Display)]
+   |                 ^^^^^^^
+
+error[E0277]: `controller::ControllerError` doesn't implement `std::fmt::Display`
+  --> src/restserver.rs:10:6
+   |
+10 | impl ResponseError for ControllerError {
+   |      ^^^^^^^^^^^^^ `controller::ControllerError` cannot be formatted with the default formatter
+   |
+   = help: the trait `std::fmt::Display` is not implemented for `controller::ControllerError`
+   = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+```
+
+If I explicitly try to `use std::fmt::Display;` I get an additional warning:
+```
+warning: unused import: `std::fmt::Display`
+ --> src/controller.rs:3:5
+  |
+3 | use std::fmt::Display;
+  |     ^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+```
+
+Explicitly using the `derive_more::Display` fixes that but it's yet another dependency I'm not keen on actually having.

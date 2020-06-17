@@ -1,0 +1,130 @@
+Hi, I'm wondering is it okay to use distributed training without calling amp.initilize(), if I don't want to use the mixed-precision ability. 
+When training my model which samples from `Categorical` distribution I every now and then get this stack trace
+
+```python
+/cvlabdata2/home/tyszkiew/PhD/points/algorithm.py in point_distribution(logits)
+     23     spatial_dist = Categorical(logits=logits)
+     24     candidate_marks = spatial_dist.sample()
+---> 25     spatial_logp = spatial_dist.log_prob(candidate_marks)
+     26 
+     27     survival_logits = torch.gather(
+
+/usr/local/lib/python3.6/dist-packages/torch/distributions/categorical.py in log_prob(self, value)
+    114         value, log_pmf = torch.broadcast_tensors(value, self.logits)
+    115         value = value[..., :1]
+--> 116         return log_pmf.gather(-1, value).squeeze(-1)
+    117 
+    118     def entropy(self):
+
+RuntimeError: cuda runtime error (710) : device-side assert triggered at /pytorch/aten/src/THC/generic/THCTensorScatterGather.cu:75
+```
+This problem seems to be ameliorated by decreasing the magnitude of logits, but is otherwise elusive. I was thinking that normalization fails due to numerical precision and samples go outside of the allowed range but [it seems to be handled](https://github.com/pytorch/pytorch/blob/ae6af8d55faa6efa6018d20fec3a4909acd36a4e/aten/src/ATen/native/cuda/MultinomialKernel.cu#L100).
+I use apex in the `mask_rcnn_r50_fpn_1x.py` mmdetection, and use pytorch roi layer.
+
+1. when I choose opt_level: `O1`, report error:
+```
+  from torchvision.ops import roi_align as tv_roi_align
+  File "/opt/anaconda3/lib/python3.7/site-packages/torchvision/__init__.py", line 1, in <module>
+    from torchvision import models
+  File "/opt/anaconda3/lib/python3.7/site-packages/torchvision/models/__init__.py", line 12, in <module>
+    from . import detection
+  File "/opt/anaconda3/lib/python3.7/site-packages/torchvision/models/detection/__init__.py", line 1, in <module>
+    from .faster_rcnn import *
+  File "/opt/anaconda3/lib/python3.7/site-packages/torchvision/models/detection/faster_rcnn.py", line 13, in <module>
+    from .rpn import AnchorGenerator, RPNHead, RegionProposalNetwork
+  File "/opt/anaconda3/lib/python3.7/site-packages/torchvision/models/detection/rpn.py", line 8, in <module>
+    from . import _utils as det_utils
+  File "/opt/anaconda3/lib/python3.7/site-packages/torchvision/models/detection/_utils.py", line 74, in <module>
+    @torch.jit.script
+  File "/opt/anaconda3/lib/python3.7/site-packages/torch/jit/__init__.py", line 1181, in script
+    return _compile_function(fn=obj, qualified_name=qualified_name, _frames_up=_frames_up + 1, _rcb=_rcb)
+  File "/opt/anaconda3/lib/python3.7/site-packages/torch/jit/__init__.py", line 1077, in _compile_function
+    script_fn = torch._C._jit_script_compile(qualified_name, ast, _rcb, get_default_args(fn))
+  File "/opt/anaconda3/lib/python3.7/site-packages/torch/jit/__init__.py", line 1009, in _try_compile_fn
+    qualified_name = _qualified_name(fn)
+  File "/opt/anaconda3/lib/python3.7/site-packages/torch/_jit_internal.py", line 404, in _qualified_name
+    "__module__ can't be None.".format(name))
+RuntimeError: Could not get qualified name for class 'log': __module__ can't be None.
+```
+
+2. when I choose opt_level: `O2`, report error:
+```
+ValueError: nan or inf found in loss.
+```
+I set loss_scale to 1.0, the program also report this error. 
+
+When I run my own program without using mixed precision training, it works well. But when I run it with mixed precision training, I get this message. 
+`Traceback (most recent call last):
+  File "train_Selective_Net_GoPro.py", line 118, in <module>
+    main(args)
+  File "train_Selective_Net_GoPro.py", line 77, in main
+    scale_loss.backward()
+  File "/home/grd/miniconda3/envs/torch1.1/lib/python3.7/contextlib.py", line 119, in __exit__
+    next(self.gen)
+  File "/home/grd/miniconda3/envs/torch1.1/lib/python3.7/site-packages/apex/amp/handle.py", line 127, in scale_loss
+    should_skip = False if delay_overflow_check else loss_scaler.update_scale()
+  File "/home/grd/miniconda3/envs/torch1.1/lib/python3.7/site-packages/apex/amp/scaler.py", line 200, in update_scale
+    self._has_overflow = self._overflow_buf.item()
+RuntimeError: CUDA error: an illegal memory access was encountered`
+I have installed apex with 
+pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./
+
+however the project i want to use is build in python3 so in that project i am unable to import apex.
+How can i import or how can i install apex with python3? pip3 is not working for me . it throw many errors. 
+
+My environment
+ubuntu 16.04 
+CUDA Version 10.0.130
+CuDNN     7.4.1
+torch.__version__    '1.3.1'
+Python 3.5.2
+Hello,
+
+I have a model where in each forward pass, layers are randomly skipped with some probability, something like this:
+
+```
+def forward(self, x):
+    p = 0.2
+    for i in range(self.n_layers):
+        # drop this layer with probability p
+        random_number = random.uniform(0, 1)
+        if self.training and (random_number < p):
+            continue
+        x = self.layers[i](x)
+    return x
+```
+Theoretically, higher p should result in faster training as the number of skipped layers is higher. However, when training this model using `apex.parallel.DistributedDataParallel`, I observed a very significant slowdown (when p > 0). I try timing the forward passes and indeed, they were faster when p is higher, so I think the issue lies in the backward or the gradient gathering steps.
+
+Note that this issue does not occur when using `torch.nn.parallel.DistributedDataParallel` (I had to set `find_unused_parameters = True` for it to work): faster training for higher p.
+
+Could you please help checking this?
+When all layers are used (i.e. p = 0), `apex` was faster than `torch.nn` (especially on multiple nodes), so I hope that I can use `apex` for all my experiments.
+Thank you very much in advance!
+Hi, 
+I have this bug following, could you help me to fix that?
+
+
+  File "/home/shiz31/frame_interpolation/main.py", line 100, in main
+    scaled_loss.backward()
+  File "/home/shiz31/anaconda3/lib/python3.7/site-packages/torch/tensor.py", line 118, in backward
+    torch.autograd.backward(self, gradient, retain_graph, create_graph)
+  File "/home/shiz31/anaconda3/lib/python3.7/site-packages/torch/autograd/__init__.py", line 93, in backward
+    allow_unreachable=True)  # allow_unreachable flag
+RuntimeError: _cublasOpFromChar input should be 't', 'n' or 'c' but got `
+
+
+This string
+https://github.com/NVIDIA/apex/blob/master/examples/imagenet/main_amp.py#L146
+__delay_allreduce__ is an _undefined name_ in this context which will raise NameError at runtime instead of the expected ValueError.  __self.delay_allreduce__ is set on line 223 and is used three lines below the modified line.
+
+__buckets__ is an _undefined name_ in this context which will raise NameError at runtime.  __self.buckets__ is used on the previous line and __bucket__ best matches the use on this same line.
+
+$ __flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics__
+```
+./apex/parallel/distributed.py:258:49: F821 undefined name 'delay_allreduce'
+        if self.allreduce_different_streams and delay_allreduce:
+                                                ^
+./apex/parallel/distributed.py:600:40: F821 undefined name 'buckets'
+                                b, len(buckets[b]), self.bucket_sizes[b])
+                                       ^
+```

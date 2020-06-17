@@ -1,0 +1,155 @@
+Git receive places the receive pack in a quarantined directory.
+It's not possible to update any refs in this directory. This breaks build scripts that fetches from other git repos. 
+
+More information about the changes is here:
+
+https://git-scm.com/docs/git-receive-pack#_quarantine_environment
+https://github.com/git/git/commit/722ff7f876c8a2ad99c42434f58af098e61b96e8
+Git now supports push-to-deploy without the need for a bare repo, update script?
+Good afternoon,
+
+I am very new to git, cloud and deployment. Is it possible to easily create a tunnel between local computer and a coreOs machine (hosted by digital ocean), and remotely push golang source code to the cloud, automatically build the binary at reception, start a docker container running this binary (webapp) and delete source code to secure the app?
+
+It seems that gitreceive cannot receive tags. Every time tag is pushed I get:
+
+```
+  ! [remote rejected] fix.1 -> fix.1 (pre-receive hook declined)
+```
+
+This seems to happen before receiver script is even called.
+
+This PR adds a new feature that allows for:
+- Perform some checks before creating a new repo;
+- Calling some command when a new repo is created.
+# Implementation
+
+When you `gitreceive init`, a new script named `newrepo` is created next to the `receiver` script.
+
+When a new repository is to be created, the `newrepo` script is called instead of simply creating a new repository.
+
+Of course, the default of the `newrepo` script is to add a new repository as always, but it also takes a few other parameters that allow to neat uses of this feature, namely the name of the repository, the username and fingerprint of the user trying to create the repository.
+# Use cases
+## Performing some checks before creating a new repo.
+
+This allow to control which user/fingerprint can create which repo. Or to inforce some policy on the repo names.
+
+As an example, the following `newrepo` script will make sure that users can only create repo starting with their usernames followed by a dash (note that only the middle part has been edited from the default `newrepo` script):
+
+``` bash
+#!/bin/bash
+# This script gets called to create a new repository at $repo_path.
+# Note: /dev/stdout is already redirected to /dev/null.
+declare repo_path="$1" repo_name="$2" username="$3" fingerprint="$4"
+
+# Check if $repo_name starts with $username-
+if [ "${repo_name##"$username"-*}" ]; then
+    echo "Error: your repos should start with '$username-'." > /dev/stderr
+    exit 1
+fi
+
+# The default is to create a bare repository ($repo_path is absolute)
+git init --bare "$repo_path" || exit $?
+```
+
+And here is the output when you try to git clone (the same happens if you `git remote add` and `git push` on an existing local repo):
+
+```
+$ git clone git@example.com:foobar
+Cloning into 'foobar'...
+Enter passphrase for key '<snip>': 
+Error: your repos should start with 'alice-'.
+fatal: Could not read from remote repository.
+
+Please make sure you have the correct access rights and the repository exists.
+$ git clone git@example.com:alice-foobar
+Cloning into 'alice-foobar'...
+Enter passphrase for key '<snip>': 
+warning: You appear to have cloned an empty repository.
+Checking connectivity... done.
+```
+## Calling some commands when a new repo is created
+
+Just append those commands at the end of the `newrepo` script.
+# Please review
+
+This is quite an important change, but I believe the feature could allow many use-cases, as it is quite flexible. For example, I put the `git init --bare` in the `newrepo` script to allow that to be changed if needed (however, make sure that a `repo_path` is been created).
+
+Please note that if this PR is accepted, current gitreceive users should add a `newrepo` in their existing `$GITHOME`s, since it is only created when you `gitreceive init`. This means that some communication may be needed.
+
+Pleade **do** review this PR. I tried to stick to the coding conventions I saw, but feel free to mention any problems (e.g. if you don't like the name of the `newrepo` script).
+
+Final note: I've put a new link to the wiki on the README, which would have to be populated when/if this PR is merged. The content of this PR can act as a good starting point for that.
+
+When a file with the repo name exists in `$GITHOME`, exit with an error message.
+
+This gives a proper error message (although I am open to suggestions for a better error message) when the user tries to create a repository but a file with the same name exits.
+
+Example with the default settings (trying to create a repo named `receiver`, while a file with the same name exists in `$GITHOME`…):
+
+Before:
+
+```
+$ git clone git@example.com:receiver
+Cloning into 'receiver'...
+Enter passphrase for key '<snip>': 
+mkdir: cannot create directory '/home/git/receiver': File exists
+fatal: Could not read from remote repository.
+
+Please make sure you have the correct access rights and the repository exists
+```
+
+After this PR:
+
+```
+$ git clone git@git.debiantest.local:receiver
+Cloning into 'receiver'...
+Enter passphrase for key '<snip>': 
+Fatal error: invalid repository name.
+fatal: Could not read from remote repository.
+
+Please make sure you have the correct access rights and the repository exists.
+```
+
+Do you think the error message should be made more obvious (e.g. by inserting a newline before and after)?
+
+_This is a security-related bug_
+# Problem & POC
+
+The name of the repos can contain sequences such as `../`, which allows the repositories to be stored outside the `$GITHOME` directory.
+
+For example, the command `git clone git@example.com:../../tmp/foo` creates the repo in the directory `/tmp/foo` (with default configuration).
+
+Also, one could create a repo named `foo`, then someone else a repo named `foo/bar`, which will completely hides the existence of the second repo. Also, replace `bar` for `refs` and you have an other error.
+# Solution
+
+The solution is to filter the allowed repository name and/or to escape them.
+
+The following code is to be changed:
+
+``` bash
+parse_repo_from_ssh_command() {
+  awk '{print $2}' | perl -pe 's/(?<!\\)'\''//g' | sed 's/\\'\''/'\''/g' | strip_root_slash
+}
+```
+
+However, I don't have the perl knowledge to be sure to understand the code already, so I leave the fix to others.
+
+Here is my suggestion:
+- Make sure that there is no `/` in the repo name. Exit right away with an error message if there is.
+- Also, it may be a good idea to check that the repo name does not start with a dot, so that a simple `ls $GITHOME` will show all repos.
+
+_**Edit**_: Not allowing `/` in the repo name may be asking for too much (e.g. can not use `user/something` as repo names _a la_ GitHub). Alternatively, we could replace `/` for some character (`-`? `_`? a space?), but this may lead to conflicts (e.g. `user/something` and `user-something` would be the same repo).
+
+I will happily review commits aiming at fixing this flaw, provided they don't use any perl (as I don't have any knowledge in the area).
+
+Automagically enforce a 2 space indentation to vim users.
+
+Nothing fancy, just one comment line at the end of the file. The alternative is to put this line at the very top of the file, just after the shebang (i.e. on line number 2). Please tell me if you prefer the alternative more.
+
+...@hostname'
+
+not sure if this is outside of the scope of gitreceive - but is there any way to save repositories when they're pushed to me to specific folders? so even if the remote is set up as: 
+
+git remote add demo git@yourserver.com:example
+
+... I can still save the repo in a folder besides /git/example ? maybe this would be some sort of processing done in a hook?

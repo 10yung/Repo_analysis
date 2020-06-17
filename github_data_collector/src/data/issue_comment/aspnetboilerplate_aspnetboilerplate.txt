@@ -1,0 +1,253 @@
+**ABP package version:** 5.1
+**Base framework:** .Net Core 3.1
+
+In the .NET core Multi-Page MVC template there is an error in the code for the delete entity sweet alert. The second argument should be the title which will be displayed in bold. Upon download at present it is as follows:
+
+```
+function deleteUser(userId, userName) {
+	abp.message.confirm(
+		abp.utils.formatString(abp.localization.localize('AreYouSureWantToDelete', 'AbpTest'), userName),
+		function (isConfirmed) {
+			if (isConfirmed) {
+				_userService.delete({
+					id: userId
+				}).done(function () {
+					refreshUserList();
+				});
+			}
+		}
+	);
+}
+```
+
+In this form it will display the actual function in plain text as the sweet alert title. The second argument should be the title. I also altered the first argument and added both to the localisation file to make it display as demonstrated on https://aspnetboilerplate.com/Pages/Documents/Javascript-API/Message
+
+```
+function deleteUser(UserId, UserName) {
+	abp.message.confirm(
+		abp.utils.formatString(abp.localization.localize('WillBeDeleted', 'AbpTest'), UserName),
+		abp.localization.localize('AreYouSure', 'AbpTest'),
+		function (isConfirmed) {
+			if (isConfirmed) {
+				_userService.delete({
+					id: UserId
+				}).done(function () {
+					refreshUserList();
+				});
+			}
+		}
+	);
+}
+```
+
+```
+<text name="AreYouSure">Are you sure?</text>
+<text name="WillBeDeleted">{0} will be deleted</text>
+```
+
+
+
+
+Fixes #5230 
+
+# Investigation
+
+To reproduce the issue, add a line in [aspnetboilerplate/module-zero-core-template's AccountController.cs#L450-L455](https://github.com/aspnetboilerplate/module-zero-core-template/blob/92f8bf5367d7d3238ce360276c2889b38cd57cdd/aspnet-core/src/AbpCompanyName.AbpProjectName.Web.Mvc/Controllers/AccountController.cs#L450-L455):
+
+```diff
+  await _notificationPublisher.PublishAsync(
+          "App.SimpleMessage",
+          new MessageNotificationData(message),
++         entityIdentifier: new EntityIdentifier(typeof(Entity), 0),
+          severity: NotificationSeverity.Info,
+          userIds: new[] { defaultTenantAdmin, hostAdmin }
+      );
+```
+
+To get the error (maybe silently caught inside SignalR), add a line at [SignalRRealTimeNotifier.cs#L55](https://github.com/aspnetboilerplate/aspnetboilerplate/blob/8d460dd9fe7297b99551adc9ed160290e8685582/src/Abp.AspNetCore.SignalR/AspNetCore/SignalR/Notifications/SignalRRealTimeNotifier.cs#L55):
+
+```diff
++ JsonSerializer.Serialize(userNotification);
+  signalRClient.SendAsync("getNotification", userNotification);
+```
+
+Error log:
+
+```
+WARN  2020-01-18 23:45:56,409 [27   ] Host.Controllers.SignalRRealTimeNotifier - Could not send notification to user: 2@1
+WARN  2020-01-18 23:45:56,497 [27   ] Host.Controllers.SignalRRealTimeNotifier - System.Text.Json.JsonException: A possible object cycle was detected which is not supported. This can either be due to a cycle or if the object depth is larger than the maximum allowed depth of 0.
+   at System.Text.Json.ThrowHelper.ThrowInvalidOperationException_SerializerCycleDetected(Int32 maxDepth)
+   at System.Text.Json.JsonSerializer.Write(Utf8JsonWriter writer, Int32 originalWriterDepth, Int32 flushThreshold, JsonSerializerOptions options, WriteStack& state)
+   at System.Text.Json.JsonSerializer.WriteCore(Utf8JsonWriter writer, Object value, Type type, JsonSerializerOptions options)
+   at System.Text.Json.JsonSerializer.WriteCore(PooledByteBufferWriter output, Object value, Type type, JsonSerializerOptions options)
+   at System.Text.Json.JsonSerializer.WriteCoreString(Object value, Type type, JsonSerializerOptions options)
+   at System.Text.Json.JsonSerializer.Serialize[TValue](TValue value, JsonSerializerOptions options)
+   at AbpCompanyName.AbpProjectName.Web.Host.Controllers.SignalRRealTimeNotifier.SendNotificationsAsync(UserNotification[] userNotifications) in C:\Users\Aaron\Desktop\module-zero-core-template\aspnet-core\src\AbpCompanyName.AbpProjectName.Web.Mvc\Controllers\SignalRRealTimeNotifier.cs:line 63
+System.Text.Json.JsonException: A possible object cycle was detected which is not supported. This can either be due to a cycle or if the object depth is larger than the maximum allowed depth of 0.
+   at System.Text.Json.ThrowHelper.ThrowInvalidOperationException_SerializerCycleDetected(Int32 maxDepth)
+   at System.Text.Json.JsonSerializer.Write(Utf8JsonWriter writer, Int32 originalWriterDepth, Int32 flushThreshold, JsonSerializerOptions options, WriteStack& state)
+   at System.Text.Json.JsonSerializer.WriteCore(Utf8JsonWriter writer, Object value, Type type, JsonSerializerOptions options)
+   at System.Text.Json.JsonSerializer.WriteCore(PooledByteBufferWriter output, Object value, Type type, JsonSerializerOptions options)
+   at System.Text.Json.JsonSerializer.WriteCoreString(Object value, Type type, JsonSerializerOptions options)
+   at System.Text.Json.JsonSerializer.Serialize[TValue](TValue value, JsonSerializerOptions options)
+   at AbpCompanyName.AbpProjectName.Web.Host.Controllers.SignalRRealTimeNotifier.SendNotificationsAsync(UserNotification[] userNotifications) in C:\Users\Aaron\Desktop\module-zero-core-template\aspnet-core\src\AbpCompanyName.AbpProjectName.Web.Mvc\Controllers\SignalRRealTimeNotifier.cs:line 63
+```
+
+# Root cause
+
+(De)serialization of `System.Type` is bad and not supported. See https://github.com/dotnet/corefx/issues/42712.
+
+# Solution
+
+1. Set `EntityType` of `TenantNotification` to `null` before sending via SignalR.
+2. Deprecate `EntityType` property of serializable class `TenantNotification`.
+Platform: ABP 5.1.0 (ASP.NET Core MVC)
+
+Something is wrong with `NotificationPublisher` when a notification is sent including an `EntityIdentifier`. When a notification with that parameter set is sent, SignalR disconnects and reconnects, and the notification is never displayed. To see the notification I am forced to refresh the page.
+
+If I simply remove the `EntityIdentifier` parameter, that same notification works correctly with SignalR.
+
+Sample with the error:
+```C#
+public async Task DataClearedAsync(Guid processStatusId, int tenantId, int userId)
+{
+	var notificationData = new LocalizableMessageNotificationData(
+		new LocalizableString(
+			"ClearDataNotificationMessage",
+			InAccessConsts.LocalizationSourceName
+		)
+	);
+
+	await _notificationPublisher
+		.PublishAsync(AppNotificationNames.ClearData,
+		notificationData,
+		new Abp.Domain.Entities.EntityIdentifier(typeof(ProcessStatus), processStatusId),
+		userIds: new[] { new UserIdentifier(tenantId, userId) },
+		severity: NotificationSeverity.Success);
+}
+```
+
+Sample that works correctly:
+```C#
+public async Task DataClearedAsync(Guid processStatusId, int tenantId, int userId)
+{
+	var notificationData = new LocalizableMessageNotificationData(
+		new LocalizableString(
+			"ClearDataNotificationMessage",
+			InAccessConsts.LocalizationSourceName
+		)
+	);
+
+	notificationData["processStatusId"] = processStatusId;
+
+	await _notificationPublisher
+		.PublishAsync(AppNotificationNames.ClearData,
+		notificationData,
+		userIds: new[] { new UserIdentifier(tenantId, userId) },
+		severity: NotificationSeverity.Success);
+}
+```
+
+I suspect this might be a JSON serialization error with the EntityIdentifier that breaks the JSON SignalR generates for the notification.
+
+Is there any way to control whether a request will show or not the sweetalert popup on the angular 8 project?
+
+At first, I thought that if an error method was provided, no popup would show. Something like this:
+
+```ts
+this._rawService.upload(this.file).subscribe(
+    result => {
+    this.response = result;
+    },
+    error => {
+    // no popup is shown
+    console.error(error);
+    }
+);
+```
+
+Thank you
+https://github.com/aspnetboilerplate/aspnetboilerplate/blob/ec23a70b784d7934bac872a7c22786dd1f12da20/src/Abp.Zero.EntityFramework/EntityHistory/EntityHistoryHelper.cs#L252
+
+above line, skip to create history record for enum properties.
+
+`if (!(property.IsPrimitiveType || property.IsComplexType) && !property.IsEnumType)`
+
+i fixed it like that, please correct me if i m wrong.
+
+Thanks
+Dears,
+
+Is it possible to mark classes in framework as partial class?
+would that be easier instead of modify original class so when new version come just replace them and any modification i made will exist
+
+Thanks
+I am running multi tenancy with db per tenant. Like permissions when I enable disable feature for a tetnant it is only getting stored in host db and not in tenant db abpfeatures table. is this normal behaviour? We have defined custom features for the mobile app that is syncronizing with indivvidual tenant db and therefore need the features table to be populated in each tenant db.
+Element UI is the most popular free and opensource Vue UI-Kit . It's supported by Alibaba!! And iview is a business lib need software license.  Users need to pay for abp-zero and iview both. Higher license with make abp lose lots of potential customer. 
+Element UI(43.5k stars):https://github.com/ElemeFE/element
+Documentation :https://element.eleme.cn/#/en-US
+iView has just 20.3k stars!! Users need to buy course/license etc.
+Our team is using an additional application for our setup. As a result, we have moved the src and e2e folder to `project/aspnet-zero-template/*` (this question applies to both ABP and AN0) to adopt the [Angular monorepo file structure](https://angular.io/guide/file-structure#multiple-projects).
+
+The main problem this causes is when refactoring happens in the updates, git sometimes misses the file path rename.
+
+All things considered, the change is rather minute and it would make updating the framework substantially easier if we could have the template generated with the monorepo structure.
+
+High level diff:
+Move: `src/ -> projects/abp-template/src` and `e2e/ -> projects/abp-template/e2e` 
+Move: `src/tsconfig.json -> projects/abp-template/tsconfig.json`
+Add: `<root>/tsconfig.json`, `projects/abp-template/tsconfig.app.json`, `projects/abp-template/tsconfig.spec.json` (needs `jasmine` and `node` under types, see default tsconfig.spec.json)
+Update: `<root>/angular.json` (path updates)
+
+A further step we have taken is moving the `service-proxies.ts` and `service-proxies.module.ts` to an Angular library so that it can be shared between applications and only needs to be generated once (Causes an issue with the moment import but I have [a ticket with NSwag open on that](https://github.com/RicoSuter/NSwag/issues/1859)). Ideally we would do this with most of the components found under `src/shared` as well but have not gotten around to it as of yet.
+
+I understand this is probably an edge case for most of your users but I think the option to start with a monorepo is a valuable one, at the very least a script for applying the move would be useful.
+Implements webhook system. 
+It allows tenant's and host to subcsribe and get webhook(s) when it is triggered.
+
+### WebHookDefinition
+First of all you must create webhook provider. You can set webhook's ***unique name***, ***display name***, ***description***, and ***feature dependencies*** *(tenants must provide these dependencies)*
+
+https://github.com/aspnetboilerplate/aspnetboilerplate/blob/a024bb7236b95738f1029baab1b418c16bc9259f/test/Abp.Zero.SampleApp.Tests/WebHooks/WebHookTestBase.cs#L129-L163
+
+https://github.com/aspnetboilerplate/aspnetboilerplate/blob/a024bb7236b95738f1029baab1b418c16bc9259f/src/Abp/WebHooks/WebHookDefinitionManager.cs#L113-L140
+_________
+
+### Subscribe To Webhook
+To receive webhooks tenants/host must subscribe to it. 
+*(Tenants must have necessary features to subsribe a webhook. Checks also anytime before send a webhook)*
+
+### Webhook subscription parameters
+**WebHookUri** : Endpoint that webhook will be sent
+**WebHook(s)** : Subscribed webhook(s). For example `user_created`, 'role_deleted'. *(Must be defined in provider.)*
+**Headers** *(optional)* : Additional headers that you want to receive with that subscription. *(For example you can set auth token here)*
+
+https://github.com/aspnetboilerplate/aspnetboilerplate/blob/043e2ea3b33b22739d5882aea8844163b328e350/test/Abp.Zero.SampleApp.Tests/WebHooks/WebHookTestBase.cs#L40-L53
+
+It can get published webhooks after tenant subscribed to webhooks.
+___________
+
+### To publish webhook
+
+Get `IWebHookPublisher` and use it's Publish methods.
+See: https://github.com/aspnetboilerplate/aspnetboilerplate/blob/043e2ea3b33b22739d5882aea8844163b328e350/src/Abp/WebHooks/IWebHookPublisher.cs
+
+Forexample:
+https://github.com/aspnetboilerplate/aspnetboilerplate/blob/043e2ea3b33b22739d5882aea8844163b328e350/test/Abp.Zero.SampleApp.Tests/WebHooks/WebHookPublisher_Tests.cs#L126
+
+https://github.com/aspnetboilerplate/aspnetboilerplate/blob/043e2ea3b33b22739d5882aea8844163b328e350/test/Abp.Zero.SampleApp.Tests/WebHooks/WebHookPublisher_Tests.cs#L76-L81
+
+It creates background job to web webhooks. And tries to send webhooks to subscribed tenants. If it fails it tries to resend webhook [IWebHooksConfiguration.cs](https://github.com/aspnetboilerplate/aspnetboilerplate/blob/043e2ea3b33b22739d5882aea8844163b328e350/src/Abp/WebHooks/IWebHooksConfiguration.cs) `MaxRepetitionCount` times.
+
+### Added Entities
+[WebHookSubscriptionInfo](https://github.com/aspnetboilerplate/aspnetboilerplate/blob/043e2ea3b33b22739d5882aea8844163b328e350/src/Abp/WebHooks/WebHookSubscriptionInfo.cs): Stores webhook subscriptions
+
+[WebhookEvent](https://github.com/aspnetboilerplate/aspnetboilerplate/blob/21462edc9f7b2a4a0395ef3bfd2819994421b8f1/src/Abp/WebHooks/WebhookEvent.cs) : Stores created webhook's data. Forexample when a new user created then webhook published. One WebhookInfo will be created then webhooks will send to all subscribed tenants.
+
+[WebhookSendAttempt](https://github.com/aspnetboilerplate/aspnetboilerplate/blob/21462edc9f7b2a4a0395ef3bfd2819994421b8f1/src/Abp/WebHooks/WebhookSendAttempt.cs) : Table for store webhook work items. Each item stores web hook send attempt of WebHookInfo to subscribed tenants with webhook result.
+
+Related:
+https://github.com/aspnetboilerplate/aspnetboilerplate/issues/1427
+https://github.com/aspnetzero/aspnet-zero-core/issues/1100
+
+- [x] Add Documentation

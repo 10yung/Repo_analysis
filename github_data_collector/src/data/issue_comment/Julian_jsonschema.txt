@@ -1,0 +1,241 @@
+When using a custom scheme, such as `custom://`, intra-schema relative references will fail to resolve. They only fail, however, in schemas referenced from the base schema passed to the validator.
+
+## Minimal Repro Example
+### `foo/base.json`
+```json
+{
+    "$ref": "custom://bar.json"
+}
+```
+### `foo/bar.json`
+```json
+{
+    "definitions": {
+        "bar": {
+            "type": "number"
+        }
+    },
+    "$ref": "#/definitions/bar"
+}
+```
+### `repro.py`
+```python
+import jsonschema
+import json
+import os
+
+scheme = 'custom'
+
+
+def handler(url):
+    prefix = '{}://'.format(scheme)
+    assert(url.startswith(prefix))
+    url = url[len(prefix):]
+
+    with open(os.path.join('foo', url), 'r') as f:
+        return json.load(f)
+
+
+schema = handler('custom://base.json')
+resolver = jsonschema.RefResolver.from_schema(schema, handlers={scheme: handler})
+errors = jsonschema.Draft7Validator(schema, resolver=resolver).iter_errors(0)
+print(list(errors))
+```
+
+### Repro Stacktrace
+```
+Traceback (most recent call last):
+  File "/private/tmp/repro/lib/python3.7/site-packages/jsonschema/validators.py", line 811, in resolve_fragment
+    document = document[part]
+KeyError: 'definitions'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/private/tmp/repro/repro.py", line 20, in <module>
+    print(list(errors))
+  File "/private/tmp/repro/lib/python3.7/site-packages/jsonschema/validators.py", line 328, in iter_errors
+    for error in errors:
+  File "/private/tmp/repro/lib/python3.7/site-packages/jsonschema/_validators.py", line 263, in ref
+    for error in validator.descend(instance, resolved):
+  File "/private/tmp/repro/lib/python3.7/site-packages/jsonschema/validators.py", line 344, in descend
+    for error in self.iter_errors(instance, schema):
+  File "/private/tmp/repro/lib/python3.7/site-packages/jsonschema/validators.py", line 328, in iter_errors
+    for error in errors:
+  File "/private/tmp/repro/lib/python3.7/site-packages/jsonschema/_validators.py", line 259, in ref
+    scope, resolved = validator.resolver.resolve(ref)
+  File "/private/tmp/repro/lib/python3.7/site-packages/jsonschema/validators.py", line 766, in resolve
+    return url, self._remote_cache(url)
+  File "/private/tmp/repro/lib/python3.7/site-packages/jsonschema/validators.py", line 781, in resolve_from_url
+    return self.resolve_fragment(document, fragment)
+  File "/private/tmp/repro/lib/python3.7/site-packages/jsonschema/validators.py", line 814, in resolve_fragment
+    "Unresolvable JSON pointer: %r" % fragment
+jsonschema.exceptions.RefResolutionError: Unresolvable JSON pointer: 'definitions/bar
+```
+## Cause
+This is caused by a failure of `urllib` to allow relative paths in `urljoin` when `scheme` is not in `uses_relatives`. As a result, the call to `self._urljoin_cache` simply returns `ref` and the reference fails to resolve.
+
+Stacktrace of cause of issue:
+
+```
+jsonschema/validators.py:328 iter_errors
+jsonschema/_validators.py:259 ref
+jsonschema/validators.py:765 resolve
+...
+urllib/parse.py:493 urljoin
+```
+
+The cause of this bug was discussed in #104, specifically by @gazpachoking, [here](https://github.com/Julian/jsonschema/issues/104#issuecomment-17773026) as:
+> Possibly also do this for `urljoin` and add the scheme to `urlparse.uses_relative` and `urlparse.uses_netloc` too. This would apply to python 3.3 as well.
+
+However, this note was not addressed in #106, which fixed #104.
+
+## System Info
+* OS: MacOS 10.14.1
+* Python: 3.7.6
+* jsonschema: 3.2.0
+**Changes**
+
+- Schema exception handling.
+- Formatted errors.
+I discovered that `anyOf` related errors can be very mistleading.
+
+```
+- jobs:  # must fail as correct is 'job'
+```
+
+Validating snippet above with https://github.com/pycontribs/zuul-lint/blob/master/zuul_lint/zuul-schema.json would fail with a misleading error:
+
+```
+'nodeset' is a required property
+
+Failed validating 'required' in schema[0]:
+    {'required': ['nodeset']}
+
+On instance:
+    {'jobs': {'name': 'foo'}}
+```
+
+That schema allows multiple value and `nodeset` happens to just one of several. As you can see what user gets is an erros that makes no sense for him.
+Official meta schema files has been changed since they got committed to the project.
+This PR is to bring them in sync with official meta schema files. This PR enables us to do easy diffs in the future.
+
+Official:
+http://json-schema.org/draft-03/schema#
+http://json-schema.org/draft-04/schema#
+http://json-schema.org/draft-06/schema#
+http://json-schema.org/draft-07/schema#
+
+Good news is: draft-7 and draft-6 are pretty close to official files.
+
+Files in ./jsonschema/schema/ has been reviewed:
+a) all elements are re-sorted to be in sync with element ordering of official schema files (to enable easy PR review)
+b) formatting is now in sync with official schema
+c) git commit history is inspected to find intended changed
+d) patches of the jsonschema project are kept intact
+e) rest is updated to become in sync with official meta schema files
+
+For easyer PR review i created separate commits on each step - please review this PR commit-by-commit.
+
+Please execute your test before merge to master to ensure that everything works as expected. You may want to check if your "fail rate" (https://github.com/ebdrup/json-schema-benchmark/blob/master/reports/jsonschema.md) has changed.
+If this PR undo an intended patch (now stated in the commit history), let me know, i will re-apply it / update the PR.
+
+BTW: i have to deal with draft-03 and draft-04 JSON instances in a project - that is the reason why i put efforts in these old meta schema files.
+Hi Julian,
+
+once again i want to thank you for this great validator.
+
+To enable the crowd to easily use jsonschema in CI / CD pipelines i implemented an automated build and release of a docker image, which is available at: https://hub.docker.com/r/freifunkhamm/jsonschema. This docker image is automatically scanned for security vulnerabilities with trivy.
+
+You are warm welcomed to join the release process. If your are interested in it i can grant you direct permissions at https://github.com/Freifunk-Hamm/docker_jsonschema. Just ping me.
+
+Release cycle is very simple:
+a) change Dockerfile (new version number)
+b) commit and tag commit with version number
+c) push
+(we use sticky version numbers to have the same result on subsequent build re-runs of the same commit) 
+
+Feel free to link it in your github repo / project website.
+
+Alternative:
+If you want to create your own namespace/organisation at DockerHub feel free to grap my code and enable automation in your git repo.
+Currently, it's not possible to install jsonschema offline, as pip cannot found setup_requires dependencies.
+See https://www.scivision.dev/setuptools-pyproject-toml-offline/ and https://stackoverflow.com/questions/27307082/install-package-which-has-setup-requires-from-local-source-distributions.
+Simply removing the option from setup.cfg do the trick.
+Add support to have the offending element within the instance reported via a [JSON path](https://goessner.net/articles/JsonPath/index.html)
+
+This allows to have a "standard" way of identifying the element with the problem, that can be used by other external CLI tools for example.
+When jsonschema validates that a given object property is of type "string", and it is `null` in the data, it outputs:
+
+    None: None is not of type 'string'
+
+No more information is shown, especially not the property that failed to validate.
+
+This makes finding the error with large schemas nearly impossible.
+
+# Example
+Schema:
+```
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "properties": {
+        "foo": {
+            "type": "string"
+        }
+    }
+}
+```
+
+Data:
+```
+{"foo": null}
+```
+
+Output:
+```
+$ jsonschema -i test-data.json test-schema.json 
+None: None is not of type 'string'
+```
+I know it's a big ask; just letting you know I'm pretty excited about the new draft and am eagerly awaiting support.
+
+Thanks for all you do!
+A CI build of ours pulled the new release (3.1.0) and all validation is failing with messages like
+```
+u'go' does not match u'^[^\\s]+$'
+```
+Building with `<3.1.0` does not have this issue.
+
+Reproducer:
+
+test.json:
+```json
+{
+  "test": "testString"
+}
+```
+
+schema.json;
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Reproducer",
+  "type": "object",
+  "properties": {
+    "test": {
+      "type": "string",
+      "pattern": "^[^\\s]+$"
+    }
+  }
+}
+```
+
+dockerfile (or just install 3.1.0 locally)
+```dockerfile
+FROM alpine:3.10
+RUN apk add --no-cache py-pip jq && pip install jsonschema
+
+COPY . /build
+RUN jsonschema --version
+RUN jsonschema /build/schema.json -i /build/test.json
+```

@@ -1,0 +1,241 @@
+https://github.com/dpc/colerr/issues/2
+
+This is the followup bug for https://github.com/dpc/mioco/issues/154. I was unable to create a minimal repo case, but I will try to give you access to the environment I am seeing this bug. 
+
+Background: I am writing a replacement for [Widelands](http://www.widelands.org)'s meta server. Think of it as a sort of mini battle.net only for Widelands. The [current version](https://github.com/widelands/widelands_metaserver) is in go, the one before it was in python. I use this to learn new languages and paradigms and I was playing around with mioco.
+
+My current implementation that shows this bug on Mac OS X with latest nightlies is https://github.com/SirVer/mioco_wlms_block. When running it and connecting widelands to it, the last lines I see in the console of the sever are:
+
+```
+#sirver ALIVE src/main.rs:24
+#sirver ALIVE src/main.rs:31
+#sirver done.
+#sirver ALIVE src/protocol.rs:124
+#sirver self.buf[..self.unconsumed]: []
+#sirver ALIVE src/protocol.rs:131
+<here is a very long pause without output, 20 or so seconds>
+#sirver Read: size: 23
+#sirver ALIVE src/protocol.rs:145
+```
+
+The last lines are printed [here](https://github.com/SirVer/mioco_wlms_block/blob/master/src/protocol.rs#L131). They signify that `reader.try_read()` blocks when there a few bytes to read, but less than the buffer's size can be read - which I am surprised about.
+
+If you want to reproduce, you can get yourself a [download](https://wl.widelands.org/wiki/Download/) of widelands. On Linux you will find build-18 likely in your package tree (`apt-get install widelands` will likely work). There are also PPAs available otherwise. Once you have the game, start it once and exit immediately. Then edit `~/.widelands/config` and add under `[global]` the line: `metaserver="localhost"`. Restart the game, choose multiplayer -> internet game at which point the game should try to connect. 
+
+Not sure if this should be considered a performance issue or a bug. 
+
+Consider the following test case
+
+``` rust
+extern crate mioco;
+
+use mioco::sync::mpsc::{sync_channel, Receiver, SyncSender};
+
+fn producer(tx: SyncSender<usize>) {
+    for i in 0.. {
+        println!("sending {}", i);
+        tx.send(i).expect("failed to send to consumer");
+    }
+}
+
+fn consumer(rx: Receiver<usize>) {
+    while let Ok(i) = rx.recv() {
+        println!("received {}", i);
+    }
+}
+
+fn main() {
+    let size = 1;
+    let (tx, rx) = sync_channel(size);
+
+    mioco::start(|| {
+        let producer = mioco::spawn(|| producer(tx));
+        let consumer = mioco::spawn(|| consumer(rx));
+
+        producer.join().unwrap();
+        consumer.join().unwrap();
+    }).unwrap();
+}
+```
+
+This example shows a normal pattern where there is a producer that is decoupled from a consumer by a bounded queue (the sync_channel).
+
+It is expected that when the queue is full, either because consumer is slow or hasn't been scheduled as often, that the producer blocks. Later, when there is enough space the producer gets resumed.
+
+However, running the above code you can see that the "throughput" is somewhat surprisingly just 2 per second. Most likely, when the producer coroutine gets yielded (src/sync/mpsc.rs:238) the event loop thinks there is nothing left to do and starts blocking on IO (for some ms). In this case, the consumer coroutine is ready to be executed and the event loop should have either skipped the io_poll() entirelly, or done it with a 0 timeout.
+
+If you are wondering, increasing the queue size to 2 does increase the throughput. But the result is a lot higher than just 2x. If the scheduling gods make it so that the two courotines are alternating requests to the queue then the limit is never hit, and they are able to proceed at full CPU speed.
+
+https://travis-ci.org/dpc/mioco/builds/149097312
+
+This is what you get if you don't wait for travis to complete.
+
+https://travis-ci.org/dpc/mioco/jobs/148753236
+
+```
+failures:
+
+---- tests::simple_mutex_supports_inside_and_outside stdout ----
+
+    thread 'tests::simple_mutex_supports_inside_and_outside' panicked at 'assertion failed: `(left == right)` (left: `7`, right: `9`)', tests.rs:986
+
+stack backtrace:
+
+   1:     0x2b72145751df - std::sys::backtrace::tracing::imp::write::h29f5fdb9fc0a7395
+
+   2:     0x2b721457955b - std::panicking::default_hook::_{{closure}}::h2cc84f0378700526
+
+   3:     0x2b72145786ac - std::panicking::default_hook::hbbe7fa36a995aca0
+
+   4:     0x2b7214578d4e - std::panicking::rust_panic_with_hook::h105c3d42fcd2fb5e
+
+   5:     0x2b7214578bb1 - std::panicking::begin_panic::hbf62ea4a5ff3f9de
+
+   6:     0x2b7214578ada - std::panicking::begin_panic_fmt::h20f5943904e5791d
+
+   7:     0x2b72144f2f1f - mioco::tests::simple_mutex_supports_inside_and_outside::hf64443600be62fc3
+
+   8:     0x2b721453ef26 - _<F as alloc..boxed..FnBox<A>>::call_box::h6c46b1f51a5f97cd
+
+   9:     0x2b72145348f7 - std::panicking::try::call::h8d6a00e6c0ac8b9e
+
+  10:     0x2b72145810e6 - __rust_maybe_catch_panic
+
+  11:     0x2b721453e83e - _<F as alloc..boxed..FnBox<A>>::call_box::h173484225f9723d2
+
+  12:     0x2b7214577154 - std::sys::thread::Thread::new::thread_start::h8f3bd45211e9f5ea
+
+  13:     0x2b7214c7fe99 - start_thread
+
+  14:     0x2b721519e36c - <unknown>
+
+failures:
+```
+
+Reported originally in #122 
+
+``` rust
+let mut remote: TcpStream = ...;
+let mut origin = try!(TcpStream::connect(&addr));
+
+let mut remote2 = try!(remote.try_clone());
+let mut origin2 = try!(origin.try_clone());
+
+mioco::spawn(move || -> io::Result<()> {
+    let mut buf = [0; 1024];
+    loop {
+        let size = try!(remote2.read(&mut buf));
+        if size == 0 {
+            break;
+        }
+        origin2.write_all(&buf[..size]);
+    }
+    Ok(())
+});
+
+mioco::spawn(move || -> io::Result<()> {
+    let mut buf = [0; 1024];
+    loop {
+        let size = try!(origin.read(&mut buf));
+        if size == 0 {
+            break;
+        }
+        remote.write_all(&buf[..size]);
+    }
+    Ok(())
+});
+```
+
+`try_clone` must return a deep clone (new fd), or not work at all.  Also: make sure mioco types can't be used from multiple threads/coroutines at the same time.
+
+
+It is generally needed.
+
+When using select in a loop the event's don't have to be re-registered every time (which, for channels at least, is expensive).
+
+To test, I made `mioco::thread::tl_current_coroutine` public, and added a flag to `mioco::coroutine::Coroutine` to disable the `deregister_all` call in `unblock`. Here's a stress test using channels:
+
+`loop.rs` - The test using mioco master:
+
+``` rust
+#[macro_use] extern crate mioco;
+
+fn main(){
+    let _ = mioco::start(move ||{
+
+        let (sx,rx) = mioco::sync::mpsc::channel();
+        let (sx2,rx2) = mioco::sync::mpsc::channel();
+        let (sx3,rx3) = mioco::sync::mpsc::channel();
+        let mut counter = 0;
+        sx.send(42);
+        sx2.send(42);
+        sx3.send(42);
+
+        loop{select!(
+            r:rx2 => { let _ = rx2.try_recv(); },
+            r:rx3 => { let _ = rx3.try_recv(); },
+            r:rx => {
+                if let Ok(x) = rx.try_recv(){
+                    counter += 1;
+                    sx.send(42);
+                    if counter > 10_000_000 { break; }
+                }
+            },
+            );
+        }
+    });
+}
+```
+
+`loop2.rs` - With `tl_current_coroutine` public and `auto_deregister` added to coroutine.
+
+``` rust
+#[macro_use] extern crate mioco;
+use mioco::thread::tl_current_coroutine;
+use mioco::Evented;
+
+fn main(){
+    let _ = mioco::start(move ||{
+
+        let (sx,rx) = mioco::sync::mpsc::channel();
+        let (sx2,rx2) = mioco::sync::mpsc::channel();
+        let (sx3,rx3) = mioco::sync::mpsc::channel();
+        let mut counter = 0;
+        sx.send(42);
+        sx2.send(42);
+        sx3.send(42);
+
+        unsafe{
+            tl_current_coroutine().auto_deregister = false;
+            rx.select_add(mioco::RW::read());
+            rx2.select_add(mioco::RW::read());
+            rx3.select_add(mioco::RW::read());
+        }
+
+        loop{
+            let ret = mioco::select_wait();
+            if ret.id() == rx.id(){
+                if let Ok(_) = rx.try_recv(){
+                    counter += 1;
+                    sx.send(42);
+                    if counter > 10_000_000 { break; }
+                }
+            }
+            if ret.id() == rx2.id(){ let _ = rx2.try_recv(); }
+            if ret.id() == rx3.id(){ let _ = rx3.try_recv(); }
+        }
+    });
+}
+```
+
+and the results:
+
+```
+➜  mioco_timer git:(master) ✗  time ./target/release/loop
+./target/release/loop  13.27s user 0.51s system 98% cpu 13.929 total
+
+➜  mioco_timer git:(master) ✗  time ./target/release/loop2
+./target/release/loop2  10.11s user 0.34s system 98% cpu 10.592 total
+```
+
+One idea for a proper implementation of this would be a `select_loop!` macro, which would select in a loop without re-registering.

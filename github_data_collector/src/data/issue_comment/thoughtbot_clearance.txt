@@ -1,0 +1,71 @@
+We currently have lots of hooks for redirect URLs in the various controllers. It would be interesting to consider more hooks in the success/failure paths of the controller actions so that if people need side effects beyond just the redirect, they can more easily add those.
+This takes the work started by @nsuchy in #832 and cleans up the code and adds specs around the strategy.
+
+## Todo
+
+[ ] Configure costs
+Reopened against master from #823 
+
+> Hi guys! I saw that #682 got stale and with #817 on the way, I thought that it's a good time to try to revive this effort..
+> 
+> This PR is a rebased of #682, with extra changes on top to address the concern related to `the risk of exposing the existing encrypted password`..
+> 
+> In summary, the differences between this PR and #682 is, in this PR reset token are generated using `ActiveSupport::MessageEncryptor` instead of `ActiveSupport::MessageVerifier`..
+> 
+> As can be seen from the [module documentation](https://github.com/rails/rails/blob/v5.2.2/activesupport/lib/active_support/message_encryptor.rb#L11-L12), `ActiveSupport::MessageEncryptor` is designed as `a simple way to encrypt values which get stored somewhere you don't trust.`, which perfectly fit our needs..
+> 
+> As part of the changes, I introduces a new class `Clearance::Tokenizer` to wrap the logic around `ActiveSupport::MessageEncryptor` and changes the configuration option from `configuration.message_verifier` to `configuration.tokenizer`.. I think, in the long term, we could somehow merge `Clearance::Token` and `Clearance::Tokenizer` (or delegate token generation logic inside `Clearance::Token` to `Clearance::Tokenizer`)..
+I didn't see a way to do this right now but found [a workaround someone had developed](https://makandracards.com/makandra/1387-delete-a-clearance-session-after-some-time-of-inactivity). 
+
+Basically they set the `cookie_expiration` to a short period of time, then call `sign_in` on any controller action. This way the user will only be logged out if they stop using the site.
+
+This worked well for us, but it has one downside - every time a request is made, the existing CSRF token becomes invalid because `rotate_csrf_on_sign_in` is set to true. One example being if you have a download link on a page with a form, clicking the download will change the CSRF token and the user will not be able to submit the form. 
+
+
+Is it possible to update `cookie_expiration` manually instead of having to go through `sign_in`? Thanks!
+I created a subclass of User with scoping that restricts the login/password reset ability of certain users. But doing this, changes the url parameter used in specs.
+
+For example, with `config.user_model = ClearanceUser`, the routes expect users/:clearance_user_id/password.
+
+In order to maintain the routing/naming structure of user_password_path, I needed to be able to force the named parameter to `:user_id`.
+This PR addes indexes for`email` and `remember_token` which are unique.
+inspired by discussion here: #726
+
+The first commit to the migration simply adds unique constraints to the columns, which @derekprior  said he would invite (not sure if that meant for one or both token types)
+
+The second commit takes advantage of the constraints, because user_id is now redundant.
+
+I wasn't able to get my environment to run tests (ruby 2.4 problem?) so I just put this together for discussion, to see what changes are welcome.
+
+If removing the user_id requirement isn't desirable, then the index in the first commit could be updated to be multi-column, `[:user_id, :confirmation_token]`.
+
+LMKWYT!
+
+Currently, each account has a single remember token. Signing out of your account on one device will sign you out on all devices because the single remember token is rotated. This is nice in its simplicity, but is a pain in many contexts with mobile users, shared computers, etc.
+
+Here's a proposal for Clearance 2.0:
+1. `User#remember_token` is removed in favor of a `remember_tokens` table. 
+2. Each new sign in adds a new entry for the user to  the `remember_tokens` table.
+3. Signing out destroys that remember token only.
+
+We would also add a `sessions#index` action which lists the current users' existing sessions and allows them to be destroyed remotely.
+
+For the index view to be useful to users, each token would have to be associated to something which might give them some hope of identifying the session. How do you think we should handle this?
+
+My first thought was that when we create a new remember token, we record the IP address and user agent string of the browser and present that in the index. I feel like UA strings are ugly and require some parsing to boil down to something useful and succinct and I'm heistant to do that myself and wary of taking a dependency to do that. Should I be? Similiarly, a raw IP address isn't nearly as helpful as geolocation but I'd need a dependency for that as well, and I think they'd require an external service call. So that's out immediately in my book.
+
+Then I thought that perhaps we should also record a "last_seen_at" field, which would tell us when the token was last active. That alone might be sufficient. But then that's a database write on every request. Is that worth it?
+
+What do you all think of this feature? Do you have any other intricacies you think I should consider? How do you feel about making the information meaningful to end users?
+
+When authenticating a user, we skip any calls to BCrypt if we weren't able to find a user with the provided email address. This results in a faster response time to the client and less work on the server... but it also means one could possibly monitor the response times from the app to see if the provided user has an account.
+
+When we detect that a user does not exist with the provided email, we should go ahead and perform a bcrypt check anyway, and always return false from that check. This will keep timings consistent with the response one gets when they use an email that exists but get the password wrong.
+
+I took a quick look at how this could be done. I feel like the best way would be a new "dummy_authenticate" method on the password strategy that is called for this explict purpose. That's a breaking change to the contract of the password strategy though.
+
+Another alternative would be to handle this in the user mixin itself. We'd want to make sure we produce similar timings in any event.
+
+Do you think it's worth it to store a digest of the `confirmation_token`, so that access to the database doesn't grant easy access to user accounts?
+
+One problem is that it would be a backwards incompatible change, and would require a migration of existing data.

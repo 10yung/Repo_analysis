@@ -1,0 +1,204 @@
+
+https://sha-mbles.github.io/
+
+Per a discussion on Git mailing list at [One failed self test on Fedora 29](https://www.spinics.net/lists/git/msg354966.html) and assorted follow-ups. The discussion concerns itself with a failed audit due to unaligned accesses in `sha1dc/sha1.c` (using `CFLAGS += -fsanitize=undefined`). 
+
+And in particular, from Jeff King at [disabling sha1dc unaligned access]():
+
+> Unfortunately, I don't think sha1dc currently supports #defines in that
+> direction. The only logic is "if we are on intel, do unaligned loads"
+> and "even if we are not on intel, do it anyway". There is no "even if we
+> are on intel, do not do unaligned loads".
+> 
+> I think you'd need something like this:
+> 
+> diff --git a/Makefile b/Makefile
+> index 148668368b..705c54dcd8 100644
+> --- a/Makefile
+> +++ b/Makefile
+> @@ -1194,6 +1194,7 @@ BASIC_CFLAGS += -fsanitize=$(SANITIZE) -fno-sanitize-recover=$(SANITIZE)
+>  BASIC_CFLAGS += -fno-omit-frame-pointer
+>  ifneq ($(filter undefined,$(SANITIZERS)),)
+>  BASIC_CFLAGS += -DNO_UNALIGNED_LOADS
+> +BASIC_CFLAGS += -DSHA1DC_DISALLOW_UNALIGNED_ACCESS
+>  endif
+>  ifneq ($(filter leak,$(SANITIZERS)),)
+>  BASIC_CFLAGS += -DSUPPRESS_ANNOTATED_LEAKS
+> diff --git a/sha1dc/sha1.c b/sha1dc/sha1.c
+> index df0630bc6d..0bdf80d778 100644
+> --- a/sha1dc/sha1.c
+> +++ b/sha1dc/sha1.c
+> @@ -124,9 +124,11 @@
+>  #endif
+>  /*ENDIANNESS SELECTION*/
+> 
+> +#ifndef SHA1DC_DISALLOW_UNALIGNED_ACCESS
+>  #if defined(SHA1DC_FORCE_UNALIGNED_ACCESS) || defined(SHA1DC_ON_INTEL_LIKE_PROCESSOR)
+>  #define SHA1DC_ALLOW_UNALIGNED_ACCESS
+>  #endif /*UNALIGNMENT DETECTION*/
+> +#endif
+> 
+> 
+>  #define rotate_right(x,n) (((x)>>(n))|((x)<<(32-(n))))
+> 
+> but of course we cannot touch sha1dc/*, because we might actually be
+> using the submodule copy instead. And AFAIK there is no good way to
+> modify the submodule-provided content as part of the build. Why do we
+> even have the submodule again? ;P
+> 
+> I guess the same would be true for DC_SHA1_EXTERNAL, too, though.
+> 
+> So anyway, I think this needs a patch to the upstream sha1dc project.
+
+Please provide an option to disable unaligned accesses.
+This is the continuation of e8397b2 (.gitignore: ignore lib/.depend/ and
+other .depend/ directories, 2017-05-19) and helps git.git which uses
+this as a submodule.
+
+When running 'make coverage' in git.git, we'll find some files (with the
+extension of .gcda and .gcno [1]), to be ignored in this submodule.
+
+[1] https://gcc.gnu.org/onlinedocs/gcc/Gcov-Data-Files.html
+
+Signed-off-by: Stefan Beller <sbeller@google.com>
+Building on AIX using XLC gives an error during make test:
+Error: Compiled for incorrect endianness
+This also breaks in git from 2.13.2
+
+Add a #ifdef guard based on macros defined at [2] and [3].
+
+Should perhaps __xlc__ should should be changed to or combined with _AIX
+based on the behavour of GCC on AIX or XL C on Linux.
+
+1. https://github.com/git/git/commit/6b851e536b05e0c8c61f77b9e4c3e7cedea39ff8
+2. https://www.ibm.com/support/knowledgecenter/SSGH2K_13.1.3/com.ibm.xlc1313.aix.doc/compiler_ref/macros_platform.html
+3. https://www.ibm.com/support/knowledgecenter/SSGH2K_13.1.3/com.ibm.xlc1313.aix.doc/compiler_ref/xlmacros.html
+Makes compilation using xlc on AIX (and likely other compilers) not warn so much.
+I noticed that on some older PPC systems I have, the SHA1 hashes created in git were failing since this code was included. When built with newer gcc compilers (e.g. gcc6) git would generate properly working binaries. 
+
+The stock Apple compilers are gcc-4.2 and less, and they don't generate the #defines needed to succeed in the current big endian tests. Forcing big endian with `-DSHA1DC_FORCE_BIGENDIAN` does work to create a working git.
+
+Perhaps the big endian detection might be tweaked to add support for these older stock Apple compilers, and that would fix git on these systems.  
+
+Here's the output:
+```
+$ ./gcc-apple-4.2 -E -dM  - < /dev/null
+#define __DBL_MIN_EXP__ (-1021)
+#define __FLT_MIN__ 1.17549435e-38F
+#define __DEC64_DEN__ 0.000000000000001E-383DD
+#define __CHAR_BIT__ 8
+#define _ARCH_PPCGR 1
+#define __WCHAR_MAX__ 2147483647
+#define __DBL_DENORM_MIN__ 4.9406564584124654e-324
+#define __FLT_EVAL_METHOD__ 0
+#define __DBL_MIN_10_EXP__ (-307)
+#define __FINITE_MATH_ONLY__ 0
+#define __GNUC_PATCHLEVEL__ 1
+#define __DEC64_MAX_EXP__ 384
+#define __SHRT_MAX__ 32767
+#define __LDBL_MAX__ 1.79769313486231580793728971405301e+308L
+#define __APPLE_CC__ 5666
+#define __UINTMAX_TYPE__ long long unsigned int
+#define __DEC32_EPSILON__ 1E-6DF
+#define __block __attribute__((__blocks__(byref)))
+#define __LDBL_MAX_EXP__ 1024
+#define __SCHAR_MAX__ 127
+#define __USER_LABEL_PREFIX__ _
+#define __STDC_HOSTED__ 1
+#define __LDBL_HAS_INFINITY__ 1
+#define __DEC64_MIN_EXP__ (-383)
+#define __DBL_DIG__ 15
+#define __FLT_EPSILON__ 1.19209290e-7F
+#define __LDBL_MIN__ 2.00416836000897277799610805135016e-292L
+#define __DEC32_MAX__ 9.999999E96DF
+#define __ppc__ 1
+#define __strong 
+#define __APPLE__ 1
+#define __DECIMAL_DIG__ 33
+#define __LDBL_HAS_QUIET_NAN__ 1
+#define __DYNAMIC__ 1
+#define __GNUC__ 4
+#define __FLT_HAS_DENORM__ 1
+#define __DBL_MAX__ 1.7976931348623157e+308
+#define __DBL_HAS_INFINITY__ 1
+#define __DEC32_MIN_EXP__ (-95)
+#define OBJC_NEW_PROPERTIES 1
+#define __LDBL_HAS_DENORM__ 1
+#define __DEC128_MAX__ 9.999999999999999999999999999999999E6144DL
+#define __DEC32_MIN__ 1E-95DF
+#define __weak __attribute__((objc_gc(weak)))
+#define __DBL_MAX_EXP__ 1024
+#define __DEC128_EPSILON__ 1E-33DL
+#define __LONG_LONG_MAX__ 9223372036854775807LL
+#define __GXX_ABI_VERSION 1002
+#define __FLT_MIN_EXP__ (-125)
+#define __DBL_MIN__ 2.2250738585072014e-308
+#define __DBL_HAS_QUIET_NAN__ 1
+#define __DEC128_MIN__ 1E-6143DL
+#define __REGISTER_PREFIX__ 
+#define __DBL_HAS_DENORM__ 1
+#define __NO_INLINE__ 1
+#define __DEC_EVAL_METHOD__ 2
+#define _ARCH_PPC 1
+#define __FLT_MANT_DIG__ 24
+#define __VERSION__ "4.2.1 (Apple Inc. build 5666) (dot 3) (MacPorts apple-gcc42 5666.3_15)"
+#define __BIG_ENDIAN__ 1
+#define __DEC64_EPSILON__ 1E-15DD
+#define __DEC128_MIN_EXP__ (-6143)
+#define __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ 1040
+#define __SIZE_TYPE__ long unsigned int
+#define __DEC32_DEN__ 0.000001E-95DF
+#define __FLT_RADIX__ 2
+#define __LDBL_EPSILON__ 4.94065645841246544176568792868221e-324L
+#define __NATURAL_ALIGNMENT__ 1
+#define __LDBL_DIG__ 31
+#define __FLT_HAS_QUIET_NAN__ 1
+#define __FLT_MAX_10_EXP__ 38
+#define __LONG_MAX__ 2147483647L
+#define __FLT_HAS_INFINITY__ 1
+#define __DEC64_MAX__ 9.999999999999999E384DD
+#define __DEC64_MANT_DIG__ 16
+#define __DEC32_MAX_EXP__ 96
+#define _BIG_ENDIAN 1
+#define __DEC128_DEN__ 0.000000000000000000000000000000001E-6143DL
+#define __LDBL_MANT_DIG__ 106
+#define __CONSTANT_CFSTRINGS__ 1
+#define __WCHAR_TYPE__ int
+#define __pic__ 2
+#define __FLT_DIG__ 6
+#define __INT_MAX__ 2147483647
+#define __LONG_DOUBLE_128__ 1
+#define __FLT_MAX_EXP__ 128
+#define __BLOCKS__ 1
+#define __DBL_MANT_DIG__ 53
+#define __DEC64_MIN__ 1E-383DD
+#define __WINT_TYPE__ int
+#define __LDBL_MIN_EXP__ (-968)
+#define __MACH__ 1
+#define __LDBL_MAX_10_EXP__ 308
+#define __DBL_EPSILON__ 2.2204460492503131e-16
+#define __INTMAX_MAX__ 9223372036854775807LL
+#define __FLT_DENORM_MIN__ 1.40129846e-45F
+#define __PIC__ 2
+#define __FLT_MAX__ 3.40282347e+38F
+#define __FLT_MIN_10_EXP__ (-37)
+#define __INTMAX_TYPE__ long long int
+#define __DEC128_MAX_EXP__ 6144
+#define __GNUC_MINOR__ 2
+#define __DEC32_MANT_DIG__ 7
+#define __DBL_MAX_10_EXP__ 308
+#define __LDBL_DENORM_MIN__ 4.94065645841246544176568792868221e-324L
+#define __STDC__ 1
+#define __PTRDIFF_TYPE__ int
+#define __DEC128_MANT_DIG__ 34
+#define __LDBL_MIN_10_EXP__ (-291)
+#define __POWERPC__ 1
+#define __GNUC_GNU_INLINE__ 1
+```
+
+perhaps checking for ```__APPLE__``` and ```__BIG_ENDIAN__``` would do it?
+Upon code review, @cr-marcstevens  and I noticed that the ihv2 buffers and m2 buffers on the context are unnecessary for the struct.  And hence can be removed to simplify the code.
+- Declare API entry points as __cdecl (through a compiler-specific macro).
+- Add a new void* parameter to the callback function.
+- Allow multiple calls to SHA1DCFinal() - enable getting partial hashes.
+- FIX: Callback was never called.

@@ -1,0 +1,408 @@
+Over the years, we've increasingly strengthened `noexcept`. However, we haven't yet done so for `array` iterators:
+
+https://github.com/microsoft/STL/blob/e36c3bff618fd9be798b3d9752205b96e66adbb6/stl/inc/xutility#L3045-L3047
+
+This is increasingly visible; e.g. `span` has a conditionally strengthened constructor where this matters.
+_Ctypevec has some padding than can be elminated by moving the pointers to the front.  Here is the sizes before and after rearranging the members.
+
+class _Ctypevec	size(32):
+	+---
+ 0	| _Page
+  	| <alignment member> (size=4)
+ 8	| _Table
+16	| _Delfl
+  	| <alignment member> (size=4)
+24	| _LocaleName
+	+---
+
+class std::ctype<char>	size(48):	
+class std::ctype<wchar_t>	size(96):
+class std::ctype<unsigned short>	size(96):
+
+///////////  After
+
+class _Ctypevec	size(24):
+	+---
+ 0	| _Table
+ 8	| _LocaleName
+16	| _Page
+20	| _Delfl
+	+---		
+class std::ctype<char>	size(40):
+class std::ctype<wchar_t>	size(88):
+class std::ctype<unsigned short>	size(88):
+Resolves GH-6, GH-38, and drive-by fixes GH-414.
+
+Constexprizes the following algorithms and enables all relevant libc++ tests:
+
+* adjacent_find
+* all_of
+* any_of
+* binary_search
+* copy
+* copy_backward
+* copy_if
+* copy_n
+* count
+* count_if
+* equal
+* equal_range
+* exchange
+* fill
+* fill_n
+* find
+* find_end
+* find_first_of
+* find_if
+* find_if_not
+* for_each
+* for_each_n
+* generate
+* generate_n
+* includes
+* is_heap
+* is_heap
+* is_heap_until
+* is_partitioned
+* is_permutation
+* is_sorted
+* is_sorted_until
+* iter_swap
+* lexicographical_compare
+* lower_bound
+* make_heap
+* merge
+* mismatch
+* move
+* move_backward
+* next_permutation
+* none_of
+* nth_element
+* partial_sort
+* partial_sort_copy
+* partition
+* partition_copy
+* partition_point
+* pop_heap
+* prev_permutation
+* push_heap
+* remove
+* remove_copy
+* remove_copy_if
+* remove_if
+* replace
+* replace_copy
+* replace_copy_if
+* replace_if
+* reverse_copy
+* revese
+* rotate
+* rotate_copy
+* search
+* search_n
+* set_difference
+* set_intersection
+* set_symmetric_difference
+* set_union
+* sort
+* sort_heap
+* swap
+* swap_ranges
+* transform
+* unique
+* unique_copy
+* upper_bound
+
+This commit also contains the contents of https://github.com/microsoft/STL/pull/423 to workaround DevCom-883631, it will be rebased and that content removed once that is merged (the other one needs to be merged first).
+
+Specific notes:
+
+`<xutility>`:
+* The `_Ptr_copy_cat` family are moved down next to std::copy as that is their first consumer.
+* The core language loop for `copy_n` is fairly long and so it was extracted into its own function, `_Copy_n_core` (note similar name schema to `_Copy_memmove`)
+* `reverse` was changed to use early-returns for its optimization passes; this removes the nice thing of having if constexpr not instantiate the loop. However, this form allows the loop to not be duplicated.
+
+Updates the llvm submodule to get https://github.com/llvm/llvm-project/commit/6d8abe424a77f736fbed114eeac574b9bfe6b0c1
+
+# Checklist
+
+Be sure you've read README.md and understand the scope of this repo.
+
+If you're unsure about a box, leave it unchecked. A maintainer will help you.
+
+- [x] Identifiers in product code changes are properly `_Ugly` as per
+  https://eel.is/c++draft/lex.name#3.1 or there are no product code changes.
+- [ ] The STL builds successfully and all tests have passed (must be manually
+  verified by an STL maintainer before automated testing is enabled on GitHub,
+  leave this unchecked for initial submission).
+- [x] These changes introduce no known ABI breaks (adding members, renaming
+  members, adding virtual functions, changing whether a type is an aggregate
+  or trivially copyable, etc.).
+- [x] These changes were written from scratch using only this repository,
+  the C++ Working Draft (including any cited standards), other WG21 papers
+  (excluding reference implementations outside of proposed standard wording),
+  and LWG issues as reference material. If they were derived from a project
+  that's already listed in NOTICE.txt, that's fine, but please mention it.
+  If they were derived from any other project (including Boost and libc++,
+  which are not yet listed in NOTICE.txt), you *must* mention it here,
+  so we can determine whether the license is compatible and what else needs
+  to be done.
+
+`<xutility>`  
+4660: _Find_pr is a helper for is_permutation, so move it down to that area.  
+4684: The SHOUTY banners were attached to functions which were implementation details of is_permutation, so I fixed them up to say is_permutation and removed the banners for helper functions.  
+4711: Use if constexpr to avoid a tag dispatch call for _Trim_matching_suffixes. Optimizers will like this because they generally hate reference-to-pointer, and it also serves to workaround DevCom-883631 when this algorithm is constexprized.  
+4766: Indicate that we are trimming matching prefixes in this loop body, and break apart comment block that was incorrectly merged by clang-format.  
+4817: In the dual range forward version of the algorithm, calculate the distances concurrently to avoid wasting lots of time when the distances vary by a lot. For example, is_permutation( a forward range of length 1, a forward range of length 1'000'000 ) used to do the million increments, now it stops at 1 increment.  
+4862: In the dual range random-access version, avoid recalculating _Last2 when it has already been supplied to us.  
+  
+`<xhash>`  
+1404: Move down construction of _Bucket_hi in _Equal_range to before the first loop body using it.  
+1918: Added a new function to calculate equality for unordered multicontainers. We loop over the elements in the left container, find corresponding ranges in the right container, trim prefixes, then dispatch to is_permutation's helper _Check_match_counts.  
+Improvements over the old implementation:  
+* For standard containers, we no longer need to hash any elements from the left container; we know that we've found the "run" of equivalent elements because we *started* with an element in that container. We also never go "backwards" or multiply enumerate _Left (even for !_Standard), which improves cache use when the container becomes large.
+* Just like the dual range is_permutation improvement above, when the equal_ranges of the containers are of wildly varying lengths, this will stop on the shorter of the lengths.
+* We avoid the 3-arg is_permutation doing a linear time operation to discover _Last2 that we already had calculated in determining _Right's equal_range.
+
+The function _Multi_equal_check_equal_range tests one equal_range from the left container against the corresponding equal_range from the right container, while _Multi_equal invokes _Multi_equal_check_equal_range for each equal_range.
+
+Performance results:
+
+![image](https://user-images.githubusercontent.com/1544943/72472988-9a36df00-379a-11ea-8dec-cb1c6692f030.png)
+
+Benchmark code:
+```
+#undef NDEBUG
+#define _SILENCE_STDEXT_HASH_DEPRECATION_WARNINGS
+#include <assert.h>
+#include <benchmark/benchmark.h>
+#include <hash_map>
+#include <random>
+#include <stddef.h>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+using namespace std;
+
+template <template <class...> class MapType> void HashRandomUnequal(benchmark::State &state) {
+    std::minstd_rand rng(std::random_device{}());
+    const auto range0 = static_cast<ptrdiff_t>(state.range(0));
+    vector<pair<unsigned, unsigned>> testData;
+    testData.resize(range0 * 5);
+    const auto dataEnd = testData.begin() + range0;
+    std::generate(testData.begin(), dataEnd, [&]() { return pair<unsigned, unsigned>{rng(), 0u}; });
+    std::copy(testData.begin(), dataEnd,
+              std::copy(testData.begin(), dataEnd,
+                        std::copy(testData.begin(), dataEnd, std::copy(testData.begin(), dataEnd, dataEnd))));
+    std::unordered_multimap<unsigned, unsigned> a(testData.begin(), testData.end());
+    testData.clear();
+    std::unordered_multimap<unsigned, unsigned> b = a;
+    next(b.begin(), b.size() - 1)->second = 1u;
+    for (auto &&_ : state) {
+        (void)_;
+        assert(a != b);
+    }
+}
+
+BENCHMARK_TEMPLATE1(HashRandomUnequal, unordered_multimap)->Arg(1)->Arg(10)->Range(100, 100'000);
+BENCHMARK_TEMPLATE1(HashRandomUnequal, hash_multimap)->Arg(1)->Arg(10)->Range(100, 100'000);
+
+template <template <class...> class MapType> void HashRandomEqual(benchmark::State &state) {
+    std::minstd_rand rng(std::random_device{}());
+    const auto range0 = static_cast<ptrdiff_t>(state.range(0));
+    vector<pair<unsigned, unsigned>> testData;
+    testData.resize(range0 * 5);
+    const auto dataEnd = testData.begin() + range0;
+    std::generate(testData.begin(), dataEnd, [&]() { return pair<unsigned, unsigned>{rng(), 0}; });
+    std::copy(testData.begin(), dataEnd,
+              std::copy(testData.begin(), dataEnd,
+                        std::copy(testData.begin(), dataEnd, std::copy(testData.begin(), dataEnd, dataEnd))));
+    std::unordered_multimap<unsigned, unsigned> a(testData.begin(), testData.end());
+    testData.clear();
+    std::unordered_multimap<unsigned, unsigned> b = a;
+    for (auto &&_ : state) {
+        (void)_;
+        assert(a == b);
+    }
+}
+
+BENCHMARK_TEMPLATE1(HashRandomEqual, unordered_multimap)->Arg(1)->Arg(10)->Range(100, 100'000);
+BENCHMARK_TEMPLATE1(HashRandomEqual, hash_multimap)->Arg(1)->Arg(10)->Range(100, 100'000);
+
+template <template <class...> class MapType> void HashUnequalDifferingBuckets(benchmark::State &state) {
+    std::unordered_multimap<unsigned, unsigned> a;
+    std::unordered_multimap<unsigned, unsigned> b;
+    const auto range0 = static_cast<ptrdiff_t>(state.range(0));
+    for (ptrdiff_t idx = 0; idx < range0; ++idx) {
+        a.emplace(0, 1);
+        b.emplace(1, 0);
+    }
+
+    a.emplace(1, 0);
+    b.emplace(0, 1);
+    for (auto &&_ : state) {
+        (void)_;
+        assert(a != b);
+    }
+}
+
+BENCHMARK_TEMPLATE1(HashUnequalDifferingBuckets, unordered_multimap)->Arg(2)->Arg(10)->Range(100, 100'000);
+BENCHMARK_TEMPLATE1(HashUnequalDifferingBuckets, hash_multimap)->Arg(2)->Arg(10)->Range(100, 100'000);
+
+BENCHMARK_MAIN();
+```
+
+# Checklist
+
+Be sure you've read README.md and understand the scope of this repo.
+
+If you're unsure about a box, leave it unchecked. A maintainer will help you.
+
+- [x] Identifiers in product code changes are properly `_Ugly` as per
+  https://eel.is/c++draft/lex.name#3.1 or there are no product code changes.
+- [x] The STL builds successfully and all tests have passed (must be manually
+  verified by an STL maintainer before automated testing is enabled on GitHub,
+  leave this unchecked for initial submission).
+- [x] These changes introduce no known ABI breaks (adding members, renaming
+  members, adding virtual functions, changing whether a type is an aggregate
+  or trivially copyable, etc.).
+- [x] These changes were written from scratch using only this repository,
+  the C++ Working Draft (including any cited standards), other WG21 papers
+  (excluding reference implementations outside of proposed standard wording),
+  and LWG issues as reference material. If they were derived from a project
+  that's already listed in NOTICE.txt, that's fine, but please mention it.
+  If they were derived from any other project (including Boost and libc++,
+  which are not yet listed in NOTICE.txt), you *must* mention it here,
+  so we can determine whether the license is compatible and what else needs
+  to be done.
+
+When VS 2019 16.5 Preview 2 is available, we should update our required compiler version accordingly:
+
+https://github.com/microsoft/STL/blob/d862650bd5044708a9bf1808ee3edf20dbd06f9d/stl/inc/yvals_core.h#L443-L444
+
+(The Microsoft-internal checked-in toolset is already version 19.25, so we don't need to wait for that.)
+# Description
+
+Resolves #19 and #20. I mostly copied standard quotes, unrolled some function calls and _Uglified. Now I wonder if it is possible to merge some code between `uses_allocator_construction_args` and `_Uses_allocator_construct` (from `xpolymorphic_allocator.h`), their purpose is same it seems.
+
+# Checklist
+
+Be sure you've read README.md and understand the scope of this repo.
+
+If you're unsure about a box, leave it unchecked. A maintainer will help you.
+
+- [x] Identifiers in product code changes are properly `_Ugly` as per
+  https://eel.is/c++draft/lex.name#3.1 or there are no product code changes.
+- [ ] The STL builds successfully and all tests have passed (must be manually
+  verified by an STL maintainer before automated testing is enabled on GitHub,
+  leave this unchecked for initial submission).
+- [ ] These changes introduce no known ABI breaks (adding members, renaming
+  members, adding virtual functions, changing whether a type is an aggregate
+  or trivially copyable, etc.).
+- [x] These changes were written from scratch using only this repository,
+  the C++ Working Draft (including any cited standards), other WG21 papers
+  (excluding reference implementations outside of proposed standard wording),
+  and LWG issues as reference material. If they were derived from a project
+  that's already listed in NOTICE.txt, that's fine, but please mention it.
+  If they were derived from any other project (including Boost and libc++,
+  which are not yet listed in NOTICE.txt), you *must* mention it here,
+  so we can determine whether the license is compatible and what else needs
+  to be done.
+
+# Description
+
+Resolves #53 . According to the table from [P1165](http://wg21.link/P1165) only `lvalue + lvalue` case needed fixing. I also checked other overloads, seems conforming.
+I tried to leave 1 allocation but am not sure if I got SOCCC right, don't know how to check it.
+Also due to operator+ not being friend `_Alty_traits` was copied.
+
+# Checklist
+
+Be sure you've read README.md and understand the scope of this repo.
+
+If you're unsure about a box, leave it unchecked. A maintainer will help you.
+
+- [x] Identifiers in product code changes are properly `_Ugly` as per
+  https://eel.is/c++draft/lex.name#3.1 or there are no product code changes.
+- [ ] The STL builds successfully and all tests have passed (must be manually
+  verified by an STL maintainer before automated testing is enabled on GitHub,
+  leave this unchecked for initial submission).
+- [ ] These changes introduce no known ABI breaks (adding members, renaming
+  members, adding virtual functions, changing whether a type is an aggregate
+  or trivially copyable, etc.).
+- [x] These changes were written from scratch using only this repository,
+  the C++ Working Draft (including any cited standards), other WG21 papers
+  (excluding reference implementations outside of proposed standard wording),
+  and LWG issues as reference material. If they were derived from a project
+  that's already listed in NOTICE.txt, that's fine, but please mention it.
+  If they were derived from any other project (including Boost and libc++,
+  which are not yet listed in NOTICE.txt), you *must* mention it here,
+  so we can determine whether the license is compatible and what else needs
+  to be done.
+# Description
+
+...which has been fixed for 16.6p1.
+
+Fixes #416.
+
+[This is a dual of internal PR MSVC-PR-222093.]
+
+# Checklist
+
+Be sure you've read README.md and understand the scope of this repo.
+
+If you're unsure about a box, leave it unchecked. A maintainer will help you.
+
+- [X] Identifiers in product code changes are properly `_Ugly` as per
+  https://eel.is/c++draft/lex.name#3.1 or there are no product code changes.
+- [ ] The STL builds successfully and all tests have passed (must be manually
+  verified by an STL maintainer before automated testing is enabled on GitHub,
+  leave this unchecked for initial submission).
+- [X] These changes introduce no known ABI breaks (adding members, renaming
+  members, adding virtual functions, changing whether a type is an aggregate
+  or trivially copyable, etc.).
+- [X] These changes were written from scratch using only this repository,
+  the C++ Working Draft (including any cited standards), other WG21 papers
+  (excluding reference implementations outside of proposed standard wording),
+  and LWG issues as reference material. If they were derived from a project
+  that's already listed in NOTICE.txt, that's fine, but please mention it.
+  If they were derived from any other project (including Boost and libc++,
+  which are not yet listed in NOTICE.txt), you *must* mention it here,
+  so we can determine whether the license is compatible and what else needs
+  to be done.
+
+Microsoft-internal VSO-1006185 "/clr is incompatible with LWG-2899's changes to unique_ptr" was fixed by Microsoft-internal MSVC-PR-221726.
+
+This will be available in VS 2019 16.6 (presumably Preview 1); when that is released, we should remove the workarounds in `<memory>`. For example:
+
+https://github.com/microsoft/STL/blob/31bed7ae0d2ff22029e7ed3e8c58d6ee429974fc/stl/inc/memory#L1824-L1826
+
+There are also workarounds in our devcrt test suite.
+# Description
+This fixes #41 by unconditionally defining the default constructors
+
+In contrast to the paper the constructors do not utilize the explicit constructors as that seems to be against the common praxis of the STL
+
+# Checklist
+
+Be sure you've read README.md and understand the scope of this repo.
+
+If you're unsure about a box, leave it unchecked. A maintainer will help you.
+
+- [x] Identifiers in product code changes are properly `_Ugly` as per
+  https://eel.is/c++draft/lex.name#3.1 or there are no product code changes.
+- [ ] The STL builds successfully and all tests have passed (must be manually
+  verified by an STL maintainer before automated testing is enabled on GitHub,
+  leave this unchecked for initial submission).
+- [x] These changes introduce no known ABI breaks (adding members, renaming
+  members, adding virtual functions, changing whether a type is an aggregate
+  or trivially copyable, etc.).
+- [x] These changes were written from scratch using only this repository,
+  the C++ Working Draft (including any cited standards), other WG21 papers
+  (excluding reference implementations outside of proposed standard wording),
+  and LWG issues as reference material. If they were derived from a project
+  that's already listed in NOTICE.txt, that's fine, but please mention it.
+  If they were derived from any other project (including Boost and libc++,
+  which are not yet listed in NOTICE.txt), you *must* mention it here,
+  so we can determine whether the license is compatible and what else needs
+  to be done.

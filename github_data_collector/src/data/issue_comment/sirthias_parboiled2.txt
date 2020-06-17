@@ -1,0 +1,170 @@
+
+When a rule transforms the value stack (rather than simply pushing values onto it) then these transformations are not always rolled back (as one would expect) when an `optional` or repetition rules fails further up in the rule structure.
+
+The tests added with the referenced commit below demonstrate the problem.
+
+Due to the mutable nature of the value stack (which is mutable in order to avoid an allocation with every `push`) fixing this problem is not entirely trivial. Switching to an immutable stack implementation would provide an easy, immediate solution but come with a quite severe performance penalty.
+
+One way could be to switch to a hybrid mutable/immutable value stack implementation, which mutates in place for the large majority of cases and only allocates when `optional`, `zeroOrMore` or `oneOrMore` is applied to rules that actually consume values (i.e. whose `I` type parameter is not `HNil`).
+
+Another solution would be to completely disallow reduction rules for `optional`, `zeroOrMore` or `oneOrMore` combinators, which would be an unfortunate restriction, since they can be quite handy in many cases.
+- https://github.com/sirthias/parboiled2/blob/dc9f7b5cb15f189a48492ba659bf5bd240c614fe/scalaParser/src/test/scala/scalaparser/RealSourcesSpec.scala#L17-L25
+
+- https://github.com/sirthias/parboiled2/blob/dc9f7b5cb15f189a48492ba659bf5bd240c614fe/scalaParser/src/test/scala/scalaparser/RealSourcesSpec.scala#L75
+I would like to suggest the implementation of the parsing elements of this project to include serializable characteristics from scratch. this would enable the parsers defined with parboiled to used in distributed environments like Apache Storm!
+There is a bug in (the application of) the `TailSwitch` logic, which causes certain parsers to compile when they shouldn't:
+
+``` scala
+class Par extends Parser {
+  def A: Rule1[Any] = ???
+  def B: PopRule[Int :: HNil] = ???
+  def C = rule { A ~ B }
+}
+```
+
+The problem appears only when the 2nd rule consumes all of the 1st rule's output.
+This parser for example correctly doesn't compile:
+
+``` scala
+class Par extends Parser {
+  def A: Rule2[String, Any] = ???
+  def B: PopRule[Int :: HNil] = ???
+  def C: Rule1[String] = rule { A ~ B }
+}
+```
+
+I think the reason for this issue is that we currently use two `TailSwitch` type logic application for computing the output of the `~` operator, whereby no distinction is made between the application for a contravariant type parameter (the first) and the application for a covariant type parameter (the second).
+
+`parboiled2` type system should catch errors in a grammar as follows:
+
+``` scala
+class SomeParser extends Parser {
+  def test = rule { push("x") ~ (a | b) }
+  def a = rule { str("a") ~> { (i: Int) => push("a") } }  
+  def b = rule { str("b") ~> { (i: String) => push("b") } }
+}
+```
+
+Currently it fails in runtime:
+
+``` scala
+scala> new org.parboiled2.examples.SomeParser("a").test.run()
+res0: scala.util.Try[String] = Failure(java.lang.ClassCastException: java.lang.String cannot be cast to java.lang.Integer)
+
+scala> new org.parboiled2.examples.SomeParser("b").test.run()
+res1: scala.util.Try[String] = Success(b)
+```
+
+[Mail list discussion](https://groups.google.com/forum/#!topic/parboiled-user/-d7X-LsCQqQ).
+
+parboiled2's dependency on shapeless means that any application that uses parboiled2, directly or transitively, must pin to that fast-moving dependency.
+
+This declares a minimal `org.parboiled2.support.HList`, extracted from shapeless, to replace the shapeless dependency.  shapeless remains in test scope only for `illTyped`, which could be replaced with some more effort.  More operations could be added to this `HList` if desired, but `HList` is _mostly_ an implementation detail, and `::` and `reverse` are sufficient to compile all the tests.
+
+/cc https://github.com/http4s/http4s/issues/646
+
+There are cases when error collecting is not necessary. A user just'd like to know if parsing was successful or not. In meantime, error collecting is time consuming. 
+
+I suggest a patch as follows:
+
+``` diff
+diff --git a/parboiled-core/src/main/scala/org/parboiled2/Parser.scala b/parboiled-core/src/main/scala/org/parboiled2/Parser.scala
+index b306d5a..6d6788b 100644
+--- a/parboiled-core/src/main/scala/org/parboiled2/Parser.scala
++++ b/parboiled-core/src/main/scala/org/parboiled2/Parser.scala
+@@ -24,7 +24,8 @@ import shapeless._
+ import org.parboiled2.support._
+
+ abstract class Parser(initialValueStackSize: Int = 16,
+-                      maxValueStackSize: Int = 1024) extends RuleDSL {
++                      maxValueStackSize: Int = 1024,
++                      collectErrors: Boolean = true) extends RuleDSL {
+   import Parser._
+
+   require(maxValueStackSize <= 65536, "`maxValueStackSize` > 2^16 is not supported") // due to current snapshot design
+@@ -203,11 +204,15 @@ abstract class Parser(initialValueStackSize: Int = 16,
+       if (phase0_initialRun())
+         scheme.success(valueStack.toHList[L]())
+       else {
+-        val principalErrorIndex = phase1_establishPrincipalErrorIndex()
+-        val p2 = phase2_establishReportedErrorIndex(principalErrorIndex)
+-        val reportQuiet = phase3_determineReportQuiet(principalErrorIndex)
+-        val parseError = phase4_collectRuleTraces(p2.reportedErrorIndex, principalErrorIndex, reportQuiet)()
+-        scheme.parseError(parseError)
++        if (collectErrors) {
++          val principalErrorIndex = phase1_establishPrincipalErrorIndex()
++          val p2 = phase2_establishReportedErrorIndex(principalErrorIndex)
++          val reportQuiet = phase3_determineReportQuiet(principalErrorIndex)
++          val parseError = phase4_collectRuleTraces(p2.reportedErrorIndex, principalErrorIndex, reportQuiet)()
++          scheme.parseError(parseError)
++        } else {
++          scheme.failure(new Exception("Parser is not collecting errors. Set `collectErrors` to true to collect errors"))
++        }
+       }
+     } catch {
+       case e: Parser.Fail ⇒
+@@ -670,4 +675,4 @@ object ParserMacros {
+
+     reify { ctx.Expr[RuleX](ruleTree).splice.asInstanceOf[Rule[I, O]] }
+   }
+-}
+\ No newline at end of file
++}
+```
+
+Could you add it to code base?
+
+Compile fails with message: 
+`Error:scalac: unexpected UnApply collection.this.Seq.unapplySeq[String](<unapply-selector>) <unapply> ((single @ _))`
+
+``` scala
+import org.parboiled2.{Rule1, CharPredicate, ParserInput, Parser}
+
+class SeqMatch(val input: ParserInput) extends Parser {
+  def id: Rule1[String] = rule {
+    capture(CharPredicate.Printable -- '.')
+  }
+
+  def root = rule {
+    (id + '.') ~> {
+      (ids: Seq[String]) =>
+        ids match {
+          case Seq(single) => MATCH
+          case _ => MISMATCH
+        }
+    }
+  }
+}
+```
+
+Validation of the following triple with Cheló̱na (https://github.com/JuPfu/chelona) , a Parboiled2 based Scala Parser for the W3C RDF 1.1 Turtle Language
+
+**http://www.w3.org/2013/TurtleTests/s http://www.w3.org/2013/TurtleTests/p 123.abc .**
+
+results in the following error message, which also lists **"capture"** as expected rule / token:
+
+Validate: TurtleTests/turtle-syntax-bad-num-01.ttl
+File 'TurtleTests/turtle-syntax-bad-num-01.ttl': Invalid input "abc ", expected capture, statement or 'EOI' (line 1, column 83):
+http://www.w3.org/2013/TurtleTests/s http://www.w3.org/2013/TurtleTests/p 123.abc .
+
+16 rules mismatched at error location:
+  ... +:-4 /object/ |:-4 /literal/ |:-4 /numericLiteral/ |:-4 /DOUBLE/ atomic:-4 / capture:-4 / |:-4 / \* / Digit:<CharPredicate>
+  ...43 /po/ /objectList/ +:-4 /object/ |:-4 /literal/ |:-4 /numericLiteral/ |:-4 /DOUBLE/ atomic:-4 / capture:-4 /EXPONENT/ 'e'
+  ...tList/ +:-4 /object/ |:-4 /literal/ |:-4 /numericLiteral/ |:-4 /DECIMAL/ atomic:-4 / capture:-4 / + / Digit:<CharPredicate>
+  /turtleDoc/ *:-82 /statement/ | /directive/ | /sparqlPrefix/ cut / atomic / "prefix" / 'p'
+  /turtleDoc/ *:-82 /statement/ | /directive/ | /sparqlBase/ cut / atomic / "base" / 'b'
+  /turtleDoc/ *:-82 /statement/ | /triples/ | /subject/ | /iri/ | /IRIREF/ atomic / '<'
+  ...ect/ | /iri/ | /prefixedName/ | /PNAME_LN/ /PNAME_NS/ ? /PN_PREFIX/ atomic / capture / *:1 / |:3 / PN_CHARS:<CharPredicate>
+  .../iri/ | /prefixedName/ | /PNAME_LN/ /PNAME_NS/ ? /PN_PREFIX/ atomic / capture / *:1 / |:3 / &:3 / +:3 / DOT:<CharPredicate>
+  .../iri/ | /prefixedName/ | /PNAME_LN/ /PNAME_NS/ ? /PN_PREFIX/ atomic / capture / *:1 / |:3 / isHighSurrogate:<CharPredicate>
+  /turtleDoc/ *:-82 /statement/ | /triples/ | /subject/ | /iri/ | /prefixedName/ | /PNAME_LN/ /PNAME_NS/ ':'
+  ...es/ | /subject/ | /iri/ | /prefixedName/ | /PNAME_NS/ ? /PN_PREFIX/ atomic / capture / *:1 / |:3 / PN_CHARS:<CharPredicate>
+  ...subject/ | /iri/ | /prefixedName/ | /PNAME_NS/ ? /PN_PREFIX/ atomic / capture / *:1 / |:3 / &:3 / +:3 / DOT:<CharPredicate>
+  ...subject/ | /iri/ | /prefixedName/ | /PNAME_NS/ ? /PN_PREFIX/ atomic / capture / *:1 / |:3 / isHighSurrogate:<CharPredicate>
+  /turtleDoc/ *:-82 /statement/ | /triples/ | /subject/ | /iri/ | /prefixedName/ | /PNAME_NS/ ':'
+  /turtleDoc/ *:-82 /statement/ | /triples/ | /subject/ | /blankNode/ | /BLANK_NODE_LABEL/ atomic / "_:" / '_'
+  /turtleDoc/ 'EOI'
+
+The error message is emitted by
+
+case Failure(e: ParseError) ⇒ System.err.println("File '" + file.head + "': " + parser.formatError(e, new ErrorFormatter(showTraces = true)))

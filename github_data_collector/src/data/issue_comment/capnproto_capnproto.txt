@@ -1,0 +1,73 @@
+Fixes #924
+This is a follow up to https://github.com/capnproto/capnproto/issues/919.
+
+I don't want to make STDOUT_FILENO non-blocking, because it can have side-effect to stdin/stderr, e.g. when they all point to the same tty.
+I'm fine with writing to stdout being blocking, so I made an `AsyncOutputStream` where the `write(...)` is just a call to `kj::FdOutputStream(STDOUT_FILENO).write(...)`.
+
+However, there is one thing I'd like to watch when stdout is pollable, it's hangups / `whenWriteDisconnected()`.
+So that my application can be stopped when the output stream read-end closes, e.g.:
+
+    ./myapp | grep --max-count=1 SomeEvent
+
+To support this, I used `kj::UnixEventPort::FdObserver::OBSERVE_WRITE`, but truth be told, it wasn't for waiting for writes, just to get an `FdObserver` that signals `whenWriteDisconnected()`.
+And I realize now, that this had an unfortunate side-effect.
+
+When running my application under strace, I now get an infinite loop, because strace writes to STDERR, which is shared with STDOUT:
+
+    $ strace ./myapp
+    ...
+    [pid 15119] epoll_wait(3, [{EPOLLOUT, {u32=23202328, u64=23202328}}], 16, -1) = 1
+    [pid 15119] epoll_wait(3, [{EPOLLOUT, {u32=23202328, u64=23202328}}], 16, -1) = 1
+    [pid 15119] epoll_wait(3, [{EPOLLOUT, {u32=23202328, u64=23202328}}], 16, -1) = 1
+
+My understanding is that each write to stderr strace make, generates an `epoll_wait()` event (not sure why, but why not?).
+Each event generates an strace writes.
+And this loop goes on indefinitely.
+
+I found a way to watch only `whenWriteDisconnected()`, by instantiating an `FdObserver` that observes for nothing, value `0`: that is neither `OBSERVE_WRITE`, nor `OBSERVER_READ`, nor `OBSERVER_URGENT`.
+This still watches hang-ups, since the epoll man page states that:
+
+       EPOLLHUP
+          Hang up happened on the associated file descriptor.
+          epoll_wait(2) will always wait for this event; it is not necessary to set it in events.
+
+
+With the current FdObserver code, this work fine:
+
+https://github.com/capnproto/capnproto/blob/b301982c66f18d8f299537375f4293c5717f2e93/c++/src/kj/async-unix.c++#L341-L350
+
+But I'm wondering if I'm relying on an implementation detail here, or if you think it is safe?
+Also asking, in case there is a better method I did not think of.
+capnproto is available as a port in vcpkg, a C++ library manager that simplifies installation for capnproto and other project dependencies. Documenting the install process here will help users get started by providing a single set of commands to build capnproto, ready to be included in their projects.
+
+We also test whether our library ports build in various configurations (dynamic, static) on various platforms (OSX, Linux, Windows: x86, x64, UWP, ARM) to keep a wide coverage for users.
+
+I'm a maintainer for vcpkg, and [here is what the port script looks like](https://github.com/microsoft/vcpkg/blob/master/ports/capnproto/portfile.cmake). We try to keep the library maintained as close as possible to the original library.
+Should work with Windows, Linux, macOS using the default settings.
+Also includes a manylinux2010 compatibility build which is used to build
+linux pypi packages (to maximize glibc compatibility of binary
+packages). manylinux2010 uses a newer gcc (8+) with an older glibc 2.12
+
+These don't fully replace (yet) the travis and appveyor builds. However, they are much easier to maintain and write.
+- This is needed to handle CentOS 6 builds
+  Specifically for manylinux2010 which is used for compiling pypi binary
+  packages
+- Should resolve Issue #743
+- There were some Windows test issues (not 100% sure on why) using only posix_memalign and _aligned_malloc
+The Json Rpc class doesn't seem to be able to make jsonrpc2.0 array requests as far as I can see it. Array requests exist according to this [specification](https://www.jsonrpc.org/specification).  
+
+I have some code hacked together which is based on capnproto and rewrote parts of the jsonrpc class in this [file](https://github.com/keldu/genralapi/blob/master/source/JsonRpcAdapter.cpp) and made it usable for the `kj::HttpService` class. But since I changed to much, have added unnecessary/unfinished stuff and don't have a client implemented I don't want to merge my code into capnproto. Also it's not written to my standard, but I can make jsonrpc2.0 array calls. I can write a proper merge though.  
+
+I just wanted to open an issue before doing that.  
+
+My hacky implementation generates orphans if an array request was sent and adopts them into an appropriately sized array of orphans and serializes that into json. I do this because I don't know the response size since notifications don't generate array elements.  
+Tracking discussion in https://groups.google.com/forum/#!topic/capnproto/KFPRyvmc33c, would be nice if it were possible to define inlineable structs that behaved identically to a group but provided a strong name that could be reused multiple times.
+
+Considerations:
+* Do we want to support only "sealed" types or should we support a general mechanism to provide named groups?
+* What is the complexity this adds to cap'n'proto?
+This is a draft of the new tutorial sample. I'm currently unable to build it against head, but am able to build against the C++ source from capnproto.org (you can see an artifact of that in the build file 'src ='). I spent hours trying to track down the problem thinking it was my mistake.
+
+This is a draft, I'm interested in feedback. I realize you probably want cmake over meson; cmake isn't something I know how to do. I'll add more comments before the final version. But mostly, I'd like to know what features you think are important to demonstrate in a tutorial.
+https://capnproto.org/capnproto-c++-0.7.0.tar.gz linked from https://capnproto.org/install.html needs to include samples.
+Would be nice if there was a way to adopt external data in a way that guarantees it’s the last segment even if an allocation for a far pointer would be needed. Use case is having a large bulk data segment that ideally we could handle loss in gracefully without worrying about corrupting cap’n’proto data fields (eg sending a video frame and being able to handle loss in the video payload more easily without worrying about cap’n’proto framing).

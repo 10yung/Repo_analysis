@@ -1,0 +1,216 @@
+### Prerequisites
+
+- [x] I have written a descriptive pull-request title
+- [x] I have verified that there are no overlapping [pull-requests](https://github.com/SixLabors/ImageSharp/pulls) open
+- [x] I have verified that I am following matches the existing coding patterns and practice as demonstrated in the repository. These follow strict Stylecop rules :cop:.
+- [x] I have provided test coverage for my change (where applicable)
+
+### Description
+Merge sources and tests from SixLabors.Core, resolve #1002.
+- Namespace structure were left untouched.
+- The new source structure follows namespace hierarchy in `src`. 
+- SixLabors.Core tests have been grouped under their own directory
+- Most memory-intensive `ArrayPoolMemoryAllocatorTests` have been disabled temporarily. The safest way to run such tests would be arcane's [RemoteExecutor](https://github.com/dotnet/runtime/blob/master/docs/project/writing-tests.md#remoteexecutor)
+
+*Do not squash-merge!*
+### Prerequisites
+
+- [x] I have written a descriptive pull-request title
+- [x] I have verified that there are no overlapping [pull-requests](https://github.com/SixLabors/ImageSharp/pulls) open
+- [x] I have verified that I am following matches the existing coding patterns and practice as demonstrated in the repository. These follow strict Stylecop rules :cop:.
+- [x] I have provided test coverage for my change (where applicable)
+
+### Description
+Added ability to skip pixel data for each row
+
+### Prerequisites
+
+- [x] I have written a descriptive pull-request title
+- [x] I have verified that there are no overlapping [pull-requests](https://github.com/SixLabors/ImageSharp/pulls) open
+- [x] I have verified that I am following matches the existing coding patterns and practice as demonstrated in the repository. These follow strict Stylecop rules :cop:.
+- [x] I have provided test coverage for my change (where applicable)
+
+### Description
+see https://github.com/SixLabors/ImageSharp/issues/1080
+Please change from internal so I can subclass Image the following methods...
+
+ Accept
+ EnsureNotDisposed 
+
+Doing so will allow me to create a MipMap class based off of Image for the ImageSharp.Textures library
+
+### Prerequisites
+
+- [x] I have written a descriptive pull-request title
+- [x] I have verified that there are no overlapping [pull-requests](https://github.com/SixLabors/ImageSharp/pulls) open
+- [x] I have verified that I am following matches the existing coding patterns and practice as demonstrated in the repository. These follow strict Stylecop rules :cop:.
+- [x] I have provided test coverage for my change (where applicable)
+
+### Description
+Currently WIP and started PR so that progress can be watched and commented on.
+
+<!-- Thanks for contributing to ImageSharp! -->
+
+### Prerequisites
+
+- [X] I have written a descriptive pull-request title
+- [X] I have verified that there are no overlapping [pull-requests](https://github.com/SixLabors/ImageSharp/pulls) open
+- [X] I have verified that I am following matches the existing coding patterns and practice as demonstrated in the repository. These follow strict Stylecop rules :cop:.
+- [X] I have provided test coverage for my change (where applicable)
+
+### Description
+The `OilPaintingProcessor` was allocating 4 arrays for each single pixel being processed. I've switched to a single, shared `float[]` array rented from the used configuration, and I'm using that as temporary data for all the 4 processing bins. In doing so, I've also switched to `Unsafe.Add` for all the read/write operations to the 4 bins, for that extra micro-optimization breeze 🙌
+
+Just noticed those 4 throwaway arrays while working on my other pull request and I couldn't resist 🤣
+
+<!-- Thanks for contributing to ImageSharp! -->
+
+## Introduction
+Apart from the API simplification, the main intent of #907 was to enable new optimizations: it's possible to eliminate a bunch of unnecessary processing steps from the most common YCbCr Jpeg thumbnail making use-case. As it turned out in #1062, simply changing the pixel type to `Rgba24` is not sufficient, we need to implement the processing pipeline optimizations enabled by the [.NET Core 3.0 Hardware Intrinsic API](https://devblogs.microsoft.com/dotnet/hardware-intrinsics-in-net-core/), especially by the [shuffle and permutation intrinsics](https://www.google.com/search?q=intel+intrinsics+shuffle&tbm=isch) which are allowowing fast conversion between different pixel type representations and component orders (eg. `Rgba32` <--> `Rgb24`), as well as fast conversion between [Planar](https://en.wikipedia.org/wiki/Planar_(computer_graphics))/SOA and [Packed](https://en.wikipedia.org/wiki/Packed_pixel)/AOS pixel representations. The latter is important because raw Jpeg data consists of 3 planes representing the YCbCr data, while an ImageSharp `Image` is always packed.
+
+**This analyisis:**
+1. Kicks off by explaining the causes of the `Rgb24` slowdown in #1062
+2. Defines Processing Pipelines as a chains of Data States and Transformations
+3. Presents a deep overview of the current floating point Jpeg and Resize pipelines, showing incremental improvement opportunities. *Note: the Resize pipeline is still TODO, and it will remain so for a couple of days/weeks. This should not prevent you from getting the big picture though.*
+4. Roughly explains the challenges of adding integer SIMD operations to the Jpeg pipeline
+
+Please let me know, if some pieces are still hard to follow. It's worth to check out all URL-s while reading.
+
+**TLDR**
+If you want to hear some good news before reading through the whole thing, jump to the Conclusion part 😄
+
+## Why is `Rgb24` post processing slow in our current code?
+
+### `YCbCr` -> `TPixel` conversions, the generic case
+[`JpegImagePostprocessor`](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/Formats/Jpeg/Components/Decoder/JpegImagePostProcessor.cs#L166) is processing the YCbCr data in two steps:
+1. Color convert AND pack the Y + Cb + Cr image planes to `Vector4` RGBA buffers. The two operations are carried out together by the [matching `JpegColorConverter`](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/Formats/Jpeg/Components/Decoder/ColorConverters/JpegColorConverter.FromYCbCrSimdAvx2.cs#L25). With the YCbCr colorspace which has only 3 components, this is already a sub-optimal, since the 4th alpha component (`Vector4.W`) is redundant. `Vector4` packing is done with [non-vectorized code](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/Formats/Jpeg/Components/Decoder/ColorConverters/JpegColorConverter.cs#L192).
+2. Convert the `Vector4` buffer to pixel buffer, [using the pixel specific implementation](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/Formats/Jpeg/Components/Decoder/JpegImagePostProcessor.cs#L176).
+
+### `Rgba32` vs `Rgb24`
+- [Perf profile for `PostProcessIntoImage<Rgba32>`](https://user-images.githubusercontent.com/6835152/70854343-a9382200-1eba-11ea-90fd-53a010af628e.png)
+- [Perf profile for `PostProcessIntoImage<Rgb24>`](https://user-images.githubusercontent.com/6835152/70854328-61b19600-1eba-11ea-9d75-139aeb12ac84.png)
+
+The difference is that `PixelOperations<Rgba32>.FromVector4()` does not need to do any component shuffling, only expanding `byte` values to `float`-s, while in `PixelOperations<Rgba32>.FromVector4()`, we first convert the float buffers to `Rgba32` buffers (fast), which is followed by an `Rgba32` -> `Rgb24` conversion using the [sub-optimal default conversion implementation](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/PixelFormats/PixelOperations%7BTPixel%7D.Generated.cs#L91). This operation:
+- Could be significantly optimized by utilizing byte shuffling SIMD intrinsics.
+- Is in fact unnecessary. By extending `JpegColorConverter` with a method to pack data into `Vector3` buffers, we could convert `Vector3` data into `Rgb24` data exactly the same way we do the `Vector4` -> `Rgba32` conversion.
+
+## Definition of Processing Pipelines
+
+Personally, my memory is terrible and I always need to reverse engineer my own code when we want to understand what's happening and make decisions. Lack of comments and confusing terminology is also misleading. To get a good overview, it's really important to step back and abstract away implementation details, by thinking about our algorithms as PIPELINES composed of **Data States** and *Transformations*, where
+- **[D] Data States (nodes) are representations of pixel data buffers in a specific form**
+- *(T) Transformations (edges) are specific SIMD or scalar implementations of algorithms*
+
+This representation is only good for analyzing data flow for a specific configuration, eg. a well defined input image format + decoder configuration + output pixel type. To visualize the junctions, we need [DAG](https://en.wikipedia.org/wiki/Directed_acyclic_graph)-s :nerd_face:.
+
+##  Current floating point YCbCr Jpeg Color Processing & Resize pipelines, improvement opportunities
+
+Presumtions:
+- The executing runtime is > `netcoreapp2.1` (enables `Vector.Widen`)
+- The executing CPU supports the AVX2 instruction set, implying that `Vector<T>`-s are in fact AVX2 registers and  `Vector<T>` intrinsics are JIT-ed to AVX2 instructions
+- `Vector4` operations are JIT-ed to SSE2 instructions
+
+### (I.) Converting raw jpeg spectral data to YCbCr planes
+
+|         | Converting raw jpeg spectral data to YCbCr planes, done by [`CopyBlocksToColorBuffer`](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/Formats/Jpeg/Components/Decoder/JpegImagePostProcessor.cs#L142)  |
+| ------- | :--- |
+| **[D]** | **3 planes of quantized spectral `Int16` jpeg [components](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/Formats/Jpeg/Components/Decoder/JpegComponent.cs#L68) (3 x `Buffer2D<Block8x8>`, Y+Cb+Cr)** |
+|  *(T)*  | *AVX2 `Int16` -> `Int32` widening and `Int32` -> `float` conversion, both using `Vector<T>`, implemented in [`Block8x8F.LoadFrom(Block8x8)`](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/Formats/Jpeg/Components/Block8x8F.cs#L497)* |
+| **[D]** | **3 planes of quantized spectral `float` jpeg components  (3 x `Buffer2D<Block8x8>`, Y+Cb+Cr)** |
+|  *(T)*  | *Dequantization by SSE2 multiplication: [`Block8x8F.MultiplyInplace(DequantiazationTable)`](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/Formats/Jpeg/Components/Block8x8F.cs#L304)* |
+| **[D]** | **3 planes of DEquantized spectral `float` jpeg components  (3 x `Buffer2D<Block8x8>`, Y+Cb+Cr)** |
+|  *(T)*  | *[SSE2 floating point IDCT](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/Formats/Jpeg/Components/Decoder/JpegBlockPostProcessor.cs#L85)* |
+| **[D]** | **3 Planes of `float` jpeg color channels  (3 x `Buffer2D<Block8x8>`, Y+Cb+Cr)** |
+|  *(T)*  | *AVX2 [normalization and rounding](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/Formats/Jpeg/Components/Block8x8F.Generated.cs#L124) using `Vector<T>`. Rounding is needed for better libjpeg compatibility* |
+| **[D]** | **3 Planes of SUBSAMPLED `float` jpeg color channels normalized to 0-255 (3 x `Buffer2D<Block8x8>`, Y+Cb+Cr)** |
+|  *(T)*  | *Chroma supersampling. No SIMD, fully scalar code, full of ugly optimizations to make it at least cache friendly. Done by [`Block8x8.CopyTo())`](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/Formats/Jpeg/Components/Block8x8F.CopyTo.cs#L18) (super misleading name!)* |
+| **[D]** | **3 Planes of W\*H sized `float` jpeg color channels normalized to 0-255 (3 x `Buffer2D<Block8x8>`, Y+Cb+Cr)** |
+
+### (II. a) Converting the Y+Cb+Cr planes to an `Rgba32` buffer
+
+|         | Y+Cb+Cr planes -> `Rgba32` buffer, done by [`ConvertColorsInto`](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/Formats/Jpeg/Components/Decoder/JpegImagePostProcessor.cs#L145) |
+| ------- | :--- |
+| **[D]** | **3 Planes of W\*H sized `float` jpeg color channels normalized to 0-255 (3 x `Buffer2D<Block8x8>`, Y+Cb+Cr)** |
+|  *(T)*  | *[Color convert](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/Formats/Jpeg/Components/Decoder/ColorConverters/JpegColorConverter.FromYCbCrSimdAvx2.cs#L77) and [pack](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/Formats/Jpeg/Components/Decoder/ColorConverters/JpegColorConverter.FromYCbCrSimdAvx2.cs#L105) into a single `Vector4` buffer* |
+| **[D]** | **Floating point RGBA data as `Memory<Vector4>`** |
+|  *(T)*  | *Convert the `Vector4` buffer to an `Rgba32` buffer. In the `Rgba32` case case, the input buffer could be handled as homogenous `float` buffer, where all individual `float` values should be converted to `byte`-s. The conversion is implemented in [`BulkConvertNormalizedFloatToByteClampOverflows`](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/Common/Helpers/SimdUtils.ExtendedIntrinsics.cs#L137), utilizing AVX2 conversion and narrowing operations through `Vector<T>`* |
+| **[D]** | **The result image as an `Rgba32` buffer** |
+
+### (II. b) Converting the Y+Cb+Cr planes to an `Rgba24` buffer, current sub-optimal pipeline
+|         | Y+Cb+Cr planes -> `Rgb24` buffer, done by [`ConvertColorsInto`](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/Formats/Jpeg/Components/Decoder/JpegImagePostProcessor.cs#L145) |
+| ------- | :--- |
+| **[D]** | **3 Planes of W\*H sized `float` jpeg color channels normalized to 0-255 (3 x `Buffer2D<Block8x8>`, Y+Cb+Cr)** |
+|  *(T)*  | *[Color convert](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/Formats/Jpeg/Components/Decoder/ColorConverters/JpegColorConverter.FromYCbCrSimdAvx2.cs#L77) and [pack](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/Formats/Jpeg/Components/Decoder/ColorConverters/JpegColorConverter.FromYCbCrSimdAvx2.cs#L105) into a single `Vector4` buffer* |
+| **[D]** | **Floating point RGBA data as `Memory<Vector4>`** |
+|  *(T)*  | *Convert the `Vector4` buffer to an `Rgba32` buffer, utilizing [`BulkConvertNormalizedFloatToByteClampOverflows`](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/Common/Helpers/SimdUtils.ExtendedIntrinsics.cs#L137), utilizing AVX2 conversion and narrow operations through `Vector<T>`* |
+| **[D]** | **[Temporary `Rgba32` buffer](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/PixelFormats/Utils/Vector4Converters.RgbaCompatible.cs#L106)** |
+|  *(T)*  | *[`PixelOperations<Rgb24>.FromRgba32()`](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/PixelFormats/PixelOperations%7BTPixel%7D.Generated.cs#L451) (sub-optimal, extra transformation!)* |
+| **[D]** | **The result image as an `Rgb24` buffer** |
+
+### (II. b++) Converting the Y+Cb+Cr planes to an `Rgba24` buffer, IMPROVEMENT PROPOSAL
+|         | Y+Cb+Cr planes -> `Rgb24` buffer, done by [`ConvertColorsInto`](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/Formats/Jpeg/Components/Decoder/JpegImagePostProcessor.cs#L145) |
+| ------- | :--- |
+| **[D]** | **3 Planes of W\*H sized `float` jpeg color channels normalized to 0-255 (3 x `Buffer2D<Block8x8>`, Y+Cb+Cr)** |
+|  *(T)*  | *Color convert and pack into a single `Vector3` (!!!) buffer. We can utilize shuffling intrinsics for the packing. Hint: extend the `JpegColorConverter` interface with a `bool CanConvertToRgbVector3` property and a `ConvertToRgbVector3()` method* |
+| **[D]** | **Floating point RGBA data as `Memory<Vector3>`** |
+|  *(T)*  | *Convert the `Vector3` buffer to an `Rgba24` buffer, using [`BulkConvertNormalizedFloatToByteClampOverflows`](https://github.com/SixLabors/ImageSharp/blob/master/src/ImageSharp/Common/Helpers/SimdUtils.ExtendedIntrinsics.cs#L137)* 
+| **[D]** | **The result image as an `Rgb24` buffer** |
+
+### (III. a) Resize `Image<Rgba32>`, current pipeline
+TODO
+
+### (III. b) Resize `Image<Rgb24>`, current pipeline
+TODO.
+Without any change, the current code shall run faster than for `Image<Rgba32>`.
+
+### (III. b++) Resize `Image<Rgb24>`, IMPROVEMENT PROPOSAL
+TODO
+
+## Integer-based SIMD pipelines
+
+Although the Hardware Intrinsic API removes all theoretical boundaries to have 1:1 match with other high performance imaging libraries, for both Jpeg Decoder and Resize by utilizing AVX2 and SSE2 integer algorithms, there is a big practical challange: It's very hard to introduce these improvements in an iterative manner.
+
+It's not possible to exchange the elements of the Jpeg pipeline at arbitrary points, because it would lead to insertion of extra `float` <-> `Int16/32` conversions. To overcome this, we should start introducing integer transformations and data states at the beginning and/or at the end of the pipeline. This could be done by replacing the transformations and the data states in subsequent PR-s while moving the `Int16` -> `float` conversion towards the bottom (when starting from the beginning), and the `float` -> `byte` conversion towards the top (when starting from the end). EG:
+- At the beginning of the pipeline first replace dequantization, then IDCT, then normalization etc..
+- At the end of the pipeline, we shall implement a full integer `YCbCr24` -> `Rgb24` SIMD conversion first
+
+## Conclusion
+If we aim for low hanging fruits, I would start by implementing **(II. b++)** and **(III. b++)**. After that, we can continue by introducing integer SIMD operations starting at the beginning or at the end of the Jpeg pipeline.
+
+I would also suggest to keep the current floating point pipeline in the codebase as is, to avoid perf regressions for pre-3.0 users. I believe those platforms will be still relevant for many customers for a couple of other years.
+I have done this effect but not very good I think so.
+I am using DrawText method and pre-calculate every text watermark point to do.
+But I haven't found how to roate this text watermark when DrawText.
+I want to make every text watemark rotate 45-degree angle. Like below image effect
+Wolud you have another simple way to do this？
+![preview](https://user-images.githubusercontent.com/22338989/68639979-4a8d2a80-0541-11ea-967b-4cdc1b7a7df2.png)
+
+### Prerequisites
+
+- [x] I have written a descriptive pull-request title
+- [x] I have verified that there are no overlapping [pull-requests](https://github.com/SixLabors/ImageSharp/pulls) open
+- [x] I have verified that I am following matches the existing coding patterns and practice as demonstrated in the repository. These follow strict Stylecop rules :cop:.
+- [ ] I have provided test coverage for my change (where applicable)
+
+### Description
+<!-- A description of the changes proposed in the pull-request -->
+The format of the 1-, 4-, and 8-bit Bmp images embedded in an .ico is subtly different (and undocumented). I came up with some changes to the Bmp decoder to properly process a Bmp image extracted from an .ico file that has transparency.
+
+### Examples
+Here are several images that shows the effect of the changes. The image samples Word document shows the original .ico file, the raw bitmap extraction from the .ico, and the fixed image using the updated code.
+
+
+<!-- Thanks for contributing  to ImageSharp! -->
+
+[Image samples.docx](https://github.com/SixLabors/ImageSharp/files/3818469/Image.samples.docx)
+
+### Prerequisites
+
+- [x] I have written a descriptive pull-request title
+- [x] I have verified that there are no overlapping [pull-requests](https://github.com/SixLabors/ImageSharp/pulls) open
+- [ ] I have verified that I am following matches the existing coding patterns and practice as demonstrated in the repository. These follow strict Stylecop rules :cop:.
+- [ ] I have provided test coverage for my change (where applicable)
+
+### Description
+Before going though all the prereqs since I'm new to this project I'm creating this to discuss https://github.com/SixLabors/ImageSharp/issues/1016 further
+
+Note that the `switch` approach isn't possible because `Type`s aren't compile time constants. If statements should work though 

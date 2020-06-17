@@ -1,0 +1,266 @@
+Since the *bash* binary is [not always located in */bin*][0], the *leon*
+script doesn't always run.
+
+This change makes the script more portable, so leon will run on more
+systems.
+
+[0]: https://stackoverflow.com/questions/21612980
+``` scala
+import leon.collection._ // for List
+import leon.lang._       // for holds
+
+object Example {
+  def rightUnitAppend[T](l1: List[T]): Boolean = {
+    l1 ++ Nil() == l1
+  }.holds
+}
+```
+
+In https://github.com/epfl-lara/leon/blob/master/src/sphinx/neon.rst
+> If you try to verify this last example you'll face a delicate situation: Leon runs indeterminately until it is either killed or times out. But why does this happen? The proposition doesn't seems more complicated than appendContent. Perhaps even more surprisingly, Leon is able to verify the following:
+
+However, it actually compiles
+https://leon.epfl.ch#link/5cd42b18a4baeb936e2bd7ec996b90ab-1
+
+Fixes #304 
+
+I use the leon library in another project where I compile it with these settings:
+
+```
+scalacOptions ++= Seq(
+  "-deprecation",
+  "-encoding", "UTF-8",     // yes, this is 2 args
+  "-feature",
+  "-language:existentials",
+  "-language:higherKinds",
+  "-language:implicitConversions",
+  "-unchecked",
+  "-Xfatal-warnings",
+  "-Xlint",
+  "-Yno-adapted-args",
+  "-Ywarn-dead-code",       // N.B. doesn't work well with the ??? hole
+  "-Ywarn-numeric-widen",
+  "-Ywarn-value-discard",
+  "-Xfuture",
+  "-Ywarn-unused-import",   // 2.11 only
+  "-Yno-imports"            // no automatic imports at all; all symbols must be imported explicitly
+)
+```
+
+Most of the refactoring is to due to moving classes and objects that were defined in a package object file to a separate compilation unit. 
+
+I was surprised that `-Yno-imports` helps readability of the library where an unqualified type name could be misunderstood to refer to a type in leon's library instead of the scala library. For example, in `leon.lang.Bag`, the unqualified `List` type needs to refer to `scala.collection.immutable.List` instead of `leon.collection.List`.
+I like to compile my scala code with these flags:
+
+```
+
+scalacOptions ++= Seq(
+  "-deprecation",
+  "-encoding", "UTF-8",     // yes, this is 2 args
+  "-feature",
+  "-language:existentials",
+  "-language:higherKinds",
+  "-language:implicitConversions",
+  "-unchecked",
+  "-Xfatal-warnings",
+  "-Xlint",
+  "-Yno-adapted-args",
+  "-Ywarn-dead-code",       // N.B. doesn't work well with the ??? hole
+  "-Ywarn-numeric-widen",
+  "-Ywarn-value-discard",
+  "-Xfuture",
+  "-Ywarn-unused-import",   // 2.11 only
+  "-Yno-imports"            // no automatic imports at all; all symbols must be imported explicitly
+)
+```
+
+The león library defines many objects & classes in a package object.
+This results in a warning with scalac that with the above flags becomes an error.
+
+Is it possible to refactor the library; e.g., instead of:
+
+file: `library/leon/annotation/package.scala`:
+```
+
+package leon
+
+import scala.annotation.StaticAnnotation
+
+package object annotation {
+  @ignore
+  class library    extends StaticAnnotation
+...
+
+```
+
+Each of the objects/classes would be defined in a corresponding compilation unit, e.g.:
+
+`library` would be defined in `library/leon/annotation/library.scala`
+
+
+
+
+Is it possible to publish the leon library as a maven jar with sources such that one could write scala code with a dependency on the leon library maven jar/source and use leon to analyze such source code? (verification, synthesis, etc...)
+I tried to compile Leon code using the generic `copy()` method for generic case classes (see [here](http://stackoverflow.com/questions/7249396/how-to-clone-a-case-class-instance-and-change-just-one-field-in-scala)), but it seems that it is not yet in the Leon library. Is it possible to provide support for this construct?
+```scala
+import leon.lang._
+import leon.lang.xlang._
+import leon.util.Random
+
+import leon.collection._
+
+object DataRacing {
+  case class Core(val r:BigInt, val choice:Core, val nbtasks:BigInt)
+  case class SharedState(val progress:BigInt, val cores:BigInt => Core)
+
+  case class AtomicInstr(instr: (Core, SharedState) => (Core, SharedState))
+  implicit def toInstr(instr: (Core, SharedState) => (Core, SharedState)): AtomicInstr = AtomicInstr(instr)
+
+  abstract class Runnable
+  case class RunnableCons(instr: AtomicInstr, tail: Runnable) extends Runnable
+  case class RunnableNil() extends Runnable
+
+  def executeOne(instr: AtomicInstr, core:BigInt, state:SharedState):(SharedState) = {
+     val (newCore, newState) = instr.instr(state.cores(core), state)
+     SharedState(newState.progress, state.cores)
+  } ensuring(res => true);
+}
+```
+
+Results in a "Error: Z3 exception" (latest build). Any idea on how to debug that?
+
+Thanks.
+
+
+The following program make verification crash, apparently in RecursionCountInstrumenter, but the bug might be due to some other component.
+
+```scala
+/* Copyright 2009-2016 EPFL, Lausanne */
+
+import leon.annotation.extern
+
+object Aliasing3 {
+
+  case class MutableInteger(var x: Int)
+
+  def scope = {
+    var x = 0
+
+    def hoo(m: MutableInteger) {
+      toto()
+      foo(42, m)
+    }
+
+    def foo(y: Int, m: MutableInteger) {
+      toto()
+      x = 1
+      bar(m)
+      m.x = y
+    }
+
+    foo(42, MutableInteger(58))
+
+    val m = MutableInteger(58)
+
+    hoo(m)
+
+    def goo(y: Int) {
+      foo(y, m)
+    }
+    goo(42)
+
+    m.x
+  } ensuring { _ == 42 }
+
+  def bar(m: MutableInteger) {
+    m.x = 0
+  }
+
+  def toto() = { }
+
+  def _main(): Int = {
+    if (scope == 42) 0
+    else 1
+  } ensuring { _ == 0 }
+
+  @extern
+  def main(args: Array[String]): Unit = _main()
+}
+```
+
+Stacktrace looks like this:
+
+```
+java.util.NoSuchElementException: key not found: def foo$1(y$6 : Int, m$5 : MutableInteger$0): (Unit, MutableInteger$0) = {
+  var m$8 = m$5
+  ({
+    toto$0
+    x$25 = 1
+    val res$203 = bar$1(m$8)
+    m$8 = res$203._2
+    res$203._1
+    m$8 = MutableInteger$0(y$6)
+  }, m$8)
+}
+	at scala.collection.MapLike$class.default(MapLike.scala:228)
+	at scala.collection.AbstractMap.default(Map.scala:59)
+	at scala.collection.mutable.HashMap.apply(HashMap.scala:65)
+	at leon.invariant.datastructure.DirectedGraph.successors(Graph.scala:178)
+	at leon.invariant.datastructure.Graph$class.search$1(Graph.scala:109)
+	at leon.invariant.datastructure.Graph$class.processNeighbor$1(Graph.scala:99)
+	at leon.invariant.datastructure.Graph$$anonfun$1.apply(Graph.scala:109)
+	at leon.invariant.datastructure.Graph$$anonfun$1.apply(Graph.scala:109)
+	at scala.collection.TraversableOnce$$anonfun$foldLeft$1.apply(TraversableOnce.scala:157)
+	at scala.collection.TraversableOnce$$anonfun$foldLeft$1.apply(TraversableOnce.scala:157)
+	at scala.collection.immutable.Set$Set1.foreach(Set.scala:94)
+	at scala.collection.TraversableOnce$class.foldLeft(TraversableOnce.scala:157)
+	at scala.collection.AbstractTraversable.foldLeft(Traversable.scala:104)
+	at leon.invariant.datastructure.Graph$class.search$1(Graph.scala:109)
+	at leon.invariant.datastructure.Graph$$anonfun$sccs$2.apply(Graph.scala:130)
+	at leon.invariant.datastructure.Graph$$anonfun$sccs$2.apply(Graph.scala:129)
+	at scala.Option.foreach(Option.scala:257)
+	at leon.invariant.datastructure.Graph$class.sccs(Graph.scala:129)
+	at leon.invariant.datastructure.DirectedGraph.sccs(Graph.scala:143)
+	at leon.transformations.RecursionCountInstrumenter.<init>(RecursionCountInstrumenter.scala:19)
+	at leon.transformations.InstrumentationPhase$$anonfun$1.apply(SerialInstrumentationPhase.scala:37)
+```
+
+When this is fixed, `src/test/resources/regression/genc/unverified/Aliasing3.scala` should be moved to `src/test/resources/regression/genc/valid/Aliasing3.scala` (ATM only available on `topic/genc_v2` branch).
+The following program makes Leon's ImperativeCodeElimination crash.
+
+```scala
+object Dummy {
+
+  case class M(var value: Int)
+
+  def barM(m: M) = {
+    m.value = m.value + 1
+    303
+  }
+
+  def foo(m: M) = m match {
+    case n: M => barM(n)
+  }
+
+}
+```
+
+Stacktrace looks like:
+
+```
+java.lang.AssertionError: assertion failed
+	at scala.Predef$.assert(Predef.scala:156)
+	at leon.xlang.ImperativeCodeElimination$.leon$xlang$ImperativeCodeElimination$$toFunction(ImperativeCodeElimination.scala:75)
+	at leon.xlang.ImperativeCodeElimination$$anonfun$20.apply(ImperativeCodeElimination.scala:177)
+	at leon.xlang.ImperativeCodeElimination$$anonfun$20.apply(ImperativeCodeElimination.scala:175)
+	at scala.collection.immutable.List$$anonfun$foldRight$1.apply(List.scala:397)
+	at scala.collection.LinearSeqOptimized$class.foldLeft(LinearSeqOptimized.scala:124)
+	at scala.collection.immutable.List.foldLeft(List.scala:84)
+	at scala.collection.immutable.List.foldRight(List.scala:397)
+	at leon.xlang.ImperativeCodeElimination$.leon$xlang$ImperativeCodeElimination$$toFunction(ImperativeCodeElimination.scala:175)
+	at leon.xlang.ImperativeCodeElimination$.leon$xlang$ImperativeCodeElimination$$toFunction(ImperativeCodeElimination.scala:200)
+	at leon.xlang.ImperativeCodeElimination$$anonfun$44.apply(ImperativeCodeElimination.scala:376)
+	at leon.xlang.ImperativeCodeElimination$$anonfun$44.apply(ImperativeCodeElimination.scala:374)
+```
+
+When this is fixed, `src/test/resources/regression/genc/unverified/Inheritance9.scala` should be moved to `src/test/resources/regression/genc/valid/Inheritance9.scala`.

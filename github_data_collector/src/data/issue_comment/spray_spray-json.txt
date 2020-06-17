@@ -1,0 +1,143 @@
+I've been trying for hours to get some code to compile and about to give up on spray-json as I'm having no luck.  I'm trying to get rid of the error:
+
+```
+Error:(18, 24) Cannot find JsonWriter or JsonFormat type class for com.intertrust.modulus.services.audit.Event
+        val result = e.toJson
+```
+
+I've used spray-json for years and am always confounded by errors such as this, and seek some methodology for debugging these and isolating WHY I get these occasionally when I'm pretty certain that I have implicit json formatters in-scope for all the case classes that extend the base trait (here Event).  
+
+When the hierarchy is:
+
+```
+    trait Event extends Product with Serializable 
+    sealed trait AccountEvent extends Event
+    case class AccountAdded(name: String, password: String) extends AccountEvent
+    case class AccountDeleted(name: String) extends AccountEvent
+    case class AccountPasswordChanged(name: String, password: String) extends AccountEvent
+    sealed trait FooEvent extends Event
+    case class FooEvent1() extends FooEvent
+```
+
+The compiler should be able to find that the ONLY types that extend Event are those case classes (since the trait from which they derive is sealed).  So why can't it find the implicit jsonFormatter I have defined in a trait that is extended by the class in which the error is occurring?
+
+
+
+ * [ ] parser changes
+ * [ ] implicit definition changes
+ * [ ] parser improvements
+String parsing dominates parsing times so far for real world input (that isn't particularly number heavy). So, here's a first attempt to improve performance.
+
+The speed-ups mostly come from
+ * no explicit bounds checking
+ * removing tricks
+ * some code reorganization
+
+Before:
+
+```
+GithubIssuesJsonAST.readCirce                github-akka-issues.json 2465.716 ± 191.574  ops/s
+GithubIssuesJsonAST.readCirce                  big-string-array.json 3375.916 ± 317.283  ops/s
+GithubIssuesJsonAST.readPlayJson             github-akka-issues.json 2002.679 ± 159.931  ops/s
+GithubIssuesJsonAST.readPlayJson               big-string-array.json 2790.919 ±  59.378  ops/s
+
+GithubIssuesJsonAST.readSprayJsonFromBytes   github-akka-issues.json 1048.052 ±  12.170  ops/s
+GithubIssuesJsonAST.readSprayJsonFromBytes     big-string-array.json 1353.650 ±  27.423  ops/s
+GithubIssuesJsonAST.readSprayJsonFromString  github-akka-issues.json 1202.670 ±  28.346  ops/s
+GithubIssuesJsonAST.readSprayJsonFromString    big-string-array.json 1507.546 ±  19.228  ops/s
+
+GithubIssuesCaseClassReading.readCircePartial           2074.334 ± 463.204  ops/s
+GithubIssuesCaseClassReading.readJacksonPartial         3393.928 ± 166.386  ops/s
+GithubIssuesCaseClassReading.readPlayJsonPartial        1883.332 ± 182.801  ops/s
+
+GithubIssuesCaseClassReading.readSprayJsonViaASTPartial 1141.810 ± 3.432  ops/s
+```
+
+After:
+
+```
+GithubIssuesJsonAST.readSprayJsonFromBytes   github-akka-issues.json 2321.173 ±  74.728  ops/s
+GithubIssuesJsonAST.readSprayJsonFromBytes     big-string-array.json 4250.720 ± 187.668  ops/s
+GithubIssuesJsonAST.readSprayJsonFromString  github-akka-issues.json 2181.839 ±  60.334  ops/s
+GithubIssuesJsonAST.readSprayJsonFromString    big-string-array.json 3447.510 ±  27.173  ops/s
+
+GithubIssuesCaseClassReading.readSprayJsonViaASTPartial  2142.250 ± 99.059  ops/s
+```
+
+I.e. about 2x-3x faster for byte input. So, string parsing has been improved by ~ 3x which leads to a 2x improvement for the test case (88k json from github API).
+
+As `ParserInput` needs to be changed, the change won't be simply binary compatible. I'll probably deprecate the current parser infrastructure and duplicate it by simpler entry-points that don't leak so many implementation details for common cases.
+This PR adds an instance of `JsonFormat[UUID]` as requested in https://github.com/spray/spray-json/issues/243.
+I'm not sure as to where to place this object, currently `BasicFormats` is my best guess, but feel free to request any changes.
+
+Closes https://github.com/spray/spray-json/issues/243
+To keep it compatible we just remove the `implicit` marker for now and provide implicit forwarders in traits that are mixed into `JsonFormat`.
+
+Later we should deprecate usage (and especially inheritance) of `BasicFormats` etc.  and recommend to use the methods in JsonFormat directly.
+
+Refs #308.
+By providing the predefined implicits directly from the companion object of JsonFormat no extra imports are needed for simple usages. That's standard for any type-class based library but we missed it back then.
+
+The difficulty is to keep everything compatible but it seems I found a way that it is simple and compatible.
+
+Let's keep an open tab of implicits that have been converted in that style:
+
+ - [ ] AdditionalFormats
+ - [ ] BasicFormats
+ - [ ] CollectionFormats
+ - [ ] StandardFormats
+
+All of those are included in #309.
+close #170
+close  #268
+
+This implementation uses  [agemooij's implementations](https://gist.github.com/agemooij/7679130).
+
+Implementation is simpler than #268, but performance is less than #268.
+The "not show bad performance characteristics when object keys' hashCodes collide" test in JsonParserSpec is flaky.
+
+https://github.com/spray/spray-json/blob/0b893f26ed2fd71649389e7eccc7bba6f1507946/src/test/scala/spray/json/JsonParserSpec.scala#L117
+
+In absolute terms, the `regularTime` is about 3E6 (3ms) on a modern laptop. This time is sufficiently large to make the test mostly pass on a dedicated machine. However, on a shared environment such as a Travis-CI build, it frequently causes the build to fail.
+
+Potential solutions:
+- easy: increase the number of keys by an order of magnitude
+- future-proof: don't assume a number of keys will give a large enough time, but rather incrementally deduce that number for a given system time and then run the test
+import spray.json._
+import spray.json.DefaultJsonProtocol._
+
+  val list = Map("k"->"f","n"->"r","d"->List("ffff"))
+  println(list.toJson)
+
+
+compiler error: Cannot find JsonWriter or JsonFormat type class for scala.collection.immutable.Map[String,java.io.Serializable]
+
+I used  wrong?
+Otherwise, it's easy to create BigDecimals that are so big that any operation on them will take a long time. It's somewhat arguable that spray-json needs to care for this: if your application does anything with user-supplied BigDecimals it should cut them into digestible proportion. But on the other hand, as most of these values are somewhat unlikely, it might make sense to provide guards.
+
+Quoting @plokhotnyuk at https://github.com/spray/spray-json/pull/283#issuecomment-434363836:
+
+> Even after successful parsing of `BigDecimal` values like `1e1000000000` or `1e-1000000000` users can be affected by any subsequent operations like `+`, `%`, `longValue`, etc.
+> 
+> Just try how this code works in your Scala REPL:
+> 
+> ```
+> scala> val f = (x: BigDecimal) => x + 1
+> f: BigDecimal => scala.math.BigDecimal = $$Lambda$1210/93981118@790ac3e0
+>     
+> scala> f(BigDecimal("1e1000000000"))
+> ```
+> or
+> 
+> ```
+> scala> val g = (x: BigDecimal) => 1 + x
+> g: BigDecimal => scala.math.BigDecimal = $$Lambda$1091/1954133542@e8ea697
+>     
+> scala> g(BigDecimal("1e-1000000000", java.math.MathContext.UNLIMITED))
+> ```
+> To prevent this, the parser should avoid returning of `BigDecimal` with too big exponent (or scale) or with `MathContext.UNLIMITED` by default.
+> 
+> BTW, in jsoniter-scala `java.math.MathContext.DECIMAL128` and a corresponding ~6K limit for the scale were selected as safe defaults:
+> 
+> [plokhotnyuk/jsoniter-scala:jsoniter-scala-macros/src/main/scala/com/github/plokhotnyuk/jsoniter_scala/macros/JsonCodecMaker.scala@`master`#L65-L66](https://github.com/plokhotnyuk/jsoniter-scala/blob/master/jsoniter-scala-macros/src/main/scala/com/github/plokhotnyuk/jsoniter_scala/macros/JsonCodecMaker.scala#L65-L66)
+

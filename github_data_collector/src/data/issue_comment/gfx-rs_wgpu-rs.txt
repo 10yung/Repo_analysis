@@ -1,0 +1,398 @@
+I tried to init wgpu by my hand. And I made mistake at Line 26 of the code. This code compiles a fragment shader code into vertex shader and passing to `create_render_pipeline` as a fragment shader:
+```Rust
+extern crate wgpu;
+extern crate glsl_to_spirv;
+
+fn main() {
+    let adapter = wgpu::Adapter::request(
+        &wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::Default
+        },
+        wgpu::BackendBit::PRIMARY
+    )
+    .unwrap();
+    
+    let (device, mut queue) = adapter.request_device(&wgpu::DeviceDescriptor {
+        extensions: wgpu::Extensions {
+            anisotropic_filtering: false,
+        },
+        limits: wgpu::Limits::default(),
+    });
+    
+    let vs = include_str!("shader.vert"); // GLSL vertex shader code from example/hello-triangle
+    let vs_module =
+    device.create_shader_module(&wgpu::read_spirv(glsl_to_spirv::compile(&vs, glsl_to_spirv::ShaderType::Vertex).unwrap()).unwrap());
+    
+    let fs = include_str!("shader.frag"); // GLSL fragment shader code from example/hello-triangle
+    let fs_module =
+    device.create_shader_module(&wgpu::read_spirv(glsl_to_spirv::compile(&fs, glsl_to_spirv::ShaderType::Vertex /* glsl_to_spirv::ShaderType::Fragment */).unwrap()).unwrap());
+    
+    
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        bind_group_layouts: &[],
+    });
+    
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor { // SIGSEGV
+        layout: &pipeline_layout,
+        vertex_stage: wgpu::ProgrammableStageDescriptor {
+            module: &vs_module,
+            entry_point: "main",
+        },
+        fragment_stage: Some(wgpu::ProgrammableStageDescriptor {
+            module: &fs_module,
+            entry_point: "main",
+        }),
+        rasterization_state: Some(wgpu::RasterizationStateDescriptor {
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: wgpu::CullMode::Back,
+            depth_bias: 0,
+            depth_bias_slope_scale: 0.0,
+            depth_bias_clamp: 0.0,
+        }),
+        primitive_topology: wgpu::PrimitiveTopology::TriangleList,
+        color_states: &[],
+        depth_stencil_state: None,
+        index_format: wgpu::IndexFormat::Uint16,
+        vertex_buffers: &[],
+        sample_count: 1,
+        sample_mask: !0,
+        alpha_to_coverage_enabled: false,
+    });
+}
+```
+```Cargo.toml
+[package]
+name = "wgpu-rs-segv"
+version = "0.1.0"
+authors = ["stentol <stentol24@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+wgpu = { git = "https://github.com/gfx-rs/wgpu-rs.git", branch = "master" }
+glsl-to-spirv = "0.1"
+```
+```
+$ cargo run
+    Finished dev [unoptimized + debuginfo] target(s) in 0.04s
+     Running `target/debug/wgpu-rs-segv`
+Segmentation fault (core dumped)
+```
+Yes it is just a my mistake. But I thought it is not desired behavior.
+I'm just a newbie of Rust. Sorry if it's wrong.
+Currently, `wgpu-rs` uses the C API of `wgpu-native`, which then uses `wgpu-core` for the gory details. This issue raises the question of whether the middle step can be skipped. In order to answer the question, we need to consider all the possible targets for `wgpu-rs`:
+  1. Native execution with `wgpu`. This is the only target supported *right now*. It could easily bypass `wgpu-native` and call into `wgpu-core`.
+  2. Native execution with Dawn (see https://github.com/gfx-rs/wgpu/issues/47). We'd have to use the API calls according to [webgpu-headers](https://github.com/webgpu-native/webgpu-headers). This would technically work if `wgpu-native` implements the headers and becomes a drop-in replacement for Dawn. The target is incompatible with using `wgpu-core` directly. cc @Kangz
+  3. Browser execution on the Web (see #101). The plan is to use `web-sys` directly and thus it doesn't depend on `wgpu`. cc @grovesNL 
+
+With that in mind, the only blocker for using `wgpu-core` directly is running on Dawn. This is somewhat a minor goal for us, given that we are trying to make `wgpu` a batter (or comparable) solution.
+
+My proposal would be to turn `wgpu-rs` into a multi-backend library (like `gfx-rs` is), enforcing the API with traits. The backends are:
+  1. `wgpu-core` - for fastest native development, no FFI boundary.
+  2. `webgpu-headers` - for generic standard-compatible target with `wgpu-native`, `dawn`, and possibly some `emscripten` drop-in libraries implementing the headers.
+  3. `web-sys` - for web development
+Hello, thanks for working on this!
+
+It would seem I'm having a little trouble running the examples on a `Surface Pro 4`  (Iris Graphics 540) on `ClearLinux`. Vulkan, however, works (I tested the examples from https://github.com/SaschaWillems/Vulkan.git). Desktop is GNOME/Wayland.
+
+```   
+Running `target/debug/examples/hello-triangle`
+[2019-12-29T23:00:31Z ERROR gfx_backend_vulkan] 
+    VALIDATION [VUID-VkDescriptorPoolCreateInfo-poolSizeCount-arraylength (0)] : vkCreateDescriptorPool: parameter pCreateInfo->poolSizeCount must be greater than 0. The Vulkan spec states: poolSizeCount must be greater than 0 (https://www.khronos.org/registry/vulkan/specs/1.1-extensions/html/vkspec.html#VUID-VkDescriptorPoolCreateInfo-poolSizeCount-arraylength)
+    object info: (type: UNKNOWN, hndl: 0)
+    
+thread 'main' panicked at 'called `Result::unwrap()` on an `Err` value: ()', src/libcore/result.rs:1189:5
+stack backtrace:
+   0: backtrace::backtrace::libunwind::trace
+             at /cargo/registry/src/github.com-1ecc6299db9ec823/backtrace-0.3.40/src/backtrace/libunwind.rs:88
+   1: backtrace::backtrace::trace_unsynchronized
+             at /cargo/registry/src/github.com-1ecc6299db9ec823/backtrace-0.3.40/src/backtrace/mod.rs:66
+   2: std::sys_common::backtrace::_print_fmt
+             at src/libstd/sys_common/backtrace.rs:77
+   3: <std::sys_common::backtrace::_print::DisplayBacktrace as core::fmt::Display>::fmt
+             at src/libstd/sys_common/backtrace.rs:59
+   4: core::fmt::write
+             at src/libcore/fmt/mod.rs:1057
+   5: std::io::Write::write_fmt
+             at src/libstd/io/mod.rs:1426
+   6: std::sys_common::backtrace::_print
+             at src/libstd/sys_common/backtrace.rs:62
+   7: std::sys_common::backtrace::print
+             at src/libstd/sys_common/backtrace.rs:49
+   8: std::panicking::default_hook::{{closure}}
+             at src/libstd/panicking.rs:195
+   9: std::panicking::default_hook
+             at src/libstd/panicking.rs:215
+  10: std::panicking::rust_panic_with_hook
+             at src/libstd/panicking.rs:472
+  11: rust_begin_unwind
+             at src/libstd/panicking.rs:376
+  12: core::panicking::panic_fmt
+             at src/libcore/panicking.rs:84
+  13: core::result::unwrap_failed
+             at src/libcore/result.rs:1189
+  14: core::result::Result<T,E>::unwrap
+             at /rustc/3a3f4a7cbaff09722b8c7cc8f09ce86ff5f953a3/src/libcore/result.rs:961
+  15: <smithay_client_toolkit::window::concept_frame::ConceptFrame as smithay_client_toolkit::window::Frame>::redraw
+             at /home/oleid/.cargo/registry/src/github.com-1ecc6299db9ec823/smithay-client-toolkit-0.6.4/src/window/concept_frame.rs:482
+  16: smithay_client_toolkit::window::Window<F>::refresh
+             at /home/oleid/.cargo/registry/src/github.com-1ecc6299db9ec823/smithay-client-toolkit-0.6.4/src/window/mod.rs:406
+  17: winit::platform_impl::platform::wayland::event_loop::EventLoop<T>::post_dispatch_triggers::{{closure}}
+             at /home/oleid/.cargo/registry/src/github.com-1ecc6299db9ec823/winit-0.20.0-alpha5/src/platform_impl/linux/wayland/event_loop.rs:692
+  18: winit::platform_impl::platform::wayland::window::WindowStore::for_each
+             at /home/oleid/.cargo/registry/src/github.com-1ecc6299db9ec823/winit-0.20.0-alpha5/src/platform_impl/linux/wayland/window.rs:455
+  19: winit::platform_impl::platform::wayland::event_loop::EventLoop<T>::post_dispatch_triggers
+             at /home/oleid/.cargo/registry/src/github.com-1ecc6299db9ec823/winit-0.20.0-alpha5/src/platform_impl/linux/wayland/event_loop.rs:673
+  20: winit::platform_impl::platform::wayland::event_loop::EventLoop<T>::run_return
+             at /home/oleid/.cargo/registry/src/github.com-1ecc6299db9ec823/winit-0.20.0-alpha5/src/platform_impl/linux/wayland/event_loop.rs:486
+  21: winit::platform_impl::platform::wayland::event_loop::EventLoop<T>::run
+             at /home/oleid/.cargo/registry/src/github.com-1ecc6299db9ec823/winit-0.20.0-alpha5/src/platform_impl/linux/wayland/event_loop.rs:463
+  22: winit::platform_impl::platform::EventLoop<T>::run
+             at /home/oleid/.cargo/registry/src/github.com-1ecc6299db9ec823/winit-0.20.0-alpha5/src/platform_impl/linux/mod.rs:639
+  23: winit::event_loop::EventLoop<T>::run
+             at /home/oleid/.cargo/registry/src/github.com-1ecc6299db9ec823/winit-0.20.0-alpha5/src/event_loop.rs:148
+  24: hello_triangle::main
+             at examples/hello-triangle/main.rs:115
+  25: std::rt::lang_start::{{closure}}
+             at /rustc/3a3f4a7cbaff09722b8c7cc8f09ce86ff5f953a3/src/libstd/rt.rs:67
+  26: std::rt::lang_start_internal::{{closure}}
+             at src/libstd/rt.rs:52
+  27: std::panicking::try::do_call
+             at src/libstd/panicking.rs:296
+  28: __rust_maybe_catch_panic
+             at src/libpanic_unwind/lib.rs:79
+  29: std::panicking::try
+             at src/libstd/panicking.rs:272
+  30: std::panic::catch_unwind
+             at src/libstd/panic.rs:394
+  31: std::rt::lang_start_internal
+             at src/libstd/rt.rs:51
+  32: std::rt::lang_start
+             at /rustc/3a3f4a7cbaff09722b8c7cc8f09ce86ff5f953a3/src/libstd/rt.rs:67
+  33: main
+  34: __libc_start_main
+             at ../csu/libc-start.c:308
+  35: _start
+```
+
+Not sure if related: `Vulkano`'s triangle example shows a window and a triangle, however, panics: `INTEL-MESA: error: ../src/intel/vulkan/anv_queue.c:1309: drm_syncobj_wait failed: No such file or directory (VK_ERROR_DEVICE_LOST)`
+Unfortunately, ZeroCopy take a really long time to build. It's a part of Fuchsia code base, and communicating with developers or filing issues seems... problematic. Perhaps, we could make a simpler version of it for ourselves, or find an existing alternative.
+Per https://github.com/gpuweb/gpuweb/issues/144#issuecomment-456897457, compressed textures will be included in the WebGPU spec. However, I can't find much else referencing them. Are there plans to add support to wgpu-rs/wgpu-core in the near term? Or even a sense of what form they may take?
+All examples panic with the same error:
+```
+RUST_BACKTRACE=full cargo run --example cube
+    Finished dev [unoptimized + debuginfo] target(s) in 0.08s
+     Running `target/debug/examples/cube`
+thread 'main' panicked at 'internal error: entered unreachable code', /home/oskar/.cargo/git/checkouts/wgpu-53e70f8674b08dd4/b51053d/wgpu-native/src/device.rs:150:5
+stack backtrace:
+   0:     0x55d5b534ad44 - backtrace::backtrace::libunwind::trace::hda41dbcdfba36aa0
+                               at /cargo/registry/src/github.com-1ecc6299db9ec823/backtrace-0.3.37/src/backtrace/libunwind.rs:88
+   1:     0x55d5b534ad44 - backtrace::backtrace::trace_unsynchronized::h1a8d6e1f8cb3f5d4
+                               at /cargo/registry/src/github.com-1ecc6299db9ec823/backtrace-0.3.37/src/backtrace/mod.rs:66
+   2:     0x55d5b534ad44 - std::sys_common::backtrace::_print_fmt::h610c4127487e10da
+                               at src/libstd/sys_common/backtrace.rs:76
+   3:     0x55d5b534ad44 - <std::sys_common::backtrace::_print::DisplayBacktrace as core::fmt::Display>::fmt::h0722dc552e01bd1d
+                               at src/libstd/sys_common/backtrace.rs:60
+   4:     0x55d5b53718fc - core::fmt::write::h01edf6dd68a42c9c
+                               at src/libcore/fmt/mod.rs:1030
+   5:     0x55d5b5347467 - std::io::Write::write_fmt::hf15985f193f03c04
+                               at src/libstd/io/mod.rs:1412
+   6:     0x55d5b534d8b5 - std::sys_common::backtrace::_print::hd8d5d08a1795e743
+                               at src/libstd/sys_common/backtrace.rs:64
+   7:     0x55d5b534d8b5 - std::sys_common::backtrace::print::hf89a79e3921a2366
+                               at src/libstd/sys_common/backtrace.rs:49
+   8:     0x55d5b534d8b5 - std::panicking::default_hook::{{closure}}::h3a8f42beb3bb8ae3
+                               at src/libstd/panicking.rs:196
+   9:     0x55d5b534d5a6 - std::panicking::default_hook::h8f803b0bc31a5c37
+                               at src/libstd/panicking.rs:210
+  10:     0x55d5b534dfb5 - std::panicking::rust_panic_with_hook::h825f041245da8739
+                               at src/libstd/panicking.rs:473
+  11:     0x55d5b5339ca3 - std::panicking::begin_panic::h388fb4712cd8b371
+                               at /rustc/4560ea788cb760f0a34127156c78e2552949f734/src/libstd/panicking.rs:407
+  12:     0x55d5b4d4c2be - wgpu_adapter_request_device
+                               at /home/oskar/.cargo/git/checkouts/wgpu-53e70f8674b08dd4/b51053d/wgpu-native/src/device.rs:150
+  13:     0x55d5b4b72cbe - wgpu::Adapter::request_device::h73edcd099787d207
+                               at src/lib.rs:564
+  14:     0x55d5b4917adb - cube::framework::run::hcc7ccdd3b3a7321d
+                               at examples/cube/../framework.rs:105
+  15:     0x55d5b48f9765 - cube::main::h3ed8822a0442a267
+                               at examples/cube/main.rs:364
+  16:     0x55d5b48ea770 - std::rt::lang_start::{{closure}}::h4c16b6915395d96c
+                               at /rustc/4560ea788cb760f0a34127156c78e2552949f734/src/libstd/rt.rs:64
+  17:     0x55d5b534d9e3 - std::rt::lang_start_internal::{{closure}}::ha04574f12d97cbe2
+                               at src/libstd/rt.rs:49
+  18:     0x55d5b534d9e3 - std::panicking::try::do_call::h7c2a8488f72db90c
+                               at src/libstd/panicking.rs:292
+  19:     0x55d5b535618a - __rust_maybe_catch_panic
+                               at src/libpanic_unwind/lib.rs:80
+  20:     0x55d5b534e4ad - std::panicking::try::hc3a9b5da4250385d
+                               at src/libstd/panicking.rs:271
+  21:     0x55d5b534e4ad - std::panic::catch_unwind::hf27600bf8c37809a
+                               at src/libstd/panic.rs:394
+  22:     0x55d5b534e4ad - std::rt::lang_start_internal::h409d4f2fe51133b0
+                               at src/libstd/rt.rs:48
+  23:     0x55d5b48ea749 - std::rt::lang_start::h70086e28cfd76dbc
+                               at /rustc/4560ea788cb760f0a34127156c78e2552949f734/src/libstd/rt.rs:64
+  24:     0x55d5b48f979a - main
+  25:     0x7fdfc370d09b - __libc_start_main
+  26:     0x55d5b48b11aa - _start
+  27:                0x0 - <unknown>
+```
+
+OS is Ubuntu 18.10 using nvidia-driver-418. Hardware:
+```
+H/W path         Device           Class          Description
+============================================================
+                                  system         MS-7681 (To be filled by O.E.M.)
+/0                                bus            P67A-GD55 (MS-7681)
+/0/0                              memory         64KiB BIOS
+/0/4                              memory         256KiB L1 cache
+/0/5                              memory         1MiB L2 cache
+/0/6                              memory         6MiB L3 cache
+/0/27                             memory         8GiB System Memory
+/0/27/0                           memory         4GiB DIMM DDR3 Synchronous 1333 MHz (0,8 ns)
+/0/27/1                           memory         DIMM Synchronous [empty]
+/0/27/2                           memory         4GiB DIMM DDR3 Synchronous 1333 MHz (0,8 ns)
+/0/27/3                           memory         DIMM Synchronous [empty]
+/0/68                             processor      Intel(R) Core(TM) i5-2500K CPU @ 3.30GHz
+/0/100                            bridge         2nd Generation Core Processor Family DRAM Controller
+/0/100/1                          bridge         Xeon E3-1200/2nd Generation Core Processor Family PCI Express Root Port
+/0/100/1/0                        display        GP104 [GeForce GTX 1080]
+/0/100/1/0.1                      multimedia     GP104 High Definition Audio Controller
+/0/100/16                         communication  6 Series/C200 Series Chipset Family MEI Controller #1
+/0/100/1a                         bus            6 Series/C200 Series Chipset Family USB Enhanced Host 
+```
+I'm honestly not sure entirely where I should post this, given the different projects that cover what goes into wgpu, but I figured I would put it here, even if perhaps it needs to be delegated upstream.
+
+I've been working with projects that require rendering across multiple windows, as well as trying to fit the entire project on an async runtime (tokio in my case) to parallelize my projects better, and make better use of worker threads.
+
+At this time WGPU has a function that prevents me from rendering to multiple windows efficiently without creating a thread per window, or putting WGPU rendering code on the tokio runtime. Specifically the function `SwapChain::get_next_texture`.
+
+On native platforms, this function will block until the next texture is available. This means that, without using 1 thread per window, all rendering and updating of all windows will stall whenever an attempt is made to render to one window, without any way to in advance detect if it will block.
+
+This also means it can't be used on a tokio runtime, as multiple windows being rendered to will effectively stall worker threads until it's done blocking.
+
+It would be nice if there was an alternative function, or a feature on this function, to never block but instead poll. At the very least the Vulkan backend supports this behavior on acquiring the next swapchain image. This would also make it possible to implement a `Future` around the SwapChain and use WGPU on a tokio runtime without blocking the worker thread.
+
+Currently, I don't know if there's any other functions in WGPU that have similar issues, but if there are it would be nice to, where possible, have similar non-blocking APIs available.
+I have just pulled master and run `cargo update`. The example with the triangle worked. The cube map one still fails:
+
+```
+cargo run --example cube RUST_BACKTRACE=1
+    Finished dev [unoptimized + debuginfo] target(s) in 0.17s
+     Running `target/debug/examples/cube RUST_BACKTRACE=1`
+2019-12-13 09:46:57.163 cube[5832:37615] -[MTLIGAccelBuffer addDebugMarker:range:]: unrecognized selector sent to instance 0x7fcf42d3ebd0
+[2019-12-13T08:46:57Z ERROR relevant] Values of this type can't be dropped!
+[1]    5832 segmentation fault  cargo run --example cube RUST_BACKTRACE=1
+```
+
+I have the same error (`[MTLIGAccelBuffer addDebugMarker:range:]: unrecognized selector sent to instance`) for the examples `mipmap`, `capture`, `shadow`, `msaa-line`, `skybox`, `hello-compute`.
+`hello-triangle` and `describe` are working.
+The examples: `describe` and `hello-triangle`
+
+I am on Mac OS "El Capitan", MacBook Pro (Retina, 13-inch, Mid 2014).
+GPU Intel Iris 1536 MB.
+This is a blocker for gfx-rs/gfx#3027. It's currently not possible to access the `AdapterInfo.device_type` field from within `gfx` library code because the compiler tries to use the local version of `DeviceType` rather than the one used by `wgpu`, causing a version conflict:
+
+```
+error[E0308]: mismatched types
+   --> src\backend\wgpu\src\lib.rs:999:23
+    |
+999 |                 info: a.get_info(),
+    |                       ^^^^^^^^^^^^ expected struct `gfx_hal::adapter::AdapterInfo`, found a different struct `gfx_hal::adapter::AdapterInfo`
+    |
+    = note: expected type `gfx_hal::adapter::AdapterInfo` (struct `gfx_hal::adapter::AdapterInfo`)
+               found type `gfx_hal::adapter::AdapterInfo` (struct `gfx_hal::adapter::AdapterInfo`)
+note: Perhaps two different versions of crate `gfx_hal` are being used?
+```
+
+It would probably also be good just for consistency reasons, since we already re-export all the other `gfx` types used in `wgpu`'s public interfaces.
+![2019-11-3011-08-19](https://user-images.githubusercontent.com/49613045/69899133-590d7b80-1362-11ea-9461-2d477a897899.gif)
+
+OS: Fedora 31
+Display Manager: Xorg
+
+Log:
+```
+thread 'main' panicked at 'index out of bounds: the len is 3 but the index is 32767', /rustc/4560ea788cb760f0a34127156c78e2552949f734/src/libcore/slice/mod.rs:2717:10
+stack backtrace:
+   0: backtrace::backtrace::libunwind::trace
+             at /cargo/registry/src/github.com-1ecc6299db9ec823/backtrace-0.3.37/src/backtrace/libunwind.rs:88
+   1: backtrace::backtrace::trace_unsynchronized
+             at /cargo/registry/src/github.com-1ecc6299db9ec823/backtrace-0.3.37/src/backtrace/mod.rs:66
+   2: std::sys_common::backtrace::_print_fmt
+             at src/libstd/sys_common/backtrace.rs:76
+   3: <std::sys_common::backtrace::_print::DisplayBacktrace as core::fmt::Display>::fmt
+             at src/libstd/sys_common/backtrace.rs:60
+   4: core::fmt::write
+             at src/libcore/fmt/mod.rs:1030
+   5: std::io::Write::write_fmt
+             at src/libstd/io/mod.rs:1412
+   6: std::sys_common::backtrace::_print
+             at src/libstd/sys_common/backtrace.rs:64
+   7: std::sys_common::backtrace::print
+             at src/libstd/sys_common/backtrace.rs:49
+   8: std::panicking::default_hook::{{closure}}
+             at src/libstd/panicking.rs:196
+   9: std::panicking::default_hook
+             at src/libstd/panicking.rs:210
+  10: std::panicking::rust_panic_with_hook
+             at src/libstd/panicking.rs:473
+  11: std::panicking::continue_panic_fmt
+             at src/libstd/panicking.rs:380
+  12: rust_begin_unwind
+             at src/libstd/panicking.rs:307
+  13: core::panicking::panic_fmt
+             at src/libcore/panicking.rs:85
+  14: core::panicking::panic_bounds_check
+             at src/libcore/panicking.rs:61
+  15: <usize as core::slice::SliceIndex<[T]>>::index
+             at /rustc/4560ea788cb760f0a34127156c78e2552949f734/src/libcore/slice/mod.rs:2717
+  16: core::slice::<impl core::ops::index::Index<I> for [T]>::index
+             at /rustc/4560ea788cb760f0a34127156c78e2552949f734/src/libcore/slice/mod.rs:2568
+  17: <alloc::vec::Vec<T> as core::ops::index::Index<I>>::index
+             at /rustc/4560ea788cb760f0a34127156c78e2552949f734/src/liballoc/vec.rs:1796
+  18: <gfx_backend_vulkan::window::Surface as gfx_hal::window::PresentationSurface<gfx_backend_vulkan::Backend>>::acquire_image
+             at /home/master/.cargo/registry/src/github.com-1ecc6299db9ec823/gfx-backend-vulkan-0.4.0/src/window.rs:507
+  19: wgpu_core::swap_chain::<impl wgpu_core::hub::Global<F>>::swap_chain_get_next_texture
+             at /home/master/.cargo/git/checkouts/wgpu-53e70f8674b08dd4/b51053d/wgpu-core/src/swap_chain.rs:149
+  20: wgpu_swap_chain_get_next_texture
+             at /home/master/.cargo/git/checkouts/wgpu-53e70f8674b08dd4/b51053d/wgpu-native/src/device.rs:366
+  21: wgpu::SwapChain::get_next_texture
+             at src/lib.rs:1410
+  22: cube::framework::run::{{closure}}
+             at examples/cube/../framework.rs:167
+  23: winit::platform_impl::platform::sticky_exit_callback
+             at /home/master/.cargo/registry/src/github.com-1ecc6299db9ec823/winit-0.20.0-alpha4/src/platform_impl/linux/mod.rs:693
+  24: winit::platform_impl::platform::x11::EventLoop<T>::run_return
+             at /home/master/.cargo/registry/src/github.com-1ecc6299db9ec823/winit-0.20.0-alpha4/src/platform_impl/linux/x11/mod.rs:305
+  25: winit::platform_impl::platform::x11::EventLoop<T>::run
+             at /home/master/.cargo/registry/src/github.com-1ecc6299db9ec823/winit-0.20.0-alpha4/src/platform_impl/linux/x11/mod.rs:389
+  26: winit::platform_impl::platform::EventLoop<T>::run
+             at /home/master/.cargo/registry/src/github.com-1ecc6299db9ec823/winit-0.20.0-alpha4/src/platform_impl/linux/mod.rs:640
+  27: winit::event_loop::EventLoop<T>::run
+             at /home/master/.cargo/registry/src/github.com-1ecc6299db9ec823/winit-0.20.0-alpha4/src/event_loop.rs:148
+  28: cube::framework::run
+             at examples/cube/../framework.rs:128
+  29: cube::main
+             at examples/cube/main.rs:364
+  30: std::rt::lang_start::{{closure}}
+             at /rustc/4560ea788cb760f0a34127156c78e2552949f734/src/libstd/rt.rs:64
+  31: std::rt::lang_start_internal::{{closure}}
+             at src/libstd/rt.rs:49
+  32: std::panicking::try::do_call
+             at src/libstd/panicking.rs:292
+  33: __rust_maybe_catch_panic
+             at src/libpanic_unwind/lib.rs:80
+  34: std::panicking::try
+             at src/libstd/panicking.rs:271
+  35: std::panic::catch_unwind
+             at src/libstd/panic.rs:394
+  36: std::rt::lang_start_internal
+             at src/libstd/rt.rs:48
+  37: std::rt::lang_start
+             at /rustc/4560ea788cb760f0a34127156c78e2552949f734/src/libstd/rt.rs:64
+  38: main
+  39: __libc_start_main
+  40: _start
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+```

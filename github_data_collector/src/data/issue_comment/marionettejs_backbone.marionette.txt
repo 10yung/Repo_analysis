@@ -1,0 +1,146 @@
+We cannot move forward with nondestructive view regions without moving to a vanilla dom api.    The vanilla should be the default, but we should extract the jquery one for legacy projects.
+This'll also mean that for the most part users of the jquery dom api will continue to use `onRender` to manage children rather than `onReady` such that children will need to be rebuilt any time the parent layout changes
+If you call `getRegion` during a `region` before `isRendered()` is `true` you'll get a callstack error.  We should throw a better error in these situations
+An iteration and replacement for https://github.com/marionettejs/backbone.marionette/pull/3620
+
+This is starting to feel really good.
+This is a WIP and I'll add more notes here shortly, but I wanted to get it out for 👀 
+I do think there's a handful of things we can introduce in a v4.x as well as some small deprecations that can be made for the breaking changes.
+There are actually few breaking changes I believe the breaking changes that are there are minor and like inconsequential for most users.
+I haven't done perf tests yet, but I feel moderately confident this will be more performant, and again I haven't tested it, but I believe this makes rendering views non-destructive to children.
+
+I will work on documenting changes as well as breaking up this PR into sane commits as well as making v4.x PRs for features and deprecations we can do now.
+
+But this I think is a good start.  @marionettejs/marionette-core 
+
+**Breaking Changes**
+- Region no longer accepts a jquery instances as `el` `el: $el[0]` should be used instead of `el: $el`  This removes region's dependencies on jquery.
+- As previously discussed, the not documented `allowMissingEl` is removed, however the reasoning for adding this flag in the first place is not an issue with this revision
+- Both `add:region` and `remove:region` events were removed.  They're even less useful now than they were previously, and there's a new hook for when regions are bound to the view `bind:regions` that should cover any use case this previously had.  This should make rendering cheaper overall as well.
+- Regions no longer empty on `render`.  This may be the biggest breaking change to watch out for.  However for the general case where the user is setting the children in `onRender` the 2nd show will handle the empty effectively in the same way as before.  But there may be some cases where conditional child renders will no longer empty out the previous view.  Users will need to handle these cases now, but this also should allow children to be created once in an `onReady` and child views may not need to be re-rendered at all when the parent is rendered.
+- Not documented, but Region's `@ui` allowed the user to build complex selectors such as:
+`regionName: '@ui.foo @ui.bar'` producing `regionName: '#foo .bar'`.  This change prevents that and requires a single ui only.  Not only is the complex selector not recommended anyways, this prevents needing to requery the selector and the already queried ui is used instead.
+- Not documented, but defining a Region on a view's region hash allowed the user to pass either and instance of a region or a region class. 
+  ```js
+   regions : {
+     foo: myRegion
+     bar: MyRegionClass
+   }
+  ```
+  Both of these options are no longer supported as an `el` selector is required to be managed by the view, and both of these options prevent that.  However allowing the view to maintain regions outside of the view is problematic and certainly makes `showChildView` difficult to understand.  While I doubt many people are using this feature anyways, the way to support these options is:
+  ```js
+  const MyRegionClass = Region.extend({ el: '#foo' }); // some predefined selector
+  const MyView = View.extend({
+    initialize({ myRegion }) {
+      this.myRegion = myRegion;
+    },
+    regions: {
+      bar: {
+        el: '#foo',
+        regionClass: MyRegionClass
+      }
+    }
+  ```
+- Though largely considered a bug https://github.com/marionettejs/backbone.marionette/issues/3320 if a user was setting up regions to be within a child view, this will no longer work.  It should be documented however that using `addRegion` or `addRegions` _after_ the view is rendered will query all of the children until the render in which it will only query the rendered template.  It might be best to suggest simply adding a definition to `myView.regions` and then re-rendering.
+- Regions are no longer instantiated prior to `View#initialize`.  This shouldn't really be an issue as getting a region will render and instantiation the region needed... but if someone was doing something strange and expecting the region init to be prior to the view's init, it would technically be breaking.
+- The `el` on a region prior to showing a view was possibly the `selector` (if instantiated with a selector)  Now it will always be a DOM element or `undefined` if nothing was found by the query.  It might be an issue for users who instantiate a region that does a global look up for DOM that didn't exist at the time of instantiation.
+- `Region#reset` was removed.  In this context it is no longer needed.
+
+**New Features**
+`View` `ready` event indicating the best spot to attach children
+`Application` `region` can now be defined as a function returning a region or region definition
+`Region#setElement` was made public and properly handles the various attached states of the elements
+This functionality required in my tasks very often. Can you add it to export along with View, Region, Object? 
+I have found a couple of things (so far) not mentioned in the upgrade guide:
+
+1.  filter of a CollectionView is now viewFilter and parameters have changed
+2. ` { sort:false }` on a CollectionView should now be `{sortWithCollection: false}`
+
+Also, the depreciated section of the upgrade guide in the docs is not displaying correctly.
+
+
+A collectionview renders on `addChildView` and a view renders with `getRegion` in both of these cases we should prevent the render if these items are occurring inside of a `before:render` event by keeping track of a private `_isRendering` flag.
+It can iterate over the reset event's `previousModels`  This prevents a `collection.reset` from removing customly added views.
+
+We should also indicate that child view was created from a collection model rather than using `this._children.findByModel` to account for views added from a collectionview that do not have the collection's model.  We should add a custom index so that we can find children by the custom index.  All of this can be private API.
+This event is analogous to the region's show event.  What it describes is that children were attached to the collection view.  Yes, if they weren't already rendered they were rendered, but children only get rendered once, so for the most part unless children are added to the view, no child is rendered at all on subsequent triggers of this event after the first instance
+
+https://jsfiddle.net/smgpw05w/
+```javascript
+const myCollection = new Backbone.Collection([{ num: 4 }, { num: 2 }, { num: 1 }, { num: 3 }]);
+
+const myCollectionView = new CollectionView({ collection: myCollection });
+
+function countRenders(event) {
+  let count = 0;
+
+  this.children.each(child => {
+    if(child.isRendered()) count++;
+  });
+  console.log(event + ' : ' + count);
+}
+
+myCollectionView.on({
+  'before:render:children': _.partial(countRenders, 'before:render:children'),
+  'render:children': _.partial(countRenders, 'render:children')
+});
+
+someRegion.show(myCollectionView);
+// before:render:children : 0
+// render:children : 4
+
+myCollectionView.setComparator('num');
+// before:render:children : 4
+// render:children : 4
+```
+
+
+Currently in v4 if a region is `destroyed` the view the region belongs to will not trigger the `remove:region` event.  They are only triggered if `view.removeRegion(name)` is used.  All that method does is trigger the events and destroy the region.
+
+It seems minor, but inconsistent.
+
+Seems like `_removeReferences` and the remove events could be triggered off of the region's destroy event.  Of course that means adding a listener for each region instance which is less than ideal.
+[Custom Elements](https://developers.google.com/web/fundamentals/web-components/customelements) are gaining traction as the best way to create interoperable components for web. Ionic, the popular mobile framework, is being rewritten with [custom elements](https://stenciljs.com/). Angular is making Custom Element a [first class citizen](https://medium.com/vincent-ogloblinsky/export-angular-components-as-custom-elements-with-angular-elements-a2a0bfcd7f8a).
+
+By migrating to Custom Element, Marionette would align with current web development technology and opens the door to easier [interoperability](https://micro-frontends.org/). The code would be simplified a lot since Custom Elements already implement features like attach/detach(connect/disconnect) lifecycle events. 
+
+Implementation could be done with [class mixins](http://justinfagnani.com/2015/12/21/real-mixins-with-javascript-classes/) like is [skatejs](https://github.com/skatejs/skatejs/) and [elix](https://elix.org/) are doing.
+
+SkateJS allows to customize the rendering with a similar concept as Marionette setRenderer, using mixins instead of a class method.
+
+Marionette would provide withEvents, withUI, withBehaviors etc mixins with each functionality implemented and a withView mixin with all features. This would allow to customize the View class as needed.
+
+The default one should be:
+```
+import {withView} from 'marionette'
+
+const View = withView()
+```
+
+if only events is used the user could do
+```
+
+import {withEvents} from 'marionette'
+
+const SimpleView = withEvents()
+```
+
+Is has some drawbacks like being a big breaking
+
+Pros
+ * Align with current web technology
+ * Remove hard dependency on Backbone
+ * Less/simplified code
+ * First class interoperability with other frameworks
+
+Cons
+ * Big breaking change
+ * No destroy lifecycle for view
+ * Not possible to create a CollectionView with ul/li tags (the custom element name must be separated by a dash)
+
+
+
+
+
+
+

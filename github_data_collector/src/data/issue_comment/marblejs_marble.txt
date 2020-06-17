@@ -1,0 +1,253 @@
+Problem: When using `use(multipart$())`, I can't seem to expand the Observable with additional values beyond the multipart upload. For example:
+
+```typescript
+const a$ = r.pipe(
+    r.matchPath('a'),
+    r.matchType('POST'),
+    r.useEffect(Rx.pipe(
+        use(multipart$()),
+        // Expanding the Observables with additional values.
+        Ro.combineLatest(Rx.from([1, 2, 3])),
+        // Seems to only log once, apparently the last value in above array.
+        Ro.tap(([upload, n]) => console.log(n)),
+        Ro.count(),
+        // Responds with 1. Should be 3.
+        Ro.map(body => ({status: 200, body})),
+    )),
+)
+```
+
+I created a repository to reproduce the issue: https://github.com/tstelzer/marble-playground
+
+node: v13.2.0
+"@marblejs/core": "^3.0.0-next.78",
+"@marblejs/middleware-body": "^3.0.0-next.78",
+"@marblejs/middleware-cors": "^3.0.0-next.78",
+"@marblejs/middleware-io": "^3.0.0-next.78",
+"@marblejs/middleware-logger": "^3.0.0-next.78",
+"@marblejs/middleware-multipart": "^3.0.0-next.78",
+"rxjs": "^6.5.3"
+Hi there!
+I believe there is a bug createServer factory:
+```javascript
+event$(serverEventSubject.pipe(takeWhile(e => !isCloseEvent(e))), server, metadata).subscribe();
+```
+takeWhile takes a second argument, `inclusive` - setting it to `true` should allow server close callback to get called.
+```javascript
+event$(serverEventSubject.pipe(takeWhile(e => !isCloseEvent(e), true)), server, metadata).subscribe();
+```
+thanks!
+Marble.js v3 is right around the corner. Before its official release I would like to introduce the incoming new features and potential API breaking changes. This is a place for general discussion about all the changes, their relevance and potential impact to your codebase. Feel free to ask questions and propose improvements. 😊
+
+### General overview of new features:
+- official support for TypeScript v3.7
+- official support for RxJS v6.5
+- official support for fp-ts v2.x
+- simplified dependency injection via new `useContext` hook
+- introducing new module `@marblejs/messaging` for building Microservices
+  - for MVP version with support for AMQP (RabbitMQ) and Redis transport layers
+  - I expect more transport layers to be introduced after release
+  - I'll post another issue when needed (or expect a surprise 😎🤪)
+
+### Incoming breaking changes::
+
+**Context API**
+
+`fp-ts@2.x` brought a major breaking change in it's API (see [changelog](https://gcanti.github.io/fp-ts/introduction/upgrade-to-v2.html)). It introduced changes that have a major impact to Context API (eg. Reader monad). What's new?
+
+More explicit dependency binding. Previous API wasn't so precise, which could result to confusion, eg. when the dependency is lazily/eagerly evaluated.
+
+**Old way:**
+```typescript
+// eager
+bindTo(WsServerToken)(websocketsServer.run),
+
+// lazy
+bindTo(WsServerToken)(websocketsServer),
+```
+
+**New way:**
+```typescript
+// eager
+bindEagerlyTo(WsServerToken)(websocketsServer),
+
+// lazy
+bindTo(WsServerToken)(websocketsServer),
+bindLazilyTo(WsServerToken)(websocketsServer),
+```
+
+---
+
+Reader creation:
+
+**Old way:**
+```typescript
+import { reader } from '@marblejs/core';
+
+const someService = reader.map(ctx => {
+  // ...
+});
+```
+
+**New way:**
+```typescript
+import { reader } from '@marblejs/core';
+import { pipe } from 'fp-ts/lib/pipeable';
+import { map } from 'fp-ts/lib/Reader';
+
+const someService = pipe(reader, map(ctx => {
+  // ...
+}));
+```
+
+---
+
+The release of fp-ts also had an impact to HTTP and  WebSocket server creators. Since the `run()` method on Reader, etc. has been replaced with a thunk, server creation also applied to this change. Bootstrap thunks are promisified, which means that they will return an instance only when started listening, if not then will throw an error.
+
+**Old way:**
+```typescript
+const server = createServer({
+  // ...
+});
+
+server.run();
+```
+
+**New way:**
+```typescript
+const server = createServer({
+  // ...
+});
+
+await server();
+```
+
+---
+
+**Effect interface changes:**
+
+Currently `Effect` interface defines three arguments where the second one is used for accessing contextual client, eg. *HttpResponse*, *WebSocketClient*, etc. Typicaly the second argument was not used very often. That's why in the next major version client parameter will be moved to context object which will result to reduced available number of parameters from 3 to 2:
+
+**Old way:**
+```typescript
+const foo$: WsEffect = (event$, client, meta) =>
+  event$.pipe(
+    matchEvent('FOO'),
+    // meta.ask       ---    context reader
+  );
+```
+
+**New way:**
+```typescript
+const foo$: WsEffect = (event$, ctx) =>
+  event$.pipe(
+    matchEvent('FOO'),
+    // ctx.client    ---    contextual client
+    // ctx.ask       ---    context reader
+  );
+```
+
+This change also implies a much cleaner base `Effect` interface:
+```typescript
+interface Effect<I, O, Client> {
+  (input$: Observable<I>, ctx: EffectContext<Client>): Observable<O>;
+}
+
+interface EffectContext<T, U extends SchedulerLike = SchedulerLike> {
+  ask: ContextProvider;
+  scheduler: U;
+  client: T;
+}
+```
+
+With that change the last argument of Effect interface is no more called as `EffectMetadata` but rather as `EffectContext`
+
+When dealing with error or output Effect, the developer had to use the attribute placed in the third effect argument, eg. ```const effect = (req$, client, { initiator, error }) => ...``` In the case of `ErrorEffect` the thrown error is passed to stream directly:
+
+```typescript
+const error$: HttpErrorEffect<HttpError> = req$ =>
+  req$.pipe(
+    map(({ req, error }) => {
+      // ...
+    }),
+  );
+```
+
+In the case of `OutputEffect` the message initiator (eg. initial request) is passed to stream directly:
+```typescript
+const output$: HttpOutputEffect = out$ =>
+  res$.pipe(
+    map(({ req, res }) => {
+      // ...
+    }),
+  );
+```
+
+---
+
+### Nightly builds
+If you would like to take part in beta testing feel free to try out `canary` [releases](https://www.npmjs.com/package/@marblejs/core/v/3.0.0-next.70).
+I'll try to inform here about new builds and changes that they introduce.
+
+CC @tstelzer
+Hi there,
+
+Is there any way to known when a websocket client's connection is broken so that I can do a follow-up action, e.g. update the database about the client's status.
+I have used fp-ts in my project and that has a version of ^2.0.1 and I have used [@marblejs/middleware-logger ](https://github.com/marblejs/marble/tree/master/packages/middleware-logger) to log my requests. when I request my server that exited with the error below.
+
+> TypeError: Option_1.fromNullable(...).map is not a function
+ in the file, /node_modules/@marblejs/middleware-logger/dist/logger.util.js:8:10)
+
+Then, I inspected your code, that package also using fp-ts in the old style (.map, .getOrElse). 
+I don't know, how to debug this.
+
+And, I hesitated to use other middlewares. Because of other package also use that lib in the same manner. 
+**Is your feature request related to a problem? Please describe.**
+
+Hello,
+
+I noticed that Marble is inspired by the Angular ecosystem. In my everyday developer experience I really appreciate what the CLI tools bring to me. It helps to quickly scaffold main building blocks and enforce consistency. 
+
+It could be really nice to have CLI tools for Marble.
+
+**Describe the solution you'd like**
+
+The @angular/dev-kit and schematics can be a good fit to provide CLI functionality.
+
+**Describe alternatives you've considered**
+
+After digging in other CLI tools it appeared to me that there is no strong alternative to the @angular/dev-kit package.
+
+I’m a big fan of marblejs - I’ve been following it closely since the early releases and I love the simplicity of its design. 
+
+Has anyone proposed that marblejs expand to include messaging capabilities (i.e. NATS, grpc, SQS, etc.). The fact that it is lightweight and simple makes it a great candidate for microservices that rely on messaging. I think NATS in particular could be a good fit. 
+Hi, guys :hand:
+I want to implement json-schema-validator for marblejs.
+### Why
+Have written json-schema validation middleware for my pet project, and I wish to contribute to marblejs and thing that the solution can be useful for the marblejs community.
+
+**Why Joi middleware is not enough?**
+Joi looks pretty good but I need to generate swagger specs for my API. So use the same schema for validation and documentation is a good idea in my opinion.
+
+**Internal realization**
+In my project I use [typescript-json-schema](https://github.com/YousefED/typescript-json-schema) for generation schema from typescript interfaces. So I have custom logic for schema loading and not sure that such solution will be good for marble.
+
+### Implementation proposal
+I propose one of three ways implementation json-schema validator for marble.
+
+#### Use typescript-json-schema API for generating schema from typescript types or interfaces
+The way is fully based on typescript interfaces or types. So we have a simple described type and generate JSON schema in runtime (when application start). Then we keep generated schemas in memory and use for validation or/and serving swagger specs (if we need).
+
+#### Prebuild schemas for validation
+This way is similar to previous, but instead compiling JSON schema on the fly we will build schemas before and just read the schemas from files.
+
+#### Pass JSON schema manually
+This way is simplest from this list. Just pass JSON schema as a simple object (and marble users should implement source yourself). It will like as Joi middleware, but instead passing Joi builder we will pass JSON schema object.
+
+I think last way it preferred for marble, such as not all users need the functionality for generation schemas and serving specs.
+
+### Questions
+1. What you guys think about implementing such middleware?
+2. If you approve implementing the middleware which way you prefer?
+3. Should I clarify something from the description above?
+

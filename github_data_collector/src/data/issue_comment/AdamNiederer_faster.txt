@@ -1,0 +1,191 @@
+
+Compilation with the latest version on crates.io does not work, however `master` works fine. Would be nice if you could update crates.io.
+```rust
+vec![0u8; 100000].iter().map(|&x| {
+    x as u64 * x as u64
+}).sum::<u64>();
+```
+is essentially what I'd like to use this crate to SIMD-accelerate.
+
+The issue I'm bumping into is reading the slice as `u8x8` such that I can then use [`<u64x8 as From<u8x8>>::from`](https://rust-lang-nursery.github.io/packed_simd/packed_simd/type.u8x8.html#impl-From%3Cu8x8%3E-7) to cast it.
+
+What is the best way to do this currently?
+
+Related to #8, #32 and #46.
+Opening another ticket since this is a separate discussion from #47 and might be more controversial:
+
+The more I look into the upcoming `std::simd`, the more I wonder if `faster` should not become a thinner "SIMD-friendly iteration" library that neatly plugs into `std::simd` and is really good at handling variable slices, zipping, ... instead of providing a blanket implementation over `std::arch`.
+
+Right now it seems that many common intrinsics and operations faster provides on packed types are or might be implemented in `std::simd` (compare [coresimd/ppsv](https://github.com/rust-lang-nursery/stdsimd/tree/master/coresimd/ppsv)).
+
+At the same time, for things that won't be in `std::simd` (and will be more platform specific), faster will have a hard time providing a consistent performance story anyway. 
+
+By that reasoning I see a certain appeal primarily focusing on a more consistent cross-platform experience with a much lighter code base (e.g., imagine faster without `arch/` and `intrin/` and using mostly `std::simd` instead of `vektor`).
+
+Faster could also integrate `std::arch` specific functions and types, but rather as extensions and helpers (e.g., for striding) for special use cases, instead of using them as internal fundamentals. 
+
+While working on #47 I noticed what looks like performance regressions in the `cargo bench`, in particular functions like `map_simd` and `map_scalar`, but quite a few others.
+
+```
+test tests::map_scalar                                ... bench:       2,022 ns/iter (+/- 264)
+test tests::map_simd                                  ... bench:       6,898 ns/iter (+/- 392)
+```
+
+However, comparing #49 to the commit before the refactoring, the numbers are mostly unchanged. 
+
+I then assumed it's related to unfortunate default feature flags on my machine, but playing with `avx2` and `sse4.1` didn't have any effect either. I also have a first implementation of #48, and it actually looks like no fallbacks are emitted for `map_simd`. (Tried to cross check that with `radare2`, but have some problems locating the right symbol / disassembly for the benchmarks). Lastly, the functions `map_scalar` and `map_simd` differ a bit, but even when I make them equal (e.g., `sqrt` vs. `rsqrt`) the difference remains.
+
+- Is that a "known issue"? 
+- Did `rustc` became so good in auto-vectorization?
+- Any suggestions how to extract the disassembly from `tests::map_simd` and `tests::map_scalar`?
+
+Running on `rustc 1.29.0-nightly (9fd3d7899 2018-07-07)`, MBP 2015, i7-5557U.
+
+**Update:** I linked the latest faster version from my SVM library and I don't see these problems in 'production':
+
+```
+csvm_predict_sv1024_attr1024_problems1 ... bench:     232,109 ns/iter (+/- 20,808) [faster AVX2]
+csvm_predict_sv1024_attr1024_problems1 ... bench:     942,925 ns/iter (+/- 64,156) [scalar]
+```
+
+**Update 2** Seems to be related to some intrinsics.  When I dissect the benchmark, I get 
+
+```
+test tests::map_scalar                                ... bench:         558 ns/iter (+/- 55) [without .abs()]
+test tests::map_scalar                                ... bench:         556 ns/iter (+/- 33) [with .abs()]
+test tests::map_simd                                  ... bench:         144 ns/iter (+/- 17) [without .abs()]
+test tests::map_simd                                  ... bench:         883 ns/iter (+/- 64) [with .abs()]
+```
+
+I now think that each intrinsic should have its own benchmark, e.g. `intrinsic_abs_scalar`, `intrinsic_abs_simd`, ...
+
+
+**Update 3** ... oh boy. I think that by "arcane magic" Rust imports and prefers `std::simd::f32x4` and friends over the `faster` types and methods. 
+
+So when you do `my_f32s.abs()`, it calls `std::simd::f32x4::abs`, not `faster::arch::current::intrin::abs`. 
+
+The reason I think that's the problem is you can now easily do `my_f32s.sqrte()`, which isn't implemented in `faster`, but in `std::simd`. 
+
+What's more annoying is that it doesn't warn about any collision, and that `std::simd` is actually slower than "vanilla" Rust. 
+
+**TODO:**
+- Investigate import tree why that happens
+- Clean up imports if import problem
+- Have single-intrinsic benchmarks to detect bad intrinsics 
+- Have Rust warn somehow if similar name conflict happens again? 
+- Remove all usages of `#![feature(stdsimd)]` except in `lib.rs`
+
+**Update 4** Now one more thing makes sense ... I sometimes got `use of unstable library feature 'stdsimd'` in test cases and I didn't understand why. Probably because that's where the `std::simd` built-ins were used. 
+After my last PR I noticed you had to clean up a bit. That made me wonder if it makes sense to configure and use `clippy` and `rustfmt`:
+
+* Since `clippy` is probably less controversial I went ahead and addressed all current issues, either by changing code (where I thought `clippy` made sense), or disabling lints (e.g., where faster bends rules for speed). Some of the more pedantic lints could be discussed, e.g., usage and formatting of number literals (`unreadable_literal`, `unseparated_literal_suffix`). https://github.com/ralfbiedert/faster/tree/clippy
+
+* I think `rustfmt` makes sense as well, but needs more configuration to resonate with the code. I found a few settings that worked for me (e.g., `max_width` be set rather high not to break up most macros which makes them harder to read). However you should probably take the lead on that one. 
+
+Let me know what you think about clippy, in particular `unreadable_literal`, `unseparated_literal_suffix` and `type_complexity` (I prefer the former 2, no opinion on 3rd). I can then create another PR. 
+Hi,
+
+I am trying to port a project to `aarch64` and `wasm` using the `rust-2018-migration` branch.  As of today I receive lots of: 
+
+```
+2 | use crate::vektor::x86_64::*;
+  |                    ^^^^^^ Could not find `x86_64` in `vektor`
+```
+
+Ideally, `faster` would have fallbacks for not-yet supported architectures. That way I could just write my SIMD code once using the provided API, instead of having two separate implementations.
+
+Do you have any short-term plans of making such a fallback available for the 2018 version? 
+
+Also, while I am not a Rust expert, I have 1 - 2 days to look into this myself. If you think it's feasible to outline a solution you prefer, I'd be happy to try to help you out.
+
+I'm trying to get into SIMD by implementing a trivial operation: XOR unmasking of a byte stream as required by the WebSocket specification. The implementation in x86 intrinsics is actually [very straightforward](https://stackoverflow.com/a/17743749/585725), but I have a hard time wrapping my head around expressing it in terms of Faster iterators API.
+
+The part I'm having trouble with is getting an input `[u8; 4]` to cycle within a SIMD vector of `u8`. I have looked at:
+
+1. [`load()`](https://docs.rs/faster/0.4.3/faster/vecs/struct.u8x16.html#method.load) which does accept `&[u8]` as input, but its behavior in case of length mismatch is completely undocumented. It's also not obvious what `offset` parameter does.
+1. Casting the input `[u8; 4]` to `u32`, calling `vecs::u32s()` and then downcasting repeatedly to get a SIMD vector of u8, but [Downcast](https://docs.rs/faster/0.4.3/faster/intrin/trait.Downcast.html) seems to do not at all what I want.
+1. Getting a SIMD vector of length 4 and arbitrary type inside it, load `[u8; 4]` into it (lengths now match, so it should work) then downcast repeatedly until I get a vector of u8 with arbitrary length. Except there seems to be no way to request a SIMD vector of length 4 and arbitrary type.
+1. After over an hour of head-scratching I've noticed that `From<u32x4>` is implemented for `u8x16`, so I could replace Downcast with it in approach 2 and probably get the correct result, except I have no idea how such conversions interact with host endianness.
+
+I actually expected this to be a trivial task. I guess for someone familiar with SIMD it is, but for the likes of me a snippet in examples/ folder that loads `[u8; 4]` into a vector would go a long way. Or perhaps even a convenience function in the API that deals with endianness properly, to make it harder to mess up.
+If I am reading the code correctly, it looks like in the case of SSE2 Faster currently falls back to calling round()/floor() etc on each individual lane via the fallback macro.
+
+You may be able to use these methods instead:
+http://dss.stephanierct.com/DevBlog/?p=8
+
+Or Agner Fog has a different method in his vector library:
+http://www.agner.org/optimize/vectorclass.zip
+
+edit:
+Agner's functions are slower but can handle floating point values that don't fit in an i32, the first functions only handle values that do fit in an i32.
+
+I have a function which looks vaguely like this:
+
+```rust
+struct Rect { real: f64, imag: f64 }
+struct KetRef<'a> { real: &'a [f64], imag: &'a [f64] }
+
+impl<'a> KetRef<'a> {
+    pub fn dot(self, other: KetRef) -> Rect {
+        assert_eq!(self.real.len(), other.real.len());
+        assert_eq!(self.real.len(), other.imag.len());
+        assert_eq!(self.real.len(), self.imag.len());
+        zip!(self.real, self.imag, other.real, other.imag)
+            .map(|(ar, ai, br, bi)| {
+                let real = ar * br + ai * bi;
+                let imag = ar * bi - ai * br;
+                Rect { real, imag }
+            })
+            .fold(Rect::zero(), |a,b| a + b)
+    }
+}
+```
+
+Converting it to use `faster` requires two passes over the arrays; I am unable to produce both `real` and `imag` in one pass because `simd_map` requires the function output to be a single vector:
+
+```rust
+pub fn dot<K: AsKetRef>(self, other: K) -> Rect {
+    use ::faster::prelude::*;
+
+    let other = other.as_ket_ref();
+    assert_eq!(self.real.len(), other.real.len());
+    assert_eq!(self.real.len(), other.imag.len());
+    assert_eq!(self.real.len(), self.imag.len());
+
+    let real = (
+        self.real.simd_iter(f64s(0.0)),
+        self.imag.simd_iter(f64s(0.0)),
+        other.real.simd_iter(f64s(0.0)),
+        other.imag.simd_iter(f64s(0.0)),
+    ).zip().simd_map(|(ar, ai, br, bi)| {
+        ar * br + ai * bi
+    }).simd_reduce(f64s(0.0), |acc, v| acc + v).sum();
+
+    let imag = (
+        self.real.simd_iter(f64s(0.0)),
+        self.imag.simd_iter(f64s(0.0)),
+        other.real.simd_iter(f64s(0.0)),
+        other.imag.simd_iter(f64s(0.0)),
+    ).zip().simd_map(|(ar, ai, br, bi)| {
+        ar * bi - ai * br
+    }).simd_reduce(f64s(0.0), |acc, v| acc + v).sum();
+
+    Rect { real, imag }
+}
+```
+
+So is it faster?  Well, actually, yes!  It is plenty faster... up to a point:
+
+```
+Change in run-time for different ket lengths
+dot/16              change: -33.973%
+dot/64              change: -29.575%
+dot/256             change: -26.762%
+dot/1024            change: -34.054%
+dot/4096            change: -36.297%
+dot/16384           change: -7.3379%
+```
+
+Yikes! Once we hit 16384 elements there is almost no speedup!
+
+I suspect it is because at this point, memory has become the bottleneck, and most of what was gained by using SIMD was lost by making two passes over the arrays.  It would be nice to have an API that allowed this do be done in one pass by allowing a mapping function to return a tuple (producing a new `PackedZippedIterator` or similar).

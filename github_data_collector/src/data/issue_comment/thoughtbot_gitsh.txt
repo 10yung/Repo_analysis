@@ -1,0 +1,189 @@
+How would one set it up so gitsh doesn't keep asking for passphrase?
+Normally one would use the following commands:
+```bash
+eval $(ssh-agent)
+ssh-add
+```
+but running it as follows inside the gitsh:
+```bash
+!eval $(!ssh-agent) // Started agent succesfully
+!ssh-add // Could not open a connection to your authentication agent.
+```
+I recently upgraded my MacOS to Catalina, and I can no more use gitsh. 
+When I type gitsh, it gives me following error
+
+```
+$ gitsh
+Traceback (most recent call last):
+	5: from /usr/local/Cellar/gitsh/0.14/share/gitsh/ruby/gitsh.rb:6:in `<main>'
+	4: from /usr/local/Cellar/gitsh/0.14/share/gitsh/ruby/gitsh.rb:6:in `require'
+	3: from /usr/local/Cellar/gitsh/0.14/share/gitsh/ruby/lib/gitsh/environment.rb:3:in `<top (required)>'
+	2: from /usr/local/Cellar/gitsh/0.14/share/gitsh/ruby/lib/gitsh/environment.rb:3:in `require'
+	1: from /usr/local/Cellar/gitsh/0.14/share/gitsh/ruby/lib/gitsh/line_editor.rb:1:in `<top (required)>'
+/usr/local/Cellar/gitsh/0.14/share/gitsh/ruby/lib/gitsh/line_editor.rb:1:in `require': dlopen(/usr/local/Cellar/gitsh/0.14/share/gitsh/ruby/lib/gitsh/line_editor_native.bundle, 0x0009): dependent dylib '/System/Library/Frameworks/Ruby.framework/Versions/2.3/usr/lib/libruby.2.3.0.dylib' not found for '/usr/local/Cellar/gitsh/0.14/share/gitsh/ruby/lib/gitsh/line_editor_native.bundle' - /usr/local/Cellar/gitsh/0.14/share/gitsh/ruby/lib/gitsh/line_editor_native.bundle (LoadError)
+```
+A feature request. I have all my repos in a common parent directory, so I often switch between them with `:cd ../newRepo`. Current behavior:
+
+```
+laptop:myRepo chris$ gitsh
+myRepo master@ :cd ../newRepo
+newRepo master@ :exit
+laptop:myRepo chris$ echo "now I am confused"
+```
+
+This always breaks my brain. Upon exiting, I am yanked back to the directory I was in when I entered gitsh. For some reason I consistently expect this:
+
+```
+laptop:myRepo chris$ gitsh
+myRepo master@ :cd ../newRepo
+newRepo master@ :exit
+laptop:newRepo chris$ echo "sweet consistency"
+```
+What do you think of adding support for installation via [Linuxbrew](https://docs.brew.sh/Homebrew-on-Linux) for Linux / WSL?
+## What?
+
+This PR is a large refactor which replaces dependency injection with the [registry pattern][1] for shared instances, or direct references to class names that were previously passed as constructor arguments. 
+
+Previously we had a lot of classes that looked like this:
+
+```ruby
+class Foo
+  def initialize(env, bar_factory = Gitsh::Bar)
+    @bar = bar_factory.new(env)
+    @env = env
+  end
+
+  private
+
+  attr_reader :bar, :env
+end
+```
+
+Now, those same classes look like this:
+
+```ruby
+class Foo
+  extend Registry::Client
+  use_registry_for :env
+
+  def initialize
+    @bar = Gitsh::Bar.new
+  end
+
+  private
+
+  attr_reader :bar
+end
+```
+
+The objects moved to the registry are the shared instances of:
+
+- `Gitsh::Environment`
+- `Gitsh::GitRepository`
+- `Gitsh::LineEditorHistoryFilter` (decorating `Gitsh::LineEditor`)
+
+[1]: https://mattbrictson.com/registry-pattern
+
+## Why?
+
+The nature of gitsh means that some amount of long-lasting, global state is inevitable. Unlike a Web application, which needs to handle multiple concurrent requests from different users, a gitsh process only runs a single command at any given time, and does so for a single user in a single session.
+
+We get a lot of benefits from this approach, which include:
+
+- **Fewer redundant arguments**
+
+    There were several classes which held a reference to the shared `Gitsh::Environment` instance only because they needed to pass it along to some other object that needed to use it.
+
+- **Easier to break up `Gitsh::Environment`**
+
+    The `Gitsh::Environment` has become a bit of a junk drawer. The main reason is that it was the one object that was available everywhere, so access to any shared state was easiest if it went through this object.
+
+    Introducing the registry means we are able to drop all of the `Gitsh::Environment#repo_*` methods (which delegated directly to a `Gitsh::GitRepository` instance) and instead share both the `Gitsh::Environment` and `Gitsh::GitRepository` via the registry.
+
+   The remaining responsibilities of `Gitsh::Environment` (I/O, variable access, and access to some global config) can be broken out in future PRs.
+
+- **Easier to share other instances**
+
+    The final straw in doing this refactor was starting work on globbing patterns (#145), and realising we will need to access the tab completion automaton while evaluating variable values. Adding yet another thing to the environment was not appealing, nor was passing another instance around through the whole system, or building multiple instances of a pretty large tab completion graph.
+
+    After this refactor, we'll be able to use the registry to share the tab completion automaton instance, and easily access it directly from where it's needed.
+
+### Code review
+
+This diff is very large (~1,000 changed lines), but many of the changes are very similar and reviewers should probably focus on:
+
+- The `Gitsh::Registry` implementation in `lib/gitsh/registry.rb`
+- The new test helpers in ` spec/support/registry.rb`
+I'm not 100% sure what the exact cause or error is, but here are some test cases.
+
+Works:
+```
+gitsh (ek-add-docs-to-readme@) ➜ !FOO='foo' git log --oneline -n 1
+eeb5015 (HEAD -> ek-add-docs-to-readme, origin/ek-add-docs-to-readme) Add note about `man gitsh` to Readme.
+
+gitsh (ek-add-docs-to-readme@) ➜
+```
+
+```
+gitsh (ek-add-docs-to-readme@) ➜ !echo 'hi there'
+hi there
+
+gitsh (ek-add-docs-to-readme@) ➜
+```
+
+Fails:
+```
+gitsh (ek-add-docs-to-readme@) ➜ !FOO='foo bar' git log
+/bin/sh: bar: command not found
+
+gitsh (ek-add-docs-to-readme@) ➜
+```
+
+In my case `git` is an alias to `hub`, though I have tested without `hub` and the above behavior is still exhibited.
+
+gitsh version `0.14`
+git version `2.20.1`
+hub version `2.5.0`
+
+Supersedes [thoughtbot/homebrew-formulae#60](https://github.com/thoughtbot/homebrew-formulae/pull/60).
+
+Adds a `head` configuration block to the Homebrew formula to support top-of-tree builds.
+
+Additionally adds a VERSION_SUFFIX variable to configure.ac, which is appended to PACKAGE_VERSION on `./configure`. This is used to produce a SemVer-compatible version number such as 0.14-head+5d9484d, in order to differentiate pre-release builds from official releases.
+e.g. `:echo h{i,o}p` produces `hip hop`.
+
+The implementation differs from GNU Bash and other general purpose shells in a few ways. First, there are a few deliberate things that I think improve the consistency of the language:
+
+- Single-option expansions behave like strings, e.g. `{x}` is like `'x'`.
+- Zero-option expansions behave like empty strings, e.g. `{}` is like `''`.
+- Unclosed braces cause a parse error, not a literal brace.
+- Spaces inside of expansions don't need to be escaped.
+- Quotes inside of expansions are literals not string delimiters, which mirrors the fact that braces inside of quoted strings are literals not expansion delimiters.
+
+There are also a couple of differences that we might want to consider changing:
+
+- Expansions can't be used inside of variable names, e.g. in GNU Bash `echo $FOO{1,2}` is like `echo $FOO1 $FOO2` (but `echo ${FOO1,FOO2}` is an error).
+
+To support this new behaviour this PR also updates all of the various `Gitsh::Arguments::*` classes'
+`#value` methods to produce Arrays instead of single values. The `Gitsh::ArgumentList` class takes on the responsibility of flattening the results.
+
+Begins to address #145 
+If I have `origin/foo-branch` but not `foo-branch` I can do this:
+
+```
+myrepo master@ checkout foo-branch
+Branch 'foo-branch' set up to track remote branch 'foo-branch' from 'origin'.
+Switched to a new branch 'foo-branch'
+```
+
+I'd like to be able to do the same thing but with tab completion.
+
+```
+myrepo master@ checkout foo-[[mash that tab key]]
+Branch 'foo-branch' set up to track remote branch 'foo-branch' from 'origin'.
+Switched to a new branch 'foo-branch'
+```
+e.g. https://travis-ci.org/thoughtbot/gitsh/jobs/504373680
+
+I thought I had tracked down the cause of the problem in 08398ed39ee3bf98425ea292d8fe95e080ebe075, but it's still failing sometimes. The supposed fix did do something, because prior to that commit I could reproduce the failure locally by running RSpec with the same seed, but after that commit I can't reproduce the issue reliably.
+

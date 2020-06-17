@@ -1,0 +1,101 @@
+The docs still refer to the deprecated Dispatcher Interface:
+
+https://github.com/NEventStore/NEventStore/wiki/Architectural-Overview
+
+It should be updated to describe the polling client approach which is currently minimally documented.
+that's because the same stream Id can exists in several buckets.
+I'm wondering if anyone can give some pointers when it comes to handling concurrency in NEventStore.
+
+We are using NEventStore where multiple clients can insert events into the Commits table at the same time.
+
+Initially I was using EnlistInAmbientTransaction() with TransactionScope but this resulted in multiple deadlocks. Turning off EnlistInAmbientTransaction() and removing the TransactionScope greatly reduced the number of deadlocks, however now I am getting NEventStore.ConcurrencyException.
+
+How am I supposed to be handling this exception?
+
+Some code
+
+```
+return Wireup.Init()
+                         .LogToOutputWindow()
+                         .UsingSqlPersistence(connectionFactory)
+                         .WithDialect(new MsSqlDialect())
+                         //.EnlistInAmbientTransaction() // two-phase commit
+                         .InitializeStorageEngine()
+                         .UsingJsonSerialization()
+                         .Compress()
+                         .EncryptWith(EncryptionKey)
+                         .HookIntoPipelineUsing(new[] { new AuthorizationPipelineHook() })
+                         .Build();
+```
+----
+
+```
+using (store = WireupEventStore())
+            {
+                AppendToStream(@event, streamId);
+            }
+
+```
+
+```
+private void AppendToStream(IEvent @event, Guid streamId)
+        {
+            using (IEventStream stream = store.OpenStream(@event.EventType.ToString(), streamId))
+            {
+                stream.Add(new EventMessage { Body = @event });
+                try
+                {
+                    stream.CommitChanges(Guid.NewGuid());
+                }
+                catch (NEventStore.ConcurrencyException)
+                {
+                    Thread.Sleep(100);
+
+                    try
+                    {
+                        // can't insert event
+                        stream.CommitChanges(Guid.NewGuid());
+                    }
+                    catch (NEventStore.ConcurrencyException ex)
+                    {
+                        Defect.Log(ex);
+                    }
+                }
+            }
+        }
+```
+
+Have a use-case where a deletion of a partial Commit needs to be removed from the EventStore, for example when a Transaction of saving 3 Streams, and it fails to save the 2nd Stream due ConcurrencyException, we need to remove the 1st aggregate events (the whole commit) to be able to re-run and properly re-add the commit transaction.
+
+But I've noticed in the past that instances of NES might not behave as expected after removing Commits in the ES, any guidelines or known issues surrounding this?
+Hi everybody. 
+I have some question about event upconverting. We have to change our domain model and because of it our events are changing. Is there any good solution to upconvert our events in the event store to a new version? Thank you for help. 
+there's no need for custom wrappers anymore, .net core has a flexible logging framework that support external loggers nicely
+I want to use the CommitId as an optmistic lock in higher layers. Is it possible to add this to the IEventStream interface?. I've managed to obtain it by using the IStoreEvents.Advanced.GetFrom. But this always involves loading the entire stream as an IEnumerable and enumerating the whole thing.
+
+It might also be nice if IStoreEvents.OpenStream supporting ranges of CommitIds. I haven't done too much event sourcing but it strikes me that clients may be interesting in the changes in "Version" of an aggregate, rather than the individual events that make up that change (Eg creating an aggregate may produce many events, set name, etc) but its really only one "Business level" change, comprised of multiple events.
+
+
+The new PollingClient2 has a callback function used to process the commits (and their events), the return value of this function tells the PollingClient process what to do: MoveNext, Stop or Retry.
+
+The idea is to handle any error condition in this function, log any error in a custom way that depend to your domain/project and then tell the poller what to do.
+
+Provide extended information to this return value so we can specify additional behavior, like an extended sleep time before retrying.
+
+proposal:
+
+change the HandlingResult enum in a class and those information there.
+
+This is used only in the implementation of NEventStore.Persistence.MongoDb and NEventStore.Persistence.RavenDb (offcially supported packages).
+
+It's used in a very inconsistent way in both packages:
+- in RavenDB it's used to 'serialize' the whole list of events in a commit.
+- in MongoDb it's used to serialize the single event payload (anche frankly I have my doubts on how the deserialization is made).
+
+Does anyone have a custom Persistence driver for any database that does make use of this? if so please let us know.
+
+I'm thinking about removing this because it can cause more harm than good.
+
+This is also related to: 
+- https://github.com/NEventStore/NEventStore.Persistence.MongoDB/issues/38
+- https://github.com/NEventStore/NEventStore.Persistence.MongoDB/issues/31

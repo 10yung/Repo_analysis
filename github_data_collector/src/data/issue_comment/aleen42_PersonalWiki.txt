@@ -1,0 +1,421 @@
+最近，Handlebars 模板预处理解析成为了重构任务中的最重要一环。在该环节，我们希望能通过 Webpack Loader 的预处理，直接 export 出模板解析后的函数。举个例子来说，每个模板都会有特定的一种结构：
+
+> root context
+> partials
+>> partials 1
+>> partials 2
+>> ...
+
+对应的 `.hbs` 文件就可能会是这样：
+
+```handlebars
+<!-- root context -->
+<div class="container"></div>
+<!-- end of root context -->
+
+<!-- partials -->
+<script type="text/x-handlebars-template" id="partial1">
+    <div class="partial-container">partial 1</div>
+</script>
+
+<script type="text/x-handlebars-template" id="partial2">
+    <div class="partial-container">partial 2</div>
+</script>
+<!-- end of partials -->
+```
+
+从模板文件的结构来看，我们希望能通过 loader 做出以下的预处理：
+
+- 解析模板每一部分，并 export 出相应的 render 函数
+- 过滤掉所有浪费字节的 comments
+
+```js
+module.exports = Object.assign(data => {
+    /** ... */
+}, {
+    partial1: data => { /** ... */ },
+    partial2: data => { /** ... */ },
+});
+```
+
+此外，由于各模块所加载的模板可能会含有特殊的 [template helpers](https://handlebarsjs.com/#helpers)，这就意味着我们需要用特定的方式去接收 template data 以外的 context。针对于此，我们考虑两个比较标准的方案：
+
+1. curry 化所 export 的函数，即在引用 Webpack loader 解析模板后得到的调用函数，在渲染模板前需要先调用一次函数往闭包内传递 context。
+    ```js
+    module.exports = context => Object.assign(data => {
+        /** ... */
+    }, {
+        partial1: data => { /** ... */ },
+        partial2: data => { /** ... */ },
+    });
+    ```
+2. 额外 export 函数去设定 context
+    ```js
+    module.exports = Object.assign(data => {
+        /** ... */
+    }, {
+        config: context => { /** store locally */ }
+        partial1: data => { /** ... */ },
+        partial2: data => { /** ... */ },
+    });
+    ````
+
+显然，为了避免代码中存在类似 `require('hbs!xxx.hbs')()()` 的写法，我们还是倾向于第二种方案的实现。当然，为了支持特殊的 context 传递，我们仍然会在函数内接受特定的 context 以覆盖原有：
+
+```js
+module.exports = Object.assign(data => {
+    /** ... */
+}, {
+    config: context => { /** store locally */ }
+    partial1: (data, context) => { /** ... */ },
+    partial2: (data, context) => { /** ... */ },
+});
+```
+
+另外，我们从部分历史代码的实现中还发现到，传递给 Handlebars 模板的 data 大部分都存在相似的结构，而这就意味着 module 内部会存在动态调用函数的情况：
+
+```js
+require('hbs!.xxx.hbs')[`partial${type}`](data);
+/** or */
+require('hbs!.xxx.hbs')(`partial${type}`, data);
+```
+
+因此，在设计函数我们依然需要支持 `template(id, data, context)` 的传递：
+
+```js
+module.exports = Object.assign(data => {
+    /** ... */
+}, {
+    config: context => { /** store locally */ }
+    partial1: (data, context) => { /** ... */ },
+    partial2: (data, context) => { /** ... */ },
+    template: (id, data, context) => { /** ... */ },
+});
+```
+This is a task for collecting some confusing problems during developing under IE, mostly when we are really get confused with **IE8**!! To avoid struggling with IE, it's smart to do this as early as I can.
+
+这个 Task 主要是为了收集 IE 开发中所遇到困惑，尤其当我们被 **IE8** 所折腾的时候。因此，为了避免陷入与 IE 的斗争，我理应尽早地去执行该任务。
+
+Reference Articles:
+
+引用文章：
+
+- [**Console is not defined under IE8**](https://stackoverflow.com/questions/3326650/console-is-undefined-error-for-internet-explorer)
+- [**Blur event is fired when clicking on the scrollbar under IE8**](https://stackoverflow.com/a/2136311)
+- [**Internet Explorer's CSS rules limits**](https://stackoverflow.com/a/9906889)
+
+![image](https://cloud.githubusercontent.com/assets/9573300/23983128/1c6427cc-0a4d-11e7-9b3b-069d49b37a5f.png)
+
+其实我们很多时候在设计一个 JavaScript 函数时，都可能会遇到这样的一种情况：参数数量不定，且一般会传递有多个。此时，我们就会想该如何更优雅地设计函数来接收这些不定的参数？此 Issue 的提出就是为了谈谈不才及劣者所知道的一些见解。
+
+对于这样的情况，我们肯定会想到一对函数：
+- [`Function.prototype.apply()`](https://developer.mozilla.org/zh-CN/docs/Web/JavaScript/Reference/Global_Objects/Function/apply)
+- [`Function.prototype.call()`](https://developer.mozilla.org/zh-CN/docs/Web/JavaScript/Reference/Global_Objects/Function/call)
+
+同样是为方法调用指定 `this`，两者的区别在于传递不定参数的方式。
+
+> 为了方便记忆，我通常会采用一种巧妙的方法去区分两者。`call()` 首字母为 **c**，因而可看作以逗号（**C**omma）的方式来区分参数，而 `apply()` 首字母为 **a**，因而也可看作是以数组（**A**rray）的方式来区分参数。
+
+这样一看，官方似乎已为我们预先提供了两种通用的方式：
+
+- 以逗号分隔参数
+- 以数组组合参数
+
+然而，若不去亲身实现还不知道该怎么设计函数才能更为优雅？对此，不才与劣者认为**应该先实现数组组合的方式，而后再实现逗号分隔的方式**。为了能更好地说明，我将举例 underscore 中关于 `_.without()` 与 `_.difference()` 的实现。在讨论实现之前，我们先了解这两个函数到底有何作用？其实，它们主要用于过滤数组中的部分成员。因此，通过下面的代码片段我们就能清晰地看到：
+
+```js
+var arr = [1, 2, 3, 4, 5];
+var result = _.without(arr, 1, 2, 3);
+console.log(result); /** => [4, 5] */
+```
+
+```js
+var arr = [1, 2, 3, 4, 5];
+var result = _.difference(arr, [1, 2, 3], [5, 6]);
+console.log(result); /** => [4] */
+```
+
+过滤成员需要通过不定的参数来告知函数，而两者唯一的区别与前述例子类似，也就是传递不定参数的方式不同。那么，回到原来的问题，为何我们要先设计并实现以数组组合方式的函数呢？其实很简单，原因在于反过来实现会造成许多不必要的麻烦。
+
+例如我们先实现数组方式传递的 `_.difference()`，我们就可以通过简单的数组组合来实现 `_.without()`：
+
+```js
+_.difference = function (array) {
+    /**
+      * 把后续的参数严格铺平成一个数组，即忽略不是包含在数组内的参数
+      * 如 _.difference(array, [1, 2], 3); 语句中的 3
+      */
+    var rest = flatten(arguments, true, true, 1); 
+
+    return _.filter(array, function (value) {
+        return !_.contains(rest, value);
+    });
+};
+
+_.without = function (array) {
+    return _.difference(array, Array.prototype.slice.call(arguments, 1));
+};
+```
+
+但倘若反过来，实现方式则变得更为复杂：
+
+```js
+_.without = function (array) {
+    /** 若经过 `_.difference()` 的调用，则还需要把参数进行一层铺平 */
+    var rest = (this == 'difference') ?
+        _.flatten(arguments, false, false, 1) :
+        Array.prototype.slice.call(arguments, 1);
+
+    return _.filter(array, function(value) {
+        return !_.contains(rest, value);
+    });
+};
+
+_.difference = function(array) {
+    var args = _.flatten(arguments, true, true, 1);
+
+    return _.without.apply('difference', args.unshift(array));
+};
+```
+
+综上所述，以 `_.without()` 和 `_.difference()` 为例其复杂点显然在于 `_.without()` 该如何区分到底是否经过 `_.difference()` 来调用自己？因为针对这样的两种情况，`_.without()` 都需要对参数进行不同的处理。简单来说，`_.without()` 对于来自 `_.difference()` 的调用需要再进行一次铺平（注：不才与劣者此处是通过指定 `this` 来提供一种区分的方式）。为何？细致想想就会发现，产生如此的复杂在于旧版的 JavaScript 语法只能通过数组组合来传递若干个不定的参数，而无法铺开成逗号分隔的形式来传递。
+
+那么，既然语法存在缺陷，ES6 是否提供了新的方式去解决该问题呢？不才认为，这恰恰体现出展开操作符（`...`，Spread Operator）的魅力所在。有了它，你就可以直接展开若干个不定参数呢！
+
+```js
+_.without = function (array) {
+    var rest = Array.prototype.slice.call(arguments, 1);
+
+    return _.filter(array, function(value) {
+        return !_.contains(rest, value);
+    });
+};
+
+_.difference = function(array) {
+    var args = _.flatten(arguments, true, true, 1);
+    args.unshift(array);
+
+    return _.without.call(null, ...args);
+};
+```
+
+![image](https://cloud.githubusercontent.com/assets/9573300/23734294/2cf51e3c-04b9-11e7-8d63-40f440cb8337.png)
+
+最近的两次前端开发面试中都感觉到公司开发对头部信息的一些要求，尤其是要求面试者对于 304 下的缓存机制需要有一定的了解。因此，在此不才先开一个 Issue 来初略归纳总结一下 304 Status Code 下到底涉及到哪些头部信息，以及固中的原理。然而，若想真正了解背后的道理，我认为应该通篇去阅读 MDN 下的定义文档。
+
+在谈及这些头部信息之前，我们需要了解 304 Status Code 到底是意味着什么？其实，根据不才与劣者的一些学习，可以得知 3xx （以数字3开头的 Status Code 一般意指该请求需要重定向，如301、302等）。那么 304 所具体表达的重定向指的是什么呢？在我看来，所重定向的是获取资源的目标地点由服务器转换到浏览器，换而言之，就是从本来在服务器获取资源转到在本地获取缓存。
+
+那么，HTTP 缓存机制所涉及的头部信息总共有四个组成部分：
+
+- 浏览器请求头：
+    - [**If-Modified-Since**](https://developer.mozilla.org/zh-CN/docs/Web/HTTP/Headers/If-Modified-Since)
+    - [**If-None-Match**](https://developer.mozilla.org/zh-CN/docs/Web/HTTP/Headers/If-None-Match)
+- 服务器响应头：
+    - [**Last-Modified**](https://developer.mozilla.org/zh-CN/docs/Web/HTTP/Headers/Last-Modified)
+    - [**Etag**](https://developer.mozilla.org/zh-CN/docs/Web/HTTP/Headers/ETag)
+
+首先，若服务器希望资源能被服务器缓存时，可以在响应头部添加相应的 **Last-Modified** 和 **Etag** 头部。当浏览器收到该两个头部信息时，在下次请求同样的资源时则会在请求头添加有相应的 **If-Modified-Since** 和 **If-None-Match** 头部。而后，服务器则会根据所请求的两个头部信息判断资源近期是否产生更新，若是，则返回新的资源；若否，则返回 304 Status Code 告诉浏览器从本地获取所缓存的资源。
+
+### 1. If-Modified-Since （浏览器） / Last-Modified （服务器）
+
+如上所述，服务器会通过 Last-Modified 头部告诉浏览器该资源的最后修改时间。当浏览器对同样的资源作请求时，则会以该时间作为 If-Modified-Since 的值传递给服务器，而后让服务器来判断是否返回 304。然而，这种方式中所采用的时间值只能精确到秒，因此服务器是无法通过这样的值来区分出秒级别内的资源改动。所以，If-None-Match / Etag 的这组头会采用一特征值作为判断标准。
+
+### 2. If-None-Match（浏览器）/ Etag（服务器）
+
+该特征值在我看来，服务器与浏览器可以约定以资源的 hash 值作为特征值来判断资源是否最新。
+
+### 3. 带有 304 Status Code 的响应头
+
+服务器在返回 304 响应头时，还可以通过另外的两个头部信息来告知浏览器该缓存资源的有效期：
+
+- [**Expires**](https://developer.mozilla.org/zh-CN/docs/Web/HTTP/Headers/Expires)：Expires 会跟 If-Modified-Since / Last-Modified 一样置有时间值，用于表示在该时间段前的资源都有效（即有效期）。然而，需要注意的是服务器与浏览器两者间的时间设置可能不同，从而导致差错（没有对上“表”）。
+- [**Cache-Control**](https://developer.mozilla.org/zh-CN/docs/Web/HTTP/Headers/Cache-Control)：Cache-Control 一般值会是 `max-age=3600` 或 `no-cache` 等，用于表示有效期的一些判断标准，如 `max-age=3600` 则表示3600秒内缓存依然有效。
+
+Expires 由 HTTP/1.0 所支持，而 Cache-Control 则是在 HTTP/1.1 下支持，因此，为了防止不对表的现象，建议最好是同时设置这两种头部信息（浏览器默认情况下会优先采用 Cache-Control 作为判断标准）。
+
+### 4. 所需要注意的细节
+
+1. Last-Modified 和 Expires 之间的一些区别
+
+至此，我们知道若响应头设置了 Expires 头部信息，那么浏览器在下次请求同样的资源时理应就不会有一次额外的 HTTP 请求。若是这样，为何还保留有 Last-Modified 呢？理论上，的确是会少一次 HTTP 请求，然而在低版本的 IE 或 Firefox 浏览器中，若 Refresh 页面，对于设有 Expires 头部的 URI，浏览器同样还是会对服务器作一次 HTTP 请求。形象点来说的话，Expires 似乎给浏览器提供了一次自主检查缓存的机会。
+
+2. If-None-Match / Etag 较为有意思的一点：索引存储
+
+这组头其实有一点意思，因为采用有特征值策略来进行资源的修动判断，所以会有一种资源部署策略的意思。浏览器在响应头检查到有 Etag 头部信息时，理应可以建立一个索引表（Hash）来存放该 Etag 值。倘若资源产生变动时，浏览器则在另一个索引上存放有新的 Etag，而非直接取代。这样的好处在于，若服务器资源产生版本回退时，仍然能根据此次索引表来快速判断是否返回 304 Status Code 的响应。（当然，代价当然会是需要占用一定的存储空间）
+
+ 3. If-None-Match / Etag 所带来的鸡肋
+
+虽然从上面一点可以看出，这组头所采用的索引存储方式的确能在性能上优化判断，但是它却存在有一个令人诟病的鸡肋。在谈及该问题之前，我们首先需要意识到一点的是 Etag 的计算在 Apache、Nginx 或 IIS 上的计算会截然不同，因而很难保证多台服务器能计算出一样的 Etag。换句话所，同样的资源在不同服务器上可能会计算出不同的 Etag 值，这也就意味着若有多服务器做负载均衡时，浏览器请求资源的方式就不尽人意了。也许你好想，If-Modified-Since / Last-Modified 可以解决此类问题。然而，根据 [RFC2616 的规定](https://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.3.4)，若设有 If-None-Match / Etag 的情况下，优先考虑该头部信息而忽略 If-Modified-Since / Last-Modified。
+
+对于此类弊端，若是能有统一 Etag 计算算法且好，但若觉得费劲可以考虑像 Yahoo 一样直接取消 Etag 的计算。（这细节好像跟前端不大有关系，逃）
+
+
+
+![image](https://cloud.githubusercontent.com/assets/9573300/23457620/a3b94c3e-feb3-11e6-94d4-e1e63f48bb7b.png)
+
+写 JavaScript 不需要了解数据结构？别开玩笑了。自我开始学习编程以来，我一直都铭记着这样的一个概念：
+
+> **程序（Programs）** = **算法（Algorithms）** + **数据结构（Data Structures）**
+
+因此不管是什么语言，我们都需要了解数据结构并明白它们到底能带来些怎样的好处。借此，该 Issue 主要为了更为抽象地去总结一下 JavaScript 中有关数据结构知识以便记忆与实践。若想详细深入了解，可以看看我在阅读《Data Structures and Algorithms with JavaScript》后所总结出的[笔记](https://github.com/aleen42/PersonalWiki/blob/master/Programming/JavaScript/data_structure/data_structure.md)。
+
+To be continued ...
+
+![image](https://cloud.githubusercontent.com/assets/9573300/23447087/71d7b2bc-fe83-11e6-8d7b-7228c8b78cbe.png)
+
+最近，在啃一本为人所熟知的动物书《[O`Reilly] - High Performance JavaScript - [Zakas]》。本书中，作者主要以四大角度去谈及 JavaScript 如何在性能上得以提高。为了能使其变为我自身 JavaScript 知识体系中的一部分，我以自己的语言去加以总结，并归档于[此链接](https://github.com/aleen42/PersonalWiki/blob/master/Programming/JavaScript/high_performance/high_performance.md)。（虽是英文，但描述得非常直白，希望大家不要害怕。）
+
+在此，我希望通过这个 Issue，以中文的形式从更高的层次去总结所有的性能提升技巧以方便记忆与查询（但是细节也要深入去理解与学习，而非得过且过）：
+
+### 1. JavaScript 的加载 
+
+作者就此角度主要谈及如何去高效地加载与执行 JavaScript 代码。正因其执行过程会产生阻塞问题，因此我们需要通过若干方式去最小化该性能影响：
+
+- 尽可能地把所有的 script 标签置于页面的底部，即 body 标签内的末尾部分。
+- 使用构建工具把多个 script 组合在一起
+- 使用以下地方式去异步加载 JavaScript 代码：
+    - 添加 `defer` 属性可预加载 JavaScript 代码并等到页面加载渲染完成后及 onload 事件触发之前执行
+    - 以代码的方式动态加载 script
+    - 通过 `XMLHttpRequest` 来加载 script
+
+[[**详情**]](https://aleen42.github.io/PersonalWiki/Programming/JavaScript/high_performance/loading_and_execution/loading_and_execution.html)
+
+### 2. 编码技巧
+
+以优雅的编码技巧去提高性能会涉及到几个方面，如数据访问方式、DOM 相关编码或代码结构等。经过此章的阅读，个人认为这些技巧并不仅仅针对于 JavaScript 语言，而是作为一种更高层次的编程哲学去浸染开发者的编程思想，从而在骨子里下意识地提高代码的优雅程度。
+
+#### 2.1 数据访问
+
+首先，作者开篇所讲的是关于数据的访问，并区分出四种访问的方式：对字面值的访问、对变量的访问、对数组成员的访问以及对对象成员的访问。当然，访问的快慢也是与这顺序所相对应的。
+
+- 字面值与变量的访问比数组及对象的访问要快
+- 访问本地变量要比访问外部变量要快
+- 尽可能不使用 `with`、`try-catch` 及 `eval()`.
+- 减少对象成员的嵌套
+- 访问对象成员时，查找的原型链越长越消耗更多的时间
+- 闭包不仅会占用内存，而且在低版本浏览器中导致内存泄漏，因此要权衡。
+
+[[**详情**]](https://aleen42.github.io/PersonalWiki/Programming/JavaScript/high_performance/data_access/data_access.html)
+
+#### 2.2 DOM 编程
+
+第二，关于 DOM 相关的编程，我们要谨记一点：DOM 的访问及操作犹如搭载在桥梁上的收费站，太多的访问与操作只会带来性能上的消耗。因此：
+
+- 我们应该尽可能地减少对 DOM 元素的访问，而把工作放在 JavaScript 代码中去执行
+- 若需要重复操作 DOM 元素，则把其对应的引用存储在一个本地变量
+- 像 `document.getElementsByName()`、`document.getElementsByClassName()` 或 `document.getElementsByTagName()` 等方法所放回的是一个 HTML Collections。遍历该集合时我们需要考虑到，若该集合不怎么大时，我们可以把集合的大小缓存在一个本地变量以作循环条件中的判断；而若集合非常大时则需要考虑把其转换成数组来遍历
+- 若浏览器支持时，尽可能地使用更为高效的封装属性或函数，如 `firstElementChild`、`document.querySelectorAll()` 等。
+- 尽可能地去减少页面的重排与重绘
+- 在制作动画时，应把元素先置为绝对定位，以减少重排及重绘所带来的消耗
+- 使用事件委托机制来减少事件处理函数的数量
+
+[[**详情**]](https://aleen42.github.io/PersonalWiki/Programming/JavaScript/high_performance/dom_scripting/dom_scripting.html)
+
+#### 2.3 代码中的算法及代码流的控制
+
+个人认为，为何我们写的代码总运行得这么慢？主要原因在于我们的算法不够高效，而且代码流的控制不够优雅。所执行的代码越多，执行的时间也就越长。因此不管是循环结构还是控制结构，作者都给出了自己的经验之谈：
+
+- `for`、`while` 以及 `do-while` 结构都非常相似，并没说哪种循环结构更为高效
+- 除非需要遍历一个属性未知的对象，不然请不要轻易使用 `for-in` 结构
+- 尽可能地减少循环的次数及每次循环的工作量，以优化循环
+- 尽管 `switch` 结构比 `if-else` 结构要高效，但并非是一个最佳的选择
+- 对于代码有多种流向的情况，Lookup 表是一种不错的选择
+- 当算法涉及到递归时，请注意各浏览器中栈使用量的限制
+- 当递归算法超出栈使用量的限制时，尝试使用循环去替代算法或通过记忆的手段减少重复计算的次数
+
+[[**详情**]](https://aleen42.github.io/PersonalWiki/Programming/JavaScript/high_performance/algorithms_flow_control/algorithms_flow_control.html)
+
+#### 2.4 字符串及正则表达式
+
+频繁的字符串操作与不严格的正则表达式都会产生重大的性能问题，因此我们需要谨记以下几点：
+
+- 当需要拼接非常多或非常长的字符串时，有理由相信 `Array.join()` 是你的首选方式
+- 如果你不需要考虑到低版本浏览器如 IE7 或以下版本，那么你就可以选择使用简单的 `+` 和 `+=` 操作符来实现拼接
+- 使用正则表达式时，失控的 backtracking 都会导致浏览器崩溃，因此我们要加以小心
+- 当你是对已知的字符串进行操作时，请不要轻易使用正则表达式
+- 我们可以结合两个简单的正则表达式来实现字符串的 trim 操作，但若您需要考虑到字符串的长度时，末尾的 trim 最好是由遍历来实现
+
+[[**详情**]](https://aleen42.github.io/PersonalWiki/Programming/JavaScript/high_performance/string_regular_expressions/string_regular_expressions.html)
+
+#### 2.5 页面响应
+
+通常我们都知道，一个页面的 UI 更新是与 JavaScript 代码的执行共享同一条进程。这也就意味着不能同时执行代码和更新页面。因此为了不影响用户的体验，我们最好：
+
+- 尽可能地保持代码执行时间不超过 100 毫秒
+- 若算法复杂且任务执行时间无法再压缩，那么可以考虑使用 timer 函数即 `setTimeout()` 和 `setInterval()` 来分解任务
+- Web Workers 是 HTML5 所提出的新特性。它可以使得我们在一个独立的线程上执行代码来处理与 UI 无关的任务，如大型 JSON 的解析等
+
+[[**详情**]](https://aleen42.github.io/PersonalWiki/Programming/JavaScript/high_performance/responsive_interfaces/responsive_interfaces.html)
+
+#### 2.6 Ajax
+
+若想采用高性能的 Ajax 技术，也许你需要清楚自己的开发需求并根据它们来选择最合适的数据格式及传输方式。
+
+对于数据格式来说：
+
+- 纯文本和 HTML 格式的数据虽然很特殊，但是却能节省了不少的 CPU 计算资源
+- XML 之前虽被广泛运用，但是却暴露出冗长及解析慢的缺点
+- JSON 相对于 XML 来说，简单且解析快
+- 若你想传输大量的数据，那么理应前后端制定好自定义格式来格式化数据，如采用分隔符
+
+当我们需要请求数据时：
+
+- 使用 XHR 能更为深入地操纵传输过程的细节，如请求头的设置等。但由于是以字符串形式来处理应答，以致于解析速度下降
+- 使用动态 script 标签注入，可请求跨域资源且以 JavaScript 或 JSON 的形式直接解析，但需要考虑安全问题
+- MXHR 可以在加载多个资源时减少请求，但无法缓存
+
+倘若是往服务器发送数据：
+
+- 设置 Image 对象的 src 属性会是一种高效简便的方法
+- 但如果你需要传输大量的数据时，只能使用 XHR 进行 POST 请求以避免 GET 请求中 URL 过长所导致问题
+
+除此之外，还有一些提升性能的技巧需要我们注意：
+
+- 通过拼接文件或采用 MXHR 技术来减少网络请求
+- 使用 Ajax 技术可降低页面初始化时的加载时间
+
+[[**详情**]](https://aleen42.github.io/PersonalWiki/Programming/JavaScript/high_performance/ajax/ajax.html)
+
+#### 2.7 编程中的一些细节
+
+谈及性能优化，我们理应先从我们的代码入手：
+
+- 为了避免二次计算，尽可能不使用 `eval()` 或 `Function()` 构造器来执行代码。而且，使用 `setTimeout()` 和 `setInterval()` 时，第一个参数应该传递函数，而非字符串
+- 直接使用 `[]` 和 `{}` 来创建数组和对象
+- 在浏览器兼容性判断时，采取 lazy loading 或 conditional advance loading 两种策略来优化判断的过程
+- 当进行算术运算时，优先考虑按位操作
+- 尽可能使用 JavaScript 原生已实现的方法
+
+[[**详情**]](https://aleen42.github.io/PersonalWiki/Programming/JavaScript/high_performance/practices/practices.html)
+
+### 3. 代码的构建与部署
+
+如今 JavaScript 代码的构建工具层出不穷，Webpack、Gulp 等早已为人熟知，然而在使用这些辅助性工具之前，我们必须明白在构建与部署的过程中，一些细节往往会对应用的性能提升产生不可或缺的影响，如：
+
+- 合并多个 JavaScript 资源以减少 HTTP 请求的数量
+- 使用类似 YUI Compressor 的工具去压缩 JavaScript 文件
+- 致力于 JavaScript 资源的压缩（如允许 gzip 压缩）
+- 设置部分 HTTP 请求头来缓存资源
+- 尽量把资源部署于 CDN 节点，以减少网络延迟
+
+[[**详情**]](https://aleen42.github.io/PersonalWiki/Programming/JavaScript/high_performance/building_and_deploying/building_and_deploying.html)
+
+To be continued ...
+
+![image](https://cloud.githubusercontent.com/assets/9573300/23338749/0f9ed558-fc4e-11e6-9fc5-df981d753950.png)
+
+Hello guys,
+
+Maybe you have not ever touched this couple of words, and if you do have, will you mind communicating here to help me learn about them. Actually, according to cc's [talk](https://github.com/ccforward/cc/issues/48), I have basically learn the concept of them  and note down [here](https://github.com/aleen42/PersonalWiki/blob/master/Programming/JavaScript/events_loop/events_loop.md). However, I know there should be several mistakes during the process of learning. I hope that you can give a more detailed talk here so that I can note it with a more impressive and apparent way.
+
+
+We [use GitBook](https://github.com/RadicalFx/documentation) for our doco. We'd love to use the `gitbook-edit` plugin, however we have a custom [`book.json`](https://github.com/RadicalFx/documentation/blob/master/book.json) where we re-define the GitBook `root` directory.
+
+The `root` configuration element is ignored by the `gitbook-edit` plugin when building the GitHub edit path.
+
+Note: I raised the issue here because in the [official repo](https://github.com/aleen42/gitbook-edit) issues are disabled.
+This is translation work according to @xitu's translation plans. Article is talking about how to use CSS
+ to align SVG Icons to text. If there is a clear way to do this, we may say goodbye to traditional Font Icons.
+
+Read at: https://aleen42.gitbooks.io/personalwiki/content/translation/align_svg/align_svg.html
+This article is all about how the author discover the full story of different buildings in various cities. Here is the [post](https://aleen42.gitbooks.io/personalwiki/content/post/discover_city/discover_city.html).

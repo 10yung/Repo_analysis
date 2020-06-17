@@ -1,0 +1,184 @@
+select works great but I don't know how to generate views The examples I found only printed the first root so I wanted a full iteration of all categories
+We have STI classes like this:
+
+```ruby
+class Parent
+  acts_as_nested_set counter_cache: :counter
+end
+
+class Foo < Parent
+end
+
+class Bar < Parent
+end
+```
+
+Then, when I try to move a Bar instance under the Foo instance (doing `bar.move_to_child_of foo`),
+I'd like to increment `counter` field of the parent class Foo, but it's impossible because the increment is done by doing internally like:
+
+```ruby
+self.class.increment_counter(acts_as_nested_set_options[:counter_cache], new_parent)
+```
+
+It virtually equals to the following in my case:
+
+```ruby
+Bar.increment_counter(:counter, foo)
+```
+
+But they're an STI, so the SQL which will be performed is like:
+
+```sql
+UPDATE parents SET counter = COALESCE(counter, 0) + 1 WHERE parents.type = 'Bar' AND parents.id = 123
+```
+
+It updates no records because id=123 is a type of "Foo".
+So I guess the codes in `update_counter_cache` should be like:
+
+```ruby
+new_paraet.class.increment_counter(acts_as_nested_set_options[:counter_cache], new_parent)
+```
+
+If my guess is right, I'm willing to open a PullReq for it :)
+Thanks.
+We bulk upload tree data which is very slow out of the box when you are dealing with 20K+ nodes.  We were able speed this up a bunch by disabling the callbacks and doing a rebuild after the the inserts (see https://github.com/collectiveidea/awesome_nested_set/issues/326#issuecomment-537286222 for those details).  Despite that the actual rebuild is still very slow and we are trying to think of a faster way to do it.  Does anyone have any thoughts on how to make it faster?  Either improving on what we already developer or allowing for parallel process so we could split up the tree into multiple background jobs.
+
+Below is the scoped rebuild code we are using:
+
+```
+def self.rebuild_tree!(account_id, version)
+    # modeled after rebuild! in awesome_nested_set.rb
+    # account_id is our scope
+    root_nodes = self.where(account_id: account_id, version: version).roots
+    indices = {}
+
+    scope = lambda{|node|}
+    if acts_as_nested_set_options[:scope]
+      scope = lambda{|node|
+        scope_column_names.inject(""){|str, column_name|
+          str << "AND #{connection.quote_column_name(column_name)} = #{connection.quote(node.send(column_name.to_sym))} "
+        }
+      }
+    end
+
+    set_left_and_rights = lambda do |node|
+      # set left
+      node[left_column_name] = indices[scope.call(node)] += 1
+      # find
+      NestSetModel.where(["#{quoted_parent_column_full_name} = ? #{scope.call(node)}", node]).order("#{quoted_left_column_full_name}, #{quoted_right_column_full_name}, id").each{|n| set_left_and_rights.call(n) }
+      # set right
+      node[right_column_name] = indices[scope.call(node)] += 1
+      node.save!(validate: false)
+    end
+
+    root_nodes.each do |root_node|
+      indices[scope.call(root_node)] ||= 0
+      set_left_and_rights.call(root_node)
+    end
+end
+
+private
+
+def set_zero_left_and_rights
+    self[left_column_name] = 0 unless self[left_column_name].present?
+    self[right_column_name] = 0 unless self[right_column_name].present?
+end
+```
+(byebug) comment.children
+*** ArgumentError Exception: wrong number of arguments (given 0, expected 1)
+
+EXPECTED??? o_O
+
+
+
+awesome_nested_set is not currently compatible with Oracle 12, as various places will trigger: `ArgumentError: Combination of limit and lock is not supported.`
+See: https://github.com/rails/arel/pull/430
+
+The three places I've found that are triggering this in awesome_nested_set are:
+
+1. `right_most_node.lock!`, in `right_most_bound`: https://github.com/collectiveidea/awesome_nested_set/blob/master/lib/awesome_nested_set/model.rb#L194
+2. `:lock => true`, in `reload_nested_set`: https://github.com/collectiveidea/awesome_nested_set/blob/master/lib/awesome_nested_set/model.rb#L259
+3. `nested_set_scope.right_of(left).select(primary_id).lock(true)`, in `destroy_descendants`: https://github.com/collectiveidea/awesome_nested_set/blob/master/lib/awesome_nested_set/model/prunable.rb#L23
+
+I was able to work around the last one by adding my own before_destroy to my model that handles child cleanup then sets `self.skip_before_destroy = true`, but the others probably require more effort if locking is to be preserved.
+
+I know that Oracle is a hard/inaccessible platform to test on, but hopefully this will help others who run into this problem get on the right track.
+I'm getting this error using Rails 6 `ArgumentError (Unknown key: :order. Valid keys are: :class_name, :anonymous_class, :foreign_key, :validate, :autosave, :table_name, :before_add, :after_add, :before_remove, :after_remove, :extend, :primary_key, :dependent, :as, :through, :source, :source_type, :inverse_of, :counter_cache, :join_table, :foreign_type, :index_errors)`
+
+I think that removing the `order` solved the issue https://github.com/collectiveidea/awesome_nested_set/blob/v3.0.1/lib/awesome_nested_set/awesome_nested_set.rb#L90
+I'm refactor my code with bulk_insert for a tree (i'm already using awesome_nested_set) and I have an array with several objects,  where they only have the parent_id.
+
+Actually i'm using rebuild inside a Job. But I think that is not an efficient solution. So, I appreciate if you have any ideas to improve my code.
+
+I use bulk_insert gem.
+
+Job
+
+```
+class MassiveInsertJob < ApplicationJob
+  queue_as :default
+
+  def perform (task, structure)
+    Task.create_rhytmic_task(task, structure)
+    Task.rebuild!
+    begin
+      SendPusherJob.perform_later(task, structure, {message: 'Rhythmic task ok', type: 'notice'})
+    rescue => error
+      puts error
+    end
+  end
+end
+```
+Bulk
+```
+Task.bulk_insert(:name, :unique_id, :owner_id, :sector_id, :current_progress,
+                    :base_start_date, :base_end_date, :base_duration,
+                    :base_days_duration, :start_date, :end_date, :duration,
+                    :days_duration, :current_state, :completion_status,
+                    :reschedules_count, :source, :project_gantt_id, :rhytmic_task,
+                    :active, :calendar_unique_id, :parent_id, :lft, :rgt,
+                    :created_at, :updated_at)  do |worker|
+     array_children.each do |task|
+       array = [task[:name], task[:unique_id], task[:owner_id], task[:sector_id],
+                task[:current_progress], task[:base_start_date],
+                task[:base_end_date], task[:base_duration], task[:base_days_duration],
+                task[:start_date], task[:end_date], task[:duration],
+                task[:days_duration], task[:current_state],
+                task[:completion_status], task[:reschedules_count],
+                task[:source], task[:project_gantt_id], task[:rhytmic_task],
+                task[:active], task[:calendar_unique_id],
+                task[:parent_id], task[:lft], task[:rgt], DateTime.now, DateTime.now]
+       worker.add array
+     end
+   end
+```
+I create inventory_item then call move_to_child_of, then generate the below SQL which is very slow.
+Anyone can help?
+
+```
+SQL (3642.6ms)  UPDATE "inventory_items" SET "lft" = CASE WHEN "lft" BETWEEN 16948 AND 144458 THEN "lft" + 144460 - 144458 WHEN "lft" BETWEEN 144459 AND 144460 THEN "lft" + 16948 - 144459 ELSE "lft" END, "rgt" = CASE WHEN "rgt" BETWEEN 16948 AND 144458 THEN "rgt" + 144460 - 144458 WHEN "rgt" BETWEEN 144459 AND 144460 THEN "rgt" + 16948 - 144459 ELSE "rgt" END, "parent_id" = CASE WHEN "id" = 75180 THEN 75179 ELSE "parent_id" END, updated_at = '2019-01-30 08:06:54.333592' WHERE "inventory_items"."id" IN (SELECT "inventory_items"."id" FROM "inventory_items" WHERE ("inventory_items"."lft" BETWEEN 16948 AND 144460 OR "inventory_items"."rgt" BETWEEN 16948 AND 144460) ORDER BY "inventory_items"."lft" ASC)
+```
+While this feature may be somewhat niche, I had a need for it. I thought I would PR the changes in case anyone else finds them useful.
+
+The `unscoped` changes did not break any specs, but I do wonder about whether that might be a breaking change for some people. One upside from my perspective though, is that it gets closer to supporting other default scope gems like `acts_as_paranoid`.
+
+### Example Use Case
+Using the spec models for consistency:
+ - Categories have many things through CategoriesThings.
+ - Things have many categories through CategoriesThings.
+ - Existing behavior was that when viewing a list of Things for a given Category, that list is return in alphabetical order by a field (`body`).
+ - You want to add `awesome_nested_set` to CategoriesThings to allow custom ordering. You also want to preserve the alphabetical order for existing records until a user explicitly changes it.
+ - Changes were needed in order to reference an order belonging to a different database table.
+Hi folks,
+
+At solidusio/solidus#3004, we have a use case for which I can't find a good solution and I would like your advices.
+
+We have many taxonomies, and each taxonomy is a nested set of taxons.
+Taxons can be any depth level so they have ancestors.
+
+We have an API endpoint where the user can ask for multiple taxons at once and we generate a "pretty name" for each one in the form of `Ancestor3 > Ancestor2 > Ancestor1 > LeafTaxon`.
+To do that, we use the `ancestors` method, but it generates a new SQL query for each taxon the user asked to retrieve : a typical N+1 problem :/
+
+What I would like to do would be to `includes(:ancestors)` but it's not defined as an `has_many` and thus don't work.
+
+Do you have any tips on how to preload all ancestors of multiple taxons with the minimum amount of SQL queries ?

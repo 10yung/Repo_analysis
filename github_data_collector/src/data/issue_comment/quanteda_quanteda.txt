@@ -1,0 +1,221 @@
+Definitely for `print.tokens()`, maybe max_ndoc = 4, max_ntoken = 3 ?
+
+Probably don't need to do this for corpus, but we already agreed in #1851 to print some output for hte dictionary objects by default.
+
+Also: We should check and trap non-functional arguments passed (by error) in `...`.
+We will implement this in a manner exactly similar to tokens, except:
+- `print_dictionary_max_nkey` = -1L
+- `print_dictionary_max_nval` = 20L
+- appearance will match the current `print.dictionary2()` appearance (not match the [new] `print.tokens()`)
+```r
+#' @section Stopwords: 
+#' 
+#' Stopword lists were formerly built into \pkg{quanteda}, but have been moved to the 
+#' \pkg{stopwords} package. See [stopwords::stopwords()].
+#' @importFrom stopwords stopwords
+#' @name stopwords
+#' @inherit stopwords::stopwords
+#' @export 
+NULL
+```
+
+Inspired by a [SO post](
+https://stackoverflow.com/questions/59722865/how-to-do-fuzzy-pattern-matching-with-quanteda-and-kwic), I propose to make `textstat_editdist()`, whose output will be similar to
+```r
+toks <- tokens(data_corpus_inaugural)
+dat <- data.frame(feature = types(toks),
+                  dist = stringdist::stringdist("the", types(toks)))
+head(dat[order(dat$dist),], 10)
+     feature dist
+3        the    0
+188     they    1
+343       he    1
+347      The    1
+387     them    1
+548     then    1
+4223     she    1
+4261     tie    1
+7087     She    1
+7683    thee    1
+````
+
+`stringidist` seems fairly fast
+```r
+> microbenchmark::microbenchmark(
++   stringdist::stringdist("the", head(types(toks) , 1000)),
++   stringdist::stringdist("the", head(types(toks) , 10000))
++ )
+Unit: microseconds
+                                                    expr   min     lq   mean median     uq    max neval
+  stringdist::stringdist("the", head(types(toks), 1000)) 241.5 258.95 306.87 271.85 315.95  946.1   100
+ stringdist::stringdist("the", head(types(toks), 10000)) 564.1 621.00 702.29 651.65 686.40 1708.9   100
+```r
+Seems to work with non-ASCII characters
+```
+> stringdist::stringdist("世界人権宣言", "世界平和宣言")
+[1] 2
+```
+We currently have a problem with maintaining consistency across the attributes and slots, and after a lengthy discussion, @koheiw and I settled on the following scheme for v2:
+
+1. `meta$system` remains exactly the same as it is now, which is _always_ updated when the object is created. This means calling `meta_system_defaults()` to get information from the current state of the user's system, and is never affected by the function call or the state of the object itself. 
+
+    Note that this means that the `@version` slot for a dfm is removed, since this is already part of the `meta$system` list.
+
+2. `meta$user` is unchanged.
+
+3. Add a third "type" to the `meta` attribute/slot for all core objects: **properties**.
+
+    This means moving the current slots (dfm) and attributes (corpus and tokens) from top-level slots or attributes, to list elements of `meta$properties`. This will include `unit`, `weightTf`, `weightDf`, `smooth`, `ngrams`, `skip`, and `concatenator`.
+
+4. `dictionary2` class objects will also get the same structure of `meta` slot, with the "concatenator" slot moving to meta$properties. The addition of user-level metadata for dictionary objects will solve #1827.
+
+In this way, objects now will carry a minimal set of slots and attributes, namely
+
+| Attribute/slot | corpus | tokens | dfm | dictionary |
+|----------------|:------:|:------:|:---:|:----------:|
+| docvars        |    ✓   |    ✓   |  ✓ (slot)  |            |.
+| meta           |    ✓   |    ✓   |  ✓ (slot)  |      ✓ (slot)    |
+| types          |        | ✓      |     |            |
+
+(plus base object slots such as "names" or those inherited from **Matrix**, in the case of a dfm)
+
+
+`print.dfm()` should be updated to be more consistent with the `print.corpus()` and `print.tokens()` methods.
+
+- [ ] `ndoc` becomes `max_ndoc`, deprecate `ndoc`; default of `max_ndoc = 0`, and -1L means print everything.
+- [ ] `nfeature` becomes `max_nfeat`, deprecate nfeatures; same as above; but default will be 6 or 10, in case only `max_ndoc` is used, it shows a few feature columns (similar to print.tokens)
+- [ ] implement print messages for number not shown, consistent with corpus and tokens printing methods
+- [ ] update and extend tests
+- [ ] consolidate into one documentation entry print.tokens, print.corpus, print.dfm, print.dictionary
+What would be reasonable limits on what we allow a user to ask for the pattern matching functions? It appears to be an issue mainly in the number of patterns. Below, the number of patterns in `stopwords("en")` is 175, so 160/8.5 = 18.8 is not bad, but it's till 2.5 minutes of frozen console.
+
+Maybe we could issue a warning and ask to proceed if the user tries to fit more than a vector of 10 patterns? We could set this limit and the prompt with warning as global options.
+
+``` r
+library(quanteda)
+## Package version: 1.9.9007
+
+data_corpus_guardian <- as.corpus(quanteda.corpora::download("data_corpus_guardian"))
+
+# ndoc = 6000
+system.time(
+  kw1 <- kwic(data_corpus_guardian, "the")
+)
+##    user  system elapsed 
+##   8.473   0.445   8.615
+
+# compare with longer documents
+data_corpus_guardiansents <- corpus_reshape(data_corpus_guardian, to = "sentences")
+system.time(
+  kw3 <- kwic(data_corpus_guardiansents, "the")
+)
+##    user  system elapsed 
+##  12.248   0.388  11.803
+
+# with shorter documents
+data_corpus_guardianonebig <-
+  corpus(texts(data_corpus_guardian, groups = rep(1, ndoc(data_corpus_guardian))))
+system.time(
+  kw4 <- kwic(data_corpus_guardianonebig, "the")
+)
+##    user  system elapsed 
+##   6.233   0.377   6.653
+
+# not really ok
+system.time(
+  kw2 <- kwic(data_corpus_guardian, stopwords("en"))
+)
+##    user  system elapsed 
+## 160.170   5.907 125.154
+```
+🤦‍♂ 
+
+```r
+> library("quanteda")
+Package version: 1.5.2
+
+> data(data_corpus_sotu, package = "quanteda.corpora")
+ 
+> summary(data_corpus_sotu, n = 3)
+Corpus consisting of 240 documents, showing 3 documents:
+
+             Text Types Tokens Sentences FirstName  President       Date delivery type       party
+  Washington-1790   460   1167        24    George Washington 1790-01-08   spoken SOTU Independent
+ Washington-1790b   591   1501        38    George Washington 1790-12-08   spoken SOTU Independent
+  Washington-1791   814   2471        58    George Washington 1791-10-25   spoken SOTU Independent
+
+Source: data.frame
+Created: 1549885584
+Notes: 
+Warning messages:
+1: In corpus.corpus(x) : Found a pre-v2 corpus, converting.
+2: In corpus.corpus(x) : Found a pre-v2 corpus, converting.
+3: In corpus.corpus(x) : Found a pre-v2 corpus, converting.
+4: In corpus.corpus(x) : Found a pre-v2 corpus, converting.
+
+> ndoc(data_corpus_sotu)
+[1] 240
+Warning message:
+In corpus.corpus(x) : Found a pre-v2 corpus, converting.
+
+> print(data_corpus_sotu)
+Corpus consisting of 240 documents and 6 docvars.
+Warning messages:
+1: In corpus.corpus(x) : Found a pre-v2 corpus, converting.
+2: In corpus.corpus(x) : Found a pre-v2 corpus, converting.
+```
+
+This is partly caused by us not checking the *entire* warning output, as I did in https://github.com/quanteda/quanteda/commit/b7f92514e6480d0fe21be449f774ff631a1e4e86.  Just checking for the warning does not tell us _how many times_ it was issued.
+In https://github.com/quanteda/quanteda/commit/9ab6f29a91397ccb85c70306a5a8234e063abdfc#diff-0f9641f8839509fc76ca3c9c590156ed we added a `units` slot to dfm objects, but this is now causing problems:
+
+- for packages with older dfm objects, it raises an S4 error, e.g.
+```r
+> str(RNewsflow::rnewsflow_dfm)
+Formal class 'dfm' [package "quanteda"] with 16 slots
+  ..@ settings    : list()
+  ..@ Dim         : int [1:2] 1754 6968
+  ..@ Dimnames    :List of 2
+  .. ..$ docs    : chr [1:1754] "35573532" "35573536" "35573539" "35620308" ...
+  .. ..$ features: chr [1:6968] "person.688" "noun.1516" "location.119" "organization.323" ...
+  ..@ weightTf    :List of 3
+  .. ..$ scheme: chr "count"
+  .. ..$ base  : NULL
+  .. ..$ K     : NULL
+  ..@ weightDf    :List of 5
+  .. ..$ scheme   : chr "unary"
+  .. ..$ base     : NULL
+  .. ..$ c        : NULL
+  .. ..$ smoothing: NULL
+  .. ..$ threshold: NULL
+  ..@ smooth      : num 0
+  ..@ ngrams      : int 1
+  ..@ skip        : int 0
+  ..@ concatenator: chr "_"
+  ..@ version     : int [1:3] 1 3 0
+  ..@ docvars     :'data.frame':	1754 obs. of  6 variables:
+  .. ..$ docname_  : chr [1:1754] "35573532" "35573536" "35573539" "35620308" ...
+  .. ..$ docid_    : Factor w/ 1754 levels "35573532","35573536",..: 1 2 3 4 5 6 7 8 9 10 ...
+  .. ..$ segid_    : int [1:1754] 1 1 1 1 1 1 1 1 1 1 ...
+  .. ..$ date      : POSIXct[1:1754], format: "2013-06-01 05:00:00" "2013-06-01 05:00:00" "2013-06-01 05:00:00" "2013-06-01 18:33:00" ...
+  .. ..$ source    : chr [1:1754] "Print NP 2" "Print NP 2" "Print NP 2" "Online NP 1" ...
+  .. ..$ sourcetype: chr [1:1754] "Print NP" "Print NP" "Print NP" "Online NP" ...
+  ..@ i           : int [1:48695] 1456 792 800 1513 1296 374 1247 964 982 709 ...
+  ..@ p           : int [1:6969] 0 1 4 5 7 9 11 13 22 25 ...
+  ..@ x           : num [1:48695] 1 2 1 1 1 1 1 2 1 1 ...
+  ..@ factors     : list()
+  ..@ meta        :List of 2
+  .. ..$ user  : list()
+  .. ..$ system: list()
+  ..@ NA          : NULL
+Warning message:
+Not a validObject(): no slot of name "unit" for this object of class "dfm" 
+```
+
+- It's not something we provided a "forward" compatibility for in v1.5.2, as we did for pre-v2 corpus objects.
+
+- There is no used case for this slot, since we don't need it for reshaping. Any collapsing could be done just as easily with `dfm_group()`.
+
+- `as.dfm()` for an older object does not add this attribute (although this could be corrected of course). Try `str(as.dfm(RNewsflow::rnewsflow_dfm))` for proof. (But `dfm(RNewsflow::rnewsflow_dfm)` does set it.)
+
+- We can keep the units attribute in tokens objects without a problem, because this does not raise a class validity error (since it's not an S4 object).
+Dictionaries need the same metadata as corpus objects, to record the source, license, notes, etc. I propose we add the same user and system slots to the `dictionary2` object class, and define a `meta.dictionary2()` method that works just as it does for corpus objects.

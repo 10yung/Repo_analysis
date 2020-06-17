@@ -1,0 +1,201 @@
+This PR suppresses the following warning that `deep_merge` method and `deep_update` method are defined twice when using Ruby 2.6.0+.
+
+```console
+% bundle exec rake
+(snip)
+
+/Users/koic/src/github.com/hahie/hashie/lib/hashie/mash.rb:226: warning:
+method redefined; discarding old deep_merge
+/Users/koic/src/github.com/hahie/hashie/lib/hashie/mash.rb:212: warning:
+previous definition of deep_merge was here
+/Users/koic/src/github.com/hahie/hashie/lib/hashie/mash.rb:232: warning:
+method redefined; discarding old deep_update
+/Users/koic/src/github.com/hahie/hashie/lib/hashie/mash.rb:218: warning:
+previous definition of deep_update was here
+```
+Copyright on Hashie is currently _Copyright (c) 2009 Intridea, Inc., and Contributors_. We are going to change it to _Copyright (c) 2009-2019 Intridea, Inc., and Contributors_. As maintainers we don't feel we can remove the company that sponsored the project creation, so even though Intridea hasn't been involved in years we are leaving it here.
+
+IANAL, but wanted to open this in case someone has objections or comments or suggestions.
+I described part of the piece I was trying to do in #471 but I didn't explain well enough. This is really for coercion on initialization of Dash with coercion included, these cases show what I mean.
+So I feel like this is _supposed_ to happen but its a bit confusing still.
+
+My goal was to make it if an object is initialized with a hash coming from a Grape API endpoint params, that if the key is set to `nil`, to convert it to a String. I started looking at defaults as well in this research, but I found something confusing to me.
+
+I have this object:
+
+```ruby
+class WriterParams < Hashie::Trash
+  include Hashie::Extensions::IgnoreUndeclared
+  include Hashie::Extensions::IndifferentAccess
+end
+
+class AllowedParams < WriterParams
+  property :description, default: ''
+end
+```
+
+When this is ran with this initialization, the `description` property is set to `nil`:
+
+```ruby
+ap = AllowedParams.new(description: nil)
+#<AllowedParams description=nil>
+```
+
+Ok, no worries, I did explicitly set that, but! The `Dash` documents caught my eye with this:
+
+```ruby
+p.update_attributes!(occupation: nil)
+p.occupation   # => 'Rubyist'
+```
+
+Sure enough, doing an `update_attributes!` on my `AllowedParams` class gives the same result:
+
+```
+ap.update_attributes!(description: nil)
+{}
+(byebug) ap.description
+""
+```
+
+So I'm curious why this is the case, is this a bug? I feel like doing an `update_attributes!` with a nil value should behave the same way as an `initialize` right?
+This is a failing test that demonstrates a regression in in v3.6.0. The bug was initially raised as https://github.com/intridea/hashie/issues/469.
+
+If a Dashie is initialized with a `nil` value, then the key is missing when the Dashie is written out with `to_h`.
+
+```
+class Test < Hashie::Dash
+  property :foo
+  property :bar
+end
+
+# Hashie 3.5.7
+Test.new(foo: 'hi', bar: nil).to_h
+=> {:foo=>"hi", :bar=>nil}
+
+# Hashie 3.6.0
+Test.new(foo: 'hi', bar: nil).to_h
+=> {:foo=>"hi"}
+```
+
+The exact line that is causing this is [this one](https://github.com/intridea/hashie/commit/0bd18eeb5bcbbc17d476573ae8a311fc339b6c82#diff-dae6b45a806c82a65f21869f809733d8R180), as part of "Allow codependent Dash attributes to initialize". 
+
+I didn't attempt a fix immediately as @michaelherold may have some ideas about how to incorporate it in this area. The comment that "However, this is an indication of a larger problem with the architecture of Dash. [...] Rearchitecting this will be quite an undertaking." made me think this might need some thought from those more familiar with the project.
+
+There has been a change (regression?) in `hashie` 3.6.0 such that when a value is `nil`, the key is no longer written out to hash.
+
+eg:
+```
+class Test < Hashie::Dash
+  property :foo
+  property :bar
+end
+
+# Hashie 3.5.7
+Test.new(foo: 'hi', bar: nil).to_h
+=> {:foo=>"hi", :bar=>nil}
+
+# Hashie 3.6.0
+Test.new(foo: 'hi', bar: nil).to_h
+=> {:foo=>"hi"}
+```
+
+I can't see anything in the changelogs to point to this. Is it an intentional change?
+https://en.wiktionary.org/wiki/eierlegende_Wollmilchsau
+Is there any way to have some required properties to be set in the constructor, while still allowing the structure to be extended?
+
+ie a mash where you can declare required properties (as is done with Dash) or a Dash without the constraint that only declared properties can be assigned.
+Let's say I have a hash sub-class with IndifferentAccess mixed in. 
+
+```ruby
+class MyIndifferentHash < Hash
+   include Hashie::Extensions::IndifferentAccess
+end
+```
+
+What if you want to turn this back into a completely ordinary hash?  At this top-level, `#to_h` works, as indeed it's documented in ruby core as ``Returns self. If called on a subclass of Hash, converts the receiver to a Hash object.`
+
+```ruby
+ihash = MyIndifferentHash.new
+ihash["foo"] = "bar"
+ihash[:foo]
+# => "bar"
+ihash.to_h.class
+# => Hah
+ihash.to_h[:foo]
+# => nil
+ihash.to_h['foo]
+# => "bar"
+```
+
+Great, so far so good and as expected!  This came up because I ran into a bug (#451), that in my particular case I could have worked around if I were able to take my indifferent hash and turn it into a completely normal hash. 
+
+While it looks like you can do it above, you can _not_ do it with a _sub_ hash of the above hash. 
+
+```ruby
+ihash = MyIndifferentHash.new
+ihash[:sub_hash] = { :sub_key => "sub_value"}
+
+But I could not figure out how to that. 
+
+Standard ruby Hash#to_h is documented as , so that _seems_ promissing. (It's source is also C in MRI, which I don't read well, so I'm not sure how it's interacting with the Hashie extension). 
+
+However, it does not. The sub-hash has been turned into indifferent access too, which is part of the contract of IndifferentAccess, and great!
+
+```ruby
+ihash = MyIndifferentHash.new
+ihash[:sub_hash] = { :sub_key => "sub_value"}
+
+# Even though it still just a Hash, not a sub-class, it's been magically given indifferent access
+ihash[:sub_hash].class
+# => Hash
+
+ihash[:sub_hash][:sub_key]
+# => "sub_value"
+ihash[:sub_hash]['sub_key']
+# => "sub_value"
+```
+
+But what if I want to turn this sub-hash back into a completely ordinary Hash with no indifferent access?  Because I've run into a bug in the indiffernet access functionality and want to work around it, or for any reason I just want an ordinary un-decorated hash back. 
+
+I can't find any way to do it.  It's not `to_h`
+
+```ruby
+to_h_subhash = ihash[:sub_hash].to_h
+to_h_subhash[:sub_key]
+# => "sub_value"
+to_h_subhash['sub_key']
+# => "sub_value"
+to_h_subhash.respond_to?(:indifferent_value)
+=> true
+```
+It's still a magic indifferent hash. Is there a way for me to turn it back into an ordinary hash? Should there be? Should it be `#to_h`?
+hashie 3.5.7
+
+```ruby
+class HashWithI < Hash
+  include Hashie::Extensions::IndifferentAccess
+end
+
+hi = HashWithI.new
+hi[:hash_value] = { "one" => "one value"}
+
+# as expected the sub-hash is indifferent too, which is cool
+hi[:hash_value][:one]
+# => "one value"
+hi[:hash_value]["one"]
+# => "one value"
+
+# And we can still use 'merge' with an ordinary hash on top-level
+hi.merge("new top level" => "new top level value")
+#
+=> {"hash_value"=>{"one"=>"one value"}, "new top level"=>"new top level value"}
+
+# But we CAN NOT use merge on the sub-hash, which is a problem
+hi[:hash_value].merge("new sub-key" => "new sub-value")
+# NoMethodError: undefined method `convert!' for {"one"=>"one value", "new sub-key"=>"new sub-value"}:Hash
+# from /Users/jrochkind/.gem/ruby/2.4.2/gems/hashie-3.5.7/lib/hashie/extensions/indifferent_access.rb:137:in `merge'
+
+hi['hash_value'].merge("new sub-key" => "new sub-value")
+# NoMethodError: undefined method `convert!' for {"one"=>"one value", "new sub-key"=>"new sub-value"}:Hash
+# from /Users/jrochkind/.gem/ruby/2.4.2/gems/hashie-3.5.7/lib/hashie/extensions/indifferent_access.rb:137:in `merge'
+```

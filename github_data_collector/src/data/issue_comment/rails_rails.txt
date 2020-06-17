@@ -1,0 +1,554 @@
+Related #38053, #38187, #38105.
+
+This is a reattempt to fix keyword arguments warnings in Active Job.
+
+Now Ruby (master) has `Hash.ruby2_keywords_hash{?,}` and that will be
+backported to 2.7.1.
+
+https://github.com/ruby/ruby/pull/2818
+https://bugs.ruby-lang.org/issues/16486
+
+I've emulated that for 2.7.0 and older versions.
+Calling `#remove_connection` on the handler is deprecated in favor of
+`#remove_connection_pool`. This change was made to support changing the
+return value from a hash to a `DatabaseConfig` object.
+`#remove_connection` will be removed in 6.2.
+
+NOTE: `#remove_connection` on `ActiveRecord::Base` will also now return
+a `DatabaseConfig` object. We didn't use a deprecation here since
+it's not documented that this method used to return a `Hash`.
+
+Co-authored-by: John Crepezzi <john.crepezzi@gmail.com>
+
+---
+
+cc/ @rafaelfranca @matthewd @jhawthorn @tenderlove we're not totally sure it's ok to change the return value of the `remove_connection` on AR Base, but it wasn't documented so we opted to change that one and deprecate the other one so we can pass objects around everywhere. The problem with returning a configuration hash is it results in Rails creating a new database configuration object if that returned hash was passed to `establish_connection`. Thoughts on changing the return value of this public method?
+Rails 6 has introduced a regression whereby if a given model's `after_create` itself creates a number of associated sub-objects, only the first of those sub-objects' `after_commit` hooks will be called.  To clariify, I don't mean "the first of many `after_commit` hooks each sub-object has", but rather, "all of the `after_commit` hooks for the first sub-object and none of the `after_commit` hooks for the second and subsequent sub-objects."  Further complicating things is that this seems to be strongly related to whether or not the created sub-objects are defined using single-table inheritance (STI).  (Edge case much?)
+
+### Steps to reproduce
+
+This script should do the trick.  Note the comment "WOOHOO", and tweak the boolean condition to toggle back and forth between Rails 5.2 (which works as expected) and Rails 6 (which doesn't).
+
+```ruby
+require "bundler/inline"
+
+gemfile(true) do
+  source "https://rubygems.org"
+  git_source(:github) { |repo| "https://github.com/#{repo}.git" }
+
+  if false # <~~ WOOHOO!  Twiddle this for fun and profit!
+    # Work liks a charm!
+    gem 'activerecord', '~> 5.2.0', '< 6.0.0'
+    gem 'sqlite3', '~> 1.3.6'
+  else
+    # Yeah, not so much...
+    gem 'activerecord', '~> 6.0.0'
+    gem 'sqlite3', '~> 1.4'
+  end
+end
+
+require "active_record"
+require "minitest/autorun"
+require "logger"
+
+# This connection will do for database-independent bug reports.
+ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
+ActiveRecord::Base.logger = Logger.new(STDOUT)
+
+# Define the schema.
+ActiveRecord::Schema.define do
+  create_table "properties", force: :cascade do |t|
+    t.string "name", limit: 64, null: false
+    t.text "value"
+    t.string "type"
+    t.bigint "object_id"
+    t.index ["name"], name: "index_properties_on_name"
+  end
+  create_table "things", force: :cascade do |t|
+    t.integer "count"
+  end
+end
+
+# Number of properties each Thing should create for itself.
+NUM_THING_PROPS = 3
+
+# Properties in this universe use STI.  So we have our generic
+# Property parent class, which isn't meant to be instantiated, really.
+# And then for each specific model that wants a properties list, we
+# define a child class FooProperty.
+class Property < ActiveRecord::Base
+
+  # @cmpilato is a minitest amateur, and couldn't quickly think of a
+  # better system for tracking the number of executed after_commits.
+  after_commit :increment_parent_count
+  def increment_parent_count
+    self.logger.debug "#{self.type}(:name => #{self.name}) after_commit called"
+    Thing.find(self.object_id).increment_count(self)
+  end
+end
+
+class ThingProperty < Property; end
+
+# Property support plumbing for models.  By including this Concern,
+# models automagically get decorated with the stuff needed to be able
+# to refer to and act on a .properties list, which contains objects
+# carrying an STI :type value derived from the model's class name.
+module PropertiesCommon
+  extend ActiveSupport::Concern
+
+  def self.included(base)
+    base.class_eval do
+      # Find the property class that matches this one's name.
+      class_name = "#{base.name.singularize}Property"
+      begin
+        klass = class_name.constantize
+        raise unless klass.is_a?(Class)
+      rescue NameError
+        raise "Class #{class_name} doesn't seem to exist."
+      end
+
+      # Add the has_many association to the base class
+      has_many :properties, :class_name => class_name,
+                            :dependent => :destroy,
+                            :foreign_key => 'object_id'
+
+      # Now add the reverse belongs_to association to the inherited
+      # properties model class.
+      klass.class_eval do
+        @base_class_name_u = base.name.underscore
+        class << self
+          attr_accessor :base_class_name_u
+        end
+        belongs_to @base_class_name_u.to_sym, :foreign_key => 'object_id'
+      end
+    end
+  end
+end
+
+# This is our generic model.  We include PropertiesCommon so it gets
+# the property list extension support.
+class Thing < ActiveRecord::Base
+  include PropertiesCommon
+
+  # After this is created, we'll add a number of properties to it.
+  after_create :add_props
+  def add_props
+    NUM_THING_PROPS.times do |n|
+      self.properties.create!(:name => "prop#{n}", :value => "value#{n}")
+    end
+  end
+
+  # Increment a counter, like pretty much all example code should at
+  # some point, right?
+  def increment_count(prop)
+    self.count = self.count + 1
+    self.save!
+  end
+end
+
+class BugTest < MiniTest::Test
+  def test_stuff
+    thing = Thing.create!(:count => 0)
+    thing.reload
+    assert thing.count == NUM_THING_PROPS
+  end
+end
+```
+
+### Expected behavior
+
+I'd expect that for each model committed, that model's `after_commit` is run, regardless of stuff such as STI and transaction nested and lunar phases.
+
+### Actual behavior
+
+In Rails 5.2, the actual and expected behaviors are the same.  But in Rails 6, I find that in a situation where N objects are created in the way I describe, the `after_commit` of only the first of those N is executed.  Note that any `after_save` hooks don't seem to suffer this same fate in my debugging experience (though this is not demonstrated by my reproduction script).
+
+### System configuration
+
+**Rails version**:  6.0.2.1
+
+**Ruby version**: 2.6.1p33
+
+### Steps to reproduce
+* Create an initializer with the following line
+`ActionController::Parameters.action_on_unpermitted_parameters = :raise`
+* Create a form passing an unpermitted parameter to a controller which doesn't permit that field
+
+Example app to reproduce the issue: https://github.com/shaicoleman/action_on_unpermitted_parameters_bug
+
+Relevant documentation page:
+https://api.rubyonrails.org/classes/ActionController/Parameters.html
+
+### Expected behavior
+It should raise an exception
+
+### Actual behavior
+It logs the unpermitted parameter
+
+### System configuration
+**Rails version**: 6.0.2.1
+
+**Ruby version**: 2.6.5
+
+During the upgrade from 5.07 to 5.1.7 we've noticed the performance degradation in one of our jobs.
+
+### Steps to reproduce
+<details>
+<summary>script to reproduce</summary>
+
+```ruby
+require "bundler/inline"
+
+gemfile(true) do
+  source "https://rubygems.org"
+
+  git_source(:github) { |repo| "https://github.com/#{repo}.git" }
+
+  # Activate the gem you are reporting the issue against.
+  gem 'activerecord', '5.1.7'
+  gem "sqlite3"
+end
+
+require "active_record"
+require "logger"
+
+# This connection will do for database-independent bug reports.
+ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
+ActiveRecord::Base.logger = Logger.new(STDOUT)
+
+ActiveRecord::Schema.define do
+  create_table :posts, force: true do |t|
+  end
+
+  create_table :comments, force: true do |t|
+    t.integer :post_id
+  end
+
+  create_table :likes, force: true do |t|
+    t.integer :comment_id
+  end
+
+end
+
+class Post < ActiveRecord::Base
+  has_many :comments
+end
+
+class Comment < ActiveRecord::Base
+  belongs_to :post
+  has_many :likes
+end
+
+class Like < ActiveRecord::Base
+  belongs_to :post
+end
+
+10.times { Post.create! }
+30.times { |i| Comment.create!(post_id: 1 + i % 10) }
+150.times { |i |Like.create!(comment_id: 1 + i % 30) }
+
+post = Post.includes(comments: :likes).last
+
+result = Benchmark.measure do
+  100.times { post.comments.each { |c| c.likes.first.id } }
+end
+
+puts result
+
+result = Benchmark.measure do
+  100.times { post.comments.each { |c| c.likes.to_a.first.id } }
+end
+
+puts result
+```
+
+Results:
+```
+.first       0.023444   0.000693   0.024137 (  0.024844)
+.to_a.first  0.000604   0.000005   0.000609 (  0.000607)
+```
+</details>
+
+Given 3 models: Product, Variant and OptionValue. Product has_many Variants, and Variant has many OptionValues.
+```
+product = Product.includes(variants: :option_values).find_by!(catalog_number: 'G640')
+
+Benchmark.benchmark do
+  100.times { product.variants.each { |v| v.option_values.first.name } }
+end
+```
+https://github.com/sdtechdev/rails-5.1-performance-test - you can also use this repo to reproduce the issue
+
+### Actual behavior
+```
+Rails 5.0.7: 0.248867000000000 | 0.00147900000000023 | 0.0 | 0.0 | 0.25183700001798
+Rails 5.1.7: 8.444056000000003 | 0.07617300000000027 | 0.0 | 0.0 | 8.66250299999956
+```
+
+### Expected behavior
+Performance should be similar
+
+### System configuration
+**Rails version**: 5.17 
+**Ruby version**: 2.6.0
+
+### Details
+Several methods including `#first` were removed in this commit https://github.com/rails/rails/commit/592e6b7e894e0fff07ab8233fce4bf77968ee8b6 and implementation has been changed and uses methods from `ActiveRecord::Relation`.
+
+Degradation is caused by `find_nth`, however `find_nth_with_limit(index, limit)` works fast as Rails 5.0.7 https://github.com/rails/rails/blob/663206d20aec374a28a24bb43bc7b1233042ed9b/activerecord/lib/active_record/relation/finder_methods.rb#L520
+```
+find_nth            | 8.796847 | 0.1429990000000001 | 0.0 | 0.0 | 9.1316720000468
+find_nth_with_limit | 0.272821 | 0.0022189999999997 | 0.0 | 0.0 | 0.2769989999942
+```
+
+here is the call sequence
+`#find_nth` -> `#offset_index` -> `#offset_value` -> `#scope`
+https://github.com/rails/rails/blob/663206d20aec374a28a24bb43bc7b1233042ed9b/activerecord/lib/active_record/associations/association.rb#L85
+Here we come to the method that consumes a lot of time because it merges two scopes and even builds scopes from scratch
+
+Worth to mention that issue still exists in Rails 6.0 and `.to_a.first` works as fast as Rails 5.0.7.
+```
+.first 6.0 | 4.07416199999999 | 0.103387 | 0.0 | 0.0 | 4.485593999968842
+to_a.first | 0.16330200000000 | 0.001011 | 0.0 | 0.0 | 0.16510099999140948
+```
+### Steps to reproduce
+https://gist.github.com/jhottenstein/b87fbd690b3b102166c4d9f9461f0dd0
+
+Given
+```
+class Author < ActiveRecord::Base
+  has_many :books, inverse_of: :author
+  has_many :publishers, through: :books
+end
+
+class Book < ActiveRecord::Base
+  belongs_to :author
+  belongs_to :publisher
+end
+
+class Publisher < ActiveRecord::Base
+  has_many :books, inverse_of: :publisher
+end
+
+author = Author.new
+author.books.build(publisher: Publisher.new)
+author.publishers.to_a
+author.save!
+author.publishers.size => should be 1
+```
+
+### Expected behavior
+After adding records to a has_many relationship, loading a has_many :through relationship and saving the parent record, the associated has_many :through relationship returns the added records.
+
+### Actual behavior
+After adding records to a has_many relationship, loading a has_many :through relationship and saving the parent record, the associated has_many :through relationship does not return the added records.
+
+### System configuration
+**Rails version**:
+5.1 through master
+**Ruby version**:
+2.6.5
+
+--skip-keeps option in rails generator is used for skipping creating .keep files in the project. But it also skips on creating assets/images, models/concerns and controllers/concerns folders.
+When we create a new rails app with this option as in the issue https://github.com/rails/rails/issues/38222 it gives 500 error because config/manifest.js file reference to images folder which doesn't exist.
+
+Code of config/manifest.js file.
+```
+//= link_tree ../images
+
+//= link_directory ../stylesheets .css
+```
+
+
+### Steps to reproduce
+Setup STI with 2 classes and use `scoping` from a descendant with the block calling the parent class directly:
+```
+# frozen_string_literal: true
+
+require "bundler/inline"
+
+gemfile(true) do
+  source "https://rubygems.org"
+
+  git_source(:github) { |repo| "https://github.com/#{repo}.git" }
+
+  # Activate the gem you are reporting the issue against.
+  gem "activerecord"
+  gem "sqlite3"
+end
+
+require "active_record"
+require "minitest/autorun"
+require "logger"
+
+# This connection will do for database-independent bug reports.
+ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
+ActiveRecord::Base.logger = Logger.new(STDOUT)
+
+ActiveRecord::Schema.define do
+  create_table :shops, force: true do |t|
+    t.string :type
+    t.string :name
+  end
+end
+
+class Shop < ActiveRecord::Base
+  scope :deliverable, -> { all }
+end
+
+class Market < Shop
+end
+
+class BugTest < Minitest::Test
+  def test_scoping_sti
+    shop = Shop.create!(name: 'Test')
+
+    assert_equal 1, Shop.deliverable.size
+    assert_equal 1, Shop.where(name: 'Test').scoping { Shop.deliverable.size }
+    assert_equal 0, Shop.where(name: 'Other test').scoping { Shop.deliverable.size }
+
+    assert_equal 0, Market.deliverable.size
+    assert_equal 0, Shop.where(type: 'Market').scoping { Shop.deliverable.size }
+    assert_equal 0, Market.all.scoping { Shop.deliverable.size }
+  end
+end
+```
+
+As you can see, I know I can do `Shop.where(type: 'Market').scoping { Shop.all.size }` but I do find it a lot more cryptic than what I'm trying to do.
+I've managed to have a passing test using the following monkey patch, but I have not idea of what it might breaks 😞 
+```
+class ActiveRecord::Base
+  class << self
+    private
+
+    def relation
+      relation = ActiveRecord::Relation.create(self.base_class)
+
+      if finder_needs_type_condition? && !ignore_default_scope?
+        relation.where!(type_condition)
+        relation.create_with!(inheritance_column.to_s => sti_name)
+      else
+        relation
+      end
+    end
+  end
+end
+```
+
+### Expected behaviour
+I assume that the scoped block will be executed within the subclass constraint, even if we query the base class directly.
+
+### Actual behaviour
+The subclass scope is ignored and the resulting records contain all types of `Shop` instead of only `Market` ones.
+
+### System configuration
+**Rails version**: 5.2.4.1, but I've reproduced it with 5.1, 5.2, 6.0
+
+**Ruby version**: 2.6.5p114
+
+### Summary
+
+This pull request allows the resolver in the `DatabaseSelector` middleware (`ActiveRecord::Middleware::DatabaseSelector`) to have access to the response computed in the middleware and use it to update the context if necessary.
+
+Currently, in the default resolver (`ActiveRecord::Middleware::DatabaseSelector::Resolver`) and default context (`ActiveRecord::Middleware::DatabaseSelector::Resolver::Session`) this is not necessary because the context is stored in the `session`, which can be modified via the `request` and gets automatically set in the `response`. This is not the case for other cookies. 
+
+### Our use case
+
+We'd like to set a cookie that can be accessed outside Rails when the primary DB is used, mirroring `session[:last_write]` that we can't read.
+
+We could have done this with another middleware but thought about supporting this directly since [this is a case mentioned in the guides](https://guides.rubyonrails.org/active_record_multiple_databases.html#activating-automatic-connection-switching) and defining our own resolver and context, to use a cookie for example. The current implementation allows the resolver to decide whether to read or write based on other cookies (from the request) but not to persist that in the response.
+
+This PR reflects the solution we ended up with, in our particular case, but I'm happy to change it completely if you think it'd be more useful or it'd make more sense to support this differently. 
+### Steps to reproduce
+
+Open cmd and create a new Rails app:
+
+```
+rails new test-app
+```
+
+Change directory to the app:
+
+```
+cd test-app
+```
+
+Create a new test file at `test\sample_test.rb`:
+
+```
+require "test_helper"
+
+class SampleTest < ActiveSupport::TestCase
+  test "this is the first one" do
+    assert true
+  end
+
+  test "this is the second one (will fail)" do
+    assert false
+  end
+
+  test "this is the third one" do
+    assert_not false
+  end
+
+  test "this is the fourth one (will fail)" do
+    assert_not true
+  end
+end
+```
+
+Go back to cmd and run the test at a specific line number:
+
+```
+rails test test\sample_test.rb:4
+```
+
+### Expected behavior
+
+According to [the Rails Guide](https://guides.rubyonrails.org/testing.html), when you run the rails test command on a file, specifying the line number, only the test at that line number should run.
+
+### Actual behavior
+
+When you run the rails test command on a file, specifying the line number, all the tests in the file are run.
+
+In the example presented, the following output was generated:
+
+```
+Run options: --seed 25537
+
+# Running:
+
+F
+
+Failure:
+SampleTest#test_this_is_the_second_one_(will_fail) [C:/Users/myusername/rails/test-app/test/sample_test.rb:9]:
+Expected false to be truthy.
+
+
+rails test test/sample_test.rb:8
+
+.F
+
+Failure:
+SampleTest#test_this_is_the_fourth_one_(will_fail) [C:/Users/myusername/rails/test-app/test/sample_test.rb:17]:
+Expected true to be nil or false
+
+
+rails test test/sample_test.rb:16
+
+.
+
+Finished in 0.064904s, 61.6299 runs/s, 61.6299 assertions/s.
+4 runs, 4 assertions, 2 failures, 0 errors, 0 skips
+```
+
+You can see that it did not run only the test at line 4. It went on to run all the tests.
+
+If you change the line number to 12, it does the same thing and includes preceding tests as well as the ones afterward.
+
+### System configuration
+
+**Operating System**: Windows 10 Enterprise Version 1909
+**Command Line**: cmd.exe
+**Ruby Version**: `ruby 2.6.5p114 (2019-10-01 revision 67812) [x64-mingw32]`
+**Rails Version**: Rails 6.0.2.1

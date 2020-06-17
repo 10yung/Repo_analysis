@@ -1,0 +1,109 @@
+Client certificate supported with PKSC 12 / pfx.
+
+Use like this for password-less p12.
+```scala
+requests.get(
+  "https://client.badssl.com",
+  cert = "./badssl.com-client.p12"
+)
+```
+
+Add password if necessary.
+```scala
+requests.get(
+  "https://client.badssl.com",
+  cert = ("./badssl.com-client.p12", "password")
+)
+```
+
+badssl.com used in tests can and will occasionally (annually?) update certificates and that would fail the tests. Therefore I made the test print a warning in case of client certificate failure instead of failing the test.
+
+Warning looks like this:
+
+`WARNING: Certificate may have expired and needs to be updated. Please check: https://github.com/lihaoyi/requests-scala/blob/master/requests/test/resources/badssl.com-client.md and/or file issue`
+It will be great if we can use this library in Scala.js.
+According to [your code](https://github.com/lihaoyi/requests-scala/blob/master/requests/src/requests/Model.scala#L155), you need to calculate content-length for multi-part uploads.  After doing that, you specifically upload multipart as chunked data with no content-length.  This has led to issues for me exactly because of the reason stated in line 155.  
+
+when i try to POST, content-length is removed from the headers
+
+If i make a post with:
+
+```scala
+
+    val session: Session = requests.Session(
+      headers = Map(
+        "user-agent" -> userAgentHeader,
+        "authorization" -> authHeader,
+        "accept" -> "*/*",
+        "content-type" -> "application/json; charset=utf-8"
+      )
+    )
+val file = new File("path-to-file")
+val multiPart = MultiPart(MultiItem("file", file, file.getName))
+val headers = Map(
+    "thing" -> "thang",
+     "Content-Length" -> multiPart.totalBytesToSend.toString,
+      "content-type" -> s"multipart/form-data; boundary=${multiPart.boundary}"
+)
+session.post("a url", data = multiPart, headers = headers)
+```
+
+When I POST to myself and look at the headers, the content-length is gone, because it is controlled at the Java level [here](https://github.com/lihaoyi/requests-scala/blob/master/requests/src/requests/Requester.scala#L277)
+
+My current workaround is this
+
+```scala
+case class SizedMultiPart(items: requests.MultiItem*)
+    extends requests.RequestBlob.MultipartFormRequestBlob(items)
+    with requests.RequestBlob.SizedBlob {
+
+  override def length: Long = totalBytesToSend
+
+  override def inMemory: Boolean = false
+  override def headers: Seq[(String, String)] = Seq(
+    "Content-Type" -> s"multipart/form-data; boundary=$boundary",
+    "Content-Length" -> totalBytesToSend.toString
+  )
+}
+```
+
+After going through all the trouble of calculating size for MultiPartFormRequestBlob, is there a reason why that is then discarded by making MultiPart not a SizedRequestBlob?  
+```scala
+requests.head("http://httpbin.org/get", headers = Map("Accept-Encoding" -> "gzip"))
+```
+```
+java.io.EOFException
+  java.util.zip.GZIPInputStream.readUByte(GZIPInputStream.java:268)
+  java.util.zip.GZIPInputStream.readUShort(GZIPInputStream.java:258)
+  java.util.zip.GZIPInputStream.readHeader(GZIPInputStream.java:164)
+  java.util.zip.GZIPInputStream.<init>(GZIPInputStream.java:79)
+  java.util.zip.GZIPInputStream.<init>(GZIPInputStream.java:91)
+  requests.Requester.stream(Requester.scala:333)
+  requests.Requester.apply(Requester.scala:110)
+  ammonite.$sess.cmd0$Helper.<init>(cmd0.sc:2)
+  ammonite.$sess.cmd0$.<init>(cmd0.sc:7)
+  ammonite.$sess.cmd0$.<clinit>(cmd0.sc:-1)
+```
+
+I hit this in the wild while poking at the GitHub API:
+
+```scala
+requests.head("https://api.github.com/users/ryan-williams")
+```
+
+A work-around is to ask for a non-gzipped response:
+
+```scala
+requests.head(
+  "https://api.github.com/users/ryan-williams", 
+  headers = Map("Accept-Encoding" -> "identity")  // ✅ works
+)
+```
+Anyway to launch async request that returns a Future?
+
+Could you create a scala native release?
+Are you planning to add support for client-side certificates similar to [requests](http://docs.python-requests.org/en/master/user/advanced/#client-side-certificates)? 
+From my experience, the current Java API is very ugly and painful :) 
+
+
+Just a heads-up since you mentioned using `HttpURLConnection` in the README. We used `scalaj-http` and ran into [this bug](https://dzone.com/articles/pola-and-httpurlconnection), causing POST requests to retry automatically after a read timeout. Which of course can be very bad/confusing behavior.

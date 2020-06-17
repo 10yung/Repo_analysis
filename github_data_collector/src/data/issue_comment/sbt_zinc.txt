@@ -1,0 +1,106 @@
+We might need to support new API to call javac and javadoc programmatically.
+
+This is https://github.com/sbt/zinc/pull/719 but targeting `1.3.x`
+Closes: https://github.com/sbt/sbt/issues/4305
+
+DiagnosticsReporter was eagerly turning URIs into Files without checking whether or not the URI is indeed a file. This adds a check to make sure that the scheme is defined (isAbsolute) before doing the conversion, and calling `getAbsolutePath.`
+
+@eed3si9n this targets `develop` and https://github.com/sbt/sbt/issues/4305 has `1.4.0` as the target version.. is there any way to get this on `1.3.x`? I will gladly do the work to backport if needed.
+Moved over from https://github.com/sbt/sbt/issues/5217
+
+## steps
+sbt version: 1.1.5-1.3.3
+using https://github.com/scalacenter/scastie/tree/overcompilation
+run `~client/compile`
+add a new line at the end of eg `./client/src/main/scala/com.olegych.scastie.client/components/ScaladexSearch.scala`
+
+## problem
+unrelated files are recompiled, even though no code has actually changed
+here is a sample debug log https://gist.github.com/OlegYch/775e657ad4edb41b77c88e0fa8be3c83
+
+## expectation
+only the modified file is recompiled
+
+
+## notes
+this is a scala.js project, but i've been assured that this is inconsequential 
+minimizing the problem turned out to be very hard, because sometimes the problem goes away only to reappear after clean compile
+sbt 1.0.0-1.1.4 works fine, so it appears that some change in 1.1.5 caused the regression
+Currently, input and output files are specified in the API in terms of `java.io.File`. The underlying Scala compiler, however, does not require interaction with the filesystem. If inputs and outputs could be handled through in-memory data structures it could open the door for some optimizations in some cases (in this case, in the https://github.com/higherkindness/rules_scala project).
+
+I'm aware this is a large issue, but figured I'd open it to signal support.
+
+## steps
+sbt version: 1.3.4 (and 1.3.3)
+but sbt 1.2.8 works as expected
+(scala 2.12.8)
+
+## problem
+Files with nested types whose combined names are longer than a certain limit are seen as always needing recompilation by sbt (invalidated).  For me, `-Xmax-classfile-name=80` gives a limit of 65 characters: at or beyond that my test file always gets recompiled.
+
+```
+package foo
+
+object ABCD45678901234567890123456789012345678901234567890123456789 {
+  class ABCD
+}
+
+object Test {
+  val _ = new ABCD45678901234567890123456789012345678901234567890123456789.ABCD
+  //          ^^^^^^^^^^^^^^^^^^^^^^ 65 characters long ^^^^^^^^^^^^^^^^^^^^^^^
+}
+```
+
+## expectation
+When unchanged, the file should not be recompiled no matter how long the type names inside.  This was the behaviour under sbt 1.2.8
+
+## notes
+Transcript
+```
+MB19090:LengthLimit peter.robinson$ cat project/build.properties
+sbt.version=1.3.4
+MB19090:LengthLimit peter.robinson$ cat LengthTest.scala
+package foo
+
+object ABCD45678901234567890123456789012345678901234567890123456789 {
+  class ABCD
+}
+
+object Test {
+  val _ = new ABCD45678901234567890123456789012345678901234567890123456789.ABCD
+  //          ^^^^^^^^^^^^^^^^^^^^^^ 65 characters long ^^^^^^^^^^^^^^^^^^^^^^^
+}
+MB19090:LengthLimit peter.robinson$ cat build.sbt
+scalaVersion := "2.12.8"
+scalacOptions ++= Seq("-Xmax-classfile-name", "80")
+MB19090:LengthLimit peter.robinson$ sbt
+[info] Loading settings for project global-plugins from idea.sbt ...
+[info] Loading global plugins from /Users/peter.robinson/.sbt/1.0/plugins
+[info] Loading project definition from /private/tmp/LengthLimit/project
+[info] Loading settings for project lengthlimit from build.sbt ...
+[info] Set current project to lengthlimit (in build file:/private/tmp/LengthLimit/)
+[info] sbt server started at local:///Users/peter.robinson/.sbt/1.0/server/b778c582df5d59e42bb9/sock
+sbt:lengthlimit> compile
+[info] Compiling 1 Scala source to /private/tmp/LengthLimit/target/scala-2.12/classes ...
+[success] Total time: 3 s, completed 10-Dec-2019 13:03:32
+sbt:lengthlimit> compile
+[info] Compiling 1 Scala source to /private/tmp/LengthLimit/target/scala-2.12/classes ...
+[success] Total time: 0 s, completed 10-Dec-2019 13:03:35
+sbt:lengthlimit>
+```
+
+The `Dependency` file was a source of allocations of `Tuple2` objects. Given that `resolveNonLocalClass` is a completely private method (does not seem to be used anywhere else), and that the second value always flows to a local field assignment, we can do that assignment in the procedure and avoid creating the tuple.
+This uses `rootPaths` to encode `VirtualFileRef` id. As a relatively simple method of abstracting out absolute paths, `VirtualFileUtil.mapSources` takes a list of root paths, and substitutes them with positional index like `${0}`.
+
+Ref https://github.com/sbt/zinc/issues/707
+
+Currently Analysis file contains the absolute path of the classes directory. As a first step towards reducing machine-dependence, this replaces it with a dummy value `/tmp/dummy/`. There shouldn't be any downstream effect to build tools.
+Current data structure depends too much on the notion of `java.io.File`.
+For Zinc 1.4, I propose we get rid of this notion and abstract it as a virtual file.
+
+There are various benefits:
+- Reduced file size and memory footprint of Analysis data structure. Currently it's full of absolute path that we have to pass around. 
+- Repeatable build.
+- Cached compilation.
+
+There has been multiple efforts around build caching, and the technique we have been using is mapping the Analysis (Pants, hoarder, etc). We could skip this process if Analysis was machine-independent to begin with.

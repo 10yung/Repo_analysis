@@ -1,0 +1,88 @@
+The variables set in env_vars for the rabbitmq user/pass will never actually be used unless the user manually overrides (or deletes) the lines in roles/rabbitmq/vars/main.yml`. See https://docs.ansible.com/ansible/latest/user_guide/playbooks_variables.html#variable-precedence-where-should-i-put-a-variable
+Adding this PR so that we can periodically check whether the TravisCI build is working with IPV6.
+
+The test was skipped via #128 due to failing tests, because TravisCI isn't properly handling IPV6 for our uncomplicated firewall implementation.
+I'm having an issue where a long running server's logs aren't being rotated, causing one giant file.
+
+At first I thought we might want to rotate the logs manually, but as I looked into it, Ubuntu actually handles NGINX log rotation on its own, but only if nginx is using `/var/log/nginx/*.log` for its logfiles.
+
+My suggestion is to simplify this repo and remove these lines from the default NGINX template:
+
+```
+access_log {{ nginx_access_log_file }};
+error_log {{ nginx_error_log_file }};
+```
+
+and the corresponding variables. I don't see a whole lot of benefit putting the NGINX logs here vs. in the NGINX directory, and removing this setup would make logrotation work out of the box, at least for Ubuntu.
+
+The alternative might be to add this type of directive in `/etc/logrotate.d/nginx`:
+
+```
+{{ application_log_dir }} {
+        daily
+        missingok
+        rotate 14
+        compress
+        delaycompress
+        notifempty
+        create 0640 www-data adm
+        sharedscripts
+        prerotate
+                if [ -d /etc/logrotate.d/httpd-prerotate ]; then \
+                        run-parts /etc/logrotate.d/httpd-prerotate; \
+                fi \
+        endscript
+        postrotate
+                invoke-rc.d nginx rotate >/dev/null 2>&1
+        endscript
+}
+```
+
+The drawback here is that the gunicorn_supervisor logs _are_ rotated by default, so I wouldn't want to affect that by adding the above config. 
+
+What do you think @jcalazan (pinging you as you created the original NGINX template)?
+Just tried an 18.04 setup and got the following error on the "Install Security Updates" task:
+
+> Error: E:The value 'bionic-security' is invalid for APT::Default-Release as such a release is not available in the sources
+I'm very often getting the `*** System restart required ***` notification when I login to an Ubuntu instance.
+
+My suggestion is to add an (optional) task to the security role to periodically reboot the server, maybe once per month. This would allow security patches added via unattended-upgrades to be applied without having to reboot manaully.
+
+Curious as to whether others using this repo have a restart job in their system already, and how they've implemented it?
+This may be a bit of an edge case, but if you decide to change the hostname (which is picked up from inventory) then the certifcate CN won't actually change. I was able to fix this by changing certbot script to use `--force-renew` temporarily but not sure this would make sense permanently.
+My `REMOTE_ADDR` is always blank. I just ran into an issue where a Django package expected `request.META['REMOTE_ADDR']` to be the user's IP address and it's causing my application to error out.
+
+My current solution is to [add a middleware](https://stackoverflow.com/a/34254843/2532070) to manually use `HTTP_X_FORWARDED_FOR` to overwrite `REMOTE_ADDR`, but leaving this issue here if anyone using this repo has an NGINX setting they use to set the `REMOTE_ADDR` setting.
+I keep getting this error when trying to install the security updates:
+
+```shell
+fatal: [localdev]: FAILED! => {"changed": false, "msg": "Failed to update apt cache: W:The repository 'http://www.rabbitmq.com/debian testing Release' does not have a Release file., W:Data from such a repository can't be authenticated and is therefore potentially dangerous to use., W:See apt-secure(8) manpage for repository creation and user configuration details., E:Failed to fetch http://www.rabbitmq.com/debian/dists/testing/main/binary-amd64/Packages  520  Origin Error [IP: 104.20.63.197 80], E:Some index files failed to download. They have been ignored, or old ones used instead."}
+
+```
+Invalid host headers will reach the Django application, throwing an error, cluttering logs, posing possible security risks without rejection at the Nginx level.
+
+This also appears to prevent 400s returned by Nginx when the host header is blank from leaking the Nginx version and OS. Try `curl 'http://<server_name>/' -H Host: '` and should see something like this:
+```
+<html>
+<head><title>400 Bad Request</title></head>
+<body bgcolor="white">
+<center><h1>400 Bad Request</h1></center>
+<hr><center>nginx/1.10.3 (Ubuntu)</center>
+</body>
+</html>
+```
+
+Should be able to see errors thrown in application with `curl 'http://<server_name>/' -H 'Host: example.com'`. With this PR, the response should be `curl: (52) Empty reply from server`.
+
+See: https://nginx.org/en/docs/http/request_processing.html#how_to_prevent_undefined_server_names
+This is the initial fix for #66.
+
+This PR replaces the current `env_vars` directory with a `group_vars` directory as can be found in [Ansible best practices](https://docs.ansible.com/ansible/latest/user_guide/playbooks_best_practices.html#) as well as in the [best practices for incorporating Ansible Vault](https://docs.ansible.com/ansible/latest/user_guide/playbooks_best_practices.html#variables-and-vaults).
+
+There are (at least) three goals here:
+
+1. Allowing the user to override any environment variables for their playbook in one place only, rather than having to search for the variable in a specific role.
+1. Allowing for different variables in each group. For instance, right now it's difficult to set a separate `server_user_password` in both staging and production environments.
+1. Allowing easy use of Ansible Vault to encrypt secrets (I would add instructions to the README if this PR gets pulled in).
+
+@jcalazan @DavidCain @dpward @StuartMacKay do any of you have an objection to this change which would be breaking vs. the current playbook?

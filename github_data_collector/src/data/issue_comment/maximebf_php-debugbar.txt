@@ -1,0 +1,317 @@
+It seems there's a race condition when you try to use stacked data to debug embedded requests (i.e. iframes).
+
+I can confirm what the doc says about _"using the debug bar storage mechanism to store the data and re-open it later can be cumbersome"_. It doesn't seem easy to debug embedded docs simply using header data because the ID generated is different. Thus, I moved to a less-optimal but still doable solution with stacked data. However, that brings up another issue: the race condition between the main request persisting the session, and the embedded one writing to it. 
+
+I guess this could be solved if session was not used whatsoever for stacked information - i.e. Redis storage is able to append information without having to write the entire list (and creating the said race). Or else, if it was possible to easily pass-down the DebugBar request ID - no idea about this without munging embedded URLs, though, but I guess it happens with AJAX requests `AjaxHandler.handle()`?
+
+Entirely replacing the session layer could probably work if there were some adjustments on the stack data code - i.e. deleting each used key instead of clearing up the entire object. I think DebugBar should come with a basic session replacer for itself, as it would otherwise be dependent on external implementation in order to solve this race condition.
+
+- ~not sure but it seems `stackData()` is not really storing the stack in the storage?~ couldn't really double-check this but I guess it's working fine
+- [ ] is there a reasonable way to solve the race condition with embedded requests?
+- [ ] `setStackAlwaysUseSessionStorage()` doesn't seem to be documented
+- [ ] unclear from the docs that, even with storage, session is still used to identify which information will be shown next
+
+What is the preferred way to go about having a 'clean' production environment? 
+
+It might be so trivial that it's not mentioned and/or I'm just overlooking the hints in the docs, but I don't see much mention about environments. I would rather not have the debug-code running on production. The manual implies you use a normal `require` and not `require-dev`, so if I follow that you'd get the code online at least. THis is apart from the fact that you will have calls on several places?
+
+You can probably easily not-render the bar in a production environment, but then, correct me if I'm wrong, your collectors are still collecting, using resources and possibly affect stuff. I suppose most of the collection will not be in a single place and therefore I'm not seeing a quick method to not-have that code running on a production environment. Only thing I could come up with is switching out your collectors with injection for some sort of dummy / empty collector that does nothing. But that feels hacky, and as it's not mentioned anywhere that's probably not the default method :)
+
+Is there a best-practice somewhere to be found?
+I follow up #287 pull-request about aggregate timeline. This is an awesome enhancement, but I think we could go further.
+
+Why not merging this two Timeline systems in one. 
+- First timeline do not aggregate same event measures but give them a position in the timeline.
+- Second timeline system aggregates same event measures, but we lose time position information
+
+Here is a possible implementation on Roadiz CMS:
+![image](https://user-images.githubusercontent.com/380026/70755841-3d7b7b00-1d3b-11ea-86bf-298c0a75922a.png)
+
+I do not stack measures to keep timing location and ease up debugging when you need to know when a event repeats itself.
+
+Fix issue #432
+`
+public function testBigQuery()
+    {
+        $params = [
+            ':id_segmento' => 1,
+            ':id_part'     => 1,
+            ':inativo'     => 1,
+            ':ativo'       => 1
+        ];
+        $query = 'select sum(qtd) as total from (
+                    select count(*) as qtd from (
+                        select distinct vw.id_modulo, vw.id_envio, vw.id_form,
+                            vw.versao, vw.id_sistema, vw.id_grupo
+                        from vw_forms_disponiveis vw
+                        where vw.id_part = :id_part
+                            and vw.id_servico = :id_segmento
+                            and vw.concluido = :inativo
+                    ) as forms
+
+                    union
+                    select distinct count(pesq.*) as qtd from
+                        pesquisa.avaliacao_modulo_disponivel pesq
+                    join envio e
+                        on e.id_envio = pesq.id_envio
+                        and e.id_servico = pesq.id_servico
+                    join rodada r
+                        on e.id_envio = r.id_envio
+                    join part_form pf
+                        on r.ano = pf.ano
+                        and r.id_rodada = pf.id_rodada
+                        and pf.id_modulo = r.id_modulo
+                    where pf.id_part = :id_part
+                        and (
+                            r.data_fim > date(now())
+                            or pf.data_excecao_fim > date(now())
+                        )
+                        and (
+                            r.data_ini <= date(now())
+                            or pf.data_excecao_ini <= date(now())
+                        )
+                        and e.id_servico = :id_segmento
+                        and pesq.id_modulo = :inativo
+
+                    union
+                    select distinct count(p.id_pesquisa) as qtd
+                    from pesquisas.pesquisa p
+                    join pesquisas.publicacao as pub
+                        on pub.id_pesquisa = p.id_pesquisa
+                    left join pesquisas.resposta r
+                        on r.id_pesquisa = p.id_pesquisa
+                        and r.id_publicacao = pub.id_publicacao
+                        and r.id_part = :id_part
+                    where pub.id_servico = :id_segmento
+                        and pub.excluido = :inativo
+                        and p.excluido = :inativo
+                        and r.id_resposta is null 
+                        and pub.data_ini <= date(now())
+                        and pub.data_fim >= date (now())
+                        and (
+                            p.resp_primeira_publicacao = :inativo
+                            or (
+                                    pub.id_publicacao in (
+                                            select r2.id_publicacao
+                                            from pesquisas.resposta r2
+                                            where r2.id_part = :id_part
+                                                and r2.id_pesquisa = p.id_pesquisa
+                                    )
+                            )
+                            or (
+                                    not exists (
+                                            select r2.id_pesquisa
+                                            from pesquisas.resposta r2
+                                            where r2.id_part = :id_part
+                                                and r2.id_pesquisa = p.id_pesquisa
+                                    )
+                            )
+                        )
+                        and (
+                            pub.todos_parts = :ativo
+                            or :id_part in (
+                                select id_part
+                                from pesquisas.publicacao_part pp
+                                where pp.id_pesquisa = pub.id_pesquisa
+                                    and pp.id_publicacao = pub.id_publicacao
+                                    and pp.id_part = :id_part
+                            )
+                        )
+
+                    union
+                    select count(es.*) as qtd from especial.solicitacao es
+                    join especial.dados_solicitacao d
+                        on es.id_servico = d.id_servico
+                        and es.ano = d.ano
+                    join especial.liberacao el
+                        on el.ano = d.ano
+                        and el.id_servico = d.id_servico
+                        and el.id_part = es.id_part
+                    left join especial.prorrogados p
+                        on p.ano = el.ano
+                        and p.id_servico = el.id_servico
+                        and p.id_part = el.id_part
+                    where es.id_usu is null -- possui resp
+                        and el.id_servico = :id_segmento
+                        and el.id_part = :id_part
+                        and (
+                            el.id_part in (123456, 123456)
+                            or
+                            d.liberada = :ativo
+                        )
+                        and ((d.data_ini <= date(now()) and d.data_fim >= date(now()))
+                            or (
+                                d.data_ini_excecao <= date(now())
+                                and d.data_fim_excecao >= date(now())
+                                and p.id_part not in (
+                                    select s.id_part from especial.solicitacao s
+                                    where s.data < d.data_ini_excecao
+                                        and s.id_part = el.id_part and s.ano = d.ano
+                                        and s.id_servico = d.id_servico
+                                )
+                            )
+                            or (p.data_fim >= date(now()))
+                        )
+                    ) as resultados_em_aberto';
+        $expected = 'select sum(qtd) as total from (
+                    select count(*) as qtd from (
+                        select distinct vw.id_modulo, vw.id_envio, vw.id_form,
+                            vw.versao, vw.id_sistema, vw.id_grupo
+                        from vw_forms_disponiveis vw
+                        where vw.id_part = <1>
+                            and vw.id_servico = <1>
+                            and vw.concluido = <1>
+                    ) as forms
+
+                    union
+                    select distinct count(pesq.*) as qtd from
+                        pesquisa.avaliacao_modulo_disponivel pesq
+                    join envio e
+                        on e.id_envio = pesq.id_envio
+                        and e.id_servico = pesq.id_servico
+                    join rodada r
+                        on e.id_envio = r.id_envio
+                    join part_form pf
+                        on r.ano = pf.ano
+                        and r.id_rodada = pf.id_rodada
+                        and pf.id_modulo = r.id_modulo
+                    where pf.id_part = <1>
+                        and (
+                            r.data_fim > date(now())
+                            or pf.data_excecao_fim > date(now())
+                        )
+                        and (
+                            r.data_ini <= date(now())
+                            or pf.data_excecao_ini <= date(now())
+                        )
+                        and e.id_servico = <1>
+                        and pesq.id_modulo = <1>
+
+                    union
+                    select distinct count(p.id_pesquisa) as qtd
+                    from pesquisas.pesquisa p
+                    join pesquisas.publicacao as pub
+                        on pub.id_pesquisa = p.id_pesquisa
+                    left join pesquisas.resposta r
+                        on r.id_pesquisa = p.id_pesquisa
+                        and r.id_publicacao = pub.id_publicacao
+                        and r.id_part = <1>
+                    where pub.id_servico = <1>
+                        and pub.excluido = <1>
+                        and p.excluido = <1>
+                        and r.id_resposta is null 
+                        and pub.data_ini <= date(now())
+                        and pub.data_fim >= date (now())
+                        and (
+                            p.resp_primeira_publicacao = <1>
+                            or (
+                                    pub.id_publicacao in (
+                                            select r2.id_publicacao
+                                            from pesquisas.resposta r2
+                                            where r2.id_part = <1>
+                                                and r2.id_pesquisa = p.id_pesquisa
+                                    )
+                            )
+                            or (
+                                    not exists (
+                                            select r2.id_pesquisa
+                                            from pesquisas.resposta r2
+                                            where r2.id_part = <1>
+                                                and r2.id_pesquisa = p.id_pesquisa
+                                    )
+                            )
+                        )
+                        and (
+                            pub.todos_parts = <1>
+                            or <1> in (
+                                select id_part
+                                from pesquisas.publicacao_part pp
+                                where pp.id_pesquisa = pub.id_pesquisa
+                                    and pp.id_publicacao = pub.id_publicacao
+                                    and pp.id_part = <1>
+                            )
+                        )
+
+                    union
+                    select count(es.*) as qtd from especial.solicitacao es
+                    join especial.dados_solicitacao d
+                        on es.id_servico = d.id_servico
+                        and es.ano = d.ano
+                    join especial.liberacao el
+                        on el.ano = d.ano
+                        and el.id_servico = d.id_servico
+                        and el.id_part = es.id_part
+                    left join especial.prorrogados p
+                        on p.ano = el.ano
+                        and p.id_servico = el.id_servico
+                        and p.id_part = el.id_part
+                    where es.id_usu is null -- possui resp
+                        and el.id_servico = <1>
+                        and el.id_part = <1>
+                        and (
+                            el.id_part in (123456, 123456)
+                            or
+                            d.liberada = <1>
+                        )
+                        and ((d.data_ini <= date(now()) and d.data_fim >= date(now()))
+                            or (
+                                d.data_ini_excecao <= date(now())
+                                and d.data_fim_excecao >= date(now())
+                                and p.id_part not in (
+                                    select s.id_part from especial.solicitacao s
+                                    where s.data < d.data_ini_excecao
+                                        and s.id_part = el.id_part and s.ano = d.ano
+                                        and s.id_servico = d.id_servico
+                                )
+                            )
+                            or (p.data_fim >= date(now()))
+                        )
+                    ) as resultados_em_aberto';
+        $traced = new TracedStatement($query, $params);
+        $result = $traced->getSqlWithParams();
+        $this->assertEquals($expected, $result);
+    }`
+When i use the twig collection code example in the repo i get javascript errors in my console
+
+```
+Uncaught TypeError: Cannot read property 'ajax' of null
+    at itemRenderer (widget.js:22)
+    at child.<anonymous> (widgets.js:155)
+    at child.set (debugbar.js:155)
+    at child.<anonymous> (widget.js:63)
+    at child.set (debugbar.js:155)
+    at child.<anonymous> (debugbar.js:287)
+    at child.set (debugbar.js:155)
+    at Array.<anonymous> (debugbar.js:978)
+    at Function.each (jquery.min.js:2)
+    at child.dataChangeHandler (debugbar.js:972) 
+```
+Here is my code 
+
+```
+                $profile = new \Twig\Profiler\Profile();
+                $container[ViewManager::class]->getEnvironment()->addExtension(new \DebugBar\Bridge\Twig\TimeableTwigExtensionProfiler($profile));
+                $container[DebugManager::class]->getBar()->addCollector(new \DebugBar\Bridge\TwigProfileCollector($profile));
+
+```
+
+when i add the time collector to the `TimeableTwigExtensionProfiler` i get an `Failed stopping measure 'home.twig' because it hasn't been started` error.
+
+I hope someone can help 
+With the release of Twig 3.0, the global namespace classes are no longer supported.
+
+This PR updates the `DebugBar\Bridge\TwigProfileCollector` class to use the namespaced class names from Twig and adds a conflict rule into the Composer manifest to block newer versions of this package from being installed with Twig versions that do not support namespaces.
+**Background**: So far, I had only displayed debug data related to the current request. However, I have recently switched to `FileStorage` to debug non-HTML requests with more data than could fit into the headers.
+
+**Problem**: The `RequestData` collects the `POST`ed password during login, password change etc.
+
+**Question**: How can I prevent the password from appearing among the debug data?
+
+PS: Ideally I would tell the `RequestDataCollector` to mask certain fields like Sentry's `sanitizeKeys`:
+
+![grafik](https://user-images.githubusercontent.com/495429/68788940-adb3b580-0644-11ea-8130-58e98996d53e.png)
+Any plans to support `fetch` in addition to `xhr`?
+
+I don't see a way to hook php-debugbar up to Apollo currently, whilst it works just fine with Axios, is lack of fetch support the reason? I came across the docs for manual integration but it seems to be `xhr` specific and throwing `fetch` as it doesn't go so well.
+
+Would be great to hook this up to Apollo-based SPA's so I can see the horrendous number of database queries being ran easier 🙃 

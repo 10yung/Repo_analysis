@@ -1,0 +1,324 @@
+When I try to run `cargo +nightly test`, I get a whole slew of errors:
+
+```
+error[E0557]: feature has been removed
+ --> /home/joshua/.cargo/registry/src/github.com-1ecc6299db9ec823/mutagen-plugin-0.1.2/src/lib.rs:1:30
+  |
+1 | #![feature(plugin_registrar, quote, rustc_private, custom_attribute)]
+  |                              ^^^^^ feature has been removed
+
+ error[E0432]: unresolved imports `syntax::fold`, `syntax::fold`
+  --> /home/joshua/.cargo/registry/src/github.com-1ecc6299db9ec823/mutagen-plugin-0.1.2/src/lib.rs:23:20
+   |
+23 | use syntax::fold::{self, Folder, ExpectOne};
+   |             ^^^^   ^^^^ no `fold` in the root
+   |             |
+   |             could not find `fold` in `syntax`
+
+error: cannot find macro `quote_expr!` in this scope
+   --> /home/joshua/.cargo/registry/src/github.com-1ecc6299db9ec823/mutagen-plugin-0.1.2/src/lib.rs:431:42
+    |
+431 |                 let mut mut_expression = quote_expr!(self.cx(), $lit);
+    |                                          ^^^^^^^^^^
+
+...
+error[E0412]: cannot find type `TypeBinding` in this scope
+    --> /home/joshua/.cargo/registry/src/github.com-1ecc6299db9ec823/mutagen-plugin-0.1.2/src/lib.rs:1240:26
+     |
+1240 | fn ty_bindings_equal(a: &TypeBinding, b: &TypeBinding, inout: bool) -> bool {
+     |                          ^^^^^^^^^^^ not found in this scope
+
+error[E0412]: cannot find type `TypeBinding` in this scope
+    --> /home/joshua/.cargo/registry/src/github.com-1ecc6299db9ec823/mutagen-plugin-0.1.2/src/lib.rs:1240:43
+     |
+1240 | fn ty_bindings_equal(a: &TypeBinding, b: &TypeBinding, inout: bool) -> bool {
+     |                                           ^^^^^^^^^^^ not found in this scope
+
+error: aborting due to 48 previous errors
+
+Some errors have detailed explanations: E0412, E0432, E0557.
+For more information about an error, try `rustc --explain E0412`.
+error: Could not compile `mutagen-plugin`.
+```
+
+`cargo +nightly --version`: `cargo 1.37.0-nightly (545f35425 2019-05-23)`
+`rustup run nightly rustc --version`: `rustc 1.37.0-nightly (d132f544f 2019-06-07)`
+`mutagen-plugin` version: `v0.1.2`
+
+My code in `src/main.rs`:
+```
+#![cfg_attr(test, feature(plugin))]
+#![cfg_attr(test, plugin(mutagen_plugin))]
+#![feature(custom_attribute)]
+
+#[cfg(test)]
+extern crate mutagen;
+
+pub mod lex;
+// more code follows
+```
+My code in `src/lex.rs`: 
+```
+#[cfg_attr(test, mutate)]
+// lots of code
+```
+I noticed a few comments along the lines of trying to avoid mutating into infinite loops. While of course this is good to avoid too many spurious too-weak mutations, it's kind of theoretically impossible in general. The current implementation leaks processes that consume 100% CPU forever.
+
+It's easy to fix, as described in the title.
+
+I ran into this with the following test case.
+
+```
+#[mutate]
+fn finite_loop() -> usize {
+    let mut x = Some(true);
+    let mut n = 0;
+    while x.is_some() {
+        if x.unwrap() { // REPLACE_WITH_TRUE here triggers it
+            x = Some(false);
+        } else {
+            x = None;
+        }
+        n += 1;
+    }
+    n
+}
+```
+#[mutate]
+pub fn if_let() -> bool {
+    let x = Some(true);
+    if let Some(b) = x {
+        b
+    } else {
+        false
+    }
+}
+```
+```
+error: expected expression, found statement (`let`)
+   --> src/test.rs:10:8
+    |
+167 |     if let Some(b) = x {
+    |        ^^^ expected expression
+    |
+    = note: variable declaration using `let` is a statement
+```
+```
+pub fn count_to_five() -> usize {
+    let xs = vec![true, false, true, false, true];
+    let mut i = 0;
+    for _x in xs {
+        i += 1;
+    }
+    i
+}
+```
+compiles normally, but with `#[mutate]`, fails with:
+```
+error[E0277]: `std::vec::Vec<bool>` is not an iterator
+   --> src/test.rs:10:1
+    |
+164 | #[mutate]
+    | ^^^^^^^^^ `std::vec::Vec<bool>` is not an iterator
+    |
+    = help: the trait `std::iter::Iterator` is not implemented for `std::vec::Vec<bool>`
+    = note: required by `mutagen::forloop`
+
+error: aborting due to previous error
+```
+
+It works only if i explicitly put `xs.iter()`.
+```
+10 #[mutate]
+11 pub fn add_five(i: usize) -> usize {
+12     i + 4 + 1
+13 }
+```
+fails to cargo test with:
+
+```
+error: custom attribute panicked
+   --> src/test.rs:10:1
+    |
+157 | #[mutate]
+    | ^^^^^^^^^
+    |
+    = help: message: expected expression
+
+error: aborting due to previous error
+```
+
+If you change the plus to a minus, it produces instead
+```
+error[E0308]: mismatched types
+   --> src/test.rs:10:1
+    |
+157 | #[mutate]
+    | ^^^^^^^^^ expected (), found usize
+    |
+    = note: expected type `()`
+               found type `usize`
+
+error[E0308]: mismatched types
+   --> src/test.rs:10:1
+    |
+157 | #[mutate]
+    | ^^^^^^^^^- help: try adding a semicolon: `;`
+    | |
+    | expected (), found usize
+    |
+    = note: expected type `()`
+               found type `usize`
+
+error[E0600]: cannot apply unary operator `-` to type `usize`
+   --> src/test.rs:10:1
+    |
+157 | #[mutate]
+    | ^^^^^^^^^ cannot apply unary operator `-`
+    |
+    = note: unsigned values cannot be negated
+
+error: aborting due to 3 previous errors
+```
+With multiply as the second operation instead:
+```
+error[E0271]: type mismatch resolving `<i32 as mutagen::MulDiv>::Output == usize`
+   --> src/test.rs:10:1
+    |
+157 | #[mutate]
+    | ^^^^^^^^^ expected i32, found usize
+
+error: aborting due to previous error
+```
+75f61450 (for moth mutagen and mutagen-plugin)
+rustc 1.28.0-nightly (e3bf634e0 2018-06-28)
+
+```
+error[E0023]: this pattern has 2 fields, but the corresponding tuple variant has 1 field
+    --> /home/bbigras/.cargo/git/checkouts/mutagen-970aecd63f482776/75f6145/plugin/src/lib.rs:1161:9
+     |
+1161 |         TyKind::ImplTrait(_, ref bounds) => {
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected 1 field, found 2
+error[E0023]: this pattern has 2 fields, but the corresponding tuple variant has 1 field
+    --> /home/bbigras/.cargo/git/checkouts/mutagen-970aecd63f482776/75f6145/plugin/src/lib.rs:1204:11
+     |
+1204 |         (&TyKind::ImplTrait(_, ref abounds), &TyKind::ImplTrait(_, ref bbounds)) => {
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected 1 field, found 2
+error[E0023]: this pattern has 2 fields, but the corresponding tuple variant has 1 field
+    --> /home/bbigras/.cargo/git/checkouts/mutagen-970aecd63f482776/75f6145/plugin/src/lib.rs:1204:47
+     |
+1204 |         (&TyKind::ImplTrait(_, ref abounds), &TyKind::ImplTrait(_, ref bbounds)) => {
+     |                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected 1 field, found 2
+error: aborting due to 3 previous errors
+```
+mutagen dfc844f597db911f4231d09c266a1462a9240cfd
+nightly-x86_64-unknown-linux-gnu (default)
+rustc 1.28.0-nightly (e3bf634e0 2018-06-28)
+
+This builds without the `#[cfg_attr(test, mutate)]`.
+
+```rust
+enum One {
+    Value(f64),
+}
+
+impl One {
+    #[cfg_attr(test, mutate)]
+    fn something(&self) -> f64 {
+        match self {
+            One::Value(v) => *v,
+        }
+    }
+}
+```
+
+```
+error[E0425]: cannot find value `__self_mutated` in this scope
+error[E0614]: type `f64` cannot be dereferenced
+   --> src/main.rs:601:17
+    |
+601 |                 *v
+    |                 ^^
+error: aborting due to 2 previous errors
+```
+Currently mutagen uses the old unstable `quote_*!`-macros which are on the way out, as [rust issue #41285](https://github.com/rust-lang/rust/pull/51285) made me aware. We probably want to convert mutagen to use the [quote](https://docs.rs/quote) crate soon-ish.
+On a completely fresh project with mutagen as a dev-dependency:
+
+```
+$ grep -B1 mutagen Cargo.toml
+[dev-dependencies]
+mutagen = "0.1.1"
+```
+
+I see the following error when I run anything that attempts to build mutagen:
+
+```
+% RUST_BACKTRACE=1 cargo test
+   Compiling mutagen v0.1.1
+error: failed to run custom build command for `mutagen v0.1.1`
+process didn't exit successfully: `/home/daniel/personal_dev/tmp/target/debug/build/mutagen-28d4cc400087a244/build-script-build` (exit code: 101)
+--- stderr
+thread 'main' panicked at 'called `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound, message: "No such file or directory" }', libcore/result.rs:945:5
+stack backtrace:
+   0: std::sys::unix::backtrace::tracing::imp::unwind_backtrace
+             at libstd/sys/unix/backtrace/tracing/gcc_s.rs:49
+   1: std::sys_common::backtrace::print
+             at libstd/sys_common/backtrace.rs:71
+             at libstd/sys_common/backtrace.rs:59
+   2: std::panicking::default_hook::{{closure}}
+             at libstd/panicking.rs:211
+   3: std::panicking::default_hook
+             at libstd/panicking.rs:227
+   4: std::panicking::rust_panic_with_hook
+             at libstd/panicking.rs:511
+   5: std::panicking::continue_panic_fmt
+             at libstd/panicking.rs:426
+   6: rust_begin_unwind
+             at libstd/panicking.rs:337
+   7: core::panicking::panic_fmt
+             at libcore/panicking.rs:92
+   8: core::result::unwrap_failed
+             at /checkout/src/libcore/macros.rs:26
+   9: <core::result::Result<T, E>>::unwrap
+             at /checkout/src/libcore/result.rs:782
+  10: build_script_build::main
+             at ./build.rs:425
+  11: std::rt::lang_start::{{closure}}
+             at /checkout/src/libstd/rt.rs:74
+  12: std::panicking::try::do_call
+             at libstd/rt.rs:59
+             at libstd/panicking.rs:310
+  13: __rust_maybe_catch_panic
+             at libpanic_unwind/lib.rs:105
+  14: std::rt::lang_start_internal
+             at libstd/panicking.rs:289
+             at libstd/panic.rs:392
+             at libstd/rt.rs:58
+  15: std::rt::lang_start
+             at /checkout/src/libstd/rt.rs:74
+  16: main
+  17: __libc_start_main
+  18: _start
+```
+
+This was happening with nightly in the middle of last week (which was when I first attempted to use mutagen), and on the latest nightly build:
+
+```
+$ rustup show
+Default host: x86_64-unknown-linux-gnu
+
+installed targets for active toolchain
+--------------------------------------
+
+wasm32-unknown-unknown
+x86_64-unknown-linux-gnu
+
+active toolchain
+----------------
+
+nightly-x86_64-unknown-linux-gnu (default)
+rustc 1.28.0-nightly (e3bf634e0 2018-06-28)
+```
+If a `self` arg will be both exchanged and cloned (in different mutations) the latter mutation will make the former ineffective.
+
+Solving this requires tracking if `self' was exchanged and changing the `ident` accordingly.

@@ -1,0 +1,180 @@
+This example:
+
+```
+diff --git a/examples/rrr.rs b/examples/rrr.rs
+index e69de29..60374de 100644
+--- a/examples/rrr.rs
++++ b/examples/rrr.rs
+@@ -0,0 +1,7 @@
++use bytes::Bytes;
++
++fn main() {
++    let mut bytes = Bytes::from(vec![10, 20, 30]);
++    bytes.truncate(2);
++    drop(bytes);
++}
+diff --git a/src/bytes.rs b/src/bytes.rs
+index 93ab84b..6af5148 100644
+--- a/src/bytes.rs
++++ b/src/bytes.rs
+@@ -767,6 +767,7 @@ impl From<Vec<u8>> for Bytes {
+         let slice = vec.into_boxed_slice();
+         let len = slice.len();
+         let ptr = slice.as_ptr();
++        println!("dismantling a vec of cap {}", len);
+         drop(Box::into_raw(slice));
+ 
+         if ptr as usize & 0x1 == 0 {
+@@ -886,6 +887,7 @@ unsafe fn promotable_odd_drop(data: &mut AtomicPtr<()>, ptr: *const u8, len: usi
+ 
+ unsafe fn rebuild_vec(buf: *mut u8, offset: *const u8, len: usize) -> Vec<u8> {
+     let cap = (offset as usize - buf as usize) + len;
++    println!("rebuilding vec with cap {}", cap);
+     Vec::from_raw_parts(buf, cap, cap)
+ }
+ 
+diff --git a/src/lib.rs b/src/lib.rs
+index 2df1fb3..5d9355b 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,6 +1,5 @@
+ #![deny(warnings, missing_docs, missing_debug_implementations, rust_2018_idioms)]
+ #![doc(html_root_url = "https://docs.rs/bytes/0.5.3")]
+-#![no_std]
+ 
+ //! Provides abstractions for working with bytes.
+ //!
+```
+
+```
+% cargo run --example rrr
+    Finished dev [unoptimized + debuginfo] target(s) in 0.01s
+     Running `target/debug/examples/rrr`
+dismantled a vec of cap 3
+rebuilding vec with cap 2
+```
+
+So we are allocating 3 * 4 bytes, but when calling deallocation we are passing hint parameter 2 * 4 which causes deallocation by `RawVec` which calls `GlobalAlloc.dealloc` which violates the spec: ("layout must be the same layout that was used to allocate that block of memory").
+
+I suspect it may crash deallocation or cause memory leaks, although I could not reproduce either.
+
+I tried this program:
+
+```
+#[global_allocator]
+static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
+use bytes::Bytes;
+
+fn main() {
+    loop {
+        let mut bytes = Bytes::from(vec![10; 100000000]);
+        bytes.truncate(1);
+        drop(bytes);
+    }
+}
+```
+
+After a few seconds of run, macOS Activity Monitor shows 100Gb of memory usage by this program which is a sign that something doesn't work as expected.
+I have been looking for a zero-copy way of sharing mmap content via `Bytes`. I noticed the vtable feature added by #294 and didn't find follow-ups.
+
+I wonder if `bytes` is interested in getting a `Arc<memmap::Mmap>` version implemented (probably gated by a `mmap` feature that is default off). Or if other approaches are preferred (ex. expose the vtable interface and implement the mmap support in other crates).
+
+I personally think there are very limited types that meaningfully fit the vtable interface (I can hardly think of another aside from the mmap one). So it seems easier for end-users if `bytes` just implements them all (use features to keep the default deps slim). But I can see concerns about `memmap` being unmaintained.
+
+If the next steps are clear, I can help implementing them.
+
+* merge `hex.rs` and `debug.rs` into the mod `fmt`
+* merge `BsDebug` and `BytesRef` (`BsDebug` is deleted)
+* separate `impl Debug` from `bytes.rs/bytes_mut.rs`
+* fix a dead link in the comment
+* beautify the code
+Use case:
+
+```
+let bytes: Bytes = ...
+let subbytes = bytes.slice(a..b); // where a == b
+let slice = &subbytes[..];
+let slice_bytes = bytes.slice_ref(slice);
+```
+
+Last line should not panic, because `slice` object is derived from
+the original `Bytes` object.
+
+Before this commit it panics, because `Bytes::slice` returns a fresh
+`Bytes` object when `begin == end`.
+The documentation of `BufMut::advance_mut` states the following about panics:
+
+> # Panics
+>
+> This function **may** panic if `cnt > self.remaining_mut()`.
+>
+> # Implementer notes
+>
+> It is recommended for implementations of `advance_mut` to panic if
+> `cnt > self.remaining_mut()`. If the implementation does not panic,
+> the call must behave as if `cnt == self.remaining_mut()`.
+>
+> A call with `cnt == 0` should never panic and be a no-op.
+
+Currently, the impl for `Vec<u8>` will [reserve to accommodate the advance](https://github.com/tokio-rs/bytes/blob/master/src/buf/buf_mut.rs#L996). This seems to be in conflict with `If the implementation does not panic, the call must behave as if cnt == self.remaining_mut().`
+https://github.com/tokio-rs/bytes/blob/39b6646e669a35d40e0da8e582b234226f024cae/src/buf/ext/reader.rs#L8
+https://github.com/tokio-rs/bytes/blob/39b6646e669a35d40e0da8e582b234226f024cae/src/buf/ext/writer.rs#L8
+
+These are 404, eg https://docs.rs/bytes/0.5.3/bytes/buf/ext/trait.Buf.html#method.reader
+
+`trait.Buf.html` should be `trait.BufExt.html` and `trait.BufMut.html` should be `trait.BufMutExt.html`
+Hi,
+I created a `BytesBuf` with some data and removed the leading n bytes with `advance(n)`. After some more computations I converted the result to an immutable `Bytes` value. My expectation was that the content of the `BytesMut` and `Bytes` would be identical. Instead the `Bytes` still contained the discared bytes.
+
+Example program:
+
+```rust
+use bytes::{BytesMut, Buf, BufMut};
+
+fn main() {
+    let mut x = BytesMut::new();
+    x.put(&b"hello"[..]);
+    
+    
+    let mut y = BytesMut::new();
+    y.put(&b"hello"[..]);
+    y.advance(2);
+
+    println!("{:?} {:?}", x, y); // b"hello" b"llo"
+    assert_ne!(x, y);
+    assert_ne!(&x[..], &y[..]);
+    
+    let x1 = x.freeze();
+    let y1 = y.freeze();
+    
+    println!("{:?} {:?}", x1, y1); // b"hello" b"hello"
+    // expected: b"hello" b"llo"
+    assert_eq!(x1, y1);
+    assert_eq!(&x1[..], &y1[..]);
+}
+```
+
+<https://play.rust-lang.org/?version=stable&mode=debug&edition=2018&gist=ffaabad67256d03d04f6478d60b93381>
+
+As a work-around I use `split_to` instead of `advance` and ignore the return value.
+Just a few things I noticed in the `BytesMut` docs.
+Is the (new) inability to roundtrip between `Bytes` and `BytesMut` intentional? The inability to do so somewhat diminishes the usefulness of the reference counting feature this crate offers, if it means that  `freeze()` renders a chunk of memory permanently immutable with no way to reclaim borrowed ranges and start over again without reallocating.
+
+I understand that `Bytes` is (now) unaware of the existence of `BytesMut` at this time, but it should still be possible to update the `BytesMut` api to recover memory  whose ref count has reached zero. I was all set to path `BytesMut` to add a version of `freeze()` that looked like this:
+
+```rust
+pub fn freeze() -> (Bytes, Unfreeze)
+```
+
+where `Unfreeze` is a struct with a single function 
+
+```rust
+pub fn unfreeze() -> BytesMut
+```
+
+with `Unfreeze` itself containing a weak reference to the same shared memory used by `Bytes` instances, but then I discovered that `Bytes` doesn't use `Arc` but rather a custom implementation that does not support weak references.
+
+(The reason for having `BytesMut` return an `Unfreeze` rather than adding, e.g., an `unfreeze()` /`try_mut()` method to `Bytes` is that the latter would require `Bytes` keeping track of whether it was instantiated from read-only memory or not, which the current vtable mask isn't capable of distinguishing between.)
+
+(My use case involves reading some bytes into a buffer, sending the ref-counted read bytes to another thread for processing, then reclaiming them when an event is set (and the `Bytes` have been dropped) to reuse the buffer for the next cycle.)

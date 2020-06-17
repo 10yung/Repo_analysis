@@ -1,0 +1,53 @@
+When I try to map files 2.1 GB or larger on Windows 10 I get errors.
+
+Code looks like this:
+``` rust
+extern crate memmap;
+
+use memmap::MmapOptions;
+use std::fs::File;
+use std::io::{self, Error, Write};
+
+fn main() -> Result<(), Error> {
+
+    let path = "<large file>";
+
+    let file = File::open(path)?;
+    let mmap = unsafe { MmapOptions::new().map(&file)? };
+
+    io::stdout().write_all(&mmap[..10])?;
+
+    Ok(())
+}
+```
+- With a 2.1 GB file I get ```Error: Os { code: 8, kind: Other, message: "Not enough memory resources are available to process this command." }```.
+- With a 16.6 GB file I get ```Error: Custom { kind: InvalidData, error: "memory map length overflows usize" }```
+- Works file with a 1.1 GB file.
+
+My machine has 32 GB memory and opening the files as memory maps in e.g. Python works just fine. I'm new to Rust, so perhaps I'm missing something obvious...
+It seems like this crate wasn't really (well?) maintained since October 2018.
+Last commit was https://github.com/danburkert/memmap-rs/commit/3b047cc2b04558d8a1de3933be5f573c74bc8e0f (18 Apr 2018) and last release was [memmap v0.7.0](https://crates.io/crates/memmap/0.7.0) (20 Sep 2018).
+
+The `winapi` crate requires `winapi-*-pc-windows-gnu` crates, which are pretty heavy (100MB). This blow ups the vendored archives size. Which is important for such a widely used crate.
+
+There are only two ways to fix this:
+
+- Wait for https://github.com/rust-lang/rust/issues/58713, but looks like it will not be fixed anytime soon.
+- Use custom bindings (we need like 5 methods anyway).
+
+This patch doesn't make this library less safe since `winapi` crate doesn't contain any logic. We simply copy-pasting `winapi` crate definitions.
+
+This patch doesn't break comparability/api since it affects only the internal implementation.
+
+The only remaining question is portability. The `winapi` crate does a lot of linking magic, but I'm not sure if we need it at all. **UPD** since all tests are passed, looks like we don't need it anyway.
+Currently I'm creating my pages using a non cross platform independent API set. I'm basically using a modified version of this crate where page_size is exposed for windows and linux. I'm unsure of how to do this same thing on some of the other platforms memmap-rs supports or if it's the same as the linux call.
+
+Would you be interested in a pull request with these calls public and cross platform implemented?
+The `Deref` implementation of `Mmap` seems to fulfill the requirements of the `StableDeref` trait from https://crates.io/crates/stable_deref_trait, if I understand things correctly. So an implementation for it would be helpful for those who want to put an `Mmap` together with references into the mapped memory into a struct (or similar things). It will require an additional crate dependency, though (maybe opt-in or opt-out via feature flag?)
+Hi, I'm implementing a memory allocator in Rust (porting the one from Go) and one requisite is being able to grow a specific mmap'ed vector without reallocating (for lockless purposes). Would be cool if I could use your crate for this, so I added this feature to it. I made an attempt at implementing the functionality for Windows as well, but I've no Windows box at my office so I haven't tested it. If you like the feature I'll make a better attempt at documenting and perhaps adding some tests.
+Currently it doesn't seem to be possible to create an anonymous RWX mapping. Could we get something like `make_exec_mut`?
+Currently they are on unix, at least based on a reading of the source. This seems like a kinda surprising footgun, especially as memmap is potentially an indirect dependency in a bunch of use cases. Creating a shared memory segment between parent and child should probably be an explicit action in MmapOptions?
+This PR should fix issue #81.
+
+Should work on unix, untested on windows.
+It's useful to be able to map a file `PROT_READ` and `MAP_PRIVATE` on Linux. Later on you can make some pages writeable and write them, or use `/proc/.../mem` to write them. Currently `memmap` can do this but it takes two steps: a `map_copy` followed by `make_read_only`, during which there's a short window when the pages are writeable.

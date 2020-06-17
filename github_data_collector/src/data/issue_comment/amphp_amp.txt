@@ -1,0 +1,89 @@
+The author and ext-async extension disappeared for unknown reasons https://github.com/concurrent-php/ext-async, which is very sad.
+
+Thanks to others, the fork is available: https://github.com/dreamsxin/ext-async
+
+@kelunik is there still a plan to implement the 3rd version with `ext-async` support?
+Here are some mentions about 3rd version plans:
+1. https://github.com/amphp/amp/issues/253#issuecomment-449875440
+2. https://github.com/amphp/amp/issues/229#issuecomment-448705155
+
+Thanks!
+I cannot upgrade from Amp 2.1.1 due to intermittent stability issues with 2.1.2 and above. The relevant change was a complete rewrite of `TimerQueue` in that (minor) version. To be clear, this is a somewhat rare bug that rears its head once every 100,000 operations or so (those operations do not need to occur on the same thread or in the same job, it's an independent probability). I've captured the output of a job where this has occurred for reference and posterity. This was run on PHP 7.3 but it seems to affect all PHP 7 versions.
+
+[output.txt](https://github.com/amphp/amp/files/3962942/108.txt)
+
+To be clear, this absolutely never happens on Amp 2.1.1. That version is completely 100% stable, which is why I cannot justify upgrading any further, as stability is paramount.
+When running the test suite of [event-store-client](https://github.com/prooph/event-store-client/)
+
+I'm always getting this segfault, but not always on the same test case and if the test case is tested seperately it's green. So I cannot reproduce a single failing test, but only that the test suite itself somehow fails to pass the tests.
+
+```
+php: src/unix/core.c:925: uv__io_stop: Assertion `loop->watchers[w->fd] == w' failed.
+[1]    8509 abort (core dumped)  ./vendor/bin/phpunit --exclude=ignore --testdox
+./vendor/bin/phpunit --exclude=ignore --testdox  8,90s user 1,21s system 23% cpu 42,284 total
+```
+
+Given what I could find about this on google, libuv source code (f.e. https://github.com/libuv/libuv/issues/2387), I have no idea where this can come from. For each test case I create a new event store connection via TCP protocol using `\Amp\Socket\connect`. As logger (another source where something could read / write) a NullLogger is used during the tests.
+
+Do you have any idea where I can look at?
+
+System: Ubuntu 19.10
+PHP: 7.3.11
+uv: libuv1/eoan,now 1.30.1-1 amd64 [installed,automatic] (via Ubuntu's apt)
+
+see also https://github.com/prooph/event-store-client/issues/75
+I just noticed that my tests with [lowest dependencies](https://circleci.com/gh/ostrolucky/stdinho/257) are much quicker than [regular one](https://circleci.com/gh/ostrolucky/stdinho/256) and troubleshooted this to amp 2.3.0.
+Relates to https://github.com/amphp/http-client/issues/193.
+I spent some hours today debugging why do my loops hang. There are numerous occasions when `stream_select` does not work. Instead of throwing the error, loop is going forever, because for some unknown reason, [you throw only for one single type of error](https://github.com/amphp/amp/blob/272f78dcb2897bead923fd5f94c9b88b18e40f70/lib/Loop/NativeDriver.php#L179). 
+
+Example 1:
+
+```php
+Loop::run(function() {
+    $stream = fopen('php://memory', 'rwb');
+
+    Loop::onWritable($stream, function() {
+        throw new \Exception('I should have been thrown');
+    });
+
+    fwrite($stream, 'wat');
+});
+```
+
+Example 2:
+
+```php
+Loop::run(function() {
+    $stream = tmpfile();
+    stream_filter_append($stream, "string.rot13", STREAM_FILTER_WRITE);
+
+    Loop::onWritable($stream, function() {
+        throw new \Exception('I should have been thrown');
+    });
+
+    fwrite($stream, 'wat');
+});
+```
+
+Hereby I request you to stop ignoring stream_select errors as it leads to hard to debug issues.
+Hello, I welcome you to chip in to https://bugs.php.net/bug.php?id=77377 as this is something which can affect amp core. Current PHP master using sapi_windows_set_ctrl_handler and streams blocks for indifinite time. Reproduction is as simple as 
+```php
+sapi_windows_set_ctrl_handler(function() {
+    exit(0);
+});
+
+$server = \Amp\Socket\listen('localhost:1337');
+\Amp\Promise\wait($server->accept());
+```
+When using coroutines which do not work on streams / sockets, or proactively deferring themselves via `yield new Delayed()` or sth, then a coroutine may block the loop even though it looks like wonderful async code.
+
+The reason is that the coroutine is looping over the generator without ever returning the control to the loop. Of course, this can be handled by application code but this is:
+- hard to maintain
+- debug
+- not cooperative
+
+Are you aware of this? Have you ever discussed this?
+I ran into situations, where I handle lots of promises and when they are not resolved quick enough, the server runs out of memory. My idea is to add a kind of `PromisePool` similar to what we have as `ConnectionPool` within `Amp\Sql`.
+
+Thoughts?
+`PHP Warning:  pcntl_signal_dispatch() has been disabled for security reasons in vendor/amphp/amp/lib/Loop/NativeDriver.php on line 155`

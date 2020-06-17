@@ -1,0 +1,110 @@
+windows_386\link.exe: running gcc failed: exit status 1
+go-link-162727447\000000.o: file not recognized: File format not recognized
+collect2.exe: error: ld returned 1 exit status
+
+how to resolve this problem and cgo?
+https://www.sqlite.org/c3ref/interrupt.html
+> If the interrupted SQL operation is an INSERT, UPDATE, or DELETE that is inside an explicit transaction, then the entire transaction will be rolled back automatically.
+
+Imagine the following contrived situation (pseudo-code):
+```go
+tx := db.Begin()
+defer tx.Rollback()
+
+ctx := context.WithTimeout(time.Second)
+// this times out, so sqlite3_interrupt is called
+tx.ExecContext(ctx, "INSERT INTO Foo VALUES (1)")
+
+// this gets executed outside a transaction!
+tx.Exec("INSERT INTO Foo VALUES (2)")
+
+// no-op!
+tx.Rollback()
+```
+
+This _should_ result in the database being totally unmodified. However, as per the docs `sqlite3_interrupt` would have automatically aborted the explicit transaction. Thus the second insert is actually executed in an implicit transaction. (The Go standard library calls `Exec` on the `Conn`. There is no `Exec` on the `Tx` interface, since the assumption is that the `Conn` is stateful.)
+
+Unfortunately, this is mostly caused by `sqlite3_interrupt` not really lining up with what context cancellation is supposed to mean. The best solution I can think of is to return `sql.ErrTxDone` (or something similar) if the actual SQLite transaction has been aborted, but the user has not called `Rollback` on the `Tx` yet. Note that this would apply to both the methods of `Conn` and the methods of `Stmt`.
+I have not found the next pragmas: `loc`, `mutex` and `txlock` in the [list of pragmas](https://www.sqlite.org/pragma.html).
+So, if they are only used by "go-sqlite3", please indicate it.
+[why]
+If db.BeginTx(ctx, nil) context is cancelled too fast, "BEGIN" statement can be
+completed inside DB, but we still try to cancel it with sqlite3_interrupt.
+In such case we get context.Cancelled or context.DeadlineExceeded from exec(),
+but operation really completed. Connection returned into pool, and returns "cannot
+start a transaction within a transaction" error for next db.BeginTx() call.
+
+[how]
+If we get context cancelled on "BEGIN" statement, call "ROLLBACK" to clean-up
+connection state. Don't return cancellation error from exec() if operation completed
+without sqlite3_interrupt.
+
+[testing]
+Added unit-test which reproduces issue.
+Assuming we run this piece of code:
+```
+			ctx, cancel := context.WithCancel(ctx)
+			tx, err := db.BeginTx(ctx, nil)
+```
+it is possible to get at the same time context.Cancelled error and started transaction. This will happen only if we cancel context very fast.
+
+This happens because context cancellation is inherently racy as performed not in same go-routine where statement is executed.
+
+Proposed fix #765 
+* [ ] Join sqlite3.go and sqlite3_go18.go
+* [ ] Join sqlite3_test.go and sqlite3_go18_test.go
+* [ ] Remove 1.9.x and 1.10.x from .travis.yml
+This package doesn't seem to work with go modules. Here's a simple recipe in Docker, to make it easy to reproduce. Please tell me what I'm doing wrong:
+
+```
+$ docker run -it --rm golang:alpine
+/go # apk add build-base
+...
+/go # mkdir /src
+/go # cd /src
+/src # cat - > main.go
+package main
+import (
+        "fmt"
+	_ "github.com/mattn/go-sqlite3"
+)
+func main() {
+	fmt.Println("Hello world!")
+}
+/src # export CGO_ENABLED=1
+/src # go mod init example.com
+go: creating new go.mod: module example.com
+/src # go get github.com/mattn/go-sqlite3
+go: finding github.com/mattn/go-sqlite3 v2.0.0+incompatible
+go: downloading github.com/mattn/go-sqlite3 v2.0.0+incompatible
+go: extracting github.com/mattn/go-sqlite3 v2.0.0+incompatible
+/src # go run .
+build example.com: cannot load github.com/mattn/go-sqlite3: module github.com/mattn/go-sqlite3@latest (v2.0.0+incompatible) found, but does not contain package github.com/mattn/go-sqlite3
+```
+https://github.com/mattn/go-sqlite3/blob/master/doc.go
+```
++------------------------------+
+|go        | sqlite3           |
+|----------|-------------------|
+|nil       | null              |
+|int       | integer           |
+|int64     | integer           |
+|float64   | float             |
+|bool      | integer           |
+|[]byte    | blob              |
+|string    | text              |
+|time.Time | timestamp/datetime|
++------------------------------+
+```
+https://www.sqlite.org/draft/datatype3.html
+...
+2.2. Date and Time Datatype
+SQLite does not have a storage class set aside for storing dates and/or times. Instead, the built-in Date And Time Functions of SQLite are capable of storing dates and times as TEXT, REAL, or INTEGER values:
+
+TEXT as ISO8601 strings ("YYYY-MM-DD HH:MM:SS.SSS").
+REAL as Julian day numbers, the number of days since noon in Greenwich on November 24, 4714 B.C. according to the proleptic Gregorian calendar.
+INTEGER as Unix Time, the number of seconds since 1970-01-01 00:00:00 UTC.
+Applications can chose to store dates and times in any of these formats and freely convert between formats using the built-in date and time functions.
+...
+I would really appreciate it if you could add the [spellfix1](https://www.sqlite.org/spellfix1.html) extension. Thank you
+See #728. There the user had defined a function that took a `string` and SQLite tried to pass `NULL` to it. That resulted in an error from this library stating `argument must be BLOB or TEXT`. Changing the function to take a `*string` instead didn't work and resulted in an error stating `don't know how to convert to *string`. Please update the private `callbackArg` func used by `RegisterFunc` to properly handle an input type of kind `reflect.Ptr`.

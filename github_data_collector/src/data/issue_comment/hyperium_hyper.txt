@@ -1,0 +1,131 @@
+My library uses a global `Client` to run its requests.
+
+The following code:
+```rust
+#[cfg(test)]
+mod tests {
+    use hyper::{
+        client::{Client, HttpConnector},
+        Body, Request,
+    };
+
+    lazy_static::lazy_static! {
+        static ref CLIENT: Client<HttpConnector, Body> = Client::new();
+    }
+
+    async fn req(uri: &str) {
+        CLIENT
+            .request(Request::builder().uri(uri).body(Body::from("")).unwrap())
+            .await
+            .unwrap();
+    }
+
+    macro_rules! tests {
+        ($($name:ident)*) => {
+            $(
+                #[tokio::test]
+                async fn $name() {
+                    req("http://example.org/").await;
+                }
+            )*
+        };
+    }
+    tests!(t1 t2 t3 t4 t5 t6 t7 t8 t9 t10);
+}
+```
+With tokio 0.2.9, hyper 0.13.1 and lazy_static 1.4.0, generates 10 tests, t1-t10, with each one making a simple request using a global client. Every `cargo test`, a random number of them panic with [this backtrace](https://pastebin.com/c5qkKaa2).
+
+This has been [reported before](https://github.com/hyperium/hyper/issues/1930), but was closed by the author.
+
+The error seems to be that I am using the same Client from different runtimes on different threads.
+use tokio::net::UnixListener;
+{
+let path = "/root/test.sock";
+    if let Err(err) = fs::remove_file(path) {
+        if err.kind() != io::ErrorKind::NotFound {
+            eprintln!(".......");
+        }
+    }
+    let unix_listener = UnixListener::bind(path).unwrap();
+    let acceptor = hyper::server::accept::from_stream(unix_listener.incoming());
+    // For every connection, we must make a `Service` to handle all
+    // incoming HTTP requests on said connection.
+    let make_svc = make_service_fn(|_conn| {
+
+        async { Ok::<_, Infallible>(service_fn(hello)) }
+    });
+    let server_i = Server::builder(acceptor);
+    let server = server_i.serve(make_svc);
+    
+    server.await?;
+
+    Ok(())}
+
+
+
+
+29 |     let acceptor = hyper::server::accept::from_stream(unix_listener.incoming());
+   |                                                       ^^^^^^^^^^^^^^^^^^^^^^^^ the trait `futures::Stream` is not implemented for `future_ex::future_ex::tokio::net::unix::Incoming<'_>`
+
+_Originally posted by @IThawk in https://github.com/hyperium/hyper/issues/2102#issuecomment-574475394_
+see #2103
+It was a long time ago one had to write `::std` to make rustc recognize the path. Now just `std` works fine.
+
+Had some issues getting the examples to run as there was no clear `Cargo.toml` for referencing the correct dependancies and versions etc.
+
+Here's what worked for me, could we add it to the examples folder or the README?
+
+```
+$ cat Cargo.toml
+[dependencies]
+hyper = "0.13.1"
+tokio = { version = "0.2", features = ["full"] }
+pretty_env_logger = "0.3.1"
+```
+There's a blanket implementation of `tower_service::Service` for `&mut S` but not for `&S`. Since `hyper::Client::request` takes `&self` only, `&Client` can implement `Service`, allowing users to take advantage of Tower's abstraction without additional ownership restrictions.
+feat(client): Chunk method to detect if it is the final part of real http-chunk or not
+
+During chunked transfer - hyper can return only part of http-chunk and it does not provide ability to detect if it is just part of the chunk or not. The solution could be to fill chunks in the buffer until you know that you read full size of the http-chunk-len. This PR adds Chunk::is_end_of_chunk(&self) -> bool method which return true - if you read http-chunk-len.
+
+```rust
+let mut buf = Vec::new();
+body.for_each(move |chunk| {
+    let is_final = chunk.is_end_of_chunk();
+    buf.extend_from_slice(&chunk.into_bytes());
+
+   if !is_final {
+      return Ok(())
+   }
+
+   println!("buf contains valid json");
+   buf.clear();
+}
+```
+
+Introduced in https://github.com/hyperium/hyper/pull/1563, the HTTP Upgrade/`CONNECT` API currently is accessed via `hyper::Body::on_upgrade`. This has some downsides that I'd like to address with a modified API:
+
+- It makes the `Body` type fatter.
+- It requires people keep the `Body` around, meaning they can't use stream combinators to read the body first, *and then* wait for the upgrade to finish. This also makes it more annoying for users who may wish adjust their `http::Request<Body>` into some `http::Request<Doodad>`.
+
+## Proposed API
+
+Similar to the proposal in #1586, the change would be to pass the `http::Request` or `http::Response` to a free function.
+
+- `hyper::upgrade::on(req_or_resp) -> OnUpgrade`
+  - We can also allow passing just a mutable reference, thus not consuming the request or response.
+- Optional other functions could be added, but not necessary: `has_upgrade`, etc.
+
+## Implementation Plan
+
+The types would be inserted into the `http::Extensions` of the request/response (though with a private wrapper type to hide the exact details).
+
+- Add the new `hyper::upgrade::on` function.
+- The `Body::on_upgrade` method would become `#[deprecated]`.
+- So as to not be a behavioral breaking change, the `OnUpgrade` would need to be placed in both the `Body` *and* the `Extensions`, wrapped in some `Arc<Lock>` that only allows taking it once.
+
+I'd like to in a future release be able to *not* put it in an `Arc<Lock>` and place it in the `Body`, but I'm not sure how that could really be done in 0.13.x. (I knew I'd find something I forgot to change after finally releasing XD).
+I'm trying to work with an API on an internal server, and hyper keeps blowing away the connection due to "invalid HTTP header parsed". There doesn't appear to be a specific error provided, however, which has so far made it impossible to troubleshoot. I've enabled `RUST_LOG=trace` and even tried switching off certificate and domain name checks and gzip, is there any way to get it to work or at least figure out what hyper thinks is wrong with the header?
+
+Both curl and Postman appear to work fine, and testssl doesn't reveal any glaring issues.
+
+Thanks.

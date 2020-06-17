@@ -1,0 +1,209 @@
+I'm trying to encode a PDF417 and whenever I set the `PDF417_COMPACTION` to `Compaction.TEXT` I get this crash: 
+
+```
+    java.lang.ArrayIndexOutOfBoundsException: length=128; index=8226
+        at com.google.zxing.pdf417.encoder.PDF417HighLevelEncoder.isMixed(PDF417HighLevelEncoder.java:456)
+        at com.google.zxing.pdf417.encoder.PDF417HighLevelEncoder.encodeText(PDF417HighLevelEncoder.java:298)
+        at com.google.zxing.pdf417.encoder.PDF417HighLevelEncoder.encodeHighLevel(PDF417HighLevelEncoder.java:185)
+        at com.google.zxing.pdf417.encoder.PDF417.generateBarcodeLogic(PDF417.java:649)
+        at com.google.zxing.pdf417.PDF417Writer.bitMatrixFromEncoder(PDF417Writer.java:107)
+        at com.google.zxing.pdf417.PDF417Writer.encode(PDF417Writer.java:87)
+        at com.google.zxing.MultiFormatWriter.encode(MultiFormatWriter.java:102)
+```
+
+Here is the code for how I am trying to create the barcode: 
+
+```
+        var hints: MutableMap<EncodeHintType, Any>?
+        
+        hints = EnumMap<EncodeHintType, Any>(EncodeHintType::class.java)
+        
+        hints[EncodeHintType.CHARACTER_SET] = "UTF-8" 
+        hints[EncodeHintType.ERROR_CORRECTION] = 6
+        hints[EncodeHintType.PDF417_COMPACTION] = Compaction.TEXT
+        
+        val writer = MultiFormatWriter()
+        val result: BitMatrix
+        try {
+            result = writer.encode(contents, format, img_width, img_height, hints)
+        } catch (iae: WriterException) {
+            // Unsupported format
+            return null
+        }
+```
+
+Is this a bug or am i doing something wrong?
+Hi,
+
+First, thanks for this great library.  I'm just using the Reed Solomon part of it and I stumbled on I think a corner-case bug. 
+
+When using data+error_codes of size 256, if I corrupt the **first** byte (after ReedSolomon encoding), neither the byte is "repaired" nor an exception is thrown when decoding.  It doesn't seem to matter how many error_codes I use or the data content, but it only fails for data+error_codes of size 256.
+
+I grep'd the ReedSolomon code for literals 255 and 256 but saw nothing fishy.
+
+Hmm, code formatter on this wiki not working for me.  JUnit test below.  Depends on RSEncoderDecoder class, which looks fine by inspection (attached as '.txt')
+[RSEncoderDecoder.txt](https://github.com/zxing/zxing/files/1939513/RSEncoderDecoder.txt)
+
+
+import java.util.Arrays;
+import org.junit.Test;
+import com.casualcoding.reedsolomon.RSEncoderDecoder;
+public class ReedSolomonByte0Bug
+{
+    @Test
+    public void testRSStreamAllZeros() throws Exception
+    {
+        /*
+         * numEcBytes doesn't seem to matter
+         */
+        int numEcBytes = 8;
+
+        for (int totalBlockSizeBytes = 10; totalBlockSizeBytes <= 256; totalBlockSizeBytes++)
+        {
+
+            byte[] mesg = new byte[totalBlockSizeBytes - numEcBytes];
+
+            for (int i = 0; i < mesg.length; i++)
+            {
+                mesg[i] = (byte) i;
+            }
+
+            RSEncoderDecoder rs = new RSEncoderDecoder();
+            byte[] rsmesg = rs.encodeData(mesg, numEcBytes);
+
+            /*
+             * Corrupt byte 0.  Corrupting other bytes works correctly
+             */
+            rsmesg[0] = (byte) (rsmesg[0] + 1);
+
+            // No exception thrown ...
+            byte[] testDecode = rs.decodeData(rsmesg, numEcBytes);
+
+            /*
+             * Fails for totalBlockSize = 256
+             */
+            if (Arrays.equals(mesg, testDecode) == false)
+            {
+                System.out.println("Failed: totalBlockSizeBytes = " + totalBlockSizeBytes);
+            }
+        }
+    }
+}
+
+
+java.lang.ArrayIndexOutOfBoundsException: length=929; index=-158
+at com.google.zxing.pdf417.decoder.ec.ModulusGF.multiply(ModulusGF.java:105)
+at com.google.zxing.pdf417.decoder.ec.ModulusPoly.evaluateAt(ModulusPoly.java:99)
+at com.google.zxing.pdf417.decoder.ec.ErrorCorrection.decode(ErrorCorrection.java:53)
+at com.google.zxing.pdf417.decoder.PDF417ScanningDecoder.correctErrors(PDF417ScanningDecoder.java:553)
+at com.google.zxing.pdf417.decoder.PDF417ScanningDecoder.decodeCodewords(PDF417ScanningDecoder.java:526)
+at com.google.zxing.pdf417.decoder.PDF417ScanningDecoder.createDecoderResultFromAmbiguousValues(PDF417ScanningDecoder.java:307)
+at com.google.zxing.pdf417.decoder.PDF417ScanningDecoder.createDecoderResult(PDF417ScanningDecoder.java:276)
+at com.google.zxing.pdf417.decoder.PDF417ScanningDecoder.decode(PDF417ScanningDecoder.java:123)
+at com.google.zxing.pdf417.PDF417Reader.decode(PDF417Reader.java:87)
+at com.google.zxing.pdf417.PDF417Reader.decode(PDF417Reader.java:61)
+at com.google.zxing.MultiFormatReader.decodeInternal(MultiFormatReader.java:171)
+at com.google.zxing.MultiFormatReader.decodeWithState(MultiFormatReader.java:85)
+
+
+I have found a problem above. In the file 
+https://github.com/zxing/zxing/blob/7df4aa6694a547098fe1e3ab430e5095b93b7827/core/src/main/java/com/google/zxing/pdf417/decoder/ec/ModulusGF.java, the code in line 105 report ArrayIndexOutOfBoundsException,is it a problem?
+
+`CommandLineEncoder` appears to ignore the height and width parameters when `barcode_format` is  `DATA_MATRIX`
+
+The following command produces a 14px by 14px image instead of a 500px by 500px image: 
+
+```
+java -cp javase/target/javase-3.3.0-jar-with-dependencies.jar com.google.zxing.client.j2se.CommandLineEncoder --barcode_format DATA_MATRIX --height 500 --width 500 abcdefg
+```
+
+Here's a `Dockerfile` to reproduce this issue:
+
+```
+FROM ubuntu:16.04
+RUN apt-get update && apt-get install -y --no-install-recommends default-jdk git maven
+RUN git clone --depth 1 --branch zxing-3.3.0 https://github.com/zxing/zxing.git
+RUN cd zxing && mvn install -DskipTests
+RUN cd zxing/javase && mvn -DskipTests package assembly:single
+RUN cd zxing && java -cp javase/target/javase-3.3.0-jar-with-dependencies.jar com.google.zxing.client.j2se.CommandLineEncoder --barcode_format DATA_MATRIX --height 500 --width 500 abcdefg
+```
+
+Is this a bug or am I using `CommandLineEncoder` wrong?
+Hi everyone,
+
+i always get a illegal character exception if i try to create a DataMatrix with following code
+
+```
+HashMap<EncodeHintType, Object> options = new HashMap<>();
+options.put(EncodeHintType.DATA_MATRIX_SHAPE, SymbolShapeHint.FORCE_SQUARE);
+
+int width = 128;
+int height = 128;
+String content = "test TE>240 2 I.E ST>300";
+
+BitMatrix bitMatrix = new DataMatrixWriter().encode(content, BarcodeFormat.DATA_MATRIX, width, height, options)
+```
+
+**Stacktrace**
+
+```
+java.lang.IllegalArgumentException: Illegal character: . (0x002e)
+    at com.google.zxing.datamatrix.encoder.HighLevelEncoder.illegalCharacter(HighLevelEncoder.java:445)
+    at com.google.zxing.datamatrix.encoder.X12Encoder.encodeChar(X12Encoder.java:65)
+    at com.google.zxing.datamatrix.encoder.X12Encoder.encode(X12Encoder.java:34)
+    at com.google.zxing.datamatrix.encoder.HighLevelEncoder.encodeHighLevel(HighLevelEncoder.java:182)
+    at com.google.zxing.datamatrix.DataMatrixWriter.encode(DataMatrixWriter.java:84)
+    at com.google.zxing.Writer$encode.call(Unknown Source)
+```
+
+Is this a bug or i'm missing something?
+
+Hello, I generated a QR code from the following whole-data-events in ics format.
+#### Bug
+- The current Zxing Barcode Scanner on Android detects only the first event (20151012)
+- but **fails to detect/decode the further events**.
+
+```
+BEGIN:VCALENDAR
+PRODID:Leave Planner Version 201512041000
+COMMENT:5 day/s exported on 20151204
+VERSION:2.0
+BEGIN:VEVENT
+SUMMARY:XLEAVE
+DTSTART;VALUE=DATE:20151012
+END:VEVENT
+BEGIN:VEVENT
+SUMMARY:XLEAVE
+DTSTART;VALUE=DATE:20151013
+END:VEVENT
+BEGIN:VEVENT
+SUMMARY:XLEAVE
+DTSTART;VALUE=DATE:20151014
+END:VEVENT
+BEGIN:VEVENT
+SUMMARY:XLEAVE
+DTSTART;VALUE=DATE:20151015
+END:VEVENT
+BEGIN:VEVENT
+SUMMARY:XLEAVE
+DTSTART;VALUE=DATE:20151016
+END:VEVENT
+END:VCALENDAR
+```
+
+here's the code to generate with your online web side:
+
+https://zxing.org/w/chart?cht=qr&chs=350x350&chld=L&choe=UTF-8&chl=BEGIN%3AVCALENDAR%0APRODID%3ALeave+Planner+Version+201512041000%0ACOMMENT%3A5+day%2Fs+exported+on+20151204%0AVERSION%3A2.0%0ABEGIN%3AVEVENT%0ASUMMARY%3AXLEAVE%0ADTSTART%3BVALUE%3DDATE%3A20151012%0AEND%3AVEVENT%0ABEGIN%3AVEVENT%0ASUMMARY%3AXLEAVE%0ADTSTART%3BVALUE%3DDATE%3A20151013%0AEND%3AVEVENT%0ABEGIN%3AVEVENT%0ASUMMARY%3AXLEAVE%0ADTSTART%3BVALUE%3DDATE%3A20151014%0AEND%3AVEVENT%0ABEGIN%3AVEVENT%0ASUMMARY%3AXLEAVE%0ADTSTART%3BVALUE%3DDATE%3A20151015%0AEND%3AVEVENT%0ABEGIN%3AVEVENT%0ASUMMARY%3AXLEAVE%0ADTSTART%3BVALUE%3DDATE%3A20151016%0AEND%3AVEVENT%0AEND%3AVCALENDAR%0A
+
+Hi there!
+I've discovered, that zxing (a least, android barcode scanner) decodes DataMatrix codes with unicode text as ASCII (and, so brake it). I.e. it displays `ÑÐµÑÑ` instead of `тест` (ciryllic "test").
+
+OTOH, QR-encoded unicode is decoded fine.
+
+Can somebody fix that (or, at least, advice/guide me how to fix it)?
+
+Address / city / state / postal code and so on are supposed to be separated in MECARD and vCard, by comma and semicolon, respectively. The code right now doesn't break this down beyond an address field though, so isn't able to format accordingly. 
+
+Ideally the online encoder would have separate fields for address components. And, in Android, would retrieve address elements independently. However I am not sure Android breaks this out either, not via Intent.
+
+Ported from https://code.google.com/p/zxing/issues/detail?id=1468

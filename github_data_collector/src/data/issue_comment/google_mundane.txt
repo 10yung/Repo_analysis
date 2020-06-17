@@ -1,0 +1,78 @@
+https://docs.rs/crate/mundane/0.4.2/builds
+
+```
+[INFO] [stderr]  Documenting mundane v0.4.2 (/opt/rustwide/workdir)
+[INFO] [stderr] error: `[RsaPkcs1v15]` cannot be resolved, ignoring it...
+[INFO] [stderr]    --> src/public/rsa/mod.rs:363:26
+[INFO] [stderr]     |
+[INFO] [stderr] 363 | /// feature is enabled, [`RsaPkcs1v15`].
+[INFO] [stderr]     |                          ^^^^^^^^^^^^^ cannot be resolved, ignoring
+[INFO] [stderr]     |
+```
+
+========
+
+Edit by @joshlf : This issue is now about both fixing this issue and also about documenting all items behind feature flags in general; see [this comment](https://github.com/google/mundane/issues/22#issuecomment-563604661) below.
+To err on the safe side, we initially made our key objects neither `Send` nor `Sync`. However, BoringSSL provides concurrency semantics for key objects that allow us to relax these restrictions. In particular, key objects' reference counts are incremented and decremented atomically, and all BoringSSL operations on keys have well-defined concurrency safety semantics.
+
+I propose that we implement `Sync` on key objects, and use BoringSSL's definition of which functions are mutating to decide which methods to have take a `&mut self` vs a `&self` receiver.
+
+## An aside on `Clone` and reference counting
+
+Currently, keys are reference counted, and cloning a Mundane key object obtains a new reference-counted reference to the same underlying object. Unfortunately, we cannot implement either `Send` or `Sync` so long as it's possible to obtain multiple references to the same underlying object.
+
+If reference-counted key objects are `Send`, then different clones could be  sent to different threads, and we'd have no way of preventing those two separate clones from being operated on using `&mut self` methods concurrently, which would be unsound.
+
+If reference-counted key objects are `Sync`, then different clones owned by one thread could be accessed concurrently from different threads, and we'd have no way of preventing those two separate clones from being operated on using `&mut self` methods concurrently, which would be unsound.
+
+Thus, I conclude that **we must remove the ability to clone key objects**. The primary benefit to reference counting in BoringSSL is to be able to use keys concurrently from multiple threads at once. Since Rust's lifetime system allows us to share references across threads safely, we get the same advantage even without reference counting. Even if reference counting were desired, we could put a Mundane key object inside of an `Rc` or an `Arc` and get the same effect.
+
+Thus, the concrete tasks are:
+- [ ] Remove the ability to `Clone` key objects
+- [ ] Audit the codebase to ensure that all mutating BoringSSL functions are exposed via `&mut self` methods, and document our strategy and reasoning in code comments
+- [ ] Implement `Send` and `Sync` on key objects
+
+Old (incorrect) text:
+
+> BoringSSL key types are reference-counted, and use reference counting to implement `Clone`. While the reference counting itself is thread-safe (see `CRYPTO_refcount_xxx`, [crypto/internal.h](https://boringssl.googlesource.com/boringssl/+/master/crypto/internal.h)), it's not clear that all operations on keys are also thread-safe. In other words, having two key objects in different threads which are both references to the same underlying BoringSSL object may mean that calling methods on those objects concurrently is unsound. As a result, our key objects do not implement `Send`.
+> 
+> Eventually, we will want to identify which methods are thread-safe and which are not. This is not only a prerequisite for making our key objects `Send`, it's also a prerequisite for making them `Sync`. However, we can much more easily unblock making our key objects `Send` by just not implementing `Clone` so that a given key object is always the only reference to its underlying BoringSSL object.
+Currently, our error type can be printed as a string, which provides a lot of information about the error. Cryptography errors are a notorious source of information leak, as programmers often misuse the errors and either compute on them or expose them in ways that they shouldn't. Ring, for example, takes the much more aggressive approach of having an error type that contains no information at all.
+
+I'm not sure what the right thing for us to do here is, since it seems useful to provide _some_ error information, such as about parsing failures. But we need to strike the right balance, and exposing as much as we do now may be too much. This is also compounded by the fact that a lot of the errors we _would_ want to expose (like parsing errors) come from BoringSSL, and BoringSSL's errors cannot be inspected programmatically.
+UPDATE: ASan has been implemented in https://github.com/google/mundane/commit/0148297bf1c5bb8ccc8acbc7abcc15cb4b53d6ee. We should still run tests with MSan, although it's less important than ASan.
+
+=== old text ===
+
+We should enable ASan and MSan when running `cargo test` in order to catch issues with our use of the BoringSSL API. ASan should help catch issues with reference counting, allocation, and freeing, while MSan should help catch issues with memory initialization.
+Currently, we have a few small smoke tests to make sure that we don't decrement BoringSSL refcounts too far. However, we have no tests to ensure that we decrement refcounts far enough (in other words, that we don't leak resources by leaving unused objects allocated and constructed).
+
+We should also test the latter. The way to do this is probably to figure out how to inspect the refcount on a BoringSSL object and use that mechanism to ensure that the refcount on these objects is 1 when we only hold a single reference. That said, perhaps there's a better way to do this.
+
+EDIT: Let's first try to see if we can enable ASan (#15), which should address this.
+Currently, building Mundane requires Go 1.11+. Utilities in Go are used for three tasks:
+
+1. Generating the interned error message bundle and its index (`crypto/err_data.c` in the build tree, from `crypto/err/*.errordata` in the source tree).
+
+2. Extracting the names of public symbols from the archive created in the first library build (`crypto/libcrypto.a`) and saving the result in `symbols.txt` above the two build directories.
+
+3. Generating the headers with substitutions from regular to versioned symbol names, using the result of the previous utility.
+
+Those are rather simple programs and I have reimplemented them in Rust without much difficulty. Integrating them into `build.rs` could lead to elimination of Go as a build dependency of Mundane. While having any single dependency is not particularly onerous, I believe that minimizing their number eases the acceptance of a package, both for developers and end users. Even more so since Go 1.11 is not available on current LTS versions of popular distros.
+
+Would there be any interest of pursuing this further?
+Our `CONTRIBUTING.md` documentation on submitting code was copied from BoringSSL's. As such, it assumes that you know to pull from the googlesource.com repo. Since Mundane is also available on GitHub, it's less obvious in our case.
+
+Concretely, we should document that submissions should be pushed to https://fuchsia.googlesource.com/mundane. It's probably easiest to document that by suggesting the following command to clone: `git clone --recursive https://fuchsia.googlesource.com/mundane`.
+Both Mundane and the better-established [*ring*] are Rust cryptographic libraries that have difficulty-of-misuse as an explicit goal and are based on BoringSSL. I would like to suggest that any significant differences between them be documented such that developers in the target audience (whichever that may be) can make an informed choice between these two libraries.
+
+cc @briansmith
+
+[*ring*]: <https://github.com/briansmith/ring>
+This may have been a conscious choice to avoid but I wanted to see if it makes sense to use some type that implements `AsRef<[u8]>` in place of `&[u8]`? This would make it easy for users to supply `&str` or `String` in addition to `&[u8]` when calling functions. I thought this would be in line with the idea that mundane is intended to be easy to use.
+Open questions:
+- Presumably individual block operations should be behind a feature flag since they're low level, but we still want to be able to expose high-level cipher modes (e.g., AES-GCM) via composition. How do we do that?
+- What block cipher modes do we have to support?
+- Do we want to build in padding?
+  - Do we want to expose a non-padding variant as well?
+  - How do we ensure that padding is only with safe block cipher modes (e.g., don't allow PKCS11 padding w/ CBC, which is vulnerable to a padding oracle attack)

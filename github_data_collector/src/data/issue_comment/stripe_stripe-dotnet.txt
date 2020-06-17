@@ -1,0 +1,126 @@
+As a developer, I want to have an extension to IServiceCollection (Extensions.DependencyInjection.Abstractions) so that I can register all stripe services and inject them directly 
+Expected Method
+```csharp
+services.AddStripe(ApiKey);
+```
+Notice that for HTTP client it is recommended to use ```services.AddHttpClient```
+With some of the more recent changes, there have been a lot of string "status" fields and API methods which ask for a string value, which must be one of a set of values.  Could these not be implemented as enums instead of strings?  
+
+Examples:
+
+* [List Payment Methods](https://stripe.com/docs/api/payment_methods/list) method - has a required `type` parameter but doesn't tell you what values this can be.  API error message helpfully provided card, card_present
+* [Payment Intent Object](https://stripe.com/docs/api/payment_intents/object) - has a status field, API documentation describes the allowed values
+* `AddExpand` method - previously we would set ExpandPropertyName = true, which was type-safe.  Now we need to know the name of the object to expand, and this doesn't match up with the type names in this SDK (e.g. balance_transaction on charge).  I appreciate that you can't easily do multi-level expansion with enums, so perhaps a static class of consts would be helpful in this scenario
+
+Using enums instead of strings would make development a lot easier and reduce the possibility of runtime bugs.
+
+We just starting using stripe and noticed theres nearly no documentation, just as a suggestion or enhancement it would be really helpful if you at least provided some code comments within the library more specifically the .net lib even if only on top of methods etc.
+The current implementation of payment instruments (i.e. cards, bank accounts, sources) has a lot of inconsistencies and is hard to maintain.
+
+## Current state
+
+### Cards
+
+- Entity: `StripeCard`
+
+- API methods:
+
+   - Creation:
+       - On a customer: `StripeCardService.Create()` with `StripeCardCreateOptions`
+       - On a recipient: `StripeCardService.Create()` with `StripeCreditCardOptions`
+       - On an account: not possible, but you can pass a card when creating an account via `StripeAccountCardOptions`
+
+    - Retrieval:
+        - On a customer: `StripeCardService.Get()` with `isRecipient=false`
+        - On a recipient: `StripeCardService.Get()` with `isRecipient=true`
+        - On an account: not possible, but you can access the `ExternalAccounts` attribute which is a `StripeList<Source>` where `Source` is a wrapper over `StripeCard` / `StripeBankAccount` / `StripeDeleted`
+
+    - Update:
+        - On a customer: `StripeCardService.Update()` with `StripeCardUpdateOptions` and `isRecipient=false`
+        - On a recipient: `StripeCardService.Update()` with `StripeCardUpdateOptions` and `isRecipient=true`
+        - On an account: not possible
+
+    - Delete:
+        - On a customer: `StripeCardService.Delete()` with `isRecipient=false`
+        - On a recipient: `StripeCardService.Delete()` with `isRecipient=true`
+        - On an account: not possible
+
+    - List:
+        - On a customer: `StripeCardService.List()` with `StripeListOptions` and `isRecipient=false`
+            - **NB**: currently this will hit `/v1/customers/{CUSTOMER_ID}/sources` which will return _all_ payment sources, and non-cards will be incorrectly deserialized. Cf. #989
+        - On a recipient: `StripeCardService.List()` with `StripeListOptions` and `isRecipient=true`
+        - On an account: not possible, but you can access the `ExternalAccounts` attribute (cf. "Retrieval" above)
+
+### Bank accounts
+
+- Entities:
+    - `CustomerBankAccount` when the bank account is a payment source on a customer
+    - `StripeBankAccount` when the bank account is an external account on a custom account
+
+- API methods:
+
+    - Creation:
+        - On a customer: `BankAccountService.Create()` with `BankAccountCreateOptions`
+        - On an account: not possible, but you can pass a bank account when creating an account via `StripeAccountBankAccountOptions`
+
+    - Retrieval:
+        - On a customer: `BankAccountService.Get()`
+        - On an account: not possible, but you can access the `ExternalAccounts` attribute which is a `StripeList<Source>` where `Source` is a wrapper over `StripeCard` / `StripeBankAccount` / `StripeDeleted`
+
+    - Update:
+        - On a customer: `BankAccountService.Update()` with `BankAccountUpdateOptions`
+        - On an account: not possible
+
+    - Delete:
+        - On a customer: `BankAccountService.Delete()`
+        - On an account: not possible
+
+    - List:
+        - On a customer: `BankAccountService.List()` with `StripeListOptions`
+            - This will hit `/v1/customers/{CUSTOMER_ID}/bank_accounts`. While this returns the correct results, it is deprecated and hitting `/v1/customers/{CUSTOMER_ID}/sources?object=bank_account` would be preferable
+
+    - Verify:
+        - On a customer: `BankAccountService.Verify()` with `BankAccountVerifyOptions`
+        - On an account: N/A (external accounts don't need to be verified)
+
+### Sources
+
+- Entity: `StripeSource`
+
+- API methods:
+
+    - Creation: `StripeSourceService.Create()` with `StripeSourceCreateOptions`
+
+    - Retrieval: `StripeSourceService.Get()`
+
+    - Update: `StripeSourceService.Update()` with `StripeSourceUpdateOptions`
+
+    - Delete: N/A (source objects are not deletable)
+
+    - Attach to a customer: `StripeSourceService.Attach()` with `StripeSourceAttachOptions`
+
+    - Detach from a customer: `StripeSourceService.Detach()`
+
+    - Listing all sources on a customer: `StripeSourceService.List()` with `StripeSourceListOptions` (once #1064 is merged)
+
+    - Verify: not possible
+        - Other libraries support this so we should implement this, but there are no source types that use this yet so this is very lo-pri.
+
+## TODO
+
+- [x] Decide whether methods for nested resources should live on the service for the top-level owning resource (e.g. `StripeCustomerService`) or the service for the owned resource (e.g. `StripeCardService`)
+    Both sides have pros and cons. In the current state, most methods live on the service for the owned resource so that's probably what we should use in order to minimize breaking changes. This is slightly problematic for source objects which are a top-level API resource that can also be nested under customer objects, so we might need some special cases there.
+
+- [x] Get rid of `CustomerBankAccount` and use `StripeBankAccount` for all bank accounts, whether they're a customer's payment source or an account's external account.
+
+- [x] Add support for managing external accounts (cf. #980). If we do decide that methods should live on the service for the owned resource, then we might want to get rid of the `isRecipient` flag and either use different method names (`CreateOnCustomer`, `CreateOnRecipient` and `CreateOnAccount`) or an enum parameter to decide which URL to hit.
+
+- [x] Refactor the `Source` object, and ideally rename it as it is used as a "destination" and not a "source" in many places (external accounts, payout destinations)
+
+- [ ] Get rid of `StripeCreditCardOptions` (or at least give it a better name)
+
+- [x] Add `Stripe` prefix to `BankAccount*` service + option objects
+
+- [x] Add `StripeSourceService.Verify()` method
+
+I probably forgot a lot of things, feel free to comment/edit as needed!

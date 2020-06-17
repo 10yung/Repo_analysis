@@ -1,0 +1,128 @@
+Currently `Lcobucci\JWT\Signer\Key` utilizes a magic sentinel `'file://'` to decide whether or not to read key content from a file.
+
+Inline signalling like this can be troublesome and more than a little dangerous at times. It can also potentially (however unlikely) lead to _accidentally_ attempting to read from a file.
+
+As an alternative I would like to propose perhaps a static secondary constructor "fromFile" where a user could _specifically_ request a file's contents.
+
+It's not a large change, but adds a lot in the way of safety. As v4 final is not yet tagged I hope this breaking change isn't asking too much.
+This issue is related to current version in `master` branch and [current doc for **Issuing Tokens**](https://lcobucci-jwt.readthedocs.io/en/latest/issuing-tokens/).
+
+Related code is:
+```php
+
+$configuration = Configuration::forSymmetricSigner(
+    new Sha256(),
+    new Key('mBC5v1sOKVvbdEitdSBenu59nfNfhwkedkJVNabosTw=')
+);
+
+$token = $config->createBuilder()
+                ->issuedBy('http://example.com')
+                // ...
+                ->getToken($config->getSigner(), $config->getSigningKey());
+```
+
+I't make impossible to use `Builder` simply as service to DI container, because I need above that the `Configuration` service to get `Key` &  `Signer`. 
+
+In use case in app sound as greate flow to get prepared instance of `Builder` with few system-wide claims and allow to add custom claims and than convert to the token. This interface here required to get pair of cooperating services (configurator + prepared `Builder`) or create custom new envelope object which contains both of them and copy-provide their interface for better integration with simple DI services design.
+
+I understanding it great for tests and clean design. But maybe should be better to refactor `Builder` and split their internal implementation to `ClaimsBuilder` and `SignBuilder` and keep basic `Builder` with simple interface like in version `v3.3`.
+
+My suggest is:
+- rename `Builder` to `ClaimsBuilder`,
+- create `SignBuilder`,
+- create `Builder` with simple interface for better support use DI design.
+
+Is my things correct or I am blind at any stage?
+Recently updated and noticed that an ability to set leeway for clock skew was added in https://github.com/lcobucci/jwt/pull/248/files
+
+That's great (thanks), but I'd like to ask that the default value is made configurable through a global constant static method.  The reality is that this package is a fairly deep downstream dependency for a lot of people.  I could start the process to convince league/oauth2-server to support the setting, and then start convincing laravel/passport to support it, but it's just not worth the time.
+
+Personally I've just updated my previous composer post-install patch to:
+
+    --- a/vendor/lcobucci/jwt/src/ValidationData.php
+    +++ b/vendor/lcobucci/jwt/src/ValidationData.php
+    @@ -34,7 +34,7 @@
+          * @param int $currentTime
+          * @param int $leeway
+          */
+    -    public function __construct($currentTime = null, $leeway = 0)
+    +    public function __construct($currentTime = null, $leeway = 120)
+         {
+             $currentTime  = $currentTime ?: time();
+             $this->leeway = (int) $leeway;
+
+It would be a bit cleaner if instead I could just make a call like:
+
+    Lcobucci\JWT\ValidationData::setDefaultLeeway(120);
+
+Best
+I'd be interested in helping to stabilize the v4 code APIs. Do you have a roadmap on what is still needing to be completed?
+Currently encoder is [concrete class](https://github.com/lcobucci/jwt/blob/3.3/src/Parsing/Encoder.php) which make [this line](https://github.com/lcobucci/jwt/blob/3.3/src/Builder.php#L68) nonsense.
+
+Because user can only pass a instance of `Lcobucci\JWT\Parsing\Encoder`, but `Lcobucci\JWT\Parsing\Encoder` has no constructor which means the only option is passing a instance of `new Lcobucci\JWT\Parsing\Encoder`, so actually the `$encoder` can be eliminated because the `$encoder` always have to be the result of `new Lcobucci\JWT\Parsing\Encoder`.
+
+The best solution is using interface instead of class, this way user can inject their own `Encoder` also. Actually I have problem with `jwt\src\Parsing\Encoder::jsonEncode` because of the data to be encoded contains binary data the `json_encode` will give an error, so I want to have my own implementation of `Encoder`, but currently I can't do that because `Encoder` is not an interface.
+Disclaimer: I'm not sure if this is still relevant for `4.0`.
+
+The current implementation of `getClaim` does not allow null-values:
+
+```php
+public function getClaim($name, $default = null)
+{
+    if ($this->hasClaim($name)) {
+        return $this->claims[$name]->getValue();
+    }
+
+    if ($default === null) {
+        throw new OutOfBoundsException('Requested claim is not configured');
+    }
+
+    return $default;
+}
+```
+
+Even if you specifically provide the default value:
+
+```php
+$token->getClaim('sub', null);
+```
+
+> OutOfBoundsException
+
+This could be solved by simply changing this line:
+
+```php
+if ($default === null) {
+```
+
+to
+
+```php
+if (func_num_args() === 1) {
+```
+As stated in #229 we could be more flexible regarding the format use we generate the `iat`, `exp`, and `nbf` claims.
+@Ocramius gave a nice idea to help users: based on the `Configuration` have a really simple way to get a valid token or null from a raw token (string), something like:
+
+```php
+function (string $tokenData) use ($configuration): ?Token {
+    $parser = $configuration->getParser();
+    $validator = $configuration->getValidator();
+    $constraints = $configuration->getConstraints();
+
+    try {
+        $token = $parser->parse($tokenData);
+    } catch (\Lcobucci\JWT\Exception $e) {
+        return null;
+    }
+
+    if (!$validator->validate($token, ...$constraints) {
+        return null;
+    }
+
+    return $token;
+};
+```
+
+In order to achieve this we would need to implement #139 but also add the validation constraints in the configuration object.
+As pointed by @renatomefi we're relying on SPL exceptions and would be really good to have an exception tree for this library in order to simplify things while catching exceptions.
+

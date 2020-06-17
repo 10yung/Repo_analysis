@@ -1,0 +1,143 @@
+See https://sourceware.org/git/gitweb.cgi?p=binutils-gdb.git;a=commitdiff;h=fd3619828e94a24a92cddec42cbc0ab33352eeb4
+This is useful for binaries (using backward-cpp) that are built with
+relative source file paths.  In such a situation, backward-cpp will
+generally not be able to locate the source files.  This change allows
+the user to specify a delimited list of search paths in the following
+environment variable:
+
+```
+BACKWARD_CXX_SOURCE_PREFIXES
+```
+
+The paths are separated by semicolons on Windows and colons otherwise.
+When the environment variable is set, those search paths will be tried
+first.  If they do not yield any valid files then backward-cpp will
+fall back to current behavior.
+
+Fixes #153 
+Hi,
+I happens that, in some build systems/configurations, a binary can end up with relative paths to source files in the debug info in the binary.  This can happen in some cases when building a C++ program with CMake+Ninja (and currently this behavior is not easy to workaround in general).  Then, if the program is run in a different directory then `backward-cpp` will not be able to locate the source files and so the stack trace will not contain snippets.
+
+I propose allowing the user to specify an optional path prefix that `backward-cpp` will use when searching for source files using the following algorithm in the `SourceFile` class:
+
+1. If the source file path is absolute, just open it as-is.
+2. If the path is relative then first try to open it as-is; if this fails, and if there is a user-specified prefix, prepend the prefix to the filename and retry opening the file.
+
+The prefix could be specified through an environment variable `BACKWARD_CPP_SRC_PREFIX`, how does that sound?  If it sounds OK, then I can submit a PR for it.  Also open to other suggestions.
+It happens sometimes that otherwise working backward prints `Stack trace (most recent call last) in thread 16:` and then it hangs. I am not able to reproduce this error reliably to check better.
+
+I've only seen it happening after message from memory mallocator to stderr (`double free or corruption (!prev)`, `double free or corruption (out)`, `free(): invalid next size (normal)`) thus I am suspecting it might be linked to #97. I don't mind wrong/confusing/corrup stack trace being printed but it troubles me that the program never quits (it is a service which gets restarted automatically after abort).
+
+Would it be possible to e.g. optionally install [POSIX timer](http://man7.org/linux/man-pages/man2/timer_create.2.html) when stack is about to be printed which would send SIGKILL (or some other  so that there is at least core dump for post-mortem) to the process after a few seconds?
+
+Should I try a PR in that direction, something like adding `STACK_WALKING_TIMEOUT`, 0 by default, installing the timer just after `print_header`?
+
+https://github.com/bombela/backward-cpp/blob/377cd4b66c8a9dbefc4968aa64149afde952c903/backward.hpp#L3398
+It would be nice to have an char* get_backward_backend()  function to display what backend is being used.
+https://github.com/bombela/backward-cpp/blob/aa3f253efc7281148e9159eda52b851339fe949e/backward.hpp#L505-L515
+
+If `__cxa_demangle` fails here then `result` is NULL and the buffer is leaked.
+Backward-cpp currently finds the path to the executable by calling [`readlink`](https://linux.die.net/man/2/readlink)`("/proc/self/exe")`. `/proc/self/exe` is a special file that normally acts like a symlink, but when the executable it links to has been deleted or replaced, calling `readlink` on it returns the path to the original executable with the string " (deleted)" appended, which is obviously not a valid path, and prevents Backward-cpp from working as a result. However, in that case, directly opening `/proc/self/exe` still lets you access the original executable file!
+
+Backward-cpp should be directly opening `/proc/self/exe` rather than the file it links to in order to function correctly when the executable has been deleted or replaced.
+When cmake detects dwarf library (due incorrect initialization of `BACKWARD_LIBRARIES`) the interface target `Backward::Backward` generates an empy `INTERFACE_LINK_LIBRARIES` which causes all tests to fail at link time.
+
+Offending line:
+https://github.com/bombela/backward-cpp/blob/27349d0a751e8a0bc62d60c198972712020f34ac/BackwardConfig.cmake#L114
+
+Should be: `LIST(APPEND _BACKWARD_LIBRARIES ${LIBDWARF_LIBRARIES}) `
+
+
+Example: (note missing -ldwarf -lelf -ldl)
+```
+cmake -DCMAKE_BUILD_TYPE=Debug -DBACKWARD_TESTS=ON -G "CodeBlocks - Unix Makefiles" /home/_/Projects/backward-cpp
+-- The CXX compiler identification is GNU 7.4.0
+-- Check for working CXX compiler: /usr/bin/c++
+-- Check for working CXX compiler: /usr/bin/c++ -- works
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Could NOT find libdw (missing: LIBDW_LIBRARY LIBDW_INCLUDE_DIR) 
+-- Could NOT find libbfd (missing: LIBBFD_LIBRARY LIBBFD_INCLUDE_DIR) 
+-- Found libdwarf: /usr/lib/x86_64-linux-gnu/libdwarf.so  
+-- Found Backward: /home/_/Projects/backward-cpp  
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /home/_/Projects/backward-cpp/cmake-build-debug
+...
+[ 75%] Building CXX object CMakeFiles/test_stacktrace.dir/test/stacktrace.cpp.o
+/usr/bin/c++  -DBACKWARD_HAS_BACKTRACE=0 -DBACKWARD_HAS_BACKTRACE_SYMBOL=0 -DBACKWARD_HAS_BFD=0 -DBACKWARD_HAS_DW=0 -DBACKWARD_HAS_DWARF=1 -DBACKWARD_HAS_UNWIND=1 -isystem /usr/include/libdwarf -isystem /home/_/Projects/backward-cpp  -Wall -Wextra -pedantic-errors -g -g   -std=gnu++11 -o CMakeFiles/test_stacktrace.dir/test/stacktrace.cpp.o -c /home/_/Projects/backward-cpp/test/stacktrace.cpp
+[100%] Linking CXX executable test_stacktrace
+/home/_/.local/share/JetBrains/Toolbox/apps/CLion/ch-0/192.5728.100/bin/cmake/linux/bin/cmake -E cmake_link_script CMakeFiles/test_stacktrace.dir/link.txt --verbose=1
+/usr/bin/c++   -Wall -Wextra -pedantic-errors -g -g  -rdynamic CMakeFiles/test_stacktrace.dir/test/stacktrace.cpp.o  -o test_stacktrace -Wl,-rpath,/home/_/Projects/backward-cpp/cmake-build-debug libtest_main.so 
+CMakeFiles/test_stacktrace.dir/test/stacktrace.cpp.o: In function `backward::TraceResolverLinuxImpl<backward::trace_resolver_tag::libdwarf>::resolve(backward::ResolvedTrace)':
+/home/_/Projects/backward-cpp/backward.hpp:1692: undefined reference to `dladdr1'
+/home/_/Projects/backward-cpp/backward.hpp:1806: undefined reference to `dwarf_linesrc'
+/home/_/Projects/backward-cpp/backward.hpp:1809: undefined reference to `dwarf_dealloc'
+/home/_/Projects/backward-cpp/backward.hpp:1813: undefined reference to `dwarf_lineno'
+... 
+```
+
+Compiled with: -DBACKWARD_HAS_DW=1 and g++-6 (Debian 6.3.0-18+deb9u1) 6.3.0 20170516
+Fix the following warnings: -Wold-style-cast, -Wsign-conversion, -Wswitch-default
+In
+
+`file_handle.reset(open(filename_object.c_str(), O_RDONLY));` 
+
+`open` returns 0 only if we open `stdout`. That means in `reset` we always creating empty handler in this line: 
+
+`explicit handle(T val): _val(val), _empty(false) { if(!_val) _empty = true; }`
+
+and that means when we convert to pointer in
+
+```
+operator const dummy*() const {
+		if (_empty) {
+			return nullptr;
+		}
+		return reinterpret_cast<const dummy*>(_val);
+}
+```
+
+we always return 0.
+
+but since in lines
+
+```
+if (file_handle < 0) {
+			return r;
+}
+```
+
+`0 < 0 == true` code never returns, even when open failed. Also, since file_handle is empty, file never closes:
+
+
+```
+~handle() {
+	if (!_empty) {
+		Deleter()(_val);
+	}
+}
+```
+
+But to check this API should be changed.  Simplest change I can think of is adding lambda to check emptiness:
+
+```
+explicit handle(T val, std::function<bool(T const &val)> is_empty): _val(val), _empty(false) { 
+    _empty = is_empty(val);
+}
+
+//...
+
+void reset(T new_val, std::function<bool(T const &val)> is_empty) {
+		handle tmp(new_val, is_empty);
+		swap(tmp);
+}
+
+//...
+
+file_handle.reset(open(filename_object.c_str(), O_RDONLY), [](int const &v){return v<0;});
+```
+
+Alternatively, template can be specified differently for `int`. That's not up to me anyway.

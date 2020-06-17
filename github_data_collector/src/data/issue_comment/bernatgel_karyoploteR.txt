@@ -1,0 +1,161 @@
+`plotKaryotype` fails with a cryptic error when building a karyotype:
+
+```
+kp <- plotKaryotype(plot.type=4, genome="hg38", chromosomes=c(paste0("chr", 1:22), "chrX"))
+WARNING: There was an error when filtering the chromosomes. Falling back to using the unfiltered genome. 
+Error: subscript is a NSBS object that is incompatible with the current
+  subsetting operation
+```
+
+After some debugging, this fails at the `getCytoband` step. As `getCytoband` can also use or not use a cache, I made this test:
+
+```diff
+
+diff --git a/R/plotKaryotype.R b/R/plotKaryotype.R
+index 823ec3b..87ab532 100644
+--- a/R/plotKaryotype.R
++++ b/R/plotKaryotype.R
+@@ -247,10 +247,10 @@ plotKaryotype <- function(genome="hg19", plot.type=1, ideogram.plotter=kpAddCyto
+   #Get the CytoBands if needed
+   if(is.null(cytobands)) {
+     if(!is.null(genome.name) && all(is.character(genome.name))) {
+-      cytobands <- getCytobands(genome.name)
++      cytobands <- getCytobands(genome.name, use.cache=use.cache)
+     } else {
+       if(all(is.character(genome))) {
+-        cytobands <- getCytobands(genome)
++        cytobands <- getCytobands(genome, use.cache=use.cache)
+       }
+     }
+     #if there are cytobands, filter the cytobands using the current genome
+```
+
+If I bypass the cache like that, all is well, if not, the error persists. This happens on the latest master installed via `devtools`.
+It seems like karyoploteR is computing coverage in a different way than IGV.
+
+I think that IGV is ignoring the reads that have pairs mapping outside the viewing region. In contrast, karyoploteR is including those reads as if they cover those bases.
+
+I'm only interested to know about the actual sequenced bases supported by actual reads. I'm not interested in the gaps in the read alignments, since the gaps do not tell me anything about how well a particular position is covered.
+
+Could I please ask if you might have any hints about how to get the desired behavior?
+
+Here's what I see from karyoploteR:
+
+![image](https://user-images.githubusercontent.com/209714/72225001-5b144e00-354e-11ea-81ac-3d1b0966a8b0.png)
+
+Here's what I see in IGV:
+
+![image](https://user-images.githubusercontent.com/209714/72225009-69626a00-354e-11ea-9283-977aa356f7a6.png)
+
+Here's my code:
+
+```r
+#!/usr/bin/env Rscript
+
+bam_file <- "possorted_genome_bam.bam"
+
+# BiocManager::install(
+#   c("TxDb.Hsapiens.UCSC.hg38.knownGene", "GenomicRanges", "karyoploteR", "EnsDb.Hsapiens.v86")
+# )
+
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(GenomicRanges)
+library(karyoploteR)
+library(magrittr)
+
+txdb_file <- "gencode.v32.annotation.sqlite"
+if (!file.exists(txdb_file)) {
+  # txdb <- makeTxDbFromGFF(file = "gencode.v32.annotation.gtf3.gz")
+  txdb <- makeTxDbFromGFF(
+    file = "temp2.gtf.gz",
+    format = "gtf",
+    organism = "Homo sapiens"
+  )
+  saveDb(txdb, txdb_file)
+} else {
+  txdb <- loadDb(txdb_file)
+}
+
+gencode_rds <- "gencode.v32.annotation.gff3.rds"
+if (!file.exists(gencode_rds)) {
+  gencode <- rtracklayer::import.gff3("gencode.v32.annotation.gff3.gz")
+  saveRDS(gencode, gencode_rds)
+} else {
+  gencode <- readRDS(gencode_rds)
+}
+
+genes <- gencode[,c("gene_type", "gene_id", "gene_name")] %>% unique()
+protein_coding_ids <- genes$gene_id[genes$gene_type == "protein_coding"]
+x <- gencode[,c("gene_name", "gene_id")] %>% unique()
+ensembl_to_symbol <- x$gene_name
+names(ensembl_to_symbol) <- x$gene_id
+genes[genes$gene_id == "ENSG00000227766.1",]
+genes[genes$gene_id == "ENSG00000206503.13",]
+
+pp <- getDefaultPlotParams(plot.type=1)
+pp$leftmargin <- 0.15
+pp$topmargin <- 15
+pp$bottommargin <- 15
+pp$ideogramheight <- 5
+pp$data1inmargin <- 10
+pp$data1outmargin <- 0
+
+regions <- list(
+  "HLA-A" = toGRanges("6:29,941,260-29,945,884")
+)
+kp <- plotKaryotype(genome = regions[["HLA-A"]], zoom = regions[["HLA-A"]], cex = 1, plot.params = pp)
+kpAddBaseNumbers(kp, tick.dist = 10000, minor.tick.dist = 2000,
+                 add.units = TRUE, cex=2, tick.len = 3)
+genes.data <- makeGenesDataFromTxDb(
+  txdb                       = txdb,
+  karyoplot                  = kp,
+  plot.transcripts           = TRUE,
+  plot.transcripts.structure = TRUE
+)
+protein_coding_ids]
+genes.data$genes$name <- ensembl_to_symbol[mcols(genes.data$genes)[,1]]
+kpPlotGenes(kp, data = genes.data, gene.name.cex = 2, r0 = 0, r1 = 0.15)
+
+# How can I make this ignore the gaps in reads?
+kp <- kpPlotBAMCoverage(kp, data = bam_file, r0 = 0.35, r1 = 1)
+computed.ymax <- kp$latest.plot$computed.values$max.coverage
+kpAxis(kp, ymin = 0, ymax = computed.ymax, r0 = 0.35, r1 = 1)
+
+kpAddMainTitle(kp, "Coverage", cex = 2)
+```
+
+Hello @bernatgel - thank you for all of your work on this great package!
+
+I'm not sure if I'm missing something obvious, but if I try to make an ideograms only plot (plot.type 6), adding base numbers causes the axis text to overlap each chromosome ideogram:
+
+```
+kp <- plotKaryotype(plot.type = 6)
+kpAddBaseNumbers(kp)
+```
+![ideograms](https://user-images.githubusercontent.com/15957306/71600070-7b3e1900-2b1b-11ea-8a2d-85351502efd0.png)
+
+I'm wondering if there is some way to give an option so that kpAddBaseNumbers() would only add a single x-axis for basepair coordinates at the bottom of the image, which would be much cleaner in the case of only working with ideograms. I've tried using a simple call to axis(), but the problem seems a little more complicated than that.
+
+Thank you.
+
+I am trying out the `kpPlotRainfall` function with some internal datasets (cancer genomes). I seem to get an error when variants are absent from a particular chromosome. Considering the demo dataset used in the [tutorial](https://bernatgel.github.io/karyoploter_tutorial//Examples/Rainfall/Rainfall.html), the error can be exemplified as follows when removing variants from chromosome 1:
+
+`> sm <- sm %>% dplyr::filter(chr != "1")`
+`> sm.gr <- toGRanges(sm[,c("chr", "start", "end", "ref", "alt")])`
+`> seqlevelsStyle(sm.gr) <- "UCSC"`
+`> kp <- plotKaryotype(plot.type = 4)`
+`> kpPlotRainfall(kp, data = sm.gr)`
+
+Error_ in attr(x, "tsp") <- c(1, NROW(x), 1) :  
+ __attempt to set an attribute on NULL__
+
+If r1 is NULL and r0 has two elements, r0 and r1, use them as r0 and r1. This will reduce the typing when using autotrack.
+Similar to the two triangles in UCSC
+When plotting genes with kpPlotGenes in data.panel=2, the strand of the genes is flipped. Problems with the computation of the strand marks.
+Adding base numbers with very small tick dist is too slow. Reimplement to take into account zoomed in region before plotting.
+Hello,
+I was wondering if you had any suggestions as to how kpPoints might plot point density [in a similar way to ggplot2](https://www.r-graph-gallery.com/2d-density-plot-with-ggplot2/)?  We have points of estimated copy number in 100kb bins across chromosomes, and it's difficult to determine whether or not outliers (CN > 4, 5, 6,  etc...) are a minority of points.
+
+Thanks,
+Mike
+As reported by @lnonell there's a bug in plot.type=5 causing the data panel to be inverted. This is due to implementation changes that implemented it as a special case of plot.type=3. A potential solution would be to invert ymin and ymax? Otherwise reimplement as an independent type.

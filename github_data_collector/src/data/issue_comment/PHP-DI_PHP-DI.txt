@@ -1,0 +1,255 @@
+Hi. I believe there is one use-case missing in the docs that I am not sure how to resolve.
+
+Suppose I have **Logger1** and **Logger2** entities. Both of them implement **LoggerInterface**. I would like to inject both of them by interface, i.e. inject _Logger1_ into **Controller1** via an interface and inject _Logger2_ into **Controller2** via an interface.
+
+Is this possible via the array-like definitions file? The _LoggerInterface_ in the docs deals with one Logger entity only.
+Reproduce with:
+php php-cs-fixer --rules=native_function_invocation fix src --allow-risky=yes
+(php-cs-fixer from : https://cs.symfony.com/)
+
+Details:
+https://veewee.github.io/blog/optimizing-php-performance-by-fq-function-calls/
+PR for Fix1 of #693 
+The `DefaultValueResolver` currently gets executed before the `TypeHintContainerResolver`. This causes type hinted parameters with default values always to resolve to the default value. Thus, it's impossible to overload php functions with new parameters, which requires any additional parameter to default to `null` in order to prevent the PHP warning: `Declaration of ... should be compatible with ...`
+
+```
+public function call(Service $service = null) {
+  // $service is always null
+}
+
+$container->set(Service::class, $service);
+$container->call([$obj, 'call']);
+```
+**Fix1**
+
+`Container.php:402` needs to be changed from:
+
+```
+$parameterResolver = new ResolverChain([
+    ...
+    new DefaultValueResolver,
+    new TypeHintContainerResolver($this->delegateContainer)
+]);
+```
+
+to:
+
+```
+$parameterResolver = new ResolverChain([
+    ...
+    new TypeHintContainerResolver($this->delegateContainer),
+    new DefaultValueResolver
+]);
+```
+**Or Fix2**
+
+Allow for injecting:
+- a custom `ResolverChain`
+- or a custom `Invoker` instance or class
+DI\add does not function on nested arrays, don't know if this behavior is by design, and thus expected, or not
+
+```php
+$originalDefinitions = [
+    'settings' => [
+        'vowels' => ['a', 'e', 'i'],
+        'consonants' => ['b', 'c', 'd'],
+    ],
+];
+$overrideDefinitions = [
+    'settings' => DI\add([
+        'vowels' => ['i', 'o', 'u'],
+        'consonants' => DI\add(['f', 'g', 'h']), // <--- notice the add()
+        'emojis' => ['👌', '👍', '😎'],
+    ]),
+];
+
+$builder = new DI\ContainerBuilder();
+$builder->addDefinitions($originalDefinitions, $overrideDefinitions);
+$builder->build()->get('settings');
+```
+
+##### Expected result
+
+```php
+[
+    'vowels' => ['i', 'o', 'u'],
+    'consonants' => ['b', 'c', 'd', 'f', 'g', 'h']),
+    'emojis' => ['👌', '👍', '😎']
+]
+```
+
+##### Actual result
+
+```php
+[
+    'vowels' => ['i', 'o', 'u'],
+    'consonants' => ['f', 'g', 'h']),
+    'emojis' => ['👌', '👍', '😎']
+]
+```
+
+The result is the expected for vowels and emojis, it is replacing and adding new items to the array
+On the other hand I expect consonants to be added to the array by using DI\add, what it actually happens is that DI\add does not consider the previous array and creates a new one with the provided data mimicking the replacement done on vowels
+Hi,
+
+is there a way to force explicit definitions **with** autowiring?
+Something like this:
+
+```php
+$builder = new DI\ContainerBuilder();
+$builder->useAutowiring(false);
+$builder->addDefinitions([
+    \App\Foo::class => \DI\autowire()
+]);
+```
+
+Actually it fails with `DI\Definition\Exception\InvalidDefinition: Cannot autowire entry "App\Foo" because autowiring is disabled`
+
+This would benefit to compilation: http://php-di.org/doc/performances.html#optimizing-for-compilation
+When the class gets destroyed in its life cycle, the `__destruct` method gets called and, if there's one implementation in the original class, the proxy class tries to execute the base class implementation. But looks like the proxy class is getting destroyed before creating a instance for the base class and, as there's no check for null values, we get the following error:
+
+```
+[Wed Jun 12 00:52:18 2019] ::1:59011 [500]: / - Uncaught Error: Call to a member function __destruct() on null in <Project-path>\var\proxies\ProxyManagerGeneratedProxy__PM__<CLASS_NAME>Generated8d9f8c89dc680a18cbf6f65f21952d52.php:55
+Stack trace:
+#0 <Project-path>\vendor\php-di\php-di\src\Proxy\ProxyFactory.php(60): ProxyManagerGeneratedProxy\__PM__\<CLASS_NAME>\Generated8d9f8c89dc680a18cbf6f65f21952d52->__destruct()
+#1 <Project-path>\vendor\php-di\php-di\src\Proxy\ProxyFactory.php(74): DI\Proxy\ProxyFactory->createProxy('<CLASS_NAME>', Object(Closure))
+#2 <Project-path>\vendor\php-di\php-di\src\Compiler\ObjectCreationCompiler.php(140): DI\Proxy\ProxyFactory->generateProxyClass('<CLASS_NAME>')
+#3 <Project-path>\vendor\php-di\php-di\src\Compiler\ObjectCreationCompiler.php(39): DI\Compiler\Obje in <Project-path>\var\proxies\ProxyManagerGeneratedProxy__PM_<CLASS_NAME>Generated8d9f8c89dc680a18cbf6f65f21952d52.php on line 55
+```
+
+The project path and class full qualified names were hidden because it's a private project, where the class is related to database connectivity.
+
+That class just access authorization data and creates a new connection instance. The `__destruct` method implementation exists to ensure the connection will be closed when the class gets destroyed. 
+
+In this scenario the class was never used and that's why I believe it's getting destructed before creating an instance for the original class.
+ServiceLocator
+- Serving "lazy" dependencies for classes using ServiceSubscriberInterface.
+- A ServiceSubscriber exposes its dependencies via static getSubscribedServices() method.
+- A ServiceLocator instance could then be injected into a class via constructor or a property - the instance would be already configured with dependences read from getSubscribedServices(), but the dependences won't be instantiated until first get - that's how "laziness" is introduced
+- DI\Definition\Reference checks if it's a ServiceLocator entry by comparing its name with DI\Definition\Reference::$serviceLocatorClass
+- Reference definitions are passed with additional parameter - $requestingName which generally points to name of the class which implements ServiceSubscriberInterface - to resolve ServiceLocator for that class
+- Suggested as a lightweight alternative for heavyweight proxies from ocramius/proxy-manager
+
+note:
+- it's based on changes from PHP-DI/PHP-DI#662 (so commit 59a2216 is included here as well) - since there is second argument passed to `Reference` constructor, to also cover `AnnotationBasedAutowiring::readConstructor()` method, which was introduced in that PR
+
+Usage:
+```php
+class MyClass implements ServiceSubscriberInterface
+{
+    /**
+     * @var ServiceLocator
+     */
+    protected $serviceLocator;
+
+    /**
+     * @param ServiceLocator $serviceLocator
+     */
+    public function __construct(ServiceLocator $serviceLocator)
+    {
+        $this->serviceLocator = $serviceLocator;
+    }
+
+    /**
+     * Lazy instantiate heavy dependencies on-demand
+     */
+    public static function getSubscribedServices(): array
+    {
+        return [
+            SomeClass::class,
+            'heavyDependency' => HeavyService::class,
+        ];
+    }
+
+    public function doOperation()
+    {
+        $someClass = $this->serviceLocator->get(SomeClass::class);
+        return $someClass->doSomething();
+    }
+
+    public function getSomethingFromThatHeavyDependency()
+    {
+        // this method may be rarely used, and it might be good idea to skip resolving the dependency every time during instantiation for performance reasons
+        return $this->serviceLocator->get('heavyDependency')->getSomething();
+    }
+}
+
+```
+
+_[from ovos/PHP-DI#7]_
+- compile final function with injected dependencies
+- only for closure factories for now (as the first step)
+
+1) Simple example:
+before:
+```php
+return $this->resolveFactory(static function () {
+    return 'bar';
+}, 'factory');
+```
+now:
+```php
+return (static function () {
+    return 'bar';
+})();
+```
+2) More complex example:
+before:
+```php
+return $this->resolveFactory(static function (\DI\Factory\RequestedEntry $entry, \DI\Container $c, $dbName = null) {
+    $parts = explode('.', $entry->getName());
+    $type = $parts[1];
+    if ($dbName === null && isset($parts[2])) {
+        $dbName = $parts[2] !== '0' ? $parts[2] : false;
+    }
+    $factory = $c->get(\CMS\Database\ConnectionFactory::class);
+    return $factory->create($type, $dbName);
+}, 'db.mysql', [
+            'dbName' => NULL,
+        ]);
+```
+now:
+```php
+return (static function (\DI\Factory\RequestedEntry $entry, \DI\Container $c, $dbName = null) {
+    $parts = explode('.', $entry->getName());
+    $type = $parts[1];
+    if ($dbName === null && isset($parts[2])) {
+        $dbName = $parts[2] !== '0' ? $parts[2] : false;
+    }
+    $factory = $c->get(\CMS\Database\ConnectionFactory::class);
+    return $factory->create($type, $dbName);
+})(new DI\Compiler\RequestedEntryHolder('db.mysql'), $this->get5cc4bd5c6dc8e808068072(), NULL);
+```
+
+_[from ovos/PHP-DI#6]_
+ - run preg_replace_callback already during compilation
+
+from:
+```php
+    protected function get5ce3da5dc66c0791095127()
+    {
+        return \DI\Definition\StringDefinition::resolveExpression('path.cache', '{BASE_PATH}/application/cache', $this->delegateContainer);
+    }
+
+    protected function get5ce3da5dc66c3314070297()
+    {
+        return \DI\Definition\StringDefinition::resolveExpression('path.cache.app', '{path.cache}/file', $this->delegateContainer);
+    }
+```
+
+to:
+```php
+    protected function get5ce3da5dc66c0791095127()
+    {
+        return ''.$this->resolveStringPlaceholder('BASE_PATH', 'path.cache').'/application/cache';
+    }
+
+    protected function get5ce3da5dc66c3314070297()
+    {
+        return ''.$this->resolveStringPlaceholder('path.cache', 'path.cache.app').'/file';
+    }
+```
+
+where `resolveStringPlaceholder` proxies to `$this->delegateContainer->get()`
+
+_[from ovos/PHP-DI#5]_

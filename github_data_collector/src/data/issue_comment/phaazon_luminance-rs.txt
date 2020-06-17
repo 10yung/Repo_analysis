@@ -1,0 +1,150 @@
+In #291, some code was added to `check_types_match` to check texture arrays. That code looks very very redundant to write and pretty boring.
+
+Macro, macro man? :eyes: 
+The following program instantly crashes on my computer:
+
+```rust
+use luminance_glfw::{GlfwSurface, Surface as _, WindowDim, WindowOpt};
+
+fn main() {
+    let surface = GlfwSurface::new(WindowDim::Windowed(500, 500), "TEST", WindowOpt::default());
+
+    match surface {
+        Ok(mut surface) => loop {
+            surface.poll_events();
+            surface.swap_buffers();
+        },
+        Err(_) => {}
+    }
+}
+```
+
+The following error message is printed:
+```
+X Error of failed request:  BadWindow (invalid Window parameter)
+  Major opcode of failed request:  40 (X_TranslateCoords)
+  Resource id in failed request:  0x0
+  Serial number of failed request:  150
+  Current serial number in output stream:  150
+```
+
+Using `wait_events` preduces the same result. Commenting out the `poll_events` line causes the program to run with no crashes. My window manager is xmonad 0.15, and its possible there is a bad interaction there.
+Fix #295 
+
+This pull request add a new method, `new_multi()` , to enable the multiple OpenGL contexts creation in one thread. See the PoC [nikut](https://github.com/othelarian/nikut) for a working example. The feature `multiwin` must be explicitly declare to enable the use of this new method.
+Alpha channel can be blended separately on OpenGL. We need to change a bit the current blending interface to take an `enum` that will either allow to set blending for the regular RGBA case, or for RGB + A.
+
+That should be pretty easy to do.
+In a first attempt to go multiwin, the GraphicsState must be able to be swap from a previously current context to a new current context. As it's only relevant for the window manager to make the switch, and because it's a very specific operation, only useful in a specific case, I think the best way can be one of this two solutions:
+
+* add a feature in the toml to enable the same action of disable std, but only for the GraphicsState.
+* add a alternative constructor and a swap method to the GraphicsState impl to be able to make it swappable while keeping all the actual code unchanged.
+
+I currently starting a fork to test the second approach, but if you have a different idea of how to do it, share it! ;-) 
+Right now the only way to render with `luminance` is using the `GlfwSurface` or `GlutinSurface` structures, which provide events, cursor hiding, fullscreen support and setting samples. That's... about it.
+
+Any serious game/engine will probably want to code more things with the platform layer, but with this system you're forced to use the `Surface` trait for everything. I understand that `luminance` requires a very specific setup, and this system is a good way of abstracting it out, so it probably isn't a good idea to change it to something else.
+
+I think this could be easily solved, and without the need to change anything, by just making a way to get the window handle. So, for example, `luminance-glfw` would have a `get_handle(surface: &GlfwSurface) -> glfw::Window` function.
+
+That way if you ever need to use `glfw::Window` for anything you can just get it instead of having to implement the trait yourself. If you like this idea, I can make a pull request.
+I couldn’t find any good way to pass the number of layers, hence the RFC.
+
+It’s also missing 1D and cubemap array textures, but those can come later.
+
+Otherwise it works.
+Currently, the generated wrapper types (`Vertex`) have a `new` static method that is not `const`. We need to turn it `const`.
+Hi, thanks for your work on luminance!
+
+I was taking a look at the demos on my *very* old Lenovo X200, which has a "Mobile 4 Series Chipset Integrated Controller" (from.. 2008 it seems?).
+
+By default mesa reports OpenGL 2.1, but with some environment variables, you can get it to pretend to support OpenGL 3.3 and GLSL 330 (which it does, to some degree), so running examples becomes:
+
+```
+MESA_GL_VERSION_OVERRIDE=3.3 MESA_GLSL_VERSION_OVERRIDE=330 cargo run --example 04-shader-uniforms
+```
+
+One thing failed though: uniform type validation. I've dug into the code and it seems luminance uses `glGetUniformIndices` to retrieve the index of a uniform, which it then uses to get its GLTYPE, and then there's some mapping going on to a Rust enum, and it checks that everything matches.
+
+Unfortunately, on this machine, `glGetUniformIndices` seems to always return 0 - rather, it doesn't seem to write anything to the output, but it's kinda hard to tell, because it has a void return type. At any rate, it doesn't write `GL_INVALID_INDEX` (maybe `GL_INVALID_OPERATION` is generated though? I didn't check).
+
+Anyway it kept getting the index `0`, so there were some type mismatches as soon as you had multiple uniforms. I got it working on this computer by switching to `glGetUniformLocation` instead, but I'm entirely unsure that this is the right fix. In particular, [the docs](https://www.khronos.org/registry/OpenGL-Refpages/gl4/html/glGetUniformLocation.xhtml) seem to indicate that it wouldn't work for structures, arrays of structures, etc
+
+I see `UniformBuilder` already has some logic to get the index/location (are those two different concepts?) of a uniform whether it's a "uniform block" or "just a uniform" - maybe that could be used for type validation?
+
+---
+
+I'm not submitting a PR right now as unfortunately rustfmt was applied to my local copy, and, as I said, I'm not sure this is even a viable fix & I think there could be some code re-use opportunity here, but here's what my `uniform_type_match` function looks like:
+
+```rust
+// Check whether a shader program’s uniform type matches the type we have chosen.
+fn uniform_type_match(program: GLuint, name: &str, ty: Type) -> Result<(), UniformWarning> {
+    let mut size: GLint = 0;
+    let mut glty: GLuint = 0;
+
+    unsafe {
+        // get the max length of the returned names
+        let mut max_len = 0;
+        gl::GetProgramiv(program, gl::ACTIVE_UNIFORM_MAX_LENGTH, &mut max_len);
+
+        // get the index of the uniform
+        let index;
+
+        #[cfg(feature = "std")]
+        {
+            // here are the actual changes
+            let c_name = CString::new(name.as_bytes()).unwrap();
+            let ret = gl::GetUniformLocation(program, c_name.as_ptr() as *const GLchar);
+            index = if ret >= 0 {
+                ret as GLuint
+            } else {
+                // not sure how errors should be handled here, maybe add a new type of warning, or even an error?
+                println!("warning: could not get location of uniform {}", name);
+                return Ok(());
+            };
+        }
+
+        #[cfg(not(feature = "std"))]
+        {
+            let r = with_cstring(name, |c_name| {
+                gl::GetUniformIndices(program, 1, [c_name].as_ptr(), &mut index);
+            });
+
+            if let Err(_) = r {
+                #[cfg(feature = "std")]
+                {
+                    return Err(format!("unable to find the index of {}", name));
+                }
+
+                #[cfg(not(feature = "std"))]
+                {
+                    let mut reason = String::new();
+                    let _ = write!(&mut reason, "unable to find the index of {}", name);
+                    return Err(reason);
+                }
+            }
+        }
+
+        // get its size and type
+        let mut name_ = Vec::<GLchar>::with_capacity(max_len as usize);
+        gl::GetActiveUniform(
+            program,
+            index,
+            max_len,
+            null_mut(),
+            &mut size,
+            &mut glty,
+            name_.as_mut_ptr(),
+        );
+    }
+
+    // early-return if array – we don’t support them yet
+    if size != 1 {
+        return Ok(());
+    }
+
+    check_types_match(name, ty, glty)
+}
+```
+
+(I haven't touched the no-std parts, as I'm not using them, but I suspect they're similarly affected)

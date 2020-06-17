@@ -1,0 +1,476 @@
+Similar to PR #19617, we can enable more decimal operations by leveraging UDFs. Unlike TimeSpan, however, there isn't an acceptable type we can convert to to perform the operations, so it will require roughly one UDF per operation. For example:
+
+.NET | SQL
+--- | ---
+m1 + m2 | add($m1, $m2)
+m1 / m2 | divide($m1, $m2)
+m1 > m2 | compare($m1, $m2) > 0
+m1 >= m2 | compare($m1, $m2) >= 0
+m1 < m2 | compare($m1, $m2) < 0
+M1 <= m2 | compare($m1, $m2) <= 0
+m1 % m2 | remainder($m1, $m2)
+m1 * m2 | multiply($m1, $m2)
+m1 - m2 | add($m1, negate($m2))
+-m | negate($m)
+Average(t => t.Decimal) | mavg(t.Decimal)
+Max(t => t.Decimal) | mmax(t.Decimal)
+Min(t => t.Decimal) | mmin(t.Decimal)
+Sum(t => t.Decimal) | msum(t.Decimal)
+
+I read @ajcvickers blog post: [https://blog.oneunicorn.com/2020/01/17/dontcallupdate/](https://blog.oneunicorn.com/2020/01/17/dontcallupdate/)
+
+So I thought I would check my code...
+
+**N.B.** In my base repository class for update I have this:
+```
+        public virtual void Update(T entity)
+        {
+            _dbContext.Entry(entity).State = EntityState.Modified;
+            entity.IdString = entity.GetId().ToString();
+            _dbContext.Add(CreateAuditEntity("U", entity));
+            _dbContext.SaveChanges();
+        }
+```
+**Step 1:**
+I retrieve an entity from the dbContext using this query:
+```
+        public RvImport GetOldestPendingRvImport()
+        {
+            const int pendingStatus = (int)RvImportStatusEnums.Pending;
+
+            return _dbContext.RvImports
+                .Where(x => x.RvImportStatusId == pendingStatus)
+                .OrderBy(x => x.Id)
+                .Take(1)
+                .FirstOrDefault();
+        }
+```
+**Step 2:**
+I update 3 properties on the entity:
+```
+            rvImport.RvImportStatusId = (int)RvImportStatusEnums.Processing;
+            rvImport.ImportStartDateTime = DateTime.UtcNow;
+            rvImport.ModifiedBy = $"WebJob {typeof(Functions).Assembly.GetName().Version}";
+```
+**Step 3:**
+Call `Update()` on the base repository passing in the modified entity
+
+**Step 4:**
+I profile the SQL to find that its updating ALL columns regardless of whether they have changed or not.  See full SQL update below:
+```
+exec sp_executesql
+N'
+	SET NOCOUNT ON;
+UPDATE
+	[RvImports]
+SET
+	[Body] = @p0, 
+	[ConcurrencyStamp] = @p1, 
+	[ImportEndDateTime] = @p2, 
+	[ImportFileTypeId] = @p3, 
+	[ImportFilename] = @p4, 
+	[ImportStartDateTime] = @p5, 
+	[ProjectId] = @p6, 
+	[RecordCount] = @p7, 
+	[RequestedImportFileTypeId] = @p8, 
+	[RvImportStatusId] = @p9, 
+	[UserId] = @p10
+WHERE
+	[Id] = @p11;
+SELECT @@ROWCOUNT;',
+N'
+	@p11 int,
+	@p0 nvarchar(4000),
+	@p1 nvarchar(4000),
+	@p2 datetime2(7),
+	@p3 int,
+	@p4 nvarchar(4000),
+	@p5 datetime2(7),
+	@p6 int,
+	@p7 int,
+	@p8 int,
+	@p9 int,
+	@p10 nvarchar(4000)',
+	@p11=39,
+	@p0=NULL,
+	@p1=N'03153F3B-5EC0-4004-B290-96F97E0AA023',
+	@p2=NULL,
+	@p3=3,
+	@p4=N'Import (2).csv',
+	@p5='2020-01-18 19:30:19.9648002',
+	@p6=9,
+	@p7=NULL,
+	@p8=2,
+	@p9=2,
+	@p10=N'3f7b6467-90b3-40e0-bc86-116840900a81'
+```
+I guess I was expecting that to happen as I'm explicitly calling and marking the entire entity as Modified:
+```
+            _dbContext.Entry(entity).State = EntityState.Modified;
+```
+
+Then I thought I would try the update again but would skip over the line that is marking the state of the entire entity as Modified, expecting that this time the SQL profile would only show those 3 modified columns in the UPDATE statement. 
+
+But to my shock nothing was updated and the SQL profile was empty (except for it adding a new Audit entry which is part of the `Update()` method)
+
+It seems that even though I have an entity from the dbContext which the dbContext "_should_" be tracking the 3 modified properties on the entity are not being updated when calling `_dbContext.SaveChanges();` without explicitly calling `_dbContext.Entry(entity).State = EntityState.Modified;` but then it updates ALL columns.
+
+I just want the update statement to ONLY update the columns that have actually changed.
+
+What am I doing wrong?  
+
+### Further technical details
+
+EF Core version: 2.2.6
+Database provider: Azure - Microsoft.EntityFrameworkCore.SqlServer
+Target framework:  .NET Core 2.2.8
+Operating system: Windows 7
+IDE: Visual Studio 2019 16.4
+
+Hi guys,
+
+I found a situation that can be a **performance problem** using owned types to modeling value objects from DDD (Domain Driven Design).
+
+If there is something I am doing wrong or some configuration that has to be done, I would appreciate to know.
+
+**Entity**
+
+```cs
+public class UserEntity
+{
+    public UserEntity(long id, FullName fullName, Roles roles, Status status)
+    {
+        Id = id;
+        FullName = fullName;
+        Roles = roles;
+        Status = status;
+    }
+
+    public long Id { get; private set; }
+
+    public FullName FullName { get; private set; }
+
+    public Roles Roles { get; private set; }
+
+    public Status Status { get; private set; }
+}
+```
+**Value Object**
+
+```cs
+public sealed class FullName : ValueObject
+{
+    public FullName(string name, string surname)
+    {
+        Name = name;
+        Surname = surname;
+    }
+
+    public string Name { get; }
+
+    public string Surname { get; }
+
+    protected override IEnumerable<object> GetEquals()
+    {
+        yield return Name;
+        yield return Surname;
+    }
+}
+```
+
+**Entity Configuration**
+
+```cs
+public sealed class UserConfiguration : IEntityTypeConfiguration<UserEntity>
+{
+    public void Configure(EntityTypeBuilder<UserEntity> builder)
+    {
+        builder.ToTable("Users", "User");
+
+        builder.HasKey(x => x.Id);
+
+        builder.Property(x => x.Id).IsRequired().ValueGeneratedOnAdd();
+        builder.Property(x => x.Roles).IsRequired();
+        builder.Property(x => x.Status).IsRequired();
+
+        builder.OwnsOne(x => x.FullName, y =>
+        {
+            y.Property(x => x.Name).HasColumnName(nameof(UserEntity.FullName.Name)).IsRequired().HasMaxLength(100);
+            y.Property(x => x.Surname).HasColumnName(nameof(UserEntity.FullName.Surname)).IsRequired().HasMaxLength(200);
+        });
+    }
+}
+```
+
+Executing the following LINQ:
+
+```cs
+var user = context.Set<UserLogEntity>().Where(x => x.Id == 1).SingleOrDefault();
+```
+
+Results in the following SQL:
+
+```sql
+SELECT TOP(2) [u].[Id], [u].[Roles], [u].[Status], [t].[Id], [t].[Name], [t].[Surname]
+FROM [User].[Users] AS [u]
+LEFT JOIN (
+    SELECT [u0].[Id], [u0].[Name], [u0].[Surname], [u1].[Id] AS [Id0]
+    FROM [User].[Users] AS [u0]
+    INNER JOIN [User].[Users] AS [u1] ON [u0].[Id] = [u1].[Id]
+    WHERE [u0].[Surname] IS NOT NULL AND [u0].[Name] IS NOT NULL
+) AS [t] ON [u].[Id] = [t].[Id]
+WHERE [u].[Id] = CAST(1 AS bigint)
+```
+
+**The above SQL is very bad for something so simple, it should be the following SQL:**
+
+```sql
+SELECT TOP(2) [u].[Id], [u].[Roles], [u].[Status], [u].[Name], [u].[Surname]
+FROM [User].[Users] AS [u]
+WHERE [u].[Id] = CAST(1 AS BIGINT)
+```
+
+**The code works normally, the entity and the value object are loaded, but the generated SQL is not optimized.**
+
+Thank you for your attention and I am available for any information.
+<!-- What problem are you trying to solve? -->
+Hi,
+
+At work, we use a query which uses `TimeSpan` members `Hours`, `Minutes` and `Seconds`, but EFCore doesn't translate these members to sql.
+
+<!-- Describe the solution you'd like -->
+We fix the problem creating SqlServerTimeSpanMemberTranslator like the [SqlServerDateTimeMemberTranslator](https://github.com/dotnet/efcore/blob/master/src/EFCore.SqlServer/Query/Internal/SqlServerDateTimeMemberTranslator.cs) and we override the [SqlServerMemberTranslatorProvider](https://github.com/dotnet/efcore/blob/master/src/EFCore.SqlServer/Query/Internal/SqlServerMemberTranslatorProvider.cs) to include also our SqlServerTimeSpanMemberTranslator.
+
+I think SqlServerTimeSpanMemberTranslator can be useful also to other .NET developers, so if you want I can make a PR to include it to EFCore.SqlServer project.
+
+@ajcvickers recently posted [a blog post](https://blog.oneunicorn.com/2020/01/17/dontcallupdate/) where it recommends to use two round trip updates. Here is an proposal which combines two ways and which should give some perf improvements.
+
+```csharp
+var userExists = await context.Users
+    .Update(user => user.Email = email)
+    .Where(user => user.Name == name)
+    .AnyAsync();
+```
+
+The `Update` method should generate an `UPDATE` query to a database. Other methods should behave as before, maybe not all but mostly all. Therefore, the resulting query should look like this:
+
+```sql
+UPDATE user SET email = @email WHERE name = @name;
+```
+
+This query can be executed by SQL Server and PostgreSQL and returns number of affected rows. The number can be taken from the `ExecuteNonQueryAsync` method of a data reader. If result greater than zero, than all things done.
+
+In case when an user wants to get updated entities back, there is the `RETURNING` clause in PostgreSQL and `OUTPUT` in SQL Server:
+
+```csharp
+var users = await context.Users
+    .Update(user => user.Email = email)
+    .Where(user => user.Name == name)
+    .AsAsyncEnumerable();
+```
+```sql
+-- PostgreSQL
+UPDATE user SET email = @email WHERE name = @name RETURNING name, email;
+
+-- SQL Server
+UPDATE user SET email = @email WHERE name = @name OUTPUT name, email;
+```
+
+Need something to do with users before returning? Easily using PostgreSQL and CTEs. In case of SQL Server this could be tricky and require a temporary table.
+
+While it won't give EF Core the same functionality as raw SQL, the feature could make it a bit powerful and extend number of scenarios where it can be used.
+We ignore now when paramters are not initialized in case a EXPLAIN query is used.
+
+Fixes #16647
+
+This issue is related to https://github.com/OData/WebApi/issues/2010
+when using HasConversion convert List to json and use odata $select, it will throw a error 
+![image](https://user-images.githubusercontent.com/8691013/72657768-60a4e480-39e3-11ea-9423-2de7d6d72c81.png)
+
+
+### Steps to reproduce
+1.git clone https://github.com/keatkeat87/odata--select-HasConversion-issue.git
+2.dotnet ef migrations add init
+3.dotnet ef database update
+4.F5
+5.visit /odata/Products?$select=images
+ 
+  
+
+### Further technical details
+EF Core version: 3.1.1
+Database provider: (e.g. Microsoft.EntityFrameworkCore.SqlServer)
+Target framework: (e.g. .NET Core 3.1)
+Operating system:
+IDE: (e.g. Visual Studio 2019 16.4)
+
+<!-- Describe what isn't working as expected -->
+After migration of my  Azure function project  to  3.0 entity framework cosmos 
+I am using  below linq query to get entity from cosmos 
+
+### Steps to reproduceFuction 3.0 
+Context class  : 
+
+```c#
+public class DispatchContext : DbContext, IUnitOfWork
+{        
+        public DispatchContext(DbContextOptions<DispatchContext> options) : base(options)
+	{
+	    Database.EnsureCreated();
+        }
+
+	protected DispatchContext()
+	{
+		Database.EnsureCreated();
+	}
+ 
+        //public DbSet<Appointment> Appointments { get; set; }
+        //public DbSet<Job> Jobs { get; set; }
+        //public DbSet<Container> Containers { get; set; }
+        public DbSet<Driver> Drivers { get; set; }
+        public DbSet<DriverDispatch> DriverDispatches { get; set; }
+        public DbSet<Move> Moves { get; set; }
+        public DbSet<GeneratedPlans> PlansGeneratedEvents { get; set; }
+	public DbSet<TerminalTurnTime> TerminalTurnTimes { get; set; }
+        public DbSet<Terminal> Terminals { get; set; }
+        public DbSet<AlternatePlanLeg> AlternatePlanLegs { get; set; }
+        public CosmosDBsettings CosmosDBsettings { get; }
+
+	protected override void OnModelCreating(ModelBuilder modelBuilder)
+	{
+	    //modelBuilder.GetInfrastructure().Metadata.Cosmos().DefaultContainerName = "Dispatch";
+	    modelBuilder.HasDefaultContainer("Dispatch");		
+	    modelBuilder.ApplyConfiguration(new DriverEntityTypeConfiguration());
+            modelBuilder.ApplyConfiguration(new DriverDispatchEntityTypeConfiguration());
+            //modelBuilder.ApplyConfiguration(new JobEntityTypeConfiguration());
+            
+            modelBuilder.ApplyConfiguration(new PlansGeneratedEventConfiguration());
+            modelBuilder.ApplyConfiguration(new MoveEntityTypeConfiguration());
+            modelBuilder.ApplyConfiguration(new TerminalTurnTimesEventTypeConfiguration());
+            modelBuilder.ApplyConfiguration(new TerminalEventTypeConfiguration());
+            modelBuilder.ApplyConfiguration(new AlternatePlanLegEventTypeConfiguration());
+            base.OnModelCreating(modelBuilder);
+        }
+        
+        public async Task<bool> SaveEntitiesAsync(CancellationToken cancellationToken = default(CancellationToken))
+        {
+		//throw new System.NotImplementedException();
+		var result = await base.SaveChangesAsync(cancellationToken);
+
+		return true;
+	}
+}
+```
+
+``` C#
+var filteredDispathces = (from d in _context.Set<Driver>()
+    join dd in _context.Set<DriverDispatch>() on d.id equals dd.DriverId
+    where dd.PlanDate == dafaultPlanDate & dd.Status == "AT_RISK"
+    select d).ToList();
+```
+
+Got Exceptions? Include both the message and the stack trace
+
+```
+The LINQ expression 'DbSet<Driver>
+    .Join(
+        outer: DbSet<DriverDispatch>, 
+        inner: d => d.id, 
+        outerKeySelector: d0 => d0.DriverId, 
+        innerKeySelector: (d, d0) => new TransparentIdentifier<Driver, DriverDispatch>(
+            Outer = d, 
+            Inner = d0
+        ))' could not be translated. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to either AsEnumerable(), AsAsyncEnumerable(), ToList(), or ToListAsync(). See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.
+```
+
+### Further technical details
+
+EF Core version:
+Database provider: (e.g. Microsoft.EntityFrameworkCore.cosmos)
+Target framework: (e.g. .NET Core 3.0)
+Operating system:
+IDE: (e.g. Visual Studio 2019 16.3)
+
+I'd love to be able to provide a namespace for the generated files. My project has an `src/` directory at the root where my C# source files begin from.
+
+😊
+I detected changes in the release/3.1 branch which have not been merged yet to master. I'm a robot and am configured to help you automatically keep master up to date, so I've opened this PR.
+
+This PR merges commits made on release/3.1 by the following committers:
+
+* @wtgodbe
+
+## Instructions for merging from UI
+
+This PR will not be auto-merged. When pull request checks pass, complete this PR by creating a merge commit, *not* a squash or rebase commit.
+
+<img alt="merge button instructions" src="https://i.imgur.com/GepcNJV.png" width="300" />
+
+If this repo does not allow creating merge commits from the GitHub UI, use command line instructions.
+
+## Instructions for merging via command line
+
+Run these commands to merge this pull request from the command line.
+
+``` sh
+git fetch
+git checkout release/3.1
+git pull --ff-only
+git checkout master
+git pull --ff-only
+git merge --no-ff release/3.1
+
+# If there are merge conflicts, resolve them and then run git merge --continue to complete the merge
+# Pushing the changes to the PR branch will re-trigger PR validation.
+git push https://github.com/dotnet-maestro-bot/EntityFrameworkCore HEAD:merge/release/3.1-to-master
+```
+
+<details>
+<summary>or if you are using SSH</summary>
+
+```
+git push git@github.com:dotnet-maestro-bot/EntityFrameworkCore HEAD:merge/release/3.1-to-master
+```
+
+</details>
+
+
+After PR checks are complete push the branch
+```
+git push
+```
+
+## Instructions for resolving conflicts
+
+:warning: If there are merge conflicts, you will need to resolve them manually before merging. You can do this [using GitHub][resolve-github] or using the [command line][resolve-cli].
+
+[resolve-github]: https://help.github.com/articles/resolving-a-merge-conflict-on-github/
+[resolve-cli]: https://help.github.com/articles/resolving-a-merge-conflict-using-the-command-line/
+
+## Instructions for updating this pull request
+
+Contributors to this repo have permission update this pull request by pushing to the branch 'merge/release/3.1-to-master'. This can be done to resolve conflicts or make other changes to this pull request before it is merged.
+
+```
+git checkout -b merge/release/3.1-to-master master
+git pull https://github.com/dotnet-maestro-bot/EntityFrameworkCore merge/release/3.1-to-master
+(make changes)
+git commit -m "Updated PR with my changes"
+git push https://github.com/dotnet-maestro-bot/EntityFrameworkCore HEAD:merge/release/3.1-to-master
+```
+
+<details>
+    <summary>or if you are using SSH</summary>
+
+```
+git checkout -b merge/release/3.1-to-master master
+git pull git@github.com:dotnet-maestro-bot/EntityFrameworkCore merge/release/3.1-to-master
+(make changes)
+git commit -m "Updated PR with my changes"
+git push git@github.com:dotnet-maestro-bot/EntityFrameworkCore HEAD:merge/release/3.1-to-master
+```
+
+</details>
+
+Contact .NET Core Engineering if you have questions or issues.
+Also, if this PR was generated incorrectly, help us fix it. See https://github.com/dotnet/arcade/blob/master/scripts/GitHubMergeBranches.ps1.

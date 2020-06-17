@@ -1,0 +1,177 @@
+See https://github.com/facebookincubator/SPARTA/pull/5#issuecomment-566288425, that could impact our implementation too.
+I'm attempting to use ikos-scan on a project that calls MPI wrapper compilers instead of the C/C++ compilers directly.
+
+This fails because ikos intercepts the MPI wrapper commands and replaces them with clang compilers, but does not include the MPI header flags needed for a successful parse:
+```
+../Chombo3.2/lib/src/BaseTools/SPMD.H:31:10: fatal error: 'mpi.h'
+      file not found
+#include <mpi.h>
+         ^~~~~~~
+1 error generated.
+```
+The analyzer generates false positives when the code uses the following pattern:
+```c
+#include <ikos/analyzer/intrinsic.h>
+#define SUCCESS 0
+
+extern int f(void);
+extern int g(void);
+extern int h(void);
+
+int x = 0;
+
+int main() {
+    int status = f();
+    if (status == SUCCESS) {
+        status = g();
+        x = 1;
+    }
+    if (status == SUCCESS) {
+        status = h();
+        __ikos_assert(x == 1);
+    }
+    return 0;
+}
+```
+The analyzer generates the following warning:
+```
+test.c:18:9: warning: assertion could not be proven
+        __ikos_assert(x == 1);
+        ^
+```
+
+First, this code pattern is questionable and I would recommend not using it. It is hard to read and causes trouble to static analyzers. Prefer the early-return pattern, see [this example](https://softwareengineering.stackexchange.com/questions/18454/should-i-return-from-a-function-early-or-use-an-if-statement/18473#18473).
+
+Anyway, we could solve this false positive by optimizing the control flow graph. The current control flow graph is [here](https://github.com/NASA-SW-VnV/ikos/files/3384639/main.pdf). We could write an optimization pass that replaces the edge from `#3` to `#4` by an edge from `#3` to `#6`. This would fix remove the warning.
+
+The current analysis cannot catch a buffer overflow in a structure.
+
+For instance:
+```c
+#include <ikos/analyzer/intrinsic.h>
+
+typedef struct {
+    int tab[10];
+    int x;
+} Struct;
+
+int main() {
+    Struct s;
+    s.tab[10] = 1; // overflow on tab, writes on x
+    __ikos_assert(s.x == 1);
+    return 0;
+}
+```
+
+The analyzer only checks that the memory write is within the structure, so it is considered safe.
+
+The analyzer will actually know that `s.x` is 1, so we could say that the analysis is somewhat sound regarding the memory model.
+
+To fix this, we should investigate the `inbounds` flag of the LLVM `getelementptr` instruction.
+
+See:
+* [LLVM Language Reference Manual](https://llvm.org/docs/LangRef.html#getelementptr-instruction)
+* [What happens if an array index is out of bounds?](https://llvm.org/docs/GetElementPtr.html#what-happens-if-an-array-index-is-out-of-bounds)
+We could implement an abstract domain containing a union of at most **N** disjunctive abstract values. This should be implemented as an option to the analyzer, so that the user can specify **N**.
+
+This could be used to unroll loops and fix false positives, for instance #39 or #102. This is somewhat similar to #137.
+
+There are still questions on how to implement the abstract operators such as join, meet, widening and narrowing.
+The current analysis is imprecise when merging branches where one side has uninitialized variables.
+
+For instance:
+```c
+#include <ikos/analyzer/intrinsic.h>
+
+int main(int argc, char** argv) {
+    int tab[10];
+
+    if (argc > 2) {
+        tab[0] = 2;
+    }
+
+    __ikos_print_values("tab[0]", tab[0]);
+
+    return 0;
+}
+```
+The output of the analyzer is:
+```
+test.c:10:5: __ikos_print_values("tab[0]", tab[0]):
+	tab[0] is in [-2147483648, 2147483647]
+	tab[0] may be uninitialized
+```
+
+We could add an abstraction that remembers whether a value is uninitialized **or** within a given range.
+
+This should help with #136.
+We could implement backward operators to improve the precision on guards.
+
+This could help with #97 and #134.
+Using a small integer (e.g, `uint8_t`, `int16_t`, etc.) as a loop counter usually results into false positives.
+
+For instance:
+```c
+#include <stdint.h>
+
+void f(int* p, uint16_t n) {
+    for (uint16_t i = 0; i < n; i++) {
+        p[i] = i;
+    }
+}
+
+int main() {
+    int tab[10];
+    f(tab, 10);
+    return 0;
+}
+```
+IKOS returns:
+```
+test.c:5:14: warning: possible buffer overflow, pointer '&p[(uint64_t)i]' accesses 4 bytes at offset between 0 and 262140 bytes of local variable 'tab' of size 40 bytes
+        p[i] = i;
+             ^
+```
+
+The problem comes from the integer promotion rule in C. The comparison `i < n` actually turns into `(unsigned)i < (unsigned)n`, which creates temporary variables in the LLVM bitcode:
+```
+%4 = zext i16 %.0 to i32, !dbg !25
+%5 = zext i16 %1 to i32, !dbg !27
+%6 = icmp slt i32 %4, %5, !dbg !28
+```
+This results in a lose of precision in the analyzer, similar to #97.
+A temporary workaround is to use a relational domain such as dbm or polyhedra.
+
+This false positive appears in our benchmarks:
+* 19 times in aeroquad
+* 14 times in mnav
+* at least 5 times in BioSentinel
+On the following example:
+```c
+#include <stdio.h>
+
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        return 0;
+    }
+
+    printf("Hello, %s", argv[1]);
+    return 0;
+}
+```
+IKOS generates the following warnings:
+```
+test.c: In function 'main':
+test.c:8:5: warning: memory access might be invalid, could not infer information about pointer 'argv[1]'
+    printf("Hello, %s", argv[1]);
+    ^
+test.c: In function 'main':
+test.c:8:25: warning: possible buffer overflow, pointer '&argv[1]' accesses 8 bytes at offset 8 bytes of 'argv'
+    printf("Hello, %s", argv[1]);
+                        ^
+```
+
+We need to model `argc`/`argv` properly to get rid of these warnings. This seems complicated to achieve for non-relational numerical domains.
+The current implementation of the octagon domain has several issues (segmentation fault, unsoundness, etc.). This should be fixed before adding `-d=octagon` in the analyzer.
+
+In the meantime, the APRON octagon domain can be used with `-d=apron-octagon`.

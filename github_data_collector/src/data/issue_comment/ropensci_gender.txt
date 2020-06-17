@@ -1,0 +1,117 @@
+following https://genderize.io/#localization
+Hi @lmullen, got a random Q for you. I recently needed a non-English name-to-gender categorizer and was surprised how few there were even for English. So I built a wrapper around some really impressive C code based on [40,000 names](https://www.heise.de/ct/ftp/07/17/182/) (that site is in German, but names and languages span most of the global north, including Asia). I've currently bundled the code into [this repo](https://github.com/mpadge/gender-conscious-routing), but suspect it would be useful as/in a package of its own right. And so: What would you think about me PR-ing the lot into this package?
+
+You can check out the current readme for a demo, and easily take it for a spin yourself. (Note that it might not work because I have to figure out how to get a compiled object to read a statically-packaged external file. If it just returns "INTERNAL_ERROR", then change [this line](https://github.com/mpadge/gender-conscious-routing/blob/master/src/gen_ext.h#L87) to `"./inst/dict/nam_dict.txt"`, and you should be good.)
+
+### The obvious problem
+
+Your package is currently quite specifically aimed at accessing and utilising a single source of *historical* data. What I'm proposing is quite a different kind of functionality, and one which would alter how the overall aim of this package would have to be positioned. It would then become more like [`genderizer`](https://github.com/kalimu/genderizeR), but I am definitely not going to PR my code into there, because that's a simple wrapper to a *highly commerical* api that only allows 1,000 free requests before requiring outrageous costs.
+
+### The primary benfits
+
+- This code is truly multi-lingual, covering at least all languages listed [here](https://github.com/mpadge/gender-conscious-routing/blob/master/src/gender.c#L138-L205); and
+- It's blindingly fast, as demo'd on current readme, at around 100,000 names per second.
+
+Let me know what you think, and I'll completely understand if you'd rather not. I guess in that case I'd just spin up yet another R gender package, but hope not to have to do that.
+Follow guidelines here. https://cran.r-project.org/web/packages/submission_checklist.html
+At the moment if I pass 50 names in, and 10 don't match, I'll get 40 rows back. This can be a problem for explicitly getting a row per entry. I'd propose adding a `fill_missing` parameter, set to `FALSE` by default, that allows one to explicitly include rows for names with missing data. If that's okay I'll write the patch myself!
+> I wanted to report that the documentation is a bit out sync with the code. The documentation gives "genderize" and "kantrowitz" as possible methods, but if you use those the code returns the following error:
+Error in match.arg(method) : 
+  'arg' should be one of “ssa”, “ipums”, “napp”, “demo”
+Apologies for not browsing through all the release history for this and just spamming you with some not-quite-bugs, but I wanted to raise a few questions about `method = napp` that aren't fully described in the docs.
+1. A few places in the documentation (at least in the function `gender`) it says that "Germany" is a valid option, but it isn't; in those cases, "Denmark" seems usually not to be listed as an option, though it is, and should probably be added. (Although, there are very few names from Denmark; see the last chart).
+2. The year range is listed as 1758 to 1910, but there are only 17 total people (each with a distinct name) in the sample from the first 7 years (all in Norway or Sweden). I clipped the US ipums data to start in 1789 because there are only 419 names in that year (and fewer for those born before); something similar might be appropriate here, probably at around 1776 or so for Norway and later for other countries.
+3. It is also might worth flagging in the notes that while "United Kingdom" is included, it is significantly smaller than three of the other countries. I was tempted to use it as a general-purpose method for 1758 to 1789 until inspecting the data file to see how few names there were. Iceland is also small, but probably people know that. Some of the more recent NAPP releases have 100% British samples, so maybe they would fix this.
+
+I'll post that `gender_vectors` method soon from the other issue I filed, which will incorporate most of this in its default settings, so it may not be necessary to address more than the first issue here.
+
+![image](https://cloud.githubusercontent.com/assets/1110758/18413511/f1deaf4e-7777-11e6-9a37-d251991aef0a.png)
+
+`gender_df` is very useful, but requires a lot of programming for what I imagine is the normal case: creating a new column with the gender of every person in a frame born in many different years that might well span 1930. I'm finding I need a function that works on vectors in a less-hadleyverse-mandating kind of way. I just want to feed it a list of names and years (and maybe countries), and get a vector of `male`, `female`, or NA for each name in the set.
+
+(This is essentially the same in result as the function `humaniformat::first_name`, which I must not be the only one using in conjunction with this).
+
+I wonder if something like this would be useful in the package; it selects the appropriate name/data set based on the year, marks an NA for anything that it doesn't know how to handle, and allows you to just add gender to a data.frame without loads of merging and unmerging. E.g.:
+
+``` r
+bloo = authors %>% ungroup %>%
+  filter(!is.na(name)) %>% 
+  mutate(gender = vectorized_gender(names = first,years = birth,fuzz=30))
+```
+
+Buggy, feature-incomplete, and barely tested version of the function below. If you want pull request with a clean version, let me know and maybe I can make it; I can see all sorts of reasons you wouldn't.
+
+``` r
+vectorized_gender = function(years,names,fuzz,threshold = .9) {
+  # A function that takes a list of years and names and vectorizes the assignment of gender.
+  # Returns a vector the same length as years and names, where each element
+  # is 'male', 'female', or NA.
+  #
+  # It uses 'ssa' for dates after 1930, and 'ipums' for dates before
+  # 'fuzz' is the wiggle room on either side of the given year; eg if fuzz is 10
+  # and year is 1930, names between 1920 and 1940 will be matched.
+  # Avoids duplicating identical queries by using the gender_df method.
+
+  input = data.frame(name=names,year=years,id = 1:length(names),stringsAsFactors = F)
+
+  mins_frame = data_frame(method = c("ssa","ipums","NA"), maxx = c(2012,1930,NA), minn = c(1880,1789,NA))
+
+  labeled = 
+    input %>% 
+    mutate(method = if_else(
+      is.na(year),"NA",
+      if_else((year + fuzz) < 1789, "NA",
+              if_else((year - fuzz) > 2012, "NA",
+                      if_else (year > 1930, "ssa", "ipums"))) )
+    ) %>% mutate(min = year-fuzz,
+                 max = year+fuzz) %>%
+    inner_join(mins_frame) %>%
+    mutate(min = if_else(min < minn, minn, min),
+           max = if_else(max > maxx, maxx, max))
+
+  mergeable = labeled %>% group_by(method) %>% filter(method %in% c("ssa","ipums","napp")) %>%
+    do(gender_df(., year_col = c("min","max"), name_col = "name", method = .$method[1])) %>%
+    ungroup %>%
+    filter(abs(qlogis(proportion_male))>abs(plogis(threshold))) %>%
+    mutate(min=year_min,max=year_max) %>% 
+    select(min,max,name,gender)
+
+  meta_mergeable = labeled %>% left_join(mergeable) %>% select(name,year,gender) %>% distinct
+  newversion = input %>% left_join(meta_mergeable)
+  newversion$gender
+}
+```
+
+If I have someone named "Orestes" in 1831, I can't match it in the IPUMS sample
+
+```
+> gender("Orestes",years=c(1831),method="ipums")
+Source: local data frame [0 x 6]
+
+Variables not shown: name <chr>, proportion_male <dbl>, proportion_female <dbl>, gender <lgl>, year_min
+```
+
+No problem, right? Just broaden the net when you have a rare name
+
+```
+> gender("Orestes",years=c(1821,1841),method="ipums")
+Source: local data frame [1 x 6]
+
+     name proportion_male proportion_female gender year_min year_max
+    <chr>           <dbl>             <dbl>  <chr>    <dbl>    <dbl>
+1 Orestes               1                 0   male     1821     1841
+```
+
+Super. But if I want to do a batch test on many names, I'd like to be able to just set the years for each of them at c(year-30,year+30). But this is going to raise loads of errors for anyone near the edge of the range.
+
+```
+> gender("Orestes",years=c(1803-15,1803+15),method="ipums")
+Error in gender("Orestes", years = c(1803 - 25, 1803 + 25), method = "ipums") : 
+  Please provide a year range between 1789 and 1930.
+```
+
+Of course I can muck up my codes with a lot of maxes and mins for each of the datasets I'm using. But why not just clip `c(1788,1818)` to `c(1789, 1818)` and write a warning instead of raising an error?
+
+Data on Finnish name-gender mappings is available from the [Finnish population register](https://www.avoindata.fi/data/fi/dataset/none) for ~10,000 Finnish names that are in use in 2016. However there is no information of birth years. Would such data set be appropriate add-on in the gender/genderdata package as the birth year info is missing? If yes, I could potentially contribute that data set & processing codes here.
+
+Name-gender mappings with birth year info are available with a good coverage for Finnish name 2007-2016 [(here)](http://www.vrk.fi/default.aspx?id=279) but there is probably little variation in gender mappings in such short period and hence the addec value would be limited. There are also statistics on the most common (top-50 it seems to me) names in the 20th century with gender and birth year information [(code here)](https://louhos.wordpress.com/2011/09/24/yleisimmat-nimet-1900-luvulla/) But again it is just the few top names and the value is limited. I can provide more info on these if useful.

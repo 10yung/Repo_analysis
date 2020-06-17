@@ -1,0 +1,345 @@
+Added a method to safely retrieve the Cassandra version that doesn't throw an exception when the Cassandra versions on the different nodes of the cluster differ.
+The method cassandraVersion in CassandraConnection throws a RuntimeException when connected to a Cassandra cluster that consists of different versions.
+
+Given the return type of the method, Option[VersionNumber], None as return value would be expected in this case. Actually, None is never returned from this method.
+
+I can make a pull request if the behavior that None is returned when the version can't be determined is the desired behavior.
+
+
+Hi guys, so this is an issue I've been experiencing for a few weeks now. For some reason (node failure or something else I'm not sure), when I insert into CassyDb and try to fetch, the results sometimes have a null entry. Mostly in a specific field. I would like to know why this and what fixes I can use to solve this. Don't really want to make the column optional. Any help is appreciated, thanks
+I noticed the following behaviour, where _Scenario 1_ works fine and in _Scenario 2_  _new_table_2_ is not auto-created. The two scenarios should be equivalent.
+
+**Scenario 1**
+```
+object table_1 extends Table_1 with connector.Connector
+  
+object table_2 extends Table_2 with connector.Connector {
+    override def tableName = "new_table_2"
+  }
+```
+
+**Scenario 2**
+```
+object table_2 extends Table_2 with connector.Connector {
+    override def tableName = "new_table_2"
+  }
+
+object table_1 extends Table_1 with connector.Connector
+```
+
+Could you please add Scala 2.13 support?
+
+We want to use Cassandra to cache Exchange calendars, so they are available when Exchange is not. The following cql defines a table for storing the results of an availability request. The static `last_update` column keeps track of the last time our application wrote to the partition, if any.
+
+```cql
+CREATE TABLE IF NOT EXISTS slots_by_account_and_day
+(
+    account     text,
+    day         text,
+    ews_id      text,
+    start_time  timestamp,
+    end_time    timestamp,
+    status      text,
+    last_update timestamp STATIC,
+    PRIMARY KEY ((account, day), ews_id)
+)
+```
+
+After filling the table with testdata, I noticed that PhantomDSL gives me `None` when I expected `Some`, using the following code:
+
+```scala
+table
+  .select(_.last_update)
+  .where(_.account eqs account)
+  .and(_.day eqs day)
+  .one
+```
+
+Meanwhile, the following Datastax based solution does give me what I expect using the following code:
+
+```scala
+session
+  .execute(QueryBuilder.select("last_update")
+    .from(table.tableName)
+    .where(QueryBuilder.eq("account", account))
+    .and(QueryBuilder.eq("day", day)))
+  .one()
+  .getTimestamp("last_update")
+```
+
+_This looks like a bug._ I assume it is related to the way PhantomDSL handles static columns, because this is the first time I have tried to use this feature of Cassandra.
+
+Looking forward to Phantom 3.x.x, we need to re-implementing the core query mechanism to run on Cats free and maybe freestyle frees as concrete backends with interpreters against known free libraries. The current version of phantom is a joke with respect to how functional it is, and several steps will be required to reach a 3.0.0
+
+- Remove the EDSL entirely, in favour of working directly with encoded case classes.
+- Unlike quill, we do not plan to go fully QDSL mode, and we will have an in between approach where the syntax language of CQL will still be fully replicated in Scala, just like what phantom attempts to do today.
+- Replace execution backends and the complex poor man's Free Monad currently available via `QueryContext` with a simple implementation on top of Cats Free.
+- Research whether or not a Cats dependency with the now required `-Y-partial-unification` flag is a realistic goal that the audience would be happy with, and  consider whether this forces us to finally drop the Scala 2.10 support we worked hard to keep alive until today.
+- Add in Support for Scala 2.13.
+As requested by multiple users, we should natively support table inheritance as many applications seem to require it as a simplification of the DSL code, instead of trying to discourage it.
+
+Draft proposal.
+
+- Table inheritance should be natively possible in the DSL with no additional work.
+- Inherited columns should have order precedence. Inherited columns will be inserted *before* the "current" columns in the generated Cassandra code. A table appending a partition key for instance, will cause the new key to be added as the last in the sequence of partition keys. This is important in Cassandra so an order should be agreed upfront.
+- One example is [here|https://gist.github.com/jalaziz/f7f5030172acfccafb46a5d239975924].
+I'm looking to see how to integrate the java-cassandra-driver for opentracing with Phantom.  
+
+The Java API expects to wrap Cluster, and takes an Initializer:
+
+```java
+// Instantiate tracer
+Tracer tracer = ...
+
+// Instantiate Cluster Builder
+ Cluster.Builder builder = Cluster.builder().addContactPoints("127.0.0.1").withPort(9142);
+
+// Instantiate Tracing Cluster
+Cluster cluster = new TracingCluster(builder, tracer);
+```
+
+https://github.com/opentracing-contrib/java-cassandra-driver#usage
+
+But there doesn't seem to be an accessible way to do this from Phantom -- the closest I've found is extend the SessionProvider:
+
+```scala
+class OpentracingSessionProvider(space: KeySpace, builder: ClusterBuilder) extends DefaultSessionProvider(space, builder) with Traceable {
+  override lazy val cluster: Cluster = new TracingCluster(builder(Cluster.builder), tracer)
+}
+```
+
+But from there, it doesn't seem practical to swap out the SessionProvider instantiation.  I can't map it through the Cluster.Builder as the API expects the end result.
+
+So where I am right now is...
+
+```scala
+package sbux.ucp.simple.user.cassandra
+
+import com.datastax.driver.core.{Cluster, Session, _}
+import com.outworkers.phantom.connectors.{
+  ClusterBuilder,
+  KeySpaceCQLQuery,
+  SessionAugmenterImplicits,
+  SessionProvider
+}
+import com.outworkers.phantom.dsl._
+import io.opentracing.Tracer
+import org.slf4j.LoggerFactory
+
+import scala.concurrent.blocking
+import scala.util.control.{NoStackTrace, NonFatal}
+import scala.util.{Failure, Success, Try}
+
+class OpentracingSessionProvider(tracer: Tracer,
+                                 val space: KeySpace,
+                                 builder: ClusterBuilder,
+                                 autoinit: Boolean = true,
+                                 keyspaceQuery: Option[KeySpaceCQLQuery] = None,
+                                 errorHandler: Throwable => Throwable = identity)
+    extends SessionProvider {
+
+  val logger = LoggerFactory.getLogger(this.getClass)
+
+  val cluster: Cluster = builder(Cluster.builder).build
+
+  def defaultKeyspaceCreationQuery(session: Session, keySpace: String): String = {
+    s"CREATE KEYSPACE IF NOT EXISTS $keySpace WITH replication = {'class': 'SimpleStrategy', 'replication_factor' : 1};"
+  }
+
+  /**
+   * Initializes the keySpace with the given name on
+   * the specified Session.
+   */
+  protected[this] def initKeySpace(session: Session, space: String): Session = blocking {
+    blocking {
+      val query =
+        keyspaceQuery.map(_.queryString).getOrElse(defaultKeyspaceCreationQuery(session, space))
+      logger.info(s"Automatically initialising keyspace $space with query $query")
+      session.execute(query)
+    }
+    session
+  }
+
+  /**
+   * Creates a new Session for the specified keySpace.
+   */
+  protected[this] def createSession(keySpace: String): Session = {
+    Try {
+      val session = blocking {
+        cluster.connect
+      }
+
+      if (autoinit) {
+        initKeySpace(session, keySpace)
+      } else {
+        logger.info(s"Auto-init set to false, keyspace $space is not being auto-created.")
+        session
+      }
+    } match {
+      case Success(value) => value
+      case Failure(NonFatal(err)) => throw errorHandler(err);
+    }
+  }
+
+  val session: Session = createSession(space.name)
+}
+
+class OpentracingCassandraConnection(tracer: Tracer,
+                                     name: String,
+                                     clusterBuilder: ClusterBuilder,
+                                     autoinit: Boolean,
+                                     keyspaceFn: Option[KeySpaceCQLQuery] = None,
+                                     errorHandler: Throwable => Throwable = identity) { outer =>
+
+  import scala.collection.JavaConverters._
+
+  lazy val provider = new OpentracingSessionProvider(
+    tracer,
+    KeySpace(name),
+    clusterBuilder,
+    autoinit,
+    keyspaceFn,
+    errorHandler
+  )
+
+  /**
+   * The Session associated with this keySpace.
+   */
+  lazy val session: Session = provider.session
+
+  def cassandraVersions: Set[VersionNumber] = {
+    session.getCluster.getMetadata.getAllHosts.asScala
+      .map(_.getCassandraVersion)
+      .toSet[VersionNumber]
+  }
+
+  def cassandraVersion: Option[VersionNumber] = {
+    val versions = cassandraVersions
+
+    if (versions.nonEmpty) {
+
+      val single = versions.headOption
+
+      if (cassandraVersions.size == 1) {
+        single
+      } else {
+
+        if (single.forall(item => versions.forall(item ==))) {
+          single
+        } else {
+          throw new RuntimeException(
+            s"Illegal single version comparison. You are connected to clusters of different versions." +
+              s"Available versions are: ${versions.mkString(", ")}"
+          ) with NoStackTrace
+        }
+      }
+    } else {
+      throw new RuntimeException(
+        "Could not extract any versions from the cluster, versions were empty")
+    }
+  }
+
+  /**
+   * Trait that can be mixed into `CassandraTable`
+   * instances.
+   */
+  trait Connector
+      extends com.outworkers.phantom.connectors.Connector
+      with SessionAugmenterImplicits {
+
+    lazy val provider: OpentracingSessionProvider = outer.provider
+
+    lazy val keySpace: String = outer.name
+
+    implicit val space: KeySpace = KeySpace(outer.name)
+
+    def cassandraVersion: Option[VersionNumber] = outer.cassandraVersion
+
+    def cassandraVersions: Set[VersionNumber] = outer.cassandraVersions
+  }
+}
+
+object OpentracingContactPoints {
+
+  /**
+   * A keyspace builder based on the specified
+   * contact points, all running on the default port.
+   */
+  def apply(tracer: Tracer, hosts: Seq[String]): OpentracingKeySpaceBuilder =
+    new OpentracingKeySpaceBuilder(tracer, _.addContactPoints(hosts: _*))
+
+  /**
+   * A keyspace builder based on the specified
+   * contact points, all running on the specified port.
+   */
+  def apply(tracer: Tracer, hosts: Seq[String], port: Int): OpentracingKeySpaceBuilder =
+    new OpentracingKeySpaceBuilder(tracer, _.addContactPoints(hosts: _*).withPort(port))
+}
+
+class OpentracingKeySpaceBuilder(tracer: Tracer, clusterBuilder: ClusterBuilder) {
+
+  /**
+   * Specify an additional builder to be applied when creating the Cluster instance.
+   * This hook exposes the underlying Java API of the builder API of the Cassandra
+   * driver.
+   */
+  def withClusterBuilder(builder: ClusterBuilder): OpentracingKeySpaceBuilder =
+    new OpentracingKeySpaceBuilder(tracer, clusterBuilder andThen builder)
+
+  /**
+   * Disables the heartbeat for the current builder.
+   * This is designed for local instantiations of connectors or test environments.
+   * @return A new cluster builder, with the heartbeat interval set to 0(disabled).
+   */
+  def noHeartbeat(): OpentracingKeySpaceBuilder = {
+    new OpentracingKeySpaceBuilder(tracer,
+                                   clusterBuilder andThen (_.withPoolingOptions(
+                                     new PoolingOptions().setHeartbeatIntervalSeconds(0))))
+  }
+
+  /**
+   * Creates and can initialise a keyspace with the given name.
+   * @param name The name of the keyspace, case sensititve by default.
+   * @param autoinit Whether or not to automatically initialise the keyspace before the session is created.
+   * @param query The builder to use when producing the keyspace query.
+   * @return
+   */
+  def keySpace(
+      name: String,
+      autoinit: Boolean = true,
+      query: Option[KeySpaceCQLQuery] = None,
+      errorHandler: Throwable => Throwable = identity
+  ): OpentracingCassandraConnection = {
+    new OpentracingCassandraConnection(tracer, name, clusterBuilder, autoinit, query, errorHandler)
+  }
+
+  /**
+   * Creates and can initialise a keyspace with the given name.
+   * This will automatically initialise the keyspace by default, as we consider
+   * passing a specific keyspace query indicates clear intent you want this to happen.
+   * @param name The name of the keyspace, case sensititve by default.
+   * @param query The builder to use when producing the keyspace query.
+   * @return
+   */
+  @deprecated("Simply pass in a keySpace query, the keyspace is not required", "2.8.5")
+  def keySpace(
+      name: String,
+      query: KeySpaceCQLQuery
+  ): OpentracingCassandraConnection = {
+    new OpentracingCassandraConnection(tracer, name, clusterBuilder, true, Some(query))
+  }
+
+  /**
+   * Creates and can initialise a keyspace with the given name.
+   * This will automatically initialise the keyspace by default, as we consider
+   * passing a specific keyspace query indicates clear intent you want this to happen.
+   * @param query The builder to use when producing the keyspace query.
+   * @return
+   */
+  def keySpace(
+      query: KeySpaceCQLQuery
+  ): OpentracingCassandraConnection = {
+    new OpentracingCassandraConnection(tracer, query.keyspace, clusterBuilder, true, Some(query))
+  }
+}
+```

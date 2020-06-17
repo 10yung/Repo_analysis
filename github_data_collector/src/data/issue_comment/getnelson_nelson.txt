@@ -1,0 +1,131 @@
+# Summary
+When the changes to use the Network Loadbalancer were made, I changed that whole subsystem to assume _only_ AWS network loadbalancers were used. In reality, our deployment of Nelson previously used AWS Classic Loadbalancers.
+
+If an org used Classic Loadbalancers in the past, then we should attempt to delete the classic loadbalancer when deleting the Network loadbalancer fails. 
+# Summary
+- bugfix: When Nelson attempted to create a vault role in the PKI engine, the json body wasn't being passed. When you make a request without a body, the Vault API will assume all the defaults. 
+- modified the Vault API defaults a bit to rely on the trust chain instead of the domain. We don't force users to put a domain by default and allow any CName to get put on the certificate. 
+Even though Nelson doesn't care too much what branch events happen off of, `nelson repo enable` looks specifically in the `master` branch. We should fix this.
+
+This is partially Nelson CLI's fault and partially in here - we'll need a new flag probably in the CLI and some code changes on the service side.
+# Summary
+Nelson was designed to be extensible in that all the high-level operations are abstracted away and the system as a whole is programmed against interfaces. That adding [Kubernetes support](https://github.com/getnelson/nelson/pull/49) just required adding interpreters for the scheduler and health checker is a testament to this fact.
+
+However just having interpreters was not enough - we soon realized that because of the plethora and flexibility of different systems there would be no way for Nelson to be prescriptive about deployments. This led to the implementation of [blueprints](https://github.com/getnelson/nelson/issues/79) which have been used with great success and have solved numerous issues with regards to organizational choices without sacrificing Nelson's rigorous approach to deployment infrastructure.
+
+We are now at another crossroad. While **deployment** blueprints get us a lot of flexibility along certain axes, it is not sufficient for full flexibility in deploying Nelson. To date the following issues have come up:
+
+- Deployment blueprints still require an interpreter be written for a particular scheduler - if the scheduler is not open-sourced and/or if support hasn't been added to Nelson itself for whatever reason, the only way to integrate with Nelson is maintaining a fork.
+- Provisioning a load balancer suffers from the same problems as deployments and itself does not have a blueprint-like system. Even just considering how Kubernetes Ingresses work, every organization is going to have different requirements in the spec so being prescriptive here is impossible.
+- The same can be said for the routing layer of Nelson.
+
+This RFC proposes to re-architect Nelson as a control plane, where instead of both "deciding what to do" and "actually doing it" Nelson becomes purely about "deciding what to do" and emits these as events, leaving the "actually doing it" to a data plane. This data plane would subscribe to events from Nelson and act on them accordingly and most importantly, be controlled by an organization. Different organizations with different policies would just have different data planes.
+
+# Design
+[Relevant initial Gitter discussion](https://gitter.im/getnelson/nelson?at=5d002e747615221ffaa2fd12)
+
+Nelson is already built around an internal queuing model:
+
+```scala
+runBackgroundJob("auditor", cfg.auditor.process(cfg.storage)(cfg.pools.defaultExecutor))
+runBackgroundJob("pipeline_processor", Stream.eval(Pipeline.task(cfg)(Pipeline.sinks.runAction(cfg))))
+runBackgroundJob("workflow_logger", cfg.workflowLogger.process)
+runBackgroundJob("routing_cron", routing.cron.consulRefresh(cfg) to Http4sConsul.consulSink)
+runBackgroundJob("cleanup_pipeline", cleanup.CleanupCron.pipeline(cfg)(cfg.pools.defaultExecutor))
+runBackgroundJob("sweeper", cleanup.Sweeper.process(cfg))
+runBackgroundJob("deployment_monitor", DeploymentMonitor.loop(cfg))
+```
+
+The idea then is to take the subset of these background jobs that constitute the "data plane" and instead of having both a producer and consumer inside Nelson, have only the producer and relegate the consumption to the downstream data plane.
+
+The current thinking is these will stay in the control plane:
+- auditor
+- the "what to deploy" part of the pipeline processor (webhooks, parsing manifest files, etc.)
+- workflow logger
+- the "mark" part of the cleanup pipeline
+
+These will be relegated to the data plane:
+- the "how to deploy" part of the pipeline processor
+- routing cron
+- the "sweep" part of the cleanup pipeline
+- sweeper
+- deployment monitor
+
+For each of the data plane components, instead of being consumed by an implementation that actually acts on the event, it will instead be emitted to any subscribers listening on a network port. It is then on the subscriber to act on this information.
+
+# Implementation
+Because deploying to a scheduler is the largest burden at the moment, the pipeline processor will be our first target. However because launching, deleting, and health checking are all scheduler-specific functionality, we cannot simply just migrate the pipeline processor, but also the cleanup pipeline, sweeper, and deployment monitor. The routing cron can likely be left as a separate step. Thus the migration order is:
+
+1. pipeline processor + cleanup pipeline + sweeper + deployment monitor
+2. routing cron
+
+As for how to emit events, current proposals are:
+- unidirectional gRPC stream
+
+# Implementation steps
+1. Split the pipeline processor and cleanup pipeline into their distinctive control plane/data plane parts - e.g. "what to deploy" vs. "how to deploy" and "mark as garbage" vs. "sweep garbage"
+2. Come up with the Protobuf data models for the events
+3. Write a reference implementation of a data plane that mimics the status quo
+4. Sink the pipeline processor, cleanup pipeline, sweeper, and deployment monitor into a network port
+5. Migrate the routing cron
+
+# Other notes
+**Testing**: Rearchitecting Nelson into a control plane may also bring benefits to testing and demonstrations. Right now it has been hard to showcase Nelson because the control plane and data plane are tied together and thus require things like a functional Kubernetes cluster to startup. If instead Nelson just emitted events, we could say, have a dummy scheduler interpret those events for demo purposes, or even have something that interprets those events as D3.js actions where "deploy X" becomes rendering a node, service dependencies become edges, traffic shifting becomes moving edges, and garbage collection becomes deleting nodes.
+Using the datacenter filtering feature, if we deploy a workload on version X in DC A, and deploy a new version Y > X in a different DC B, version X in DC A does not get cleaned up.
+If you define a route for a loadbalancer
+```
+loadbalancers:
+- name: drewbalancer
+  routes:
+  - name: ingress
+    expose: default->80/tcp
+    destination: avtrajectories->default
+```
+
+Then change it in the next PR with the following content
+```
+loadbalancers:
+- name: drewbalancer
+  routes:
+  - name: ingress
+    expose: default->443/tcp
+    destination: avtrajectories->default
+```
+
+nelson lbs list -n namespace will still print
+
+```
+fdd8cac3d6ff  dc1         dev        drewbalancer--1-0-0--kj483m81    80 ~> drewunit->default             avtraj-dev--1-0-0--kj483m81-somedomain.dc1.company.net
+```
+
+The route doesn't get updated.
+I'm bad at my job and sometimes I say "nelson comit --unit teeth --version 0.0.1 -namespace prod" and then I make version 0.0.2 of my container and I want to put it into prod, so I run the same commit command for 0.0.1 because I suck at my job and now I have two 0.0.1 things competing for the same resources and its all terrible. When I try to commit 0.0.1 to prod and 0.0.1 is already in prod, that should fail
+
+
+NOTE: This is a breaking change for in-cluster deployments, more info below:
+
+Using the --namespace flag assumes the "current" credentials are valid
+for that namespace (e.g. kubectl does not try to switch contexts when
+you explicitly specify a namespace, which makes sense). However it is
+possible that a Kubernetes deployment expects different credentials
+per-namespace, which KUBECONFIG supports. However given how we're using
+--namespace right now, Nelson isn't leveraging that flexibility.
+
+This change instead uses --context to explicitly specify the context
+(and therefore token + namespace). However since contexts can be named
+anything (there is a logical name for each context which ties together
+(cluster, namespace, token)), and because we expect each DC to have
+its own KUBECONFIG, Nelson will assume the context name is the same as
+the namespace name.
+
+In addition this change also removes in/out-cluster distinction in the Kubernetes backend.
+
+Previous in-cluster behavior used assumed administrative credentials
+automatically mounted in the Pod
+(https://kubernetes.io/docs/tasks/access-application-cluster/access-cluster/#accessing-the-api-from-a-pod)
+to do deployments in-cluster. However with the previous change to use
+--context instead of --namespace, this no longer works (because there is
+no KUBECONFIG file, it just uses the token). Therefore even if Nelson
+is deployed in the same cluster a corresponding kubeconfig must still be
+mounted + specified. In any case this also makes the semantics perhaps
+slightly less confusing and/or more consistent.

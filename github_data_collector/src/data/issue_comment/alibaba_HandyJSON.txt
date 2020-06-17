@@ -1,0 +1,187 @@
+Swift 5.1
+Xcode  11.3
+HandyJSON: 5.0.1
+
+
+我的使用场景是序列化时可以不触发didSet/willSet方法。手动设置该属性时需要出发didSet/willSet方法。
+
+```
+class Test: HandyJSON{
+   var xyzList = [String](){
+   		didSet{
+    		//do some thing
+     	}
+   }
+   func mapping(mapper: HelpingMapper) {       
+	do{
+	    let pointer = withUnsafePointer(to: &self.xyzList, { return $0 })
+	    let key = Int(bitPattern: pointer)
+	    print("xyzList key: \(key)")
+	}
+	mapper <<< self.xyzList <-- "yyyList"
+  }
+}
+```
+
+
+原因是：xyzList放入mapper.mappingHandlers的key 和 getRawValueFrom方法中 let address = Int(bitPattern: property.address) 的地址不一致。 经验证mapper.mappingHandlers中的key 是错误的。
+
+导致 下面方法中if方法体不能被执行，此时从dict使用key位xyzList,而不是 yyyList，导致取不到。
+
+
+```
+fileprivate func getRawValueFrom(dict: [String: Any], property: PropertyInfo, mapper: HelpingMapper) -> Any? {
+    let address = Int(bitPattern: property.address)
+    if let mappingHandler = mapper.getMappingHandler(key: address) {
+        if let mappingPaths = mappingHandler.mappingPaths, mappingPaths.count > 0 {
+            for mappingPath in mappingPaths {
+                if let _value = dict.findValueBy(path: mappingPath) {
+                    return _value
+                }
+            }
+            return nil
+        }
+    }
+    if HandyJSONConfiguration.deserializeOptions.contains(.caseInsensitive) {
+        return dict[property.key.lowercased()]
+    }
+    return dict[property.key]
+}
+```
+
+
+
+NumberFormatter中有个locale属性，如果App支持国际化，当App切换到其他语言的时候，转换结果可能不是我们想要的。
+比如把设备切换到阿拉伯环境，print(formatter.string(from: NSNumber(value: 50962)))，打印结果为٥٠٩٦٢
+如果我们需要在页面中显示，这个结果是正常的。
+但是如果需要把这个数字作为参数传给服务端，服务端就没办法识别了
+
+代码模拟这种情况：
+`
+let formatter = NumberFormatter()
+formatter.usesGroupingSeparator = false
+formatter.numberStyle = .decimal
+formatter.maximumFractionDigits = 16
+formatter.locale = Locale(identifier: "ar_CN")
+print(formatter.string(from: NSNumber(value: 50962)))
+`
+能不能提供一种方式支持让使用者自己决定locale？
+我使用的是cocopod集成HandyJSON到项目里
+现在的问题是这样的,我现在在Xcode 9.0/Swift 3.2 环境中运行HandyJSON是没有问题的,
+现在我把环境迁移到Xcode 10.0/Swift 3.0环境运行中,其他的第三方库都没有报错,就HandyJSON报了很多错,如下图。而且我已经把Swift版本都调成Swift 3.0了,这是什么问题呢?
+
+<img width="1180" alt="屏幕快照 2020-01-06 上午11 24 00" src="https://user-images.githubusercontent.com/19338570/71793514-26992180-3078-11ea-92fb-af4eaf409e79.png">
+
+- `HandyJSON` does not specify a Swift version and none of the targets (`Test`) integrating it have the `SWIFT_VERSION` attribute set. Please contact the author or set the `SWIFT_VERSION` attribute in at least one of the targets that integrate this pod.
+当解析一个Json字符串的时候，其中某个Key的值为另一个Json字符串时，字符串的内容会被解析成prettyPrinted的字符串，Json字符串中的 冒号会被转义成等号。导致这个Key值下面的Json字符串在解析的时候不成功
+
+以下的data类型 为String的时候，userSig后面的冒号会被转义成等号
+`"{\"code\":200,\"data\":{\"usersig\":\"eJyrVgrxCdZLrSjILEpVsjI0Nbe0NDYxMrHQAYuXpRYpWSkZ6RkoQfjFKdmJBQWZKUCVJgYGRmaWFqaWEJnMlNS8ksy0TLAGCxMLc5iOzHSgQF6YRX5oll+AmVeVcXGIaURygH9Ylb+PWVVJQFJOYalJXnqUV7ZBWphpqYEtVGNJZi7EQeZA9wAdVAsAKzQxKQ==\"},\"message\":\"success\"}"` 
+服务端结果可能是这样的，要使用泛型支持2种结果的解析
+```
+{
+  "data": [
+    {"key":"value"}
+  ],
+  "succeeded": true,
+  "message": "",
+  "code": 123
+}
+{
+  "data": {
+    "key": "value"
+  },
+  "succeeded": true,
+  "message": "",
+  "code": 123
+}
+```
+
+我的代码如下
+https://gist.github.com/sunbeams001/a33e0af379077b1ffd6507a1b4fd243d
+```
+import HandyJSON
+
+extension Array: HandyJSON {}
+extension String: HandyJSON {}
+extension NSDictionary: HandyJSON {}
+
+class ResponseData<T: HandyJSON>: HandyJSON {
+    var code: Int = 0
+    var data: T?
+    var message: String?
+    var succeeded: Bool = false
+
+    required init() {}
+
+    func mapping(mapper: HelpingMapper) {
+        mapper <<<
+            data <-- ("data", TransformOf<T?, HandyJSON>(
+                fromJSON: { rawString in
+                    if T.self is Array<Any>.Type && (T.self as! Array<Any>.Type).Element.self is HandyJSON.Type {
+                        return type(of: [(T.self as! Array<Any>.Type).Element.self as! HandyJSON.Type]).deserialize(from: rawString?.toJSONString()) as? T
+                    } else {
+                        return T.deserialize(from: rawString?.toJSONString())
+                    }
+                }, toJSON: { value in
+                    value??.toJSONString()
+            }))
+    }
+}
+```
+
+结果
+ResponseData<SomeModel> 可以成功
+ResponseData<[SomeModel]> 不行，解析时 rawString 为 nil
+
+我看issue上有些也提到这个问题，这种的有解决方案吗
+#113
+#342
+
+public class Program: HandyJSON {
+    public var id: String!
+    public var name: String!
+    public var xml: String!
+    public var programPath: String!
+
+    public required init() {}
+
+    public init(id: String, name: String, xml: String, programPath: String) {
+        self.id = id
+        self.name = name
+        self.xml = xml
+        self.programPath = programPath
+    }
+}
+
+let jsons = [Program]()
+let jsonString = jsons.toJSONString()
+
+<img width="677" alt="Screen Shot 2019-10-31 at 6 00 02 PM" src="https://user-images.githubusercontent.com/28790093/67937301-4e977f00-fc08-11e9-9c36-7151ac80fd36.png">
+
+
+```
+extension CGRect: HandyJSON {
+    public mutating func mapping(mapper: HelpingMapper) {
+        mapper <<<
+            self.origin.x <-- ["x"]
+        mapper <<<
+            self.origin.y <-- ["y"]
+        mapper <<<
+            self.size.width <-- ["width"]
+        mapper <<<
+            self.size.height <-- ["height"]
+    }
+    
+    public mutating func didFinishMapping() {
+//        print(self)
+    }
+}
+```
+
+我这样写不能赋值，有什么办法吗
+添加完成之后 新建完成model就报这个错误
+Xcode 11 Swift Packages 不支持，我用的是  HandyJSON 5.0.0 
+
+The package dependency graph can not be resolved; unable find any available tag for the following requirements:
+

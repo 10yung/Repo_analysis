@@ -1,0 +1,72 @@
+Adding `repr(C)` isn't expected to change anything, since the `RawTable` consists purely of pointers and pointer-sized integers. It will, however, make it possible to pass hashmaps across the FFI boundary, which would be useful to Gecko-integrated Rust projects, such as `wgpu`.
+cc @Gankra
+This might seem impertinent, but since this is the `HashMap` of the Rust standard library and `std` is 1.x, when can this crate become 1.x itself?
+
+Obviously that wouldn't halt development any more than the standard library doesn't develop, but it would mark to direct users of the crate (as the Readme suggests a person might want to do) that they can rely on the direct crate usage not breaking out from under them just as much as they can rely on using this through `std` won't break out from under them.
+This change would make the `RawTable` usable with things like arena allocation.
+
+* `RawTable` has a new type parameter, `A: Alloc + Clone`
+* When the `nightly` flag is passed, `Alloc` will be the trait in
+`alloc::Alloc`.
+* On stable, a minimal shim implementation is provided, along with an
+implementation for the global allocator.
+* No public APIs changed.
+* For `HashMap`, everything is monomorphized to the global allocator,
+and there should be no performance or size overhead.
+Hi,
+I'm interested in whether hashbrown can be used for implementing Lua tables for [Luster](https://github.com/kyren/luster).  (Note: I'm not the owner, just someone interested in the project!)
+
+The unusual requirements for Lua's tables are:
+1. Lua's [`next(table, item)`](https://www.lua.org/manual/5.3/manual.html#pdf-next) function returns the "next" item in the table, given another.
+2. Iteration using `next` has to be stable when removing items during the iteration.
+
+I've had a look and think that hashbrown can support this with not much modification, and prototyped it here (a few months ago, so I haven't yet caught up on recent changes; this was before it was moved to rust-lang):
+
+https://github.com/jugglerchris/hashbrown/tree/hash_next
+
+I added a `fn next_after(&self, key: Option<&K>) -> Option<(&K, &V)>` which simply steps through hash buckets via a `RawIterRange` constructed to point part way through to implement #1, and #2 happens for free by using tombstones when removing (which relies on there not being a resize when shrinking too far; I'm not confident I haven't missed any cases).
+
+I would be interested to know if functionality like this would be considered for hashbrown itself (I could understand not; I can certainly see not wanting to guarantee no resize on removal), or if not whether I've missed any obvious issues if I (or someone else) were to maintain a fork with these changes.
+
+Thanks!  I've certainly enjoyed looking through and having a play either way.  :-)
+For my use case I have a worker thread that periodically updates a thread local HashMap and then copies it to another thread. For most iterations no entries are added or removed, only the values change.
+
+I would like to efficiently synchronize the two HashMaps by copying the arrays of control bytes and elements directly to the already allocated arrays of the other HashMap. Basically it would be the same thing that's done in RawTable's `clone` function without the extra allocations.
+
+https://github.com/rust-lang/hashbrown/blob/bacb169740fe04c6f0734d3b43bc5482de040ab6/src/raw/mod.rs#L978-L1028
+
+I saw that the RawTable was recently exposed in #104 but unless I missed something it is not enough to copy the contents from one map into another. Do you think it would be a good idea to implement  [clone_from](https://doc.rust-lang.org/std/clone/trait.Clone.html#method.clone_from) on RawTable which reuses the arrays if possible?
+With the switch to Hashbrow, `std::mem::size_of::<std::collections::HashMap<(), ()>>()` on 64-bit platforms grew from 40 bytes to 56. (24 to 40 bytes with `BuildHasherDefault`.)
+
+In Servo’s DOM implementation we have types whose `size_of` is several hundreds of bytes. Because some not-so-unusual pages can have very many DOM nodes this size can add up to significant memory usage. We have unit tests for `size_of` to ensure it does not accidentally grow, which fail in today’s Rust Nightly because several types grew by 16 bytes because they contain a `HashMap`.
+
+Hashbrown’s `HashMap` contains a `RawTable` which has five pointer-sized fields:
+
+https://github.com/rust-lang/hashbrown/blob/7e79b0c33ec434857e46a8ff3d4ece413c21aaba/src/raw/mod.rs#L328-L348
+
+Some of them seem potentially redundant, but I’m not sure. For example there are two pointers that seem to be in the same allocation. How expensive would it be to re-compute the second pointer every time it is needed?
+
+Are `bucket_mask`, `growth_left`, and `len` related such that one of them could be computed from the others?
+When growing a table, hashbrown will start with a table of size 2 (which can hold 1 element due to load factor) and then double every time the load factor is reached.
+
+| Table size | Capacity | Memory usage (`sizeof(T) = 4`) | Memory usage (`sizeof(T) = 8`) | Memory usage (`sizeof(T) = 16`) |
+|---|---|---|---|---|
+| (empty) | 0 | 0 | 0 | 0 |
+| 2 | 1 | 26 (32) | 34 (40) | 50 (56) |
+| 4 | 3 | 36 (40) | 52 (56) | 84 (88) |
+| 8 | 7 | 56 | 88 | 152 |
+| 16 | 14 | 96 | 160 | 288 |
+| 32 | 28 | 176 | 304 | 560 |
+
+(rounded up to 8 for allocator alignment)
+
+In comparison, the current std HashMap starts off empty but then immediately grows to a table size of 32 (capacity 29) as soon as the first element is added.
+
+We want to try to balance memory usage for small tables with the allocation overhead when growing tables up to their final size.
+The current code base only has the doctests from the standard library `HashMap`. We should add a proper testsuite.
+
+Possible sources of inspiration:
+- https://github.com/blt/bughunt-rust
+- https://github.com/bluss/indexmap/blob/master/tests/quick.rs
+The benchmarks should really be using [criterion](https://github.com/japaric/criterion.rs)
+It would be interesting to benchmark it against [bytell-hash-map](https://github.com/WaDelma/bytell-hash-map) which I did rust implementation for (Haven't optimised it that much and should really make it usable library).

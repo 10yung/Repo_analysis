@@ -1,0 +1,301 @@
+Since there's no badge yet linking to it.
+
+```markdown
+[![Crates.io](https://img.shields.io/crates/v/moxie)](https://crates.io/crates/moxie)
+```
+
+[![Crates.io](https://img.shields.io/crates/v/moxie)](https://crates.io/crates/moxie)
+Currently all arguments have to be passed via the illicit env, which has the downside of having to be 'static and needing to use interior mutability.
+I want to propose a more explicitly defined interface that the mox macro
+consumes. Some of this is based on my own local fork I'm using for
+moxie-native.
+
+Everything I'm talking about here is based on my own requirements for
+moxie-native, and I'd like to know if any of these requirements are too
+strict for other implementations, or if there are other ways of
+improving this.
+
+I'll start off with suggesting that as much as possible be moved into a
+module named `mox_impl`, so that we don't pollute the namespace of
+programs and require a blob import like `use moxie_native::prelude::*;`.
+
+Inside of this module, there will be another namespace for host elements
+(which we will distinguish from user components, as I'll detail below).
+There will also be one for attribute names, and for event names.
+
+### API Sketch
+
+None of the types used here are literal, but are just to name the return
+values so you can match them up to where they get plumbed into.
+
+```rust
+mod mox_impl {
+    mod elements {
+        // Note that this is not a macro.
+        fn element_name_here(
+            with_builder: impl FnOnce(builder: Builder) -> Builder
+        ) -> Node;
+    }
+
+    mod attributes {
+        fn attr_name_here() -> Attribute;
+    }
+
+    mod events {
+        fn on_event_name_here() -> Event;
+    }
+}
+```
+
+The builder API has these methods on it (again, the types are not actual types):
+
+```rust
+trait Builder {
+    fn set_attr(self, key: Attribute, value: Attribute::Value) -> Self;
+    fn on_event(self, event: Event, callback: impl FnMut(event)) -> Self;
+    fn set_data(self, key: &'static str, value: DataValue) -> Self;
+    fn add_child(self, child: Node) -> Self;
+    fn enter_fragment(self, with_builder: impl FnOnce(builder: Self) -> Self) -> Self;
+}
+```
+
+## Changes to syntax
+
+1. User components need to be written in a way that lets them be
+   differentiated from host components. This is already true of
+   components that take arguments, since you have to use the `<element
+   _=(...)>` syntax. Zero argument components need to be written
+   differently from `<element />` though. `<element _=() />` would work
+   if it didn't fail to parse.
+2. Instead of `<element on={func} />`, events actually have names, so
+   `<element on_foo={func} />` turns into
+   `.on(mox_impl::events::on_foo(), func)`.
+3. Add a concept of data attributes (not currently present) which are
+   not statically declared. `<element data_foo=4 />` -> `.data("foo", 4)`
+
+## Implementation
+
+Implementation here is pretty straightforward, the biggest unknown is if
+this new scheme will be difficult for other users of mox.
+
+Simple implementations can define attribute functions as just a function
+that returns a string, but this might be more manual than desired for
+something like moxie-dom.
+
+Some implementation hints from moxie-native that can come in handy here:
+
+- The builder trait can be implemented per element with a `Builder<T>`
+  generic. The element functions can create an instance of this builder
+  and pass it to the input function.
+- `set_attr` can be implemented using a trait like this:
+  ```rust
+  trait HasAttribute<Attr> where Attr: Attribute {
+      fn set_attribute(&mut self, value: Attr::Value);
+  }
+  ```
+- `on_event` can be implemented the same way using a `HasEvent` trait.
+- The element function and the `enter_fragment` method are both good
+  places to insert topo calls.
+
+## Examples
+
+### Simple with attributes
+
+```
+<foo some_attr=4 />
+```
+
+```rust
+mox_impl::elements::foo(|builder| {
+    builder
+    .set_attr(mox_impl::attributes::some_attr(), 4)
+})
+```
+
+### User components
+
+```
+<bar>
+    <user_component _=(1, "foo") />
+</bar>
+```
+
+```rust
+mox_impl::elements::bar(|builder| {
+    builder
+    .add_child(user_component!(1, "foo"))
+})
+```
+
+### Events and data attributes
+
+```rust
+<button on_click={func} data_foo=4 />
+```
+
+```rust
+mox_impl::elements::button(|builder| {
+    builder
+    .on_event(mox_impl::events::on_click(), func)
+    .data("foo", 4)
+})
+```
+
+### Children
+
+```rust
+<foo>
+    <bar />
+    "text"
+    {children}
+</foo>
+```
+
+```rust
+mox_impl::elements::foo(|builder| {
+    builder
+    .add_child(mox_impl::elements::bar(|builder| builder))
+    .add_child("text")
+    .add_child(children)
+})
+```
+
+### Fragments
+
+```rust
+<foo>
+    <>
+        <fragment_child />
+    <>
+</foo>
+```
+
+```rust
+mox_impl::elements::foo(|builder| {
+    builder
+    .enter_fragment(|builder| {
+        builder
+        .add_child(mox_impl::elements::fragment_child(|builder| builder))
+    })
+})
+```
+
+### Bare fragments
+
+Behavior here isn't super clear, but adding a `create_fragment` function
+to `mox_impl` to handle this case seems flexible enough.
+
+```rust
+<>
+    <fragment_child />
+</>
+```
+
+```rust
+mox_impl::create_fragment(|builder|
+    builder
+    .add_child(mox_impl::elements::fragment_child(|builder| builder))
+)
+```
+
+### Iterators
+
+This one is tricky to support, and I currently can't handle it correctly
+in moxie-native without trait specialization. I haven't thought of any
+workarounds that don't require modifying the syntax to be like
+`..{iterator}` or something like that. Any ideas here would be nice.
+
+```rust
+<foo>
+    {[1, 2, 3].iter().map(|index| mox!(
+        <number value={index} />
+    ))}
+</foo>
+```
+ 
+```rust
+mox_impl::elements::foo(|builder| {
+    builder
+    .add_child(
+        [1, 2, 3].iter().map(|index| 
+            mox_impl::elements::number(|builder| {
+                builder
+                .set_attr(mox_impl::attributes::value(), index)
+            })
+        )
+    )
+})
+```
+
+It would be nice to have a ready-made breakdown of where build time is being spent in the dependency graph.
+I think augdom is the only one right now.
+I stumbled on the following peculiar situation:
+
+When not accessing a key injected via `illicit::from-env`,  building results in a ICE.
+The ICE goes away when any access to the key occurs.
+
+moxie: master
+nightly: 2019-11-16
+
+```rust
+#[topo::nested]
+#[illicit::from_env(state: &Key<State>)]
+pub fn whatever() {
+    // UNcommenting this line removes the ICE
+    // let _ = state.field;
+    mox!( <p> "Loading..." </p> );
+}
+```
+
+```
+thread 'rustc' panicked at 'called `Result::unwrap()` on an `Err` value: DistinctSources(DistinctSources { begin: (Real("src/lib.rs"), BytePos(0)), end: (Real("src/views/some_view.rs"), BytePos(1831)) })', src/libcore/result.rs:1187:5
+stack backtrace:
+```
+
+Further to discussions on Discord.  With caller tracking being possibly implemented in rustc it is important to understand what this means for spawned threads and parallelism in general.
+
+In the below by  execution context I mean the environment associated with the callsite generated by either topos::root! , topos::call! or [topos::nested]. This includes the topos::current() Id.
+
+Questions include:
+
+1) What, if any, should the default behaviour be for the execution context in a spawned thread? 
+
+For instance thread with Id:4 spawns a thread, should that new thread have any particularly Id.
+
+2) What guarantees, if any, should there be regarding subsequent calls to callsite tracking methods in a new thread.
+
+For instance thread with Id:4 spawns a thread, if it has also by default has Id:4 can there be any guarantee that the id of the first new callsite in that thread would be invariant over consecutive thread spawns. 
+
+3) Should there be explicit control over the above behaviour and execution context via some kind of spawn threading api.
+
+4) if a thread is spawned and then executes a loop which in turn executes several call-site tracked methods (with a revisit to each call-site intended). How does one ensure that this happens. Would a topo::root! be sufficient to guarantee this.
+
+I.e.  will the below be sufficent to ensure that a and b always refer to the same Id.
+
+```rust
+
+thread::spawn(move || {
+    for i in 0..10 {
+        topo::root!(
+            topo::call!( let a = topo::current() );
+            topo::call!( let b = topo::current() );
+        )
+    }
+});
+```
+
+
+Boolean attributes should create dom nodes that either include the key or exclude it rather than always including it and setting to the Boolean value. For example, try using disabled on buttons.
+Tried to update two state variables on the same button press:
+
+```
+let total = state!(|| 10);
+let current = state!(|| 10);
+element!("button", |e| e
+  .attr("type", "button")
+  .on(|_: ClickEvent, _| Some(0), current)
+  .on(|_: ClickEvent, _| Some(0), total)
+  .inner(|| text!("Reset")));
+```
+
+Seems like only the first one is getting updated (I even swapped the order and tried again to double check haha).

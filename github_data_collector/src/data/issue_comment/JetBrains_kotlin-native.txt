@@ -1,0 +1,115 @@
+The previous way of handling return expressions is incorrect and gives unexpected coverage results on samples with return inside a nested loop:
+- Regions should not intersect with each other, correct mapping can contain only nested regions. Since changing offsets of an already recorded region can cause intersection, `Region.*offset` mutability is redundant 
+- Return expression "cuts" not only enclosing function, but also all of the enclosing statements
+
+Corresponding common part review: https://upsource.jetbrains.com/kotlin/review/KOTLIN-CR-3710
+
+I encountered a new type of exception after update to Kotlin/Native 1.5.61: "/Users/teamcity3/buildAgent/work/4d622a065c544371/runtime/src/main/cpp/Memory.cpp:2441: runtime assert: Must be newly frozen"
+Crash appears in the following code:
+```Kotlin
+package ru.zenmoney.mobile.platform
+
+import platform.Foundation.*
+import kotlin.native.concurrent.*
+import kotlinx.serialization.Serializable
+
+@Serializable(with = DateSerializer::class)
+actual class Date: Comparable<Date> {
+    val date: NSDate
+
+    constructor(date: NSDate) {
+        this.date = date
+        freeze() // <- HERE exception is thrown
+    }
+```
+Could you explain please, is it forbidden to call freeze() inside object constructor for some reason or it is a bug of compiler?
+
+This may just be an incomplete understand on my part, so I'd appreciate any clarification you can offer. I'm returning pinned objects from Kotlin to C, so had assumed that read-only multi-threaded access was allowed. However, I noticed some crashes when attempting to dispose pointers on different threads than they were created on.
+
+knlibrary.kt:
+```
+package knlibrary
+
+import kotlin.native.concurrent.freeze
+
+data class Foo (val thing: String)
+
+fun getFoo(thing: String): Foo {
+    return Foo(thing).freeze();
+}
+```
+
+test.cpp:
+```
+#include <thread>
+#include "knlibrary_api.h"
+
+int main()
+{
+    knlibrary_ExportedSymbols* lib = knlibrary_symbols();
+    auto knlibrary = lib->kotlin.root.knlibrary;
+    auto foo = knlibrary.getFoo("Test");
+    auto t = std::thread([&]
+    {
+        // Uncomment to prevent crash
+        //printf("Thing: %s\n", knlibrary.Foo.get_thing(foo));
+        lib->DisposeStablePointer(foo.pinned);
+    });
+    t.join();
+
+    return 0;
+}
+```
+
+run.cmd:
+```
+@echo off
+
+call kotlinc-native -g knlibrary.kt -produce dynamic -o knlibrary.dll
+
+lib.exe /def:knlibrary.def /out:knlibrary.lib /machine:x64
+cl.exe test.cpp knlibrary.lib
+test.exe
+```
+
+This assumes you have the 64-bit cl.exe on your path (e.g. using the VS x64 Native Tools Command Prompt), as well as the Kotlin and Java bin directories.
+
+If you run as is, it crashes inside `DisposeStablePointer`, evidently because an address looked up from TLS was null. Surprisingly, uncommenting the `printf` line both successfully prints the value and also prevents the crash from occurring.
+
+After observing this behavior I noticed this line from https://kotlinlang.org/docs/tutorials/native/dynamic-libraries.html:
+> Note, Kotlin/Native object references do not support multi-threaded access. Hosting the returned `libnative_ExportedSymbols*` pointer per thread might be necessary.
+
+Does this mean that no access to a Kotlin reference from different threads in C is allowed whatsoever, and that the above example is invalid? Or is the limitation more narrow? I did also try calling `knlibrary_symbols()` on the background thread to get a new pointer in case it had to initialize some thread-local state, but it had the same effect. I'd appreciate your help in better understanding this case. Thanks!
+
+The crash appears when you define a constant after a static method and use that constant inside the method.
+
+This should be either caught by the compiler or just work as is, right now it crashes at runtime and the error doesn't explain exactly what is going on so it's hard to figure it out. 
+
+This is the reproducer:
+
+```kotlin
+class SomeClass {
+
+    fun authenticate() {
+        val url = AUTHENTICATE_URL
+    }
+
+
+    companion object {
+
+        private val AUTHENTICATE_URL = "https://whatever?goto=${getAuthorizeUrl()}"
+
+
+        private fun getAuthorizeUrl(): String {
+            return "https://whatever?param1=$PARAM"
+        }
+
+        private const val PARAM = "paramvalue"
+
+    }
+
+}
+```
+ I think working on WebAssembly support in Kotlin/Native is so poor.
+Webassembly will be the first class technology for web developement in the feature and Kotlin despite of is the perfect language for the WebAssembly,it seems it drop behind c# [blazor](https://github.com/dotnet/blazor) or even python [pyodide](https://github.com/iodide-project/pyodide).
+[My call for Kotlin as a major frontend language](https://gist.github.com/sdeleuze/0da8c3d6a43c659977a16e017020503b)

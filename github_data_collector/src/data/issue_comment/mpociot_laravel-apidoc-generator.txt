@@ -1,0 +1,247 @@
+Changed:
+
+- Updated .travis.yml
+- Fixed error applying the parameter in the `phpstan.neon`
+- Added support for the latest packages. [Also see](https://github.com/sebastianbergmann/phpunit/pull/3765/commits/015ac15d7f3b1d4da8d40d18ccbf81339314bba0).
+- Added php-json extension into composer.json
+- Updated dockblocks and optimized qualified classes
+- Packages in `composer.json` file sorted alphabetically
+- Added call of travis-ci tests for PHP 7.4
+
+PS: Laravel 7 is planned to be released in February, so I immediately included it in the composer.json file.
+Enjoying the recently added support for Eloquent API Resources! I have extended this strategy locally to work around some issues / potential shortcomings.
+
+## Models being persisted to database
+Found data being added every time docs are generated. This is due to my factories creating related models, eg. the `Project` factory does something like:
+
+```
+return [
+    'user_id' => factory(App\User::class),
+]
+```
+
+The API Resource Strategy uses `factory()->make()` to avoid persisting the model, but in my case related models are still persisted.
+
+## Incomplete model data
+Related to the above - my models use Eloquent events to perform common actions. One example is assigning a UUID to each record. In order to have this UUID shown in the API docs, the model needs to be persisted. 
+
+My API resources often include other information, such as model counts of related models - eg. a `users_count` for each `ProjectResource`. 
+
+## Solution - Use database transactions along with `factory()->create()`
+
+The above issues can be resolved by using the same processes as in the `ResponseCalls` strategy.
+
+1. Copy methods from `ResponseCalls`:
+
+```php
+
+    /**
+     * @return void
+     */
+    private function configureEnvironment()
+    {
+        $this->startDbTransaction();
+    }
+
+    /**
+     * @return void
+     */
+    private function finish()
+    {
+        $this->endDbTransaction();
+    }
+
+    /**
+     * @return void
+     */
+    private function startDbTransaction()
+    {
+        try {
+            app('db')->beginTransaction();
+        } catch (\Exception $e) {
+        }
+    }
+
+    /**
+     * @return void
+     */
+    private function endDbTransaction()
+    {
+        try {
+            app('db')->rollBack();
+        } catch (\Exception $e) {
+        }
+    }
+```
+
+Ideally these methods would be moved to the `Strategy` (`Extracting/Strategies/Strategy.php`) abstract class.
+
+2. Use database transaction / rollback to avoid persisting any data
+
+Add to `__invoke()` method:
+
+```
+        $this->configureEnvironment();
+```
+
+Tweak `getApiResourceResponse()` method:
+
+```php
+            /** @var Response $response */
+            $response = $resource->toResponse(app(Request::class));
+            $response = [
+                [
+                    'status' => $statusCode ?: $response->getStatusCode(),
+                    'content' => $response->getContent(),
+                ],
+            ];
+        } catch (\Exception $e) {
+            echo 'Exception thrown when fetching Eloquent API resource response for ['.implode(',', $route->methods)."] {$route->uri}.\n";
+            if (Flags::$shouldBeVerbose) {
+                Utils::dumpException($e);
+            } else {
+                echo "Run this again with the --verbose flag to see the exception.\n";
+            }
+
+            return null;
+        } finally {
+            $this->finish();
+        }
+
+        return $response;
+```
+
+3. Change `instantiateApiResourceModel()` to instead use `->create()`:
+
+```php
+            return factory($type)->create();
+```
+
+## Further considerations
+
+The `configureEnvironment` method in `ResponseCalls` strategy:
+
+```php
+        $this->setEnvironmentVariables($rulesToApply['env'] ?? []);
+        $this->setLaravelConfigs($rulesToApply['config'] ?? []);
+```
+
+This same functionality may also be useful to be supported in `UseApiResourceTags`.
+
+## Factory `states`
+
+My factories make use of `states` which allow me to, eg:
+
+* Implement the most basic model for the default factory, with only required fields set
+* Build upon this base using states
+* Generate different types of models - `User` types / roles, models with many relations, invalid models - useful for tests
+
+I could see it being useful to allow specifying the factory state that the strategy should use, or even having a default state that the strategy looks for, with a set name such as `docs`, `apidocs`:
+
+```php
+$factory->state(App\User::class, 'docs', function (Faker $faker) {
+    return [
+        'name' => 'customised for',
+        'email' => 'apidoc@generator.com',
+    ];
+});
+```
+
+Alternatively, an annotation such as `@apiResourceState` could be the preferred solution
+
+## Related issues
+
+The following issue is potentially related to the above:
+
+[#642 Eloquent API Resource with Loaded Relation](https://github.com/mpociot/laravel-apidoc-generator/issues/642)
+
+
+----
+
+Have logged the above here for discussion or in case it helps anyone, hoping to put together a PR in the next week or two, time permitting
+
+
+
+
+
+
+
+1. I install the package in the dev environment. If you manually register the routes in the file, then when you run the "route: cache" command, there will be a problem of accessing a non-existent namespace.
+
+2. In my PR, I transferred the return code of the routes to the controller since in the initial form it is impossible to execute the "route: cache" command since it contains a callback function, which is unacceptable.
+### Feature Proposal
+Similar to generating a postman collection, generate an Open API v3 spec json file. 
+
+**Why**
+
+1. Allows you to automatically generate SDKs for your API using tools like https://github.com/OpenAPITools/openapi-generator
+2. This format can be imported into a wider range of tools and online services i.e. Postman (ironically), Apiary, [Stoplight](https://stoplight.io/), [Readme.com](https://readme.com/)
+3. Automatic validation of your documentation against your API using tools like [Dredd](https://github.com/apiaryio/dredd)
+4. While it is currently possible to use online tools to do this currently, this is a manual process which can't easily be built into a CI/CD pipeline. Specifically with step 3 which validates the docs against the API.
+
+**How**
+I am willing to write and maintain this (with contribution from my team at [LuminateOne](http://luminate.one/)). However, I would like to know if the maintainers of this package would accept this feature. I know in the past this feature has been [turned down](https://github.com/mpociot/laravel-apidoc-generator/issues/582). It would be good to keep this issue open to gauge support from the community about this feature request too.
+
+Picks up on solution discussed at https://github.com/mpociot/laravel-apidoc-generator/issues/637 
+There is an error in the proposed solution, so I fixed it and hope we can integrate this bugfix back into your repo.
+When I run `php artisan apidoc:generate` on our laravel app, I get the error allowed memory size exhausted. Total number of routes in our application is 767.
+PHP 7.2
+Laravel 5.7
+
+
+A fix for that is to increase php memory limit in the GenerateDocumentation Command construct to something like `ini_set('memory_limit','512M');`
+I used the whenLoaded for load the relation in Resources, but the apidoc:generate don't load the relations and don't load the resource correctly:
+
+`
+return [
+     'id'  => $this->id,
+     'contacts' => $this->whenLoaded('contacts', function(){
+        return  ContactResource::collection($this->contacts);
+     }),
+];
+`
+We should also support pagination for api resources
+
+https://laravel.com/docs/master/eloquent-resources#pagination
+
+Should we add another annotation like @apiResourcePagination
+
+There are 2 methods for pagination ( https://laravel.com/docs/5.8/pagination )
+
+simple and default
+
+So 
+**@apiResourcePaginate** resolves to Model::paginate(15);
+**@apiResourcePaginate simple** resolves to Model::simplePaginate(15);
+
+What do you guys think about?
+I use a filter pages which requires me to define filter params like.
+
+```
+filter[id]
+```
+
+This seems to break doc generation. Both languages bash and javascript field to compile with v3.17.1 of laravel-apidoc-generator.
+
+This happends because the cleanQueryParameters are of the route is broken during the markdown generation step.
+
+```
+array:1 [
+  "filter" => array:1 [
+    "id" => "sint"
+  ]
+]
+```
+
+this should be 
+
+
+```
+array:1 [
+  "filter[id]" => "factoryValue"
+]
+```
+
+I tracked it down to `Mpociot\ApiDoc\Tools\Generator::generateConcreteSampleForArrayKeys`. If i comment the use of this function out markdown generates fine.
+
+Is there a way to enable handle ?

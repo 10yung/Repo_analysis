@@ -1,0 +1,107 @@
+PHP 7.2+, with the same changes as I proposed for Guzzle 7, avoiding calling the helper functions within the core code, to mitigate global package installation issues.
+Looks like there are a couple of fixes merged into master that have not yet made it into a release. Looking at the outstanding PRs that could be merged or closed right now, we have:
+
+#### Looks good to merge to me:
+
+1. https://github.com/guzzle/promises/pull/98
+2. https://github.com/guzzle/promises/pull/105
+
+#### I don't think should be closed:
+
+1. https://github.com/guzzle/promises/pull/83
+2. https://github.com/guzzle/promises/pull/91
+
+#### Not immediately obvious, risky, or unfinished:
+
+1. https://github.com/guzzle/promises/pull/62
+2. https://github.com/guzzle/promises/pull/70
+3. https://github.com/guzzle/promises/pull/95
+4. https://github.com/guzzle/promises/pull/104
+
+I'm sure this doesn't affect many people, but I came across this issue in an older project that uses an autoloader that in some circumstances can call `include()` without checking for file existence (relying on the class file existing somewhere in a directory defined in `include_path`).
+
+Boiling it down, if you register a simple autoloader:
+
+```php
+spl_autoload_register(function($class) {
+	die($class);
+});
+```
+
+Then any of the following will trigger the call to `die`:
+
+```php
+$promise = new FulfilledPromise('NotAClassName1');
+```
+
+```php
+$promise = new RejectedPromise('NotAClassName2');
+```
+
+```php
+$promise = promise_for('NotAClassName3');
+```
+
+```php
+$promise = new Promise();
+$promise->then(function() {}); // A handler must be defined to get to the relevant code
+$promise->resolve('NotAClassName4'); // Or reject()
+```
+
+This happens because `method_exists` will attempt to load the class if provided with a string that could be a class name. So, this PR adds explicit object checks before calling `method_exists`, as I can't imagine triggering the autoloader being an intended side effect.
+`inspect_all()` simply goes over an iterable param and passes values to `inspect()` which accepts only `PromiseInterface` instances.
+In general, if a promise's `getState()` returns `FULFILLED` or `REJECTED`, then `wait()` returns a value or error immediately.  (i.e., you can call `inspect()` on a non-pending promise and get a valid answer).
+
+But this is *not* the case if you `resolve()` or `reject()` with a *promise* -- either directly, or indirectly by returning one from a `then()` handler.  In such a case, you can have a promise whose state is fulfilled or rejected on the surface but is actually pending internally.  Thiis appears to be a violation of [section 2.3.2.1 of the Promises/A+ spec](https://promisesaplus.com/#point-50), i.e. "If *x* is pending, *promise* must remain pending until *x* is fulfilled or rejected.  But this library's promise implementation prematurely settles the promise, rather than leaving it pending per the spec.
+
+In cases where you want to be able to poll the value of promises (but can't actually wait on them), this is a problem because there is no way to know from outside the promise that this pseudo-fulfillment condition can be detected.  The only way to avoid it seems to be to either 1) exclusively use coroutines, 2) never use `getState()` and `wait()`, or 3) never call `resolve()` with a promise or return one from a `then()` handler.
+
+ISTM that it would be better here to follow the spec, and have a promise remain pending when resolved or rejected with another promise, until such time as the other promise resolves or rejects, especially since a pending promise passed to resolve() could later reject, resulting in the paradoxical condition of a promise whose state is "fulfilled", yet throws an error when you `wait()` on it!
+Fixes #97
+If a coroutine throws **after** its 1st yield, then the promise is rejected, as expected :
+```php
+$result = Promise\coroutine(function () {
+    yield true;
+    thrown new \Exception();
+})->then(null, function () { return false; })->wait();
+
+// OK, $result === false
+```
+
+But if it throws before the 1st yield, the exception is not caught :
+```php
+$result = Promise\coroutine(function () {
+    thrown new \Exception();
+    yield true;
+})->then(null, function () { return false; })->wait();
+
+// KO, Uncaught Exception
+```
+ 
+
+
+Hey there,
+
+I've got the following code:
+
+```
+$promise->then(
+                // $onFulfilled
+                function ($user) {
+                   // bla bla
+                },
+                // $onRejected
+                function ($reason) {
+                    throw new Error('reset_password_token_expired');
+                }
+            );
+```
+
+but the error is being caught.
+
+What can I do to allow it to propagate up the error chain and crash the app?
+
+Thank you
+As far as I can quickly test, this minor change fixes this issue: https://github.com/guzzle/guzzle/issues/2066
+
+Beyond that the guzzle library appears to work just fine within a pthreads environment :)

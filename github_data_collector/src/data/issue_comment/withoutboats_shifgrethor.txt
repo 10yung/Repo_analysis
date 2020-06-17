@@ -1,0 +1,30 @@
+On [crates.io](https://crates.io/crates/shifgrethor) "MIT OR Apache-2.0" is listed, but I don't see a licence with the actual code in this repository.
+TODO: rebase on master after https://github.com/withoutboats/shifgrethor/pull/5
+
+Bugs found:
+
+- [x] memleak in tests::stack_rooted due to missing call to collect()
+- [ ] stack overflow in collect() if try to call collect() from finalize()
+This PR adds a simple TravisCI config. It passes the build. See https://travis-ci.com/kpp/shifgrethor/builds/95773988.
+The documentation says that `drop` will not be called for GC'd types - this is likely to lead to memory leaks, especially if the drop implementation has been automatically generated.
+
+Another option would be to call destructors, but to make all access to GC'd fields panic at runtime if accessed from the destructor (essentially setting them to null before calling drop).
+
+Then, finalizers could be re-purposed for destruction logic which actually requires access to GC'd fields (this would require some kind of resurrection support, like in .net)
+`Pin<&mut T>` has a `set` method which allows the user to replace the interior value with a new one (not giving access to the old value). This is generally good, however for us it presents a problem: nothing in the `set` API forces `GcStore` to begin being managed. As a result, it will functionally be leaked.
+
+Possible solutions:
+
+1. ~Run management code on first trace, rather than on root.~ (Inadequate because values may become unrooted before the next collection.)
+2. Stop using `Pin` and start using our own Pin-alike type with a slightly different APIs. This might be necessary in the long run to support copying collectors, which necessitate providing a slightly different guarantee than `Pin` provides.
+Currently shifgrethor's GC implementation uses an intrusively doubly linked list of roots. This is copied from other previous GC implementations in Rust (its been pointed out to me that this is mostly because GC implementations have been by Mozilla people, and this is how Spidermonkey tracks dynamic roots).
+
+This rooting strategy has some downsides. One is that you have to trace around the entire program while rooting: it has essentially the worst memory locality possible. Another is that every root is three times as large as a normal pointer.
+
+In languages without an unmanaged heap, roots are often tracked through stack maps: compile time generated records of which addresses in each stack frame are roots. The tracer walks the stack using the map associated with each stack frame to find the roots in that frame. This strategy has some problems for us: its not clear how to implement this in a library, and Rust has an unmanaged heap, which necessarily can't be mapped at compile time.
+
+I have an idea for a way to manage stack roots that I think is better. Stack roots are by design tied to a particular stack frame with a `'root` lifetime, meaning the pointer that they root cannot escape that stackframe. In fact, the `Gc` pointer you get from a stack root doesn't contain any root metadata at all, there's an entirely separate pointer in the `StackRoot` type which is only accessed by the GC's tracing algorithm, and never the user.
+
+An alternative design would be to maintain a global stack of roots somewhere in the heap. Every time we make a GC allocation using the StackRoot API, we push a new root onto that stack. When the `StackRoot` type drops, we pop that root. Instead of bouncing around the real stack, the GC tracer just iterates up the stack of roots.
+
+I think this can be done with an identical API to the one we have now, but it might even be more flexible and require less macro magic. I think maybe we can have a normal `StackRoot::new` function and I think we can allow returning a stack rooted pointer as long as you return the root with it. This would require the stack of roots to not be strictly a stack, but instead allow out of order nulling of roots, because destructors could run out of order.

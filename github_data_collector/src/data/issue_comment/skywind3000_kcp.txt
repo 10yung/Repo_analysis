@@ -1,0 +1,263 @@
+如果这个库线程不安全，使用起来就不方便了，使用者要考虑加锁互斥，性能就会下降，
+建议这个库内部将线程安全做了。
+
+ikcp_update和ikcp_send/ikcp_recv都可以不再一个线程中执行，
+另外建议ikcp_recv能支持阻塞，不然上层不好及时处理收到的消息。
+
+make: Entering directory `/data1/game-server/node_modules/node-kcp/build'
+  CC(target) Release/obj.target/kcp/src/kcp/ikcp.o
+../src/kcp/ikcp.c: In function ‘ikcp_send’:
+../src/kcp/ikcp.c:508:12: warning: comparison between signed and unsigned integer expressions [-Wsign-compare]
+  if (count >= IKCP_WND_RCV) return -2;
+            ^
+  CXX(target) Release/obj.target/kcp/src/kcpobject.o
+../src/kcpobject.cc: In static member function ‘static int node_kcp::KCPObject::kcp_output(const char*, int, ikcpcb*, void*)’:
+../src/kcpobject.cc:67:37: warning: ‘v8::Local<v8::Value> Nan::Callback::Call(int, v8::Local<v8::Value>*) const’ is deprecated (declared at ../../nan/nan.h:1740) [-Wdeprecated-declarations]
+             callback.Call(argc, argv);
+                                     ^
+../src/kcpobject.cc:76:37: warning: ‘v8::Local<v8::Value> Nan::Callback::Call(int, v8::Local<v8::Value>*) const’ is deprecated (declared at ../../nan/nan.h:1740) [-Wdeprecated-declarations]
+             callback.Call(argc, argv);
+                                     ^
+../src/kcpobject.cc: In static member function ‘static Nan::NAN_METHOD_RETURN_TYPE node_kcp::KCPObject::Input(Nan::NAN_METHOD_ARGS_TYPE)’:
+../src/kcpobject.cc:223:36: error: no matching function for call to ‘v8::String::Value::Value(v8::Local<v8::Value>&)’
+             String::Value data(arg0);
+
+有人遇到过吗
+node -v v12.14.0
+node-gyp -v v5.0.5
+npm-v 6.13.4 
+gcc 4.8.5
+	virtual ~DelayPacket() {
+		if (_ptr) delete _ptr;
+		_ptr = NULL;
+	}
+
+_prt是指向数组的指针，应该修改为delete []_ptr;
+It should be propagated to `ikcp_update` return via `ikcp_flush`.
+
+请帮我看看哪里用错了。
+
+这是server
+
+#include "asio.hpp"
+#include <array>
+#include <thread>
+#include <iostream>
+#include "ikcp.h"
+
+#define IPADDRESS "10.246.106.114" 
+#define UDP_PORT 11000
+
+
+using asio::ip::udp;
+using asio::ip::address;
+
+uint32_t conv = 123;
+ikcpcb* service_kcp = NULL;
+
+void Sender(const std::string& in)
+{
+	asio::io_service io_service;
+	udp::socket socket(io_service);
+	udp::endpoint remote_endpoint = udp::endpoint(address::from_string(IPADDRESS), UDP_PORT);
+	socket.open(udp::v4());
+	std::error_code err;
+	auto sent = socket.send_to(asio::buffer(in), remote_endpoint, 0, err);
+	socket.close();
+	std::cout << "Sent Payload --- " << sent << "\n";
+}
+
+
+int udp_out_put(const char* buf, int len, ikcpcb* kcp, void* user)
+{
+	std::string in(buf, len);
+	Sender(in);
+	return 0;
+}
+
+void do_recv(char* buf, int len)
+{
+	std::string in(buf, len);
+	std::cout << "kcp recv data:" << in << std::endl;
+}
+
+uint32_t update_now_time_ms()
+{
+	using namespace std;
+	auto time_now = chrono::system_clock::now();
+	auto duration_in_ms = chrono::duration_cast<chrono::milliseconds>(time_now.time_since_epoch());
+	return duration_in_ms.count();
+}
+
+struct Service {
+	asio::io_service io_service;
+	udp::socket socket{ io_service };
+	std::array<char, 1024> recv_buffer;
+	udp::endpoint remote_endpoint;
+
+	int count = 100000;
+
+	void handle_receive(const std::error_code& error, size_t bytes_transferred) {
+		if (error) {
+			std::cout << "Receive failed: " << error.message() << "\n";
+			return;
+		}
+		std::string data(recv_buffer.begin(), recv_buffer.begin() + bytes_transferred);
+		ikcp_input(service_kcp, data.c_str(), bytes_transferred);
+		char kcp_buf[1000];
+		memset(kcp_buf, '\0', sizeof(kcp_buf));
+		int kcp_recvd_bytes = ikcp_recv(service_kcp, kcp_buf, sizeof(kcp_buf));
+		if (kcp_recvd_bytes > 0)
+		{
+			do_recv(kcp_buf, kcp_recvd_bytes);
+		}
+
+		std::cout << "kcp_byte:" << kcp_recvd_bytes << " udp received: " << data << " (" << error.message() << ")\n";
+		wait();
+	}
+
+	void wait() {
+		socket.async_receive_from(asio::buffer(recv_buffer),
+			remote_endpoint,
+			bind(&Service::handle_receive, this, std::placeholders::_1, std::placeholders::_2));
+	}
+
+	void receiver()
+	{
+		socket.open(udp::v4());
+		socket.bind(udp::endpoint(address::from_string(IPADDRESS), UDP_PORT));
+
+		wait();
+		std::cout << "Receiving\n";
+		io_service.run();
+		std::cout << "Receiver exit\n";
+	}
+};
+
+void init_ikcp()
+{
+	service_kcp = ikcp_create(conv, (void*)1);
+	service_kcp->output = udp_out_put;
+	ikcp_nodelay(service_kcp,1,5,1,1);
+}
+
+
+
+int main(int argc, char* argv[])
+{
+
+	init_ikcp();
+	Service service;
+	std::thread r([&] { service.receiver(); });
+
+	while(true)
+	{ 
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		ikcp_update(service_kcp, update_now_time_ms());
+	}
+
+	r.join();
+	return 1;
+}
+
+
+-------------
+
+这是client
+
+
+#include "asio.hpp"
+#include <array>
+#include <thread>
+#include <iostream>
+#include "ikcp.h"
+
+#define IPADDRESS "10.246.106.114" 
+#define UDP_PORT 11000
+
+using asio::ip::udp;
+using asio::ip::address;
+
+uint32_t conv = 123;
+ikcpcb* client_kcp = NULL;
+
+
+void sender(const std::string& in)
+{
+	asio::io_service io_service;
+	udp::socket socket(io_service);
+	udp::endpoint remote_endpoint = udp::endpoint(address::from_string(IPADDRESS), UDP_PORT);
+	socket.open(udp::v4());
+	std::error_code err;
+	auto sent = socket.send_to(asio::buffer(in), remote_endpoint, 0, err);
+	socket.close();
+	std::cout << "Sent Payload --- " << sent << "\n";
+}
+
+
+int udp_out_put(const char* buf, int len, ikcpcb* kcp, void* arg)
+{
+	std::string in(buf, len);
+	sender(in);
+	return 0;
+}
+
+void do_recv(char* buf, int len)
+{
+	std::string in(buf, len);
+	std::cout << "recv data:" << in << std::endl;
+}
+
+
+void init_ikcp()
+{
+	client_kcp = ikcp_create(conv,NULL);
+	client_kcp->output = udp_out_put;
+	//ikcp_nodelay(client_kcp,1,5,1,1);
+}
+
+uint32_t update_now_time_ms()
+{
+	using namespace std;
+	auto time_now = chrono::system_clock::now();
+	auto duration_in_ms = chrono::duration_cast<chrono::milliseconds>(time_now.time_since_epoch());
+	return duration_in_ms.count();
+}
+
+int main(int argc, char* argv[])
+{
+	std::string input = argc > 1 ? argv[1] : "hello world";
+	std::cout << "Input is '" << input.c_str() << "'\nSending it to Sender Function...\n";
+
+	init_ikcp();
+	while(true)
+	{ 
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		ikcp_update(client_kcp, update_now_time_ms());
+		ikcp_send(client_kcp, input.c_str(), input.size());
+	}
+	return 1;
+}
+
+本机发送的最高速度只能达到17MB（约120Mb左右的速度）。
+试过很过参数也不知道怎么把速度提升。
+在网络速度不快的互联网，网速在10Mb即1.2MB字节左右的时候，基本上速度都和TCP差不多，比TCP慢一些，KCP在50Mb-100Mb和TCP差距很大，只有一半的样子甚至不到一半的样子。
+我们主要用来发送和接收大文件用。
+发送和接收的缓存，我设置成2048了，网络的RTT=17-35。
+是不是可以将滑动窗口设置一下？但是不知道怎么设置。
+const IUINT32 IKCP_CMD_PUSH = 81;		// cmd: push data
+const IUINT32 IKCP_CMD_ACK  = 82;		// cmd: ack
+const IUINT32 IKCP_CMD_WASK = 83;		// cmd: window probe (ask)
+const IUINT32 IKCP_CMD_WINS = 84;		// cmd: window size (tell)
+这地方是不是可以设置？有的修改后发现不能运行挂了，不知道作用是什么。
+不知道哪里可以设置，该设置的参数都设置了。。。
+请帮帮忙，感谢！！！
+
+ikcp_nodelay(kcp, 0, 40, 0, 0);
+nc ：是否关闭流控，默认是0代表不关闭，1代表关闭。
+使用普通模式/急速模式都相同，只要是nc设置为0，则电信4G的速度为0.2M/S（很多时候还卡着不动了），如果设置为1即关闭流控，速度稳定达到0.9M/S。
+其他的网络包括长宽和移动，都没有这个问题，无论打开流控速度和没有打开流控速度差不多，电信4G差别非常大，或者还有其他的网络没有碰到。
+请大神帮帮忙，指点迷路，感谢！！！
+
+现在设计是 kcp使用conv做用户的唯一标识，这样子移动端基站切换之后重绑定端口就可以了，但是1，这里断开连接了kcp对象数据什么时候从内存移除呢？是否需要一个定时器检测多长时间没有数据就移除kcp对象？
+2，在kcp缓存积累满了之后是否直接断开tcp和kcp对象 让他们都重新连接？

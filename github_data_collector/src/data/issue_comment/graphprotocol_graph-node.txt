@@ -1,0 +1,181 @@
+Brendan on Discord reported this: 
+
+This works:
+```graphql
+query poolContractsDrawQuery($poolAddress: ID!, $drawId: String!, $winnerAddress: String!, $first: Int!, $skip: Int!) {
+  poolContract(id: $poolAddress, block: { number: 15561871 }) {
+  }
+}
+```
+
+This doesn't:
+```graphql
+query poolContractsDrawQuery($poolAddress: ID!, $blockNumber: Int!, $drawId: String!, $winnerAddress: String!, $first: Int!, $skip: Int!) {
+  poolContract(id: $poolAddress, block: { number: $blockNumber }) {
+  }
+}
+```
+
+```
+Message: Invalid value provided for argument `block.number`: Variable("blockNumber"), Location: [object Object], Path: undefined
+```
+This also gets rid of all stored procedures that still refer to `subgraphs.entities`
+
+
+This bumps Graph CLI in the one integration test we have and updates the test environment ports from `8000` to `18000`, `8030` to `18030` and so on.
+Move subgraph metadata from JSONB storage to relational storage. One nice effect of this is that the one entity we change all the time, `SubgraphDeployment`, now lives in its own table rather than being intermingled with all the other metadata. Since we have ~ 700 deployments, but between 600k and 900k metadata entries, we are now making changes in a much smaller table.
+
+The migration in this PR takes about 5 minutes against a production dump from yesterday.
+
+I tested this by deploying new subgraphs locally (mostly Uniswap), and by running against a migrated production dump and indexing (from their state in the dump, not from the start) the subgraphs `protofire/makerdao-governance`, `graphprotocol/livepeer`, `graphprotocol/uniswap`, `protofire/token-registry`, `melonproject/melon`, and `daostack/alchemy`
+
+This fixes https://github.com/graphprotocol/graph-node/issues/1394
+It seems that subgraph starts/restarts cause an error with the `MetricsRegistry`; the error doesn't seem to cause a problem, but it's disconcerting to see that in the log. This seems to happen when a subgraph gets restarted.
+
+Here's an excerpt from the logs:
+```
+Jan 16 04:42:13.082 DEBG Starting or restarting subgraph, subgraph_id: Qmanfv
+Yz5bMSFkxxAX4JgDuHGE8hy3RYYE8w2pa3c9uWQh, component: SubgraphInstanceManager
+Jan 16 04:42:13.082 DEBG Starting block stream, subgraph_id: QmanfvYz5bMSFkxx
+AX4JgDuHGE8hy3RYYE8w2pa3c9uWQh, component: SubgraphInstanceManager
+...
+Jan 16 04:44:43.398 INFO Successfully created attribute indexes for subgraph 
+entities, subgraph_id: QmanfvYz5bMSFkxxAX4JgDuHGE8hy3RYYE8w2pa3c9uWQh, compon
+ent: SubgraphAssignmentProvider
+Jan 16 04:44:43.398 DEBG Subgraph started, start_ms: 98, subgraph_id: QmanfvY
+z5bMSFkxxAX4JgDuHGE8hy3RYYE8w2pa3c9uWQh, component: SubgraphRegistrar
+Jan 16 04:44:43.398 INFO Start subgraph, data_sources: 24, subgraph_id: Qmanf
+vYz5bMSFkxxAX4JgDuHGE8hy3RYYE8w2pa3c9uWQh, component: SubgraphInstanceManager
+Jan 16 04:44:43.406 ERRO registering metric [QmanfvYz5bMSFkxxAX4JgDuHGE8hy3RYYE8w2pa3c9uWQh_sync_total_secs] failed because: descriptor Desc { fq_name: "QmanfvYz5bMSFkxxAX4JgDuHGE8hy3RYYE8w2pa3c9uWQh_sync_total_secs", help: "total time spent syncing", const_label_pairs: [], variable_labels: [], id: 9068003578835316262, dim_hash: 15352403137211333232 } already exists with the same fully-qualified name and const label values, component: MetricsRegistry
+Jan 16 04:44:43.406 ERRO registering metric [subgraph_block_trigger_count_QmanfvYz5bMSFkxxAX4JgDuHGE8hy3RYYE8w2pa3c9uWQh] failed because: descriptor Desc { fq_name: "subgraph_block_trigger_count_QmanfvYz5bMSFkxxAX4JgDuHGE8hy3RYYE8w2pa3c9uWQh", help: "Measures the number of triggers in each block for a subgraph deployment", const_label_pairs: [], variable_labels: [], id: 10311778668539305662, dim_hash: 16777645174600874195 } already exists with the same fully-qualified name and const label values, component: MetricsRegistry
+... (more with different metrics for the same subgraph)
+```
+When we execute GraphQL queries, we set a deadline for how long the overall query is allowed to take. Currently, the deadline is only checked in between issuing SQL queries, and a long running query can cause us to massively exceed the deadline.
+
+We should set a `session_timeout` just before executing a query based on the remaining time until the deadline expires so that Postgres will abort the query if we exceed the deadline.
+
+Since `session_timeout` is set per connection, and sticks around after the query finishes, we need to make sure to reset the `session_timeout` right after running the query so that other queries that later uses this connection is not affected by it.
+The current approach in prefetch to use a window function to pick the top n rows for a set of parents can be very slow. A better way to do this would be to use a lateral join along the lines of
+```
+with parents(id) as (values (...))
+select *
+  from parents p, 
+          cross join lateral (
+            select * 
+              from children c 
+             where c.parent_id = p.id
+             order by c.sort_key 
+             limit n) c
+```
+
+This entails the following:
+
+* Update [PLAN-0001](https://graphprotocol.github.io/rfcs/engineering-plans/0001-graphql-query-prefetching.html) to reflect the changed query construction
+* Change query generation in `relational_queries`
+* For the case where the parent stores `child_id` change `EntityQuery` to pass pairs of `(parent_id, child_id)` into query generation so that we can avoid the actual join with the parent table (might be optional)
+This brings into the future of futures by upgrading to tokio 0.2, futures 0.3, hyper 0.13 and various other dependency upgrades. This not only allows us to use async/.await but also pushes us towards that by having updated dependencies. Some parts of the code were updated to use `async/.await` to serve as examples. This is working fine as far as I have tested it.
+
+#### Using std::future and async
+
+There's now a `Future` trait that lives in std, though helpers are still in the futures crate. The major difference from the one in futures 0.1 is that it has a single `Output` associated type, instead of `Item` and `Error` (same for streams). It is easy to convert back and forth between a std future that has `Output = Result<_, _>` and the old futures by calling `.compat()`.
+
+The `async` syntax can be thought of as a future literal, and works on fns and blocks (but not closures, yet). To use `async` in trait fns the async-trait crate is required, I haven't tried that yet. In blocks you usually want `async move`. Inside an async fn or block, you can use `.await` on futures as it were the old `and_then`, but more flexible. Using future combinators is still useful, so checkout the docs for `FutureExt` and `TryFutureExt` to catch up on them. There is no new syntax for streams, yet. Sometimes the compiler will complain about `Unpin`, I haven't totally understood the pinning stuff but wrapping the future in a `Box::pin` usually fixes that.
+
+#### Spawning tasks and panic handling
+
+Usually we want a tokio task panic to abort the process so that the node has a chance to recover by restarting. Except in some situations such as in the runtime or in queries. So instead of using `tokio::spawn` directly, we should choose between:
+- `graph::spawn` which runs on the default threadpool and aborts on panic.
+- `graph::spawn_blocking` which is run on the blocking threadpool and aborts on panic.
+- `graph::spawn_blocking_allow_panic` which is run on the blocking threadpool and allows panics. A panic will result in an error in the `JoinHandle`.
+
+Note that all of these now return a `JoinHandle` for joining the task, which can be very useful.
+
+Resolves #937, since we're now careful to use the blocking thread pool when called for, and we're also back to the default thread pool size.
+
+Resolves #805, panics in query processing are no longer fatal.
+Bumps [num-bigint](https://github.com/rust-num/num-bigint) from 0.2.3 to 0.2.5.
+<details>
+<summary>Changelog</summary>
+<p><em>Sourced from <a href="https://github.com/rust-num/num-bigint/blob/master/RELEASES.md">num-bigint's changelog</a>.</em></p>
+<blockquote>
+<h1>Release 0.2.5 (2020-01-09)</h1>
+<ul>
+<li><a href="https://github-redirect.dependabot.com/rust-num/num-bigint/pull/126">Updated the <code>autocfg</code> build dependency to 1.0</a>.</li>
+</ul>
+<p><strong>Contributors</strong>: <a href="https://github.com/cuviper">@cuviper</a>, <a href="https://github.com/tspiteri">@tspiteri</a></p>
+<h1>Release 0.2.4 (2020-01-01)</h1>
+<ul>
+<li><a href="https://github-redirect.dependabot.com/rust-num/num-bigint/pull/104">The new <code>BigUint::to_u32_digits</code> method</a> returns the number as a
+little-endian vector of base-2<sup>32</sup> digits. The same method on
+<code>BigInt</code> also returns the sign.</li>
+<li><a href="https://github-redirect.dependabot.com/rust-num/num-bigint/pull/113"><code>BigUint::modpow</code> now applies a modulus even for exponent 1</a>, which
+also affects <code>BigInt::modpow</code>.</li>
+<li><a href="https://github-redirect.dependabot.com/rust-num/num-bigint/pull/114"><code>BigInt::modpow</code> now returns the correct sign for negative bases with even
+exponents</a>.</li>
+</ul>
+<p><strong>Contributors</strong>: <a href="https://github.com/alex-ozdemir">@alex-ozdemir</a>, <a href="https://github.com/cuviper">@cuviper</a>, <a href="https://github.com/dingelish">@dingelish</a>, <a href="https://github.com/Speedy37">@Speedy37</a>, <a href="https://github.com/youknowone">@youknowone</a></p>
+</blockquote>
+</details>
+<details>
+<summary>Commits</summary>
+<ul>
+<li><a href="https://github.com/rust-num/num-bigint/commit/46ce3b470a86befc04097a0daf9cc54475685d94"><code>46ce3b4</code></a> Merge <a href="https://github-redirect.dependabot.com/rust-num/num-bigint/issues/127">#127</a></li>
+<li><a href="https://github.com/rust-num/num-bigint/commit/eda324427a2ceb48d611be7b7d709451d088a11a"><code>eda3244</code></a> Release 0.2.5</li>
+<li><a href="https://github.com/rust-num/num-bigint/commit/973337be3d0f10c8407411cc2e37cf77be40ba2a"><code>973337b</code></a> Merge <a href="https://github-redirect.dependabot.com/rust-num/num-bigint/issues/126">#126</a></li>
+<li><a href="https://github.com/rust-num/num-bigint/commit/cc853b2a7d45730104ac2541cda32151e3937b65"><code>cc853b2</code></a> Update to autocfg 1</li>
+<li><a href="https://github.com/rust-num/num-bigint/commit/c38a11d802a481d04e059436b69e622dac0dbce3"><code>c38a11d</code></a> Merge <a href="https://github-redirect.dependabot.com/rust-num/num-bigint/issues/125">#125</a></li>
+<li><a href="https://github.com/rust-num/num-bigint/commit/b2507b0fe2b6891aa16660b7bdffe32b8989c491"><code>b2507b0</code></a> Doc: some minor clarifications and formatting nits</li>
+<li><a href="https://github.com/rust-num/num-bigint/commit/0c1d1c2b585d648f03412d5cf51cbac8546b6871"><code>0c1d1c2</code></a> Merge <a href="https://github-redirect.dependabot.com/rust-num/num-bigint/issues/122">#122</a></li>
+<li><a href="https://github.com/rust-num/num-bigint/commit/376a090e2d5464111a5f9e22abfd48cc88935366"><code>376a090</code></a> Release 0.2.4</li>
+<li><a href="https://github.com/rust-num/num-bigint/commit/8394622f1a803507df2e946d009b51f1a1c41566"><code>8394622</code></a> Fix clippy::precedence</li>
+<li><a href="https://github.com/rust-num/num-bigint/commit/834004816a4368fc2aae717e04f196320f8a7c0e"><code>8340048</code></a> Fix clippy::redundant_closure</li>
+<li>Additional commits viewable in <a href="https://github.com/rust-num/num-bigint/compare/num-bigint-0.2.3...num-bigint-0.2.5">compare view</a></li>
+</ul>
+</details>
+<br />
+
+
+[![Dependabot compatibility score](https://api.dependabot.com/badges/compatibility_score?dependency-name=num-bigint&package-manager=cargo&previous-version=0.2.3&new-version=0.2.5)](https://dependabot.com/compatibility-score.html?dependency-name=num-bigint&package-manager=cargo&previous-version=0.2.3&new-version=0.2.5)
+
+Dependabot will resolve any conflicts with this PR as long as you don't alter it yourself. You can also trigger a rebase manually by commenting `@dependabot rebase`.
+
+[//]: # (dependabot-automerge-start)
+[//]: # (dependabot-automerge-end)
+
+---
+
+<details>
+<summary>Dependabot commands and options</summary>
+<br />
+
+You can trigger Dependabot actions by commenting on this PR:
+- `@dependabot rebase` will rebase this PR
+- `@dependabot recreate` will recreate this PR, overwriting any edits that have been made to it
+- `@dependabot merge` will merge this PR after your CI passes on it
+- `@dependabot squash and merge` will squash and merge this PR after your CI passes on it
+- `@dependabot cancel merge` will cancel a previously requested merge and block automerging
+- `@dependabot reopen` will reopen this PR if it is closed
+- `@dependabot close` will close this PR and stop Dependabot recreating it. You can achieve the same result by closing it manually
+- `@dependabot ignore this major version` will close this PR and stop Dependabot creating any more for this major version (unless you reopen the PR or upgrade to it yourself)
+- `@dependabot ignore this minor version` will close this PR and stop Dependabot creating any more for this minor version (unless you reopen the PR or upgrade to it yourself)
+- `@dependabot ignore this dependency` will close this PR and stop Dependabot creating any more for this dependency (unless you reopen the PR or upgrade to it yourself)
+- `@dependabot use these labels` will set the current labels as the default for future PRs for this repo and language
+- `@dependabot use these reviewers` will set the current reviewers as the default for future PRs for this repo and language
+- `@dependabot use these assignees` will set the current assignees as the default for future PRs for this repo and language
+- `@dependabot use this milestone` will set the current milestone as the default for future PRs for this repo and language
+- `@dependabot badge me` will comment on this PR with code to add a "Dependabot enabled" badge to your readme
+
+Additionally, you can set the following in your Dependabot [dashboard](https://app.dependabot.com):
+- Update frequency (including time of day and day of week)
+- Pull request limits (per update run and/or open at any time)
+- Out-of-range updates (receive only lockfile updates, if desired)
+- Security updates (receive only security updates, if desired)
+
+
+
+</details>
+Map between strings that represent bytes and `bytea` in the database; the difference between subgraphs that use `Bytes` for `ID` and those that use `String` is transparent to subgraph users. The only exception is that when an entity is stored with an id `0xdeadbeef` it will be returned as the string `deadbeef` stripping the `0x` prefix.
+
+Currently, this is only used for network indexing; all user-supplied subgraphs still use `String` as their `ID` and there is no way for users to switch to `Bytes`.
+
+Fixes https://github.com/graphprotocol/graph-node/issues/1414

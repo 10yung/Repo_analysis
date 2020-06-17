@@ -1,0 +1,198 @@
+Stata SE's don't agree in the below case with two-way fixed effects when I expected them to. If this is expected feel free to close. Data is RDS saved from R from repl.dta read in via code below.
+[repl.RDS.zip](https://github.com/DeclareDesign/estimatr/files/3992760/repl.RDS.zip)
+
+Agrees w/o fixed effects:
+
+```
+ . use repl.dta
+ . reg conflict dlpi_lev, robust cluster(ccode2)
+ 
+ Linear regression                               Number of obs     =      2,425
+ F(1, 96)          =      10.80
+ Prob > F          =     0.0014
+ R-squared         =     0.0021
+ Root MSE          =     .38377
+ 
+ (Std. Err. adjusted for 97 clusters in ccode2)
+ ------------------------------------------------------------------------------
+   |               Robust
+ conflict |      Coef.   Std. Err.      t    P>|t|     [95% Conf. Interval]
+ -------------+----------------------------------------------------------------
+   dlpi_lev |  -.0182238    .005546    -3.29   0.001    -.0292326   -.0072151
+ _cons |   .1827658   .0307032     5.95   0.000     .1218203    .2437113
+ ------------------------------------------------------------------------------
+```
+
+```
+repl <- haven::read_dta("repl.dta")
+
+lm_robust(conflict ~ dlpi_lev, clusters = ccode2, se_type = "stata", data = repl)
+                Estimate  Std. Error   t value     Pr(>|t|)   CI Lower     CI Upper DF
+ (Intercept)  0.18276580 0.030703249  5.952653 4.305921e-08  0.1218203  0.243711268 96
+ dlpi_lev    -0.01822383 0.005546027 -3.285925 1.420160e-03 -0.0292326 -0.007215052 96
+```
+
+Does not agree when we add two way FE:
+
+```
+ . tsset ccode2 year
+ . xtreg conflict dlpi_lev yr*, fe robust cluster(ccode2)
+ note: yr25 omitted because of collinearity
+ 
+ Fixed-effects (within) regression               Number of obs     =      2,425
+ Group variable: ccode2                          Number of groups  =         97
+ 
+ R-sq:                                           Obs per group:
+   within  = 0.0364                                         min =         25
+ between = 0.0027                                         avg =       25.0
+ overall = 0.0159                                         max =         25
+ 
+ F(25,96)          =       1.20
+ corr(u_i, Xb)  = 0.0042                         Prob > F          =     0.2602
+ 
+ (Std. Err. adjusted for 97 clusters in ccode2)
+ ------------------------------------------------------------------------------
+   |               Robust
+ conflict |      Coef.   Std. Err.      t    P>|t|     [95% Conf. Interval]
+ -------------+----------------------------------------------------------------
+   dlpi_lev |  -.0108859   .0133478    -0.82   0.417    -.0373811    .0156093
+ (year FE omitted)
+ _cons |   .2603708   .0315889     8.24   0.000     .1976673    .3230742
+ -------------+----------------------------------------------------------------
+   sigma_u |  .29765047
+ sigma_e |  .24593433
+ rho |  .59428563   (fraction of variance due to u_i)
+ ------------------------------------------------------------------------------
+```
+
+```
+lm_robust(conflict ~ dlpi_lev, fixed_effects = ~ year + ccode2, clusters = ccode2, se_type = "stata", data = repl)
+             Estimate Std. Error    t value Pr(>|t|)  CI Lower  CI Upper       DF
+ dlpi_lev -0.01088586 0.01362317 -0.7990694 0.4262228 -0.03792764 0.01615592 96
+```
+In `difference_in_means`, we've been having this problem where
+
+1. If all blocks have min 2 obs in each arm, we use neyman variance in each block, then "average" the SEs together to get an overall SE for the ATE estimate.
+
+2. If all blocks have 1 obs in each arm (e.g., a matched pairs design), we use the Imai variance estimator
+
+3. if some but not all blocks have 1 obs in at least one arm, we error out.
+
+Our wacky intuition was to do something like 1 for all the "big" blocks and something like 2 for all the "small" blocks and then average together as in 1, treating the small blocks estimate like a single block. We didn't implement this because it seemed like a hack and we wanted someone to have figured out the math..
+
+And I just met someone who did! Nicole Pashley and Luke Miratrix have this problem (and more complicated variants) worked out, mostly in line with our intuition.
+
+Take a look here: https://arxiv.org/abs/1710.10342
+
+This is a feature request, but I think a relatively high priority one. 
+
+Nicole said she'd be willing to share some code that we could check against at least.  
+
+
+It's common to see the coefficients from the first-stage regression regression in a 2SLS regression table. For example, see discussion [here](https://twitter.com/andrewheiss/status/1192231221717327873).
+
+`estimatr::iv_robust` does not currently support this AFAIK. (Although it does return some overall diagnostic results from the first-stage if the "diagnostics = T" argument is used.) Would it be possible add the first-stage to the model return object?
+
+FWIW, `lfe::felm` supports this with a "stage1" return object. Here's a reprex:
+
+``` r
+# library(AER) ## only for Cigarettes dataset
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(lfe))
+
+## Get the data
+data("CigarettesSW", package = "AER")
+## Create a new data frame with some modified variables
+cigs <-
+  CigarettesSW %>%
+  mutate(
+    rprice = price/cpi,
+    rincome = income/population/cpi,
+    rtax = tax/cpi,
+    tdiff = (taxs - tax)/cpi
+  ) 
+
+## Run the iv regression in felm with tdiff and rtax instrumenting the endogenous
+## variable log(rprice)
+iv_felm <- 
+  felm(
+    log(packs) ~ log(rincome) |
+      year + state | ## FEs
+      (log(rprice) ~ tdiff + rtax), ## Endog. variable and instruments
+    data = cigs
+  )
+
+## Shown first stage result
+summary(iv_felm$stage1)
+#> 
+#> Call:
+#>    NULL 
+#> 
+#> Residuals:
+#>      Min       1Q   Median       3Q      Max 
+#> -0.06233 -0.01529  0.00000  0.01529  0.06233 
+#> 
+#> Coefficients:
+#>               Estimate Std. Error t value Pr(>|t|)    
+#> log(rincome) -0.028994   0.147492  -0.197    0.845    
+#> tdiff         0.013457   0.003050   4.412 6.52e-05 ***
+#> rtax          0.007573   0.001049   7.221 5.43e-09 ***
+#> ---
+#> Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+#> 
+#> Residual standard error: 0.03064 on 44 degrees of freedom
+#> Multiple R-squared(full model): 0.9815   Adjusted R-squared: 0.9601 
+#> Multiple R-squared(proj model): 0.7779   Adjusted R-squared: 0.5204 
+#> F-statistic(full model):45.85 on 51 and 44 DF, p-value: < 2.2e-16 
+#> F-statistic(proj model): 51.36 on 3 and 44 DF, p-value: 2.015e-14 
+#> F-statistic(excl instr.):75.65 on 2 and 44 DF, p-value: 5.758e-15
+```
+
+<sup>Created on 2019-11-07 by the [reprex package](https://reprex.tidyverse.org) (v0.3.0)</sup>
+
+https://cran.r-project.org/web/packages/fixest/index.html
+https://twitter.com/grant_mcdermott/status/1189679123578290176
+
+From Solaris on v0.20.0: https://www.r-project.org/nosvn/R.check/r-patched-solaris-x86/estimatr-00check.html
+
+```
+Running the tests in ‘tests/testthat.R’ failed.
+Complete output:
+  > library(testthat)
+  > library(estimatr)
+  > 
+  > test_check("estimatr")
+  ── 1. Failure: Handle perfect fits appropriately (@test-lm-robust-fes.R#682) ──
+  tidy(rfo)[rfo$term == "X", ] not equivalent to tidy(ro)[ro$term == "X", ].
+  Component "std.error": 'is.NA' value mismatch: 1 in current 0 in target
+  Component "statistic": 'is.NA' value mismatch: 1 in current 0 in target
+  Component "p.value": 'is.NA' value mismatch: 1 in current 0 in target
+  Component "conf.low": 'is.NA' value mismatch: 1 in current 0 in target
+  Component "conf.high": 'is.NA' value mismatch: 1 in current 0 in target
+  
+  ══ testthat results ═══════════════════════════════════════════════════════════
+  [ OK: 1326 | SKIPPED: 0 | WARNINGS: 7 | FAILED: 1 ]
+  1. Failure: Handle perfect fits appropriately (@test-lm-robust-fes.R#682) 
+  
+  Error: testthat unit tests failed
+  Execution halted
+```
+Waiting until `gt` is on CRAN, then will change `.travis.yml` accordingly.
+tracking: https://github.com/sgaure/lfe/issues/19
+From a user:
+
+```
+Since version 0.18.0 (or earlier), I found that the joint hypothesis test is not performed with lh_robust, but it only performs single hypotheses.
+
+In the manual (pp. 24, "Example"), it writes*
+
+# The linear hypothesis argument can be specified equivalently as: 
+lh_robust(y ~ x + z, data = dat, linear_hypothesis = "z = 2x") 
+lh_robust(y ~ x + z, data = dat, linear_hypothesis = c("z = 1", "x = 2")) 
+
+but actually they perform different hypothesis tests. The former is the test of z = 2x, but the latter only performs the t-test of z = 1 and x = 2, respectively, but not the joint test of z = 1 AND x = 2. 
+
+In the car::linearHypothesis function, the same specification performs the joint test and returns the result of F-test. 
+ 
+I think that lh_robust used to returns the same result as linearHypothesis. (probably version 0.16.0)
+```

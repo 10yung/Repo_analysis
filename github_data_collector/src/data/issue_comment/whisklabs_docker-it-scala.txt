@@ -1,0 +1,450 @@
+Currently, `PullImagesTimeout`, `StartContainersTimeout`, and `StopContainersTimeout` timeouts are enforced by `Await.ready`, `Await.result`, ... e.g:
+
+https://github.com/whisklabs/docker-it-scala/blob/4d3bc7e8630fcdb7bc1a51a11a49f543564b38a4/core/src/main/scala/com/whisk/docker/DockerKit.scala#L57-L60
+
+When the timeout expires, however, the `Future`'s `body` code keeps running even if the `TimeoutException` has been raised. As an example, run this code in a Scala REPL:
+
+```scala
+Await.ready(Future { Thread.sleep(5000); println("BOOM!")}, 1 second)
+```
+The result is that the exception is raised and yet "BOOM" is printed:
+
+```
+java.util.concurrent.TimeoutException: Futures timed out after [1 second]
+  scala.concurrent.impl.Promise$DefaultPromise.ready(Promise.scala:223)
+  scala.concurrent.impl.Promise$DefaultPromise.ready(Promise.scala:157)
+  scala.concurrent.Await$$anonfun$ready$1.apply(package.scala:169)
+  scala.concurrent.Await$$anonfun$ready$1.apply(package.scala:169)
+  scala.concurrent.BlockContext$DefaultBlockContext$.blockOn(BlockContext.scala:53)
+  scala.concurrent.Await$.ready(package.scala:169)
+  ammonite.$sess.cmd65$.<init>(cmd65.sc:1)
+  ammonite.$sess.cmd65$.<clinit>(cmd65.sc)
+
+
+@ BOOM!
+```
+
+This means that, as we try to stop the containers in `afterAll`:
+
+https://github.com/whisklabs/docker-it-scala/blob/4d3bc7e8630fcdb7bc1a51a11a49f543564b38a4/scalatest/src/main/scala/com/whisk/docker/scalatest/DockerTestKit.scala#L24-L28
+
+We might still be trying to start them in a separate thread.
+
+This PR introduces `timeout` parameters in `DockerCommandExecutor` methods which propagates down to the implementations of this interface. There, it replaces `Future.apply` factory invocation with `PerishableFuture.apply`. It also adds `PerishableFuture` factory which makes sure the `body` gets interrupted when the timeout expires:
+
+```scala
+case finiteTimeout: FiniteDuration =>
+        val promise = Promise[T]
+
+        val futureTask = new FutureTask[T](new Callable[T] {
+          override def call(): T = body
+        }) {
+          override def done(): Unit = promise.tryComplete {
+            Try(get()).recoverWith {
+              case _: CancellationException => Failure(new TimeoutException())
+            }
+          }
+        }
+
+        val reaperTask = new TimerTask {
+          override def run(): Unit = {
+            futureTask.cancel(true)
+            promise.tryFailure(new TimeoutException())
+          }
+        }
+
+        timer.schedule(reaperTask, finiteTimeout.toMillis)
+        ec.execute(futureTask)
+
+        promise.future
+```
+
+If the passed timeout is `Duration.Inf` it just doesn't timeout so it uses standard `Future`  factory:
+
+```scala
+case _ => Future.apply(body)
+```
+
+These changes should improve host resources usage and pave the way to more advanced timeouts customization.
+Updated missing config fields in readme
+`DockerExecutor` allows to remove containers. It would be useful if it also allowed pausing/unpausing or starting stopped containers (a `stopContainer` method already exists but it doesn't have a corresponding `startContainer`). One use case for this is testing behaviors triggered when external dependencies are unavailable.
+I'm new to Docker, so forgive my ignorance, but I'm struggling to understand what these directions are telling me to do:
+
+https://github.com/whisklabs/docker-it-scala#configuration
+
+According to this https://github.com/whisklabs/docker-it-scala/issues/7 you simply need to set that environment variable for `DOCKER_HOST` and all unit tests should then run just fine, but on a fresh install of Docker for Lubuntu 16.04, it isn't immediately obvious what that value should be set to and the value specified in the readme didn't seem to work for me (i.e. unit tests were failing to connect to postgres).
+
+Digging into this issue further, I eventually got the postgres scalaTests for this repo passing by first configuring systemd as follows:
+
+I created a file: `/etc/systemd/system/docker.service.d/docker.conf`
+in that file I put (in order to match the host specified in the readme):
+```
+[Service]
+ExecStart=
+ExecStart=/usr/bin/dockerd -H tcp://127.0.0.1:2375 -H unix:///var/run/docker.sock
+```
+
+I then ran:
+```
+systemctl daemon-reload
+systemctl restart docker
+```
+
+I then exported the `DOCKER_HOST` to the docker daemon (dockerd) url I just configured:
+`DOCKER_HOST=tcp://127.0.0.1:2375`
+
+Now unit tests passed. 
+
+It was frustrating that I couldn't find a lot of official Docker documentation backing up my decisions. Is it common to have to configure the daemon host like I did? Should the readme for docker-it-scala maybe clarify some of the docker setup (maybe call it "prerequisites")?
+The following error message is misleading:
+
+      com.github.dockerjava.api.exception.DockerClientException: Could not pull image: image operating system "windows" cannot be used on this platform
+
+It seems to happen when the test library times out when pulling a docker image. If you do a `docker pull <image_name>` manually on your machine or the build server, the tests work fine.  
+
+```
+gradle check
+Download https://plugins.gradle.org/m2/org/eclipse/jgit/org.eclipse.jgit/maven-metadata.xml
+Download https://plugins.gradle.org/m2/org/eclipse/jgit/org.eclipse.jgit.ui/maven-metadata.xml
+Download https://plugins.gradle.org/m2/com/jcraft/jsch/maven-metadata.xml
+Download https://plugins.gradle.org/m2/org/slf4j/slf4j-api/maven-metadata.xml
+Download https://plugins.gradle.org/m2/org/ajoberstar/grgit/maven-metadata.xml
+Download https://plugins.gradle.org/m2/com/google/guava/guava/maven-metadata.xml
+> Configure project : 
+Reckoned version: 0.1.0-milestone.0.1+ba988bf682fd99ba8f1cc1a1b1a10dd029e38b4e
+Download http://artifactory.tmsglbdev.com/artifactory/exampleglobaldev-release/com/example/iw/core/0.0.32/core-0.0.32.pom
+Download http://artifactory.tmsglbdev.com/artifactory/exampleglobaldev-release/com/example/iw/core/0.0.32/core-0.0.32.jar
+> Task :compileTestScala 
+Pruning sources from previous analysis, due to incompatible CompileSetup.
+> Task :test 
+Discovery starting.
+14:32:50,363 |-INFO in ch.qos.logback.classic.LoggerContext[default] - Could NOT find resource [logback-test.xml]
+14:32:50,363 |-INFO in ch.qos.logback.classic.LoggerContext[default] - Could NOT find resource [logback.groovy]
+14:32:50,364 |-INFO in ch.qos.logback.classic.LoggerContext[default] - Found resource [logback.xml] at [file:/Users/someuser/src/iw/iw-vertx-impl/build/resources/test/logback.xml]
+14:32:50,364 |-WARN in ch.qos.logback.classic.LoggerContext[default] - Resource [logback.xml] occurs multiple times on the classpath.
+14:32:50,364 |-WARN in ch.qos.logback.classic.LoggerContext[default] - Resource [logback.xml] occurs at [file:/Users/someuser/src/iw/iw-vertx-impl/build/resources/test/logback.xml]
+14:32:50,364 |-WARN in ch.qos.logback.classic.LoggerContext[default] - Resource [logback.xml] occurs at [jar:file:/Users/someuser/.m2/repository/com/example/iw-core-schema/0.0.11/iw-core-schema-0.0.11.jar!/logback.xml]
+14:32:50,411 |-INFO in ch.qos.logback.classic.joran.action.ConfigurationAction - debug attribute not set
+14:32:50,411 |-INFO in ch.qos.logback.core.joran.action.AppenderAction - About to instantiate appender of type [ch.qos.logback.core.ConsoleAppender]
+14:32:50,416 |-INFO in ch.qos.logback.core.joran.action.AppenderAction - Naming appender as [STDOUT]
+14:32:50,439 |-WARN in ch.qos.logback.core.ConsoleAppender[STDOUT] - This appender no longer admits a layout as a sub-component, set an encoder instead.
+14:32:50,439 |-WARN in ch.qos.logback.core.ConsoleAppender[STDOUT] - To ensure compatibility, wrapping your layout in LayoutWrappingEncoder.
+14:32:50,439 |-WARN in ch.qos.logback.core.ConsoleAppender[STDOUT] - See also http://logback.qos.ch/codes.html#layoutInsteadOfEncoder for details
+14:32:50,440 |-INFO in ch.qos.logback.classic.joran.action.LoggerAction - Setting level of logger [com.example] to DEBUG
+14:32:50,440 |-INFO in ch.qos.logback.core.joran.action.AppenderRefAction - Attaching appender named [STDOUT] to Logger[com.example]
+14:32:50,440 |-INFO in ch.qos.logback.classic.joran.action.ConfigurationAction - End of configuration.
+14:32:50,441 |-INFO in ch.qos.logback.classic.joran.JoranConfigurator@7a56812e - Registering current configuration as safe fallback point
+Discovery completed in 663 milliseconds.
+Run starting. Expected test count is: 39
+VertxRedlockSpec:
+RedisRateLimiterSpec:
+14:32:59.864 [ScalaTest-2] INFO  com.example.vertx.sql.VertxSqlSpec - Loading DB migration
+14:32:59.875 [ScalaTest-2] INFO  com.example.SchemaSetup - Running migrations for 10.47.0.2:3306/dev (username: dev, password: ***)
+VertxSqlSpec:
+14:33:03.704 [ScalaTest-2] INFO  com.example.vertx.sql.VertxSqlSpec - 1 have been applied to database
+14:33:03.704 [ScalaTest-2] INFO  com.example.vertx.sql.VertxSqlSpec - Loading Test Fixtures
+Test migrations should
+Jun 08, 2018 2:33:03 PM io.vertx.ext.asyncsql.impl.MYSQLClientImpl
+INFO: Creating configuration for 10.47.0.2:3306
+- result in tables (535 milliseconds)
+- insertAndReturnKey for client should return keys (252 milliseconds)
+- update client name should return true (99 milliseconds)
+- update client name that doesn't exist should return false (49 milliseconds)
+- Query for Client should return object (100 milliseconds)
+- Query for Client should return List (61 milliseconds)
+14:36:51.924 [ScalaTest-3] ERROR com.example.vertx.VertxRedlockSpec - Futures timed out after [120 seconds]
+java.util.concurrent.TimeoutException: Futures timed out after [120 seconds]
+        at scala.concurrent.impl.Promise$DefaultPromise.ready(Promise.scala:255)
+        at scala.concurrent.impl.Promise$DefaultPromise.ready(Promise.scala:183)
+        at scala.concurrent.Await$.$anonfun$ready$1(package.scala:191)
+        at scala.concurrent.BlockContext$DefaultBlockContext$.blockOn(BlockContext.scala:53)
+        at scala.concurrent.Await$.ready(package.scala:142)
+        at com.whisk.docker.DockerKit.stopAllQuietly(DockerKit.scala:65)
+        at com.whisk.docker.DockerKit.stopAllQuietly$(DockerKit.scala:63)
+        at com.example.vertx.VertxRedlockSpec.stopAllQuietly(VertxRedlockSepc.scala:14)
+        at com.whisk.docker.scalatest.DockerTestKit.afterAll(DockerTestKit.scala:25)
+        at com.whisk.docker.scalatest.DockerTestKit.afterAll$(DockerTestKit.scala:24)
+        at com.example.vertx.VertxRedlockSpec.afterAll(VertxRedlockSepc.scala:14)
+        at org.scalatest.BeforeAndAfterAll.$anonfun$run$1(BeforeAndAfterAll.scala:225)
+        at org.scalatest.Status.$anonfun$withAfterEffect$1(Status.scala:379)
+        at org.scalatest.Status.$anonfun$withAfterEffect$1$adapted(Status.scala:375)
+        at org.scalatest.FailedStatus$.whenCompleted(Status.scala:497)
+        at org.scalatest.Status.withAfterEffect(Status.scala:375)
+        at org.scalatest.Status.withAfterEffect$(Status.scala:373)
+        at org.scalatest.FailedStatus$.withAfterEffect(Status.scala:469)
+        at org.scalatest.BeforeAndAfterAll.run(BeforeAndAfterAll.scala:224)
+        at org.scalatest.BeforeAndAfterAll.run$(BeforeAndAfterAll.scala:208)
+        at com.example.vertx.VertxRedlockSpec.run(VertxRedlockSepc.scala:14)
+        at org.scalatest.tools.SuiteRunner.run(SuiteRunner.scala:45)
+        at java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:511)
+        at java.util.concurrent.FutureTask.run(FutureTask.java:266)
+        at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+        at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+        at java.lang.Thread.run(Thread.java:748)
+com.example.vertx.VertxRedlockSpec *** ABORTED *** (4 minutes, 1 second)
+  com.github.dockerjava.api.exception.DockerClientException: Could not pull image: image operating system "windows" cannot be used on this platform
+  at com.github.dockerjava.core.command.PullImageResultCallback.awaitSuccess(PullImageResultCallback.java:50)
+  at com.whisk.docker.impl.dockerjava.DockerJavaExecutor.$anonfun$pullImage$1(DockerJavaExecutor.scala:183)
+  at scala.runtime.java8.JFunction0$mcV$sp.apply(JFunction0$mcV$sp.java:12)
+  at scala.concurrent.Future$.$anonfun$apply$1(Future.scala:655)
+  at scala.util.Success.$anonfun$map$1(Try.scala:251)
+  at scala.util.Success.map(Try.scala:209)
+  at scala.concurrent.Future.$anonfun$map$1(Future.scala:289)
+  at scala.concurrent.impl.Promise.liftedTree1$1(Promise.scala:29)
+  at scala.concurrent.impl.Promise.$anonfun$transform$1(Promise.scala:29)
+  at scala.concurrent.impl.CallbackRunnable.run(Promise.scala:60)
+  ...
+14:36:52.015 [ScalaTest-4] ERROR c.t.iw.vertx.RedisRateLimiterSpec - Futures timed out after [120 seconds]
+java.util.concurrent.TimeoutException: Futures timed out after [120 seconds]
+        at scala.concurrent.impl.Promise$DefaultPromise.ready(Promise.scala:255)
+        at scala.concurrent.impl.Promise$DefaultPromise.ready(Promise.scala:183)
+        at scala.concurrent.Await$.$anonfun$ready$1(package.scala:191)
+        at scala.concurrent.BlockContext$DefaultBlockContext$.blockOn(BlockContext.scala:53)
+        at scala.concurrent.Await$.ready(package.scala:142)
+        at com.whisk.docker.DockerKit.stopAllQuietly(DockerKit.scala:65)
+        at com.whisk.docker.DockerKit.stopAllQuietly$(DockerKit.scala:63)
+        at com.example.vertx.RedisRateLimiterSpec.stopAllQuietly(RedisRateLimiterSpec.scala:16)
+        at com.whisk.docker.scalatest.DockerTestKit.afterAll(DockerTestKit.scala:25)
+        at com.whisk.docker.scalatest.DockerTestKit.afterAll$(DockerTestKit.scala:24)
+        at com.example.vertx.RedisRateLimiterSpec.afterAll(RedisRateLimiterSpec.scala:16)
+        at org.scalatest.BeforeAndAfterAll.$anonfun$run$1(BeforeAndAfterAll.scala:225)
+        at org.scalatest.Status.$anonfun$withAfterEffect$1(Status.scala:379)
+        at org.scalatest.Status.$anonfun$withAfterEffect$1$adapted(Status.scala:375)
+        at org.scalatest.FailedStatus$.whenCompleted(Status.scala:497)
+        at org.scalatest.Status.withAfterEffect(Status.scala:375)
+        at org.scalatest.Status.withAfterEffect$(Status.scala:373)
+        at org.scalatest.FailedStatus$.withAfterEffect(Status.scala:469)
+        at org.scalatest.BeforeAndAfterAll.run(BeforeAndAfterAll.scala:224)
+        at org.scalatest.BeforeAndAfterAll.run$(BeforeAndAfterAll.scala:208)
+        at com.example.vertx.RedisRateLimiterSpec.run(RedisRateLimiterSpec.scala:16)
+        at org.scalatest.tools.SuiteRunner.run(SuiteRunner.scala:45)
+        at java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:511)
+        at java.util.concurrent.FutureTask.run(FutureTask.java:266)
+        at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+        at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+        at java.lang.Thread.run(Thread.java:748)
+com.example.vertx.RedisRateLimiterSpec *** ABORTED *** (4 minutes, 1 second)
+  com.github.dockerjava.api.exception.DockerClientException: Could not pull image: image operating system "windows" cannot be used on this platform
+  at com.github.dockerjava.core.command.PullImageResultCallback.awaitSuccess(PullImageResultCallback.java:50)
+  at com.whisk.docker.impl.dockerjava.DockerJavaExecutor.$anonfun$pullImage$1(DockerJavaExecutor.scala:183)
+  at scala.runtime.java8.JFunction0$mcV$sp.apply(JFunction0$mcV$sp.java:12)
+  at scala.concurrent.Future$.$anonfun$apply$1(Future.scala:655)
+  at scala.util.Success.$anonfun$map$1(Try.scala:251)
+  at scala.util.Success.map(Try.scala:209)
+  at scala.concurrent.Future.$anonfun$map$1(Future.scala:289)
+  at scala.concurrent.impl.Promise.liftedTree1$1(Promise.scala:29)
+  at scala.concurrent.impl.Promise.$anonfun$transform$1(Promise.scala:29)
+  at scala.concurrent.impl.CallbackRunnable.run(Promise.scala:60)
+  ...
+Run completed in 4 minutes, 1 second.
+Total number of tests run: 6
+Suites: completed 2, aborted 2
+Tests: succeeded 6, failed 0, canceled 0, ignored 0, pending 0
+*** 2 SUITES ABORTED ***
+FAILURE: Build failed with an exception.
+* What went wrong:
+Execution failed for task ':test'.
+> There were failing tests. See the report at: file:///Users/someuser/src/iw/iw-vertx-impl/build/reports/tests/test/index.html
+* Try:
+Run with --stacktrace option to get the stack trace. Run with --info or --debug option to get more log output.
+* Get more help at https://help.gradle.org
+BUILD FAILED in 4m 35s
+6 actionable tasks: 6 executed
+```
+In our continuous integration environment, I've been seeing errors like the following a lot:
+```
+com.example.iw.MigrationSpecs *** ABORTED *** (21 seconds, 591 milliseconds)
+  java.lang.RuntimeException: Cannot run all required containers
+  at com.whisk.docker.DockerKit.startAllOrFail(DockerKit.scala:59)
+  at com.whisk.docker.DockerKit.startAllOrFail$(DockerKit.scala:43)
+  at com.example.iw.MigrationSpecs.startAllOrFail(MigrationSpecs.scala:9)
+  at com.whisk.docker.scalatest.DockerTestKit.beforeAll(DockerTestKit.scala:21)
+  at com.whisk.docker.scalatest.DockerTestKit.beforeAll$(DockerTestKit.scala:19)
+  at com.example.iw.MigrationSpecs.beforeAll(MigrationSpecs.scala:9)
+  at org.scalatest.BeforeAndAfterAll.liftedTree1$1(BeforeAndAfterAll.scala:212)
+```
+
+The test kit I'm using is pretty simple too:
+
+```
+import com.whisk.docker.{DockerContainer, DockerKit, DockerReadyChecker}
+
+import scala.concurrent.Await
+import scala.concurrent.duration._
+
+trait DatabaseDockerContainers extends DockerKit {
+
+  val mariaDBContainer = DockerContainer("mariadb:5.5").
+    withEnv("MYSQL_DATABASE=dev","MYSQL_USER=dev", "MYSQL_PASSWORD=dev", "MYSQL_ROOT_PASSWORD=dev").
+    withPorts(3306 -> None).
+    withReadyChecker(DockerReadyChecker.LogLineContains("ready for connections"))
+
+  val cassandraContainer = DockerContainer("cassandra:3").
+    withPorts(9042 -> None).
+    withReadyChecker(DockerReadyChecker.LogLineContains("Starting listening for CQL clients on"))
+
+  def containerIP(c : DockerContainer) = Await.result(c.getIpAddresses(), 20 second).head
+
+  abstract override def dockerContainers : List[DockerContainer] =
+    mariaDBContainer :: cassandraContainer :: super.dockerContainers
+
+}
+```
+
+And my Spces2 is built like so:
+
+```
+import com.whisk.docker.impl.dockerjava.DockerKitDockerJava
+import com.whisk.docker.scalatest.DockerTestKit
+import org.flywaydb.core.internal.exception.FlywaySqlException
+import org.scalatest.{FreeSpec, Matchers}
+
+class MigrationSpecs extends FreeSpec with Matchers with DockerTestKit with DatabaseDockerContainers with DockerKitDockerJava {
+
+  "MySQL migrations" - {
+```
+
+I suspect that DockerKit is failing out too early when waiting for the containers to become alive. I'm going to turn logging up and see if I can reproduce/extract more information. Is there any way to expose the internal timeout and make it configurable? 
+I was trying to start up a Bind9 server (that exposes 53 on tcp and udp) and could not figure out how to make that happen.
+
+It appears as though that may not be possible given the port mappings that you have, which are an `Int -> Option[Int]`, which precludes using a string like `53/udp`
+
+I have been unable to get the same working with the docker spotify client.  However, I did manage to get this working with the docker-java client.
+
+Unsure of next steps.  I could contribute the code I have back (it would break compatibility), but the issue still remains that I could not get the docker spotify client working.
+
+
+I do not think that it will be solved in this version but I open the ticket at least to track the issue for reference.
+
+Given:
+https://github.com/whisklabs/docker-it-scala/blob/master/impl/spotify/src/main/scala/com/whisk/docker/impl/spotify/SpotifyDockerCommandExecutor.scala#L146
+
+https://github.com/whisklabs/docker-it-scala/blob/master/impl/spotify/src/main/scala/com/whisk/docker/impl/spotify/SpotifyDockerCommandExecutor.scala#L168
+
+The `DockerReadyChecker` can eventually close the Stream that is used by `LogLineReceiver`.
+
+Rough workaround is to not use `DockerReadyChecker.LogLinesContains` along with `LogLineReceiver`.
+Hi
+
+I have a requirement of running a container in privileged mode, to be able to test my functionallity.
+
+I have created PR, with a proposal #108.
+Please consider merging this PR.
+Running from the example for Postgres I am getting a ClassNotFoundException. I have tried both Specs2 and ScalaTest and get the same results.
+
+Any insights?
+
+StackTrace:
+```
+[info] com.banno.transaction.exporter.history.PostgresServiceSpec *** ABORTED ***
+[info]   java.lang.RuntimeException: java.lang.ClassNotFoundException: com.sun.ws.rs.ext.RuntimeDelegateImpl
+[info]   at javax.ws.rs.ext.RuntimeDelegate.findDelegate(RuntimeDelegate.java:122)
+[info]   at javax.ws.rs.ext.RuntimeDelegate.getInstance(RuntimeDelegate.java:91)
+[info]   at javax.ws.rs.core.UriBuilder.newInstance(UriBuilder.java:69)
+[info]   at javax.ws.rs.core.UriBuilder.fromUri(UriBuilder.java:80)
+[info]   at org.glassfish.jersey.client.JerseyWebTarget.<init>(JerseyWebTarget.java:81)
+[info]   at org.glassfish.jersey.client.JerseyClient.target(JerseyClient.java:297)
+[info]   at org.glassfish.jersey.client.JerseyClient.target(JerseyClient.java:76)
+[info]   at com.spotify.docker.client.DefaultDockerClient.resource(DefaultDockerClient.java:2602)
+[info]   at com.spotify.docker.client.DefaultDockerClient.listImages(DefaultDockerClient.java:624)
+[info]   at com.whisk.docker.impl.spotify.SpotifyDockerCommandExecutor.$anonfun$listImages$1(SpotifyDockerCommandExecutor.scala:184)
+```
+
+TestCode:
+```scala
+import java.sql.DriverManager
+
+import scala.concurrent.ExecutionContext
+import scala.util.Try
+import com.whisk.docker._
+
+trait DockerPostgresService extends DockerKit {
+  import scala.concurrent.duration._
+  import DockerPostgresService._
+  def PostgresAdvertisedPort = 5432
+  def PostgresExposedPort = 44444
+  val PostgresUser = "nph"
+  val PostgresPassword = "suitup"
+
+  val postgresContainer = DockerContainer("postgres:9.5.3")
+    .withPorts((PostgresAdvertisedPort, Some(PostgresExposedPort)))
+    .withEnv(s"POSTGRES_USER=$PostgresUser", s"POSTGRES_PASSWORD=$PostgresPassword")
+    .withReadyChecker(
+      new PostgresReadyChecker(PostgresUser, PostgresPassword, Some(PostgresExposedPort))
+        .looped(15, 1.second)
+    )
+
+  abstract override def dockerContainers: List[DockerContainer] =
+    postgresContainer :: super.dockerContainers
+}
+
+object DockerPostgresService {
+  class PostgresReadyChecker(user: String, password: String, port: Option[Int] = None)
+    extends DockerReadyChecker {
+
+    override def apply(container: DockerContainerState)
+                      (implicit docker: DockerCommandExecutor,
+                       ec: ExecutionContext) =
+      container
+        .getPorts()
+        .map(ports =>
+          Try {
+            Class.forName("org.postgresql.Driver")
+            val url = s"jdbc:postgresql://${docker.host}:${port.getOrElse(ports.values.head)}/"
+            Option(DriverManager.getConnection(url, user, password)).map(_.close).isDefined
+          }.getOrElse(false))
+  }
+
+
+}
+
+import com.whisk.docker.DockerKit
+import org.scalatest.concurrent.ScalaFutures
+import org.scalatest.time._
+import org.scalatest.{BeforeAndAfterAll, Suite}
+//import org.slf4j.LoggerFactory
+
+trait DockerTestKit extends BeforeAndAfterAll with ScalaFutures with DockerKit { self: Suite =>
+
+//  private lazy val log = LoggerFactory.getLogger(this.getClass)
+
+  def dockerInitPatienceInterval =
+    PatienceConfig(scaled(Span(20, Seconds)), scaled(Span(10, Millis)))
+
+  def dockerPullImagesPatienceInterval =
+    PatienceConfig(scaled(Span(1200, Seconds)), scaled(Span(250, Millis)))
+
+  override def beforeAll(): Unit = {
+    super.beforeAll()
+    startAllOrFail()
+  }
+
+  override def afterAll(): Unit = {
+    stopAllQuietly()
+    super.afterAll()
+
+  }
+}
+
+import com.spotify.docker.client.DefaultDockerClient
+import com.whisk.docker.impl.spotify.SpotifyDockerFactory
+import org.scalatest.time.{Second, Seconds, Span}
+import org.scalatest.{FlatSpec, Matchers}
+
+class PostgresServiceSpec
+  extends FlatSpec
+    with Matchers
+    with DockerTestKit
+    with DockerPostgresService {
+
+  implicit val pc = PatienceConfig(Span(20, Seconds), Span(1, Second))
+
+  override implicit val dockerFactory: DockerFactory = new SpotifyDockerFactory(
+    DefaultDockerClient.fromEnv().build())
+
+  "postgres node" should "be ready with log line checker" in {
+    isContainerReady(postgresContainer).futureValue shouldBe true
+  }
+}
+```
+

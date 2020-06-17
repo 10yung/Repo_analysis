@@ -1,0 +1,138 @@
+It would be useful to have an artifact on maven central. One of the advantages is to start the application from coursier.
+Fresh Install of the latest master apears to always try to connect to 127.0.0.1 which will fail if you try and build a cluster between multiple machines (i.e over a private network).
+
+Error Messages:
+```
+Jan 21 06:53:41 db01 bash[24020]: [WARN] [01/21/2017 06:53:41.374] [curiodb-akka.remote.default-remote-dispatcher-43] [akka.tcp://curiodb@10.128.21.1:9001/system/endpointManager/reliableEndpointWriter-akka.tcp%3A%2F%2Fcuriodb%40127.0.0.1%3A9001-74] Association with remote system [akka.tcp://curiodb@127.0.0.1:9001] has failed, address is now gated for [5000] ms. Reason: [Association failed with [akka.tcp://curiodb@127.0.0.1:9001]] Caused by: [Connection refused: /127.0.0.1:9001]
+Jan 21 06:53:49 db01 bash[24020]: [WARN] [01/21/2017 06:53:49.370] [curiodb-akka.remote.default-remote-dispatcher-41] [akka.tcp://curiodb@10.128.21.1:9001/system/endpointManager/reliableEndpointWriter-akka.tcp%3A%2F%2Fcuriodb%4010.128.21.3%3A9001-75] Association with remote system [akka.tcp://curiodb@10.128.21.3:9001] has failed, address is now gated for [5000] ms. Reason: [Association failed with [akka.tcp://curiodb@10.128.21.3:9001]] Caused by: [No route to host]
+Jan 21 06:53:49 db01 bash[24020]: [WARN] [01/21/2017 06:53:49.378] [curiodb-akka.remote.default-remote-dispatcher-44] [akka.tcp://curiodb@10.128.21.1:9001/system/endpointManager/reliableEndpointWriter-akka.tcp%3A%2F%2Fcuriodb%4010.128.21.2%3A9001-76] Association with remote system [akka.tcp://curiodb@10.128.21.2:9001] has failed, address is now gated for [5000] ms. Reason: [Association failed with [akka.tcp://curiodb@10.128.21.2:9001]] Caused by: [No route to host]
+Jan 21 06:53:51 db01 bash[24020]: [WARN] [01/21/2017 06:53:51.401] [curiodb-akka.remote.default-remote-dispatcher-44] [akka.tcp://curiodb@10.128.21.1:9001/system/endpointManager/reliableEndpointWriter-akka.tcp%3A%2F%2Fcuriodb%40127.0.0.1%3A9001-77] Association with remote system [akka.tcp://curiodb@127.0.0.1:9001] has failed, address is now gated for [5000] ms. Reason: [Association failed with [akka.tcp://curiodb@127.0.0.1:9001]] Caused by: [Connection refused: /127.0.0.1:9001]
+```
+
+Configuration:
+```
+curiodb {
+
+  // Addresses listening for clients.
+  listen = [
+    "tcp://10.128.21.1:6379"    // TCP server using Redis protocol.
+  ]
+
+  // Duration settings (either time value, or "off").
+  persist-after = 1 second    // Like "save" in Redis.
+  sleep-after   = 10 seconds  // Virtual memory threshold.
+  expire-after  = off         // Automatic key expiry.
+
+  transactions {
+    timeout   = 3 seconds     // Max time a transaction may take to run.
+    isolation = repeatable    // "repeatable", "committed", or "uncommitted".
+    on-error  = rollback      // "commit" or "rollback".
+  }
+
+  commands {
+    timeout  = 1 second       // Max time a command may take to run.
+    disabled = [SHUTDOWN]     // List of disabled commands.
+    debug    = off            // Print debug info for every command run.
+  }
+
+  // Cluster nodes.
+  nodes = {
+    db01: "tcp://10.128.21.1:9001"
+    db02: "tcp://10.128.21.2:9001"
+    db03: "tcp://10.128.21.3:9001"
+  }
+
+  // Current cluster node (from the "nodes" keys above).
+  node = db01
+
+}
+```
+
+It's also not even listening on port 6379 which is configured. This is using OpenJDK, I'll test out Suns next.
+```
+#/usr/bin/env python
+#coding: utf-8
+
+import redis
+
+from multiprocessing import Process
+
+def get_value(host, port, var):
+    r = redis.Redis(host=host, port=port)
+    return r.get(var)
+
+def lost_update(host, port, var):
+    r = redis.Redis(host=host, port=port)
+    pipe = r.pipeline()
+    pipe.incr(var, 1)
+    pipe.execute()
+    #for i in range(0, 10):
+    #    pipe.incr(var, 1)
+    #    pipe.execute();
+
+
+if __name__ == "__main__":
+    host = '127.0.0.1'
+    port = 6370
+    var = "test1"
+    print get_value(host, port, var)
+
+    p1 = Process(target=lost_update, args=(host, port, var))
+    p2 = Process(target=lost_update, args=(host, port, var))
+    p1.start()
+    p2.start()
+    p1.join()
+    p2.join()
+
+    print get_value(host, port, var)
+```
+
+run the above code, output:
+
+```
+43
+44
+```
+
+if you uncomment the code, run it, sometimes it will response timeout.
+
+problem 1:
+when one keyNode send _MULTI to itself(`node() ! command`), if may has receive another _MULTI from another clientNode, so both clientNodes won't wait(inTransaction will fail), they will update a data node concurrently, and update at their own data version. 
+
+problem 2:
+two clientNode can send _MULTI to every keyNode at the same time, so some keyNodes may receive _MULTI from clientNode1, some keyNodes receive _MULTI from clientNode2, and no clientNodes will finish the transaction. 
+
+and i have a question, why keynodes should have multi-version? 
+
+test 1: mget number1 number3 should return 4 15.
+redis 127.0.0.1:6370> get number3
+"15"
+redis 127.0.0.1:6370> multi
+OK
+redis 127.0.0.1:6370> mget number1 number3
+QUEUED
+redis 127.0.0.1:6370> set number3 20
+QUEUED
+redis 127.0.0.1:6370> exec
+1) 1) "4"
+   2) "20"
+2) OK
+
+test 2: dbsize in transaction should return 11, not 12.
+redis 127.0.0.1:6370> dbsize
+(integer) 11
+redis 127.0.0.1:6370> multi
+OK
+redis 127.0.0.1:6370> dbsize
+QUEUED
+redis 127.0.0.1:6370> set number2 1
+QUEUED
+redis 127.0.0.1:6370> exec
+1) (integer) 12
+2) OK
+
+the reason is the commands are sent sequently, but not executed sequently.
+
+about list blocking operations, still have some problems:
+1. not support multi keys. supporting multi keys in multi keyNode needs much more works.
+2. the scheduler in the block function may has race conditions with unblock. Is sending an unblock message in the scheduler a better solution?

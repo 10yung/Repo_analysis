@@ -1,0 +1,153 @@
+To mirror https://doc.rust-lang.org/alloc/vec/struct.Vec.html#method.splice .
+
+The implementation is a straight copy of `Vec`s implementation, only
+altered to call `len()/reserve()` instead of accessing the internal
+`len` and `buf` field respectively as those do not exist in `SmallVec`.
+An extra type parameter were also required for `Drain`.
+This issue popped up in context of https://github.com/zbraniecki/unic-locale/issues/49
+
+`SmallVec` is often used when the common scenario is a very limited number of elements. In such cases pulling in the whole complex sort mechanism is an overkill, so having some sort of `dumb_sort` which is cheap and can reasonably well handle 1-4 elements, would fit into `smallvec`.
+These are changes that weren't ready in time for 1.0 (#73).
+
+Depends on unstable Rust features:
+
+- [ ] Use const generics to change `SmallVec<[T; N]>` to `SmallVec<T, N>`. Remove the `Array` trait. (rust-lang/rust#44580).
+- [ ] Support custom allocators (#55, rust-lang/rust#32838).
+- [ ] Use specialization to optimize `extend`, `insert_many`, and `from` for slices of `Copy` types. Deprecate and remove `extend_from_slice`, `insert_from_slice`, and `from_slice` (rust-lang/rust#31844).
+- [ ] Use the `union` representation by default and remove the optional `union` feature added in #94 (rust-lang/rust#32836).
+
+Breaking API changes:
+
+- [ ] Fix variance of `SmallVec<[T; N]` over `T` (#146)?
+Constant generic is becoming more mature and I would like to know if is someone porting the existing code to use it behind a feature flag. If not, I might do it myself if you guys don't mind it.
+`SmallVec<[T; N]>` is invariant over `T`.
+Although `[T; N]` is covariant over `T` as expected.
+
+This is due to `SmallVec<A>` having field of type `<A as Array>::Item` in underlying union.
+I propose to change that field type to `A` and remove `A: Array` bound from type declaration.
+This adds a `push_light` alternative to `push` which is optimized for inlining and for vectors which fit inside the fixed size.
+
+<!-- Reviewable:start -->
+---
+This change is [<img src="https://reviewable.io/review_button.svg" height="34" align="absmiddle" alt="Reviewable"/>](https://reviewable.io/reviews/servo/rust-smallvec/134)
+<!-- Reviewable:end -->
+
+e.g. I could envision a `fn upholds_invariants() -> bool` method that could be `debug_assert!`ed on all methods that use `unsafe`, thereby allowing us to fuzz-check for mistakes we may have made w.r.t. memory safety. Alas, there are some invariants we cannot check for now (namely around uninitialized memory), but we could at least document them. 
+
+We could also add more comments describing why what we do really should be safe, so others can understand – and try to poke holes into – our thinking.
+The slice primitive type has a [`to_vec` method](https://doc.rust-lang.org/std/primitive.slice.html#method.to_vec) which makes it convenient to convert a slice to a vector. It would be great if this crate could define an extension trait that added a method called `to_smallvec` (or some other name) which did the same thing for `SmallVec`.
+
+This makes it particularly convenient to port code to using SmallVec since you can just import that extension trait instead of converting all the calls to `to_vec`. :smiley: 
+I was profiling my serde deserialization library and I went down the rabbit hole of benchmarking different KV container storage types. Got down to `Vec<(&'a[u8], &'a[u8]>` as the fastest and I wanted to see if my code would be faster by putting those string pointers on the stack. So I tried out SmallVec, was actually a little bit slower (20%) than vec. Should this be expected? I did not consider memory gains but the deserialization change doesn't make sense to me.
+
+I extract my benchmark to run inside of rust-smallvec:
+
+```#![feature(test)]
+
+#[macro_use]
+extern crate smallvec;
+extern crate test;
+extern crate bincode;
+extern crate serde;
+#[macro_use] extern crate serde_derive;
+
+
+use self::test::Bencher;
+use smallvec::{ExtendFromSlice, SmallVec};
+
+#[bench]
+fn smallvec_i32_benchmark(b: &mut Bencher) {
+
+    use self::bincode::{serialize, deserialize};
+    let data = {
+        let tinyvec : SmallVec<[i32; 5]> = smallvec![1,2,3,4,5];
+        let sv = tinyvec;
+        serialize(&sv).unwrap()
+    };
+
+    b.iter(|| {
+        let tinyvec_2 : SmallVec<[i32; 5]> = deserialize(&data[..]).unwrap();
+    });
+}
+
+#[bench]
+fn vec_i32_benchmark(b: &mut Bencher) {
+    use self::bincode::{serialize, deserialize};
+    let data = {
+        let tinyvec : Vec<i32> = vec![1,2,3,4,5];
+        let sv = tinyvec;
+        serialize(&sv).unwrap()
+    };
+
+    b.iter(|| {
+        let tinyvec_2 : Vec<i32> = deserialize(&data[..]).unwrap();
+    });
+}
+
+#[bench]
+fn smallvec_tuple_benchmark(b: &mut Bencher) {
+
+    use self::bincode::{serialize, deserialize};
+    let data = {
+        let k1 = "hey";
+        let v1 = "now";
+        let k2 = "you're";
+        let v2 = "an";
+        let k3 = "all";
+        let v3 = "star";
+        let k4 = "get";
+        let v4 = "your";
+        let k5 = "game";
+        let v5 = "one";
+        let tinyvec : SmallVec<[(&str, &str); 5]> = smallvec![(k1, v1), (k2, v2), (k3, v3), (k4, v4), (k5, v5)];
+        let sv = tinyvec;
+        serialize(&sv).unwrap()
+    };
+
+    b.iter(|| {
+        let tinyvec_2 : SmallVec<[(&str,&str); 5]> = deserialize(&data[..]).unwrap();
+    });
+}
+
+#[bench]
+fn vec_tuple_benchmark(b: &mut Bencher) {
+    use smallvec::{ExtendFromSlice, SmallVec};
+
+    use self::bincode::{serialize, deserialize};
+    let data = {
+        let k1 = "hey";
+        let v1 = "now";
+        let k2 = "you're";
+        let v2 = "an";
+        let k3 = "all";
+        let v3 = "star";
+        let k4 = "get";
+        let v4 = "your";
+        let k5 = "game";
+        let v5 = "one";
+        let regvec : Vec<(&str, &str)> = vec![(k1, v1), (k2, v2), (k3, v3), (k4, v4), (k5, v5)];
+        let v = regvec;
+        serialize(&v).unwrap()
+    };
+
+    b.iter(|| {
+        let tinyvec_2 : Vec<(&str,&str)> = deserialize(&data[..]).unwrap();
+    });
+}
+```
+
+on my laptop this spits out these numbers:
+
+```
+running 4 tests
+test smallvec_i32_benchmark   ... bench:          84 ns/iter (+/- 10)
+test smallvec_tuple_benchmark ... bench:         222 ns/iter (+/- 23)
+test vec_i32_benchmark        ... bench:          45 ns/iter (+/- 4)
+test vec_tuple_benchmark      ... bench:         186 ns/iter (+/- 20)
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 4 measured; 0 filtered out
+```
+Hi, growing the internal buffer of the  vector by factor 2 is not ideal, better would be a value close to 1.5 
+
+Please read:
+https://stackoverflow.com/questions/1100311/what-is-the-ideal-growth-rate-for-a-dynamically-allocated-array

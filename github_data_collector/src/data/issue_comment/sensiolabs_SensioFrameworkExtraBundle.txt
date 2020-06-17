@@ -1,0 +1,201 @@
+Fix #664 by adding a check on identifier
+# Context
+An URL with multiple parameter and the second one is optional
+> Example : 
+```php
+/**
+ * @Route("/gestion/salarie/{salarie<\d+>}")
+ */
+class GestionSalarieController extends AbstractController
+{
+   /**
+     * @Route("/mission/{mission<\d*>}", name="gestion_salarie_mission")
+     */
+    public function mission(
+        Salarie $salarie,
+        ?Mission $mission = null
+    ): Response {
+        .....
+    }
+}
+```
+
+- **Case 1** : Call route `gestion_salarie_mission` without mission (`{{ path('gestion_salarie_mission', {'salarie': salarie.id}) }}`)
+    - **Expected result** : `null === $mission`
+    - **Given Result** : `Mission $mission` with the first $mission of a `$salarie` passed in URL
+    - **Behaviour** : [DoctrineParamConverter ](https://github.com/sensiolabs/SensioFrameworkExtraBundle/blob/d6ad9c1b132da16b063993224e067871b02fba93/src/Request/ParamConverter/DoctrineParamConverter.php#L209) looks for all fields in the request related to `Mission` to construct a query even if Mission identifier is null
+     - **Solution** : Add `exclude` to exclude `Salarie` (Solution works only if `mission` is empty)
+```php
+   /**
+     * @Route("/mission/{mission<\d*>}", name="gestion_salarie_mission")
+     * @ParamConverter("mission", options={"exclude": {"salarie"}})
+     */
+    public function mission(
+        Salarie $salarie,
+        ?Mission $mission = null
+    ): Response {
+        .....
+    }
+```
+- **Case 2** : Call route `gestion_salarie_mission` with a mission (`{{ path('gestion_salarie_mission', {'salarie' : mission.salarie.id, 'mission' : mission.id}) }}`)
+    - **Expected result** : `Mission $mission` has identifier `mission` from the request
+    - **Given result** :  `null`
+    - **Behaviour** : The method `DoctrineParamConverter::find()` return false if `exclude` exists in options ([here](https://github.com/sensiolabs/SensioFrameworkExtraBundle/blob/d6ad9c1b132da16b063993224e067871b02fba93/src/Request/ParamConverter/DoctrineParamConverter.php#L117)) then the method `DoctrineParamConverter::findOneBy()` looks in all request fields (including mission) if it related to the given class `Mission` by checking `$metadata->hasField() || $metadataHasAssociation()` ([here](https://github.com/sensiolabs/SensioFrameworkExtraBundle/blob/d6ad9c1b132da16b063993224e067871b02fba93/src/Request/ParamConverter/DoctrineParamConverter.php#L210)), the param `mission` is not exists in class `Mission` because it is an identifier so the param is ignored !
+   - **Temporary solution** : Add mapping to map mission with id
+```php
+   /**
+     * @Route("/mission/{mission<\d*>}", name="gestion_salarie_mission")
+     * @ParamConverter("mission", options={"mapping" : {"mission" : "id"}, "exclude": {"salarie"}})
+     */
+    public function mission(
+        Salarie $salarie,
+        ?Mission $mission = null
+    ): Response {
+        .....
+    }
+```
+ 
+# Bug
+- **Case 2** : Without mapping, paramconverter should be able to map mission param to identifier, the process of getting criteria from request [here](https://github.com/sensiolabs/SensioFrameworkExtraBundle/blob/d6ad9c1b132da16b063993224e067871b02fba93/src/Request/ParamConverter/DoctrineParamConverter.php#L210) ignore if a param is an identifier
+
+# Solution
+- **Case 2** : Add a check `$metadata->isIdentifier()` on attribute [here](https://github.com/sensiolabs/SensioFrameworkExtraBundle/blob/d6ad9c1b132da16b063993224e067871b02fba93/src/Request/ParamConverter/DoctrineParamConverter.php#L210)
+```php
+foreach ($options['mapping'] as $attribute => $field) {
+            if (
+               $metadata->isIdentifier($field)
+                || $metadata->hasField($field)
+                || ($metadata->hasAssociation($field) && $metadata->isSingleValuedAssociation($field))
+                || $mapMethodSignature
+            ) {
+                $criteria[$field] = $request->attributes->get($attribute);
+            }
+        }
+```
+`Doctrine\Common\Persistence\Proxy` have been deprecated in favor of `Doctrine\Persistence\Proxy` since `doctrine/persistence` 1.3
+
+This PR deal with both Proxy class to avoid deprecation notice when the new Proxy class is available.
+
+
+I have a case looking like that:
+
+```
+class IndividualMissionController
+{
+    public function createAction(Request $request, Member $owner, ?IndividualMission $parentMission = null)
+    {
+    }
+}
+```
+
+And I have 2 routes defined on it:
+
+```
+coaching_individual_mission_create:
+    path: /missions/create
+    defaults:
+        _controller: Incenteev\WebBundle\Controller\Coaching\IndividualMissionController::createAction
+    methods: [GET, POST]
+
+coaching_individual_mission_reuse:
+    path: /missions/{parentMission}/reuse
+    defaults:
+        _controller: Incenteev\WebBundle\Controller\Coaching\IndividualMissionController::createAction
+    methods: [GET, POST]
+    requirements:
+        parentMission: '%incenteev.router.requirement.uuid%'
+```
+
+The `coaching_individual_mission_reuse` works fine.
+But the `coaching_individual_mission_create` would try to load a parent mission by owner in this case, due to the fallback by criteria when loading by identifier does not work.
+Even setting `parentMission` to `null` explicitly in the route defaults does not allow to avoid that. The workaround is to do `@ParamConverter("parentMission", options={"id": "parentMission"})` to force loading by id only, as it will disable the loading by criteria when using an explicit id.
+
+I think it should at least do the same disabling when the request has explicitly an attribute set to `null` matching the default id retrieval (i.e. `getIdentifier` returning `null` rather than `false`). What do you think about that idea ?
+Another option which would work for me would be a way to disable the criteria loading globally (maybe with a way to opt-in again in the annotation), as I'm always loading by identifier in the project when not using `expr`.
+Hi, 
+
+I'm using FOSRest and since the new update of SensionFrameworkExtraBundle (5.5) I'm facing this error :
+“Undefined offset: 0” in vendor\friendsofsymfony\rest-bundle\EventListener\ViewResponseListener.php line 99
+
+```
+namespace FOS\RestBundle\EventListener;
+/**
+ * The ViewResponseListener class handles the View core event as well as the "@extra:Template" annotation.
+ *
+ * @author Lukas Kahwe Smith <smith@pooteeweet.org>
+ *
+ * @internal
+ */
+class ViewResponseListener implements EventSubscriberInterface
+{
+   ......
+
+    /**
+     * Renders the parameters and template and initializes a new response object with the
+     * rendered content.
+     *
+     * @param GetResponseForControllerResultEvent $event
+     */
+    public function onKernelView(GetResponseForControllerResultEvent $event)
+    {
+        ......
+        $configuration = $request->attributes->get('_template');
+        ......
+        if ($configuration instanceof ViewAnnotation) {
+            ......
+            list($controller, $action) = $configuration->getOwner();   <-------------- At this line
+            $vars = $this->getDefaultVars($configuration, $controller, $action);
+            ......
+         }
+     }
+}
+```
+This come from this change : 
+```
+namespace Sensio\Bundle\FrameworkExtraBundle\Configuration;
+/**
+* The Template class handles the Template annotation parts.
+*
+* @author Fabien Potencier <fabien@symfony.com>
+* @Annotation
+ */
+class Template extends ConfigurationAnnotation
+{
+
+         ....
+
+        ----------------- After --------------------
+
+        /**
+         * The controller (+action) this annotation is set to.
+         *
+         * @var array
+         */
+        private $owner = [];
+
+       ----------------- Before --------------------
+        /**
+         * The controller (+action) this annotation is set to.
+         *
+         * @var array
+         */
+        private $owner;
+```
+
+Do you guys have any clue ?
+
+Origin : https://stackoverflow.com/questions/58528837/fosrestbundle-undefined-offset-0-in-vendor-friendsofsymfony-rest-bundle-eve
+Fixes #645 
+
+I'm not so sure about the version, but looking at the tags, I expected the next version will be 5.6 (as 5.5 is already released?).
+https://github.com/symfony/symfony/pull/33584 removes the ability to pass an array of attributes to `isGranted()` and `decide()` methods. Should the `@IsGranted()` annotation be updated to not allow arrays, too?
+
+If so, let's not forget to revert this documentation commit (https://github.com/sensiolabs/SensioFrameworkExtraBundle/commit/97cc360add63a1376bbbe8e1b912c43c07640ef2) I made in July.
+As proposed by @fabpot in [this comment](https://github.com/symfony/symfony-docs/pull/12387#discussion_r329551967) we may consider deprecating the `@Template` annotation.
+
+We always recommended to **not** use it because:
+
+1. It involves some "magic" (not exactly magic, but "hidden conventions");
+2. It's common to use `@Template` without any parameters, which makes it more difficult to know which template is being rendered.
+
+Thanks.

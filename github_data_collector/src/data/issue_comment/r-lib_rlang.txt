@@ -1,0 +1,245 @@
+I maintain the [tidyquery](https://github.com/ianmcook/tidyquery) package which uses `rlang::expr_deparse()` to power the `show_dplyr()` function. I would like to be able to disable the truncation of deparsed vectors and lists. This PR adds a new argument `max_len` to control this. Thank you!
+In ggplot2, we extensively use the pattern `<data> %||% <default value>`, as in `color <- data$color %||% "red"`. This works great when we know what column we want to look up in the data frame, but it fails if we want to do this with `eval_tidy()`, because `eval_tidy()` fails instead of returning `NULL`.
+
+In my own code, I've worked around this by defining a function `eval_default()` which works like `eval_tidy()` but swaps in a default value if `eval_tidy()` fails:
+https://github.com/wilkelab/cowplot/blob/06aeeb449ccc0fb343eb03c83111df7b171e73af/R/key_glyph.R#L145-L154
+
+``` r
+library(rlang)
+
+eval_default <- function(x, data, default) {
+  force(default)
+  
+  suppressWarnings(
+    tryCatch(
+      error = function(e) default,
+      eval_tidy(x, data)
+    )
+  )
+}
+
+data <- data.frame(x = 1)
+eval_default(quo(x), data, NULL)
+#> [1] 1
+eval_default(quo(y), data, NULL)
+#> NULL
+```
+
+<sup>Created on 2020-01-12 by the [reprex package](https://reprex.tidyverse.org) (v0.3.0)</sup>
+
+Based on the conversation [here,](https://github.com/tidyverse/ggplot2/issues/2963#issuecomment-573441165) it seems I'm not the only one running into this issue, so maybe adding something like this function to rlang is justified.
+
+One comment regarding my proposed implementation: I had to add `suppressWarnings()` to prevent a warning "restarting interrupted promise evaluation" that would sometimes pop up. I find this warning sufficiently disconcerting that I'm not sure I can just ignore it, but I don't know enough about the internals of R evaluation to understand what the warning means and whether it can be avoided instead of suppressed.
+Should be an error:
+
+```r
+set_names(1:3, c("", ""))
+#>           <NA> 
+#>    1    2    3 
+```
+This is undocumented as far as I can tell, and might be a bug ?
+
+```
+foo <- function(x){
+  print(substitute(x))
+  print(rlang::enexpr(x))
+  UseMethod("foo")
+}
+
+foo.default <- function(x){
+  print(substitute(x))
+  print(rlang::enexpr(x))
+  invisible()
+}
+
+bar <- "baz"
+foo(bar)
+#> bar
+#> bar
+#> bar
+#> [1] "baz"
+```
+The [`gradethis`](https://github.com/rstudio-education/gradethis) package needed a way to standarise call but also include the default function arguments so code written as `mean(c(1:3)` and `mean(1:3, na.rm = TRUE)` are marked as being the same.
+
+We made a PR into `gradethis` that implements this behavior (https://github.com/rstudio-education/gradethis/pull/74) along with unit tests. Would it make sense to submit this function as a PR into `rlang`?
+
+I've reproduced the function below for convenience.
+
+```r
+call_standardise_formals <- function(code, env = rlang::current_env()) {
+  # try to catch invalid function, i.e., corrupt language object
+  tryCatch({
+    fxn <- rlang::call_fn(code, env = env)
+  }, error = function(e) {
+    return(code)
+  })
+  if (!exists("fxn")) {return(code)} ## some reason the above tryCatch doesn't go to the error part
+  if(class(fxn) != "function") {return(code)}
+  
+  # standarise, but dont bother trying to fill out default formals
+  # for primitives like mean, unable to distinguish between mean and mean.default
+  if (is_infix(code) || is.primitive(fxn)) {
+    return(rlang::call_standardise(code))
+  }
+  
+  forms <- rlang::fn_fmls(fxn)
+  default_params <- forms[!vapply(forms, is.symbol, logical(1), USE.NAMES = FALSE)]
+  
+  code_std <- rlang::call_standardise(code, env = env) # order and label existing params
+  
+  code_params <- rlang::call_args(code_std) # get arguments passed from user
+  code_missing_default_args <- default_params[!names(default_params) %in% names(code_params)]
+  if (length(code_missing_default_args) == 0) {
+    return(code_std)
+  }
+  return(
+    rlang::call_standardise(rlang::call_modify(code_std, !!!code_missing_default_args),
+                            env = env)
+  )
+}
+```
+I feel like if the argument is "not missing" it should check that the input is a string, not a character vector? I think I wanted an error here
+
+``` r
+my_fn <- function(x = c("a", "b", "c")) {
+  rlang::arg_match(x)
+}
+
+my_fn(c("a", "c"))
+#> [1] "a"
+
+my_fn(c("a", "d"))
+#> [1] "a"
+```
+
+<sup>Created on 2019-12-02 by the [reprex package](https://reprex.tidyverse.org) (v0.3.0.9000)</sup>
+Currently:
+
+``` r
+rlang::set_names(NULL, character())
+#> Error: `x` must be a vector
+```
+
+<sup>Created on 2019-11-13 by the [reprex package](https://reprex.tidyverse.org) (v0.3.0)</sup>
+
+Would it be safe to return `NULL` here?
+https://adv-r.hadley.nz/s3.html#s3-subclassing
+There is a limit for the length of the error message, the default is 1000 characters, and it can be set higher, but the max is 8192. Since the trace is printed as part of the error message, this means that the trace can be truncated, which is especially not great in non-interactive sessions. E.g.
+
+``` r
+cat(deparse(substitute({
+  ff <- lapply(1:10, function(i) {
+    assign(
+      paste0("f", i), function() do.call(paste0("f", i-1), list()),
+      envir = .GlobalEnv)
+  })
+  
+  f0 <- function() rlang::abort("oops")
+  
+  f10()
+})), file = tmp <- tempfile(), sep = "\n")
+
+out <- processx::run("R", c("-q", "-f", tmp))
+cat(out$stderr)
+#> Error: oops
+#> Backtrace:
+#>      █
+#>   1. └─f10()
+#>   2.   ├─base::do.call(paste0("f", i - 1), list())
+#>   3.   └─f9()
+#>   4.     ├─base::do.call(paste0("f", i - 1), list())
+#>   5.     └─f8()
+#>   6.       ├─base::do.call(paste0("f", i - 1), list())
+#>   7.       └─f7()
+#>   8.         ├─base::do.call(paste0("f", i - 1), list())
+#>   9.         └─f6()
+#>  10.           ├─base::do.call(paste0("f", i - 1), list())
+#>  11.           └─f5()
+#>  12.             ├─base::do.call(paste0("f", i - 1), list())
+#>  13.             └─f4()
+#>  14.               ├─base::do.call(paste0("f", i - 1), list())
+#>  15.               └─f3()
+#>  16.                 ├─base::do.call(paste0("f", i - 1), list())
+#>  17.                 └─f2()
+#>  18.                   ├─base::do.call(paste0("f", i - 1), list())
+#>  19.                   └─f1()
+#>  20.                     ├─base::do.call(paste0("f", i - 1), list())
+#>  21.                     └─global::f0()
+```
+
+<sup>Created on 2019-10-25 by the [reprex package](https://reprex.tidyverse.org) (v0.3.0)</sup>
+```r
+a <- function() b()
+b <- function() c()
+c <- function() abort("low-level")
+
+f <- function() g()
+g <- function() h()
+h <- function() tryCatch(a(), error = function(err) abort("high-level", parent = err))
+
+f()
+#> Error: high-level
+#> Call `rlang::last_error()` to see a backtrace.
+
+last_error()
+#> <error/rlang_error>
+#> high-level
+#> Backtrace:
+#>  1. global::f()
+#>  2. global::g()
+#>  3. global::h()
+#> Call `rlang::last_trace()` to see the full backtrace.
+
+last_trace()
+#> <error/rlang_error>
+#> high-level
+#> Backtrace:
+#>     █
+#>  1. └─global::f()
+#>  2.   └─global::g()
+#>  3.     └─global::h()
+#> <parent: error/rlang_error>
+#> low-level
+#> Backtrace:
+#>     █
+#>  1. └─global::a()
+#>  2.   └─global::b()
+#>  3.     └─global::c()
+
+last_error()$parent
+#> <error/rlang_error>
+#> low-level
+#> Backtrace:
+#>   1. global::f()
+#>   2. global::g()
+#>   3. global::h()
+#>   8. global::a()
+#>   9. global::b()
+#>  10. global::c()
+
+last_error()$parent$trace
+#>      █
+#>   1. └─global::f()
+#>   2.   └─global::g()
+#>   3.     └─global::h()
+#>   4.       ├─base::tryCatch(...)
+#>   5.       │ └─base:::tryCatchList(expr, classes, parentenv, handlers)
+#>   6.       │   └─base:::tryCatchOne(expr, names, parentenv, handlers[[1L]])
+#>   7.       │     └─base:::doTryCatch(return(expr), name, parentenv, handler)
+#>   8.       └─global::a()
+#>   9.         └─global::b()
+#>  10.           └─global::c()
+```
+
+
+Comments from @gaborcsardi 
+
+1. It would make sense to indicate in the default output that there is another level. Even the last_error() output does not indicate that, actually. You probably end up staring at the error for a bit and then calling last_error() as suggested, and then after some more staring last_trace(), as suggested. And you'd better not mistype either one, because then the last error object will be gone.
+
+2. Having to call $parent to get a complete stack is not great, especially if you have more than two levels, i.e. last_error()$parent$parent, etc. The same with last_error()$parent$parent$trace, etc.
+
+3. Having different numbers for the parent frames in last_trace() might be confusing. Personally I would prefer if the numbers were not mangled, and they referred to the real frame numbers.
+
+4. There is no way to see all error messages and a full stack, in the same output. Personally, this is my preferred output, as above, as it shows all information, and the levels are clearly separated by whitespace, and they are easy to parse. I can decide how deep I need to dig into the output, without issuing additional commands.
+
+5. Relatedly, I am not sure that having all these different kinds of output is great. People need to learn to parse all of them, and think about whether the information they are looking for is missing in general, or they need the other kind of output, etc.

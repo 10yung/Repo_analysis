@@ -1,0 +1,261 @@
+Hello there,
+
+Unfortunately, we're dealing with a legacy system (via http), that behaves unstable and nondeterministic, i.e. it could happen, that internal server errors or similar ones occure, but a request managed to perform the intended operation, **after some time has elapsed.**
+
+So what we are trying to do, is to setup a retry policy, which, in case of any error response,
+waits a certain amount of time and then checks ( `orderCreated()` ) whether the initial operation did go through. 
+If the order was not successful  (`orderCreated()` returns false), and __only then__ retry again.
+If the ordered was successfully created, (`orderCreated()` returns true) we are done, no retries.
+
+So what we are trying to achieve: In case of any expected error, wait some time, check whether a condition is met, if not, retry again, otherwise continue.
+
+I am wondering whether this is the correct way of dealing with our issue. I have already written some unit tests and in seems to work as expected. Are there any issues, we should consider? Are we messing things up? What do you guys think?
+
+Thank you so much for your help!
+
+```
+bool orderCreated()
+{
+       // everytime 
+	Thread.Sleep(20 * 1000);
+	return GetOrderId(orderId, user, capacity).Result != null;
+}
+
+return Policy
+	.Handle<HttpRequestException>(_ => !orderCreated())
+	.Or<TimeoutRejectedException>(r => !orderCreated()) // thrown by Polly's TimeoutPolicy if the inner call times out
+	.OrResult<HttpResponseMessage>(r => !orderCreated() && ((int)r.StatusCode >= 500 || r.StatusCode == HttpStatusCode.RequestTimeout))
+	.Retry(2,
+	onRetry: (ctx, span) =>
+	{
+		// logging
+	}).ExecuteAndCaptureAsync(() => _legacyHttpClient.RequestOrder(user, order, capacity));
+```
+
+
+
+
+
+
+
+
+This feature request is related to policies.
+
+I would like to be able to annotate my class and interface methods with attributes that represent Polly policies, such as retry, circuit breaker, caching, etc. Something like this:
+
+```cs
+[Cache(...)] // cache ALL the methods of this interface unless overridden
+[Retry(...)] // retry ALL the methods on this interface unless overridden
+public interface IWebInterface
+{
+    [Cache(...)]
+    [Retry(...)]
+    [CircuitBreaker(...)]
+    [Bulkhead(...)]
+    Task<string> FetchJson1Async(string param1);
+
+    [PollyIgnore] // ignore all polly attributes for just this method
+    Task<string> FetchJson2Async(string param1);
+
+    // this method inherits cache and retry from the interface definition
+    Task<string> FetchJson3Async(string param1);
+}
+```
+
+These attributes would inherit from a `PollyBaseAttribute` class. This saves having to type the policies everywhere the function is called. You could also provide a "uber" attribute that allowed specifying all the policies in a single attribute with named parameters. I could see people making some attribute sub-classes that setup all the policies they care about and then applying those attributes as needed.
+
+The attributes would provide all the necessary properties to create a policy automatically. For example, the `Cache` attribute could provider a Key string property. If left null, an automatic key could be created using the full type name plus method name.
+
+If a class implements an interface or overrides base class methods with Polly attributes, the class implementation would always get priority for Polly attributes.
+
+The attributes would be applied in order. With the attributes, the interface call could work one of two ways:
+
+1] Have an expression tree based utility method that allows calling the interface method through a Polly helper method, like Policy.Execute already does. The helper method would take care of finding the attributes and applying the appropriate Polly policies. There is still some repetition of code, since a Polly helper method would be needed anywhere you want to call a method with Polly attributes.
+
+Example:
+
+```cs
+IWebInterface baseInterface = new WebInterface(); // WebInterface class implements IWebInterface
+string result = await Polly.Execute(obj => obj.FetchJson1Async(param1)); // finds Polly attributes and adds appropriate policies to the method call
+```
+
+The `Polly.Wrap` call would take care of finding the attributes and applying policies. You could cache the type and method name for fast attribute lookup.
+
+2] Use TypeBuilder and allow generating a Polly wrapper on an interface. For example:
+
+```cs
+IWebInterface baseInterface = new WebInterface(); // WebInterface class implements IWebInterface
+IWebInterface wrappedInterface = Polly.Wrap(baseInterface); // MOQ style interface wrapper builder magic
+string result = await wrappedInterface.FetchJson1("param1"); // wrappedInterface provides Polly policies using TypeBuilder magic.
+```
+
+Once that is done, you could call wrappedInterface and the Polly policies would be called automatically. This requires either building up an interface at runtime that wraps the existing interface, or having some sort of code generator that could generate a C# class that wraps the interface. Frameworks like MOQ do this already. This eliminates all the redundant calls to Polly and helper methods, and would be my ideal solution.
+
+`TypeBuilder` documentation: https://docs.microsoft.com/en-us/dotnet/api/system.reflection.emit.typebuilder?view=netcore-3.1
+
+I'd love any thoughts or feedback on this proposal.
+Initial work to allow for dynamically calculated CircuitBreaker break periods.
+
+### The issue or feature being addressed
+See Issue: https://github.com/App-vNext/Polly/issues/653
+( @reisenberger )
+
+### Details on the issue fix or feature implementation
+See Issue: https://github.com/App-vNext/Polly/issues/653
+Note that there seem to be 2 contentious design choices outstanding; mentioned on that Issue.
+
+w.r.t. Non-Positive inputs, I've gone with leaving static-duration behaviour unchanged, and having no checks for dynamic durations.
+
+w.r.t. Delay durations when the response is slow to come back, I've gone with re-using the same delay, until one of the responses actually completes.
+
+Several things still need to be done, before this is fully suitable for deployment, but they're all fairly rote changes, so I want to get the meat of the change approved before doing them, since if there are substantial markups the rote changes might need tweaks, which would be ... tedious :)
+
+* Trivially apply all the same changes to the Factory Methods for other syntaxes (CircuitBreakerAsync, CBTReslt, CBTResultAsync)
+* Figure out what (if anything?) should be done for the Advanced version of the CB. Then apply all the same boring Factory Method changes to all 4 version of that.
+* Update existing tests for all of the above.
+* Create new tests for the specific functionality for the duration to change dynamically (as opposed to the existing tests which all use constant-return functions. This ensures that the existing functionality is unchanged, and that the most basic use-case of the functionality works, but is somewhat lacking in depth.)
+* Add general documentation (the XMLDocs are updated, but I assume there's a high-level doc somewhere that I should update too.
+
+
+### Confirm the following
+
+**FIXED**: ~Branch state on your repo currently looks weird~
+
+^ See above, the existing tests have been updated, and crudely exercise the new functionality. Additional tests are required, and I'll create them in due course; wanted to get the meat of the change up for someone to look at while I'm doing that.
+
+- [x]  I started this PR by branching from the head of the latest dev vX.Y branch, or I have rebased on the latest dev vX.Y branch, or I have merged the latest changes from the dev vX.Y branch
+- [x]  I have targeted the PR to merge into the latest dev vX.Y branch as the base branch
+- [Y^]  I have included unit tests for the issue/feature
+- [Y]  I have successfully run a local build
+
+**Summary**: 
+
+Was looking into converting some `http` URLs to `https` in the MS docs. 
+
+When navigating to <https://thepollyproject.org/> ....
+
+**Expected behavior**: 
+
+Site loads with https
+
+**Actual behaviour**:
+
+> ![cert error](https://user-images.githubusercontent.com/2148318/67996048-f4a4b280-fc23-11e9-910b-a2805d4544da.png)
+
+Looks like the cert is only set up to cover `https://thepollyproject.azurewebsites.net/`
+
+If this project is a .NET Foundation project, I believe you are eligible for a [free SSL cert for your domain](https://dotnetfoundation.org/about): 
+
+> We've partnered with DigiCert to provide SSL certificates for the .NET Foundation OU. We set your project up in Digicert's system, you request the certificate for your website, and they're paid for centrally by the foundation.
+
+Or, since you're on the azure app service, if you're willing to spend a few bucks, the [setup for an SSL cert there isn't too tough](https://docs.microsoft.com/en-us/azure/app-service/web-sites-purchase-ssl-web-site). I've done it before; let me know if I can be of help.
+
+Wanted to drop this here in case it's useful; feel free to close if not. Thanks!
+## What is Polly.Contrib.AzureFunctions.CircuitBreaker?
+
+[Polly.Contrib.AzureFunctions.CircuitBreaker](https://github.com/Polly-Contrib/Polly.Contrib.AzureFunctions.CircuitBreaker) is a **durable, distributed circuit-breaker**, implemented in Azure Entity Functions.
+
+The durable, distributed circuit-breaker can be consumed:
+
++ within an Azure functions app
++ from anywhere, over an https api.
+
+Within an Azure functions app, the circuit-breaker is stateful and consistent across multiple function invocations and scaling of the function app.
+
+In external consumption over https api, the circuit-breaker is statefully consistent to all consumers.
+
+## Want to know more?
+
+Head over to the [Polly.Contrib.AzureFunctions.CircuitBreaker](https://github.com/Polly-Contrib/Polly.Contrib.AzureFunctions.CircuitBreaker) repo.
+
+## Questions? Ideas? Want to contribute?
+
+Open an issue on the [Polly.Contrib.AzureFunctions.CircuitBreaker](https://github.com/Polly-Contrib/Polly.Contrib.AzureFunctions.CircuitBreaker) repo.
+<!-- Thank you for contributing to Polly!  Open source is only as strong as its contributors.  All non-trivial contributions get a public credit in the readme! -->
+
+### The issue or feature being addressed
+
+I'd like to propose extracting static `SystemClock` to an interface.
+
+### Details on the issue fix or feature implementation
+
+These are initial commits with the end goal to eventually get rid of the ambient `SystemClock` instance by allowing specifying one when the policies gets created. This will allow to run all tests in parallel and will restrict _rogue_ system clock injection during runtime.
+
+### Confirm the following
+
+- [x]  I started this PR by branching from the head of the latest dev vX.Y branch, or I have rebased on the latest dev vX.Y branch, or I have merged the latest changes from the dev vX.Y branch
+- [x]  I have targeted the PR to merge into the latest dev vX.Y branch as the base branch
+- [x]  I have included unit tests for the issue/feature
+- [x]  I have successfully run a local build
+
+### The issue or feature being addressed
+
+#260 Rate limiting
+
+### Confirm the following
+
+- [ ]  ~I started this PR by branching from the head of the latest dev vX.Y branch, or~ I have rebased on the latest dev vX.Y branch, ~or I have merged the latest changes from the dev vX.Y branch~
+- [x]  I have targeted the PR to merge into the latest dev vX.Y branch as the base branch
+- [x]  I have included unit tests for the issue/feature
+- [x]  I have successfully run a local build
+
+## What is Simmy?
+
+Simmy ([github](https://github.com/Polly-Contrib/Simmy); [nuget](https://www.nuget.org/packages/Polly.Contrib.Simmy)) is a new chaos-engineering and fault-injection tool integrating with Polly.
+
+## What can I do with Simmy?
+
+Simmy lets you introduce a chaos-injection policy or policies at any location where you execute code through Polly.  
+
+You can:
+
++ [inject exceptions or fault responses](https://github.com/Polly-Contrib/Simmy#inject-fault)
++ [inject additional latency](https://github.com/Polly-Contrib/Simmy#inject-latency) to calls
++ [inject any other behaviour](https://github.com/Polly-Contrib/Simmy#inject-behavior)
+
+Configuration allows you to:
+
++ target only specific call paths you identify
++ inject chaos to randomly affect a certain proportion of calls
++ use a master switch to safely turn chaos experiments on and off.
+
+## Find out more!
+
++ Blog: [Simmy, the Monkey for Making Chaos](http://www.thepollyproject.org/2019/06/27/simmy-the-monkey-for-making-chaos/) by lead contributor [Geovanny Alzate Sandoval](http://elvanydev.com)
++ Simmy github repo: https://github.com/Polly-Contrib/Simmy
++ Simple WebAPI demo, to explore Simmy capabilities: https://github.com/Polly-Contrib/Polly.Contrib.SimmyDemo_WebApi
++ Richer example using Simmy to inject chaos into distributed microservices run from docker containers: https://github.com/vany0114/chaos-injection-using-simmy (as featured in Geovanny's [blog post](http://www.thepollyproject.org/2019/06/27/simmy-the-monkey-for-making-chaos/))
+
+## Questions? Ideas? Discussion?
+
+For questions, ideas and discussion, please open an issue on the [Simmy repo](https://github.com/Polly-Contrib/Simmy).
+
+## Credits
+
+Simmy was based on ideas from @mebjas, @reisenberger and @vany0114, with @vany0114 championing the ideas and making it all happen! The logo is by the Polly team's @joelhulen 
+We are using Cache system with Polly in our NetCore solution and we can't find the way to invalidate specific cache registries.
+
+When using IMemoryCache from NetCore we were able to do it using CancellationTokenSource
+
+This is an example about what we are doing to Cache an HttpClient Request using Polly:
+
+```
+var policyExecutionContext = new Context("myCacheEntryKey");
+var response = await _cachePolicy.ExecuteAsync(
+(context) => httpClient.GetAsync(uri), policyExecutionContext);
+```
+**Summary: What are you wanting to achieve?**
+
+I want the cache policy execution to limit concurrency on its data loading delegate per given operation key.
+
+Imagine a disrtibuted cache in Redis implemented though the IAsyncCacheProvider. The cached keys have set expiry/TTL in Redis. The system in question experiences thousands of calls per second. Now the key in Redis expires. There is a high probability that tens of requests come in (nearly) simultaneously all requiring the same key (from Redis). It is not there and the cache executes the underlying data provider once per each request, ie. needlessly because all of those executions will yield the same value. Executing the data provider is expensive. Then all of those executions start setting the same key/value pair to Redis where setting it once would be enough. This IMHO causes unnessesary load on both the cache (Redis) and the backing data store. Or rather bursts of load whenever a key expires.
+
+I would like the provider to be executed only once and once it returns all outstanding/awaiting cache request would be fulfilled immediately, also setting the value into the cache only once.
+
+
+Do you have any suggestions please? Is this possible with Polly.Cache? Or is this something you would have to implement?
+
+I have tried implementing this using Bulkhead unsuccessfuly. I would have to have two of them - one for the cache provider and one for the data provider - and even then it just limits the conncurency and does not allow for fullfiling all executions in its queue at once.
+
+As I am writing this I thought of using double cache with an inner layer of memory cache but I can't think of how to reasonably tell when it's OK to evict from the inner cache. The problem with Bulkhead is that it does not work on a per key basis and maintaining a collection of them could get expensive quickly. I am also worried about overhead.
+Something like Polly.Cache(Redis:IAsyncCacheProvider) -> Bulkhead -> Polly.Cache(Memory:ConcurrentDictionary) -> Bulkhead -> DataLoader

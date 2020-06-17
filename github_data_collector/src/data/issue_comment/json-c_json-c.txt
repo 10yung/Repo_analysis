@@ -1,0 +1,111 @@
+I found one question about the LEN_DIRECT_STRING_DATA.@rgerhards @hawicz 
+https://github.com/json-c/json-c/blob/360d28b9611a4ee9f4312e1e76e0b5c8d674ec14/json_object_private.h#L23
+32 may be a little large and it results in that one json_object struct takes up more memory. for example, value (int) 100 will cost 24 (32-8,8 is pointer length) bytes memory additionally, compared with no short string optimazation. That violates the original intention for saving memory and increasing operating efficiency. 
+For verifing this idea, I test the different LEN_DIRECT_STRING_DATA(4,8,16,32) with [nativejson-benchmark](https://github.com/miloyip/nativejson-benchmark). The results confirmed this idea. The parse memory(byte) with setting len as 4, 8, 16, 32 is 49802936, 49775744, 49754384, 53172472 respectively. The parse scenario is relatively fixed but does not affect the conclusion greatly. The other properties have little changes. 
+32 bytes:
+![32](https://user-images.githubusercontent.com/50514813/72677980-c5903580-3adc-11ea-9da4-e52d25b32a94.png)
+16 bytes:
+![16](https://user-images.githubusercontent.com/50514813/72677982-caed8000-3adc-11ea-8190-7d63fe641d0e.png)
+8 bytes:
+![8](https://user-images.githubusercontent.com/50514813/72677986-cfb23400-3adc-11ea-9a8e-de6b314d0955.png)
+4 bytes:
+![4](https://user-images.githubusercontent.com/50514813/72677990-d2ad2480-3adc-11ea-9106-6a247fb1d38b.png)
+
+in cmmmit log [c4f8c](https://github.com/json-c/json-c/commit/c4f8cc34df91715d008166e4748c5f32ee894698), @rgerhards marked that "This brings a 24-bytes memory overhead, but I consider that still useful because the memory allocator usually also has quite some overhead (16 bytes) for dyn alloced memory blocks. In any case, the max buffer size can be tweaked via #define." I don't understand the memory allocator well.  Should we consider this in short string optimization?
+
+In my opinion, the LEN_DIRECT_STRING_DATA should be set according to the data structure and using scenes. For example,  the data structure decide that the length should be set as 11/15 (32/64 bytes) in [rapidjson](https://github.com/Tencent/rapidjson). However, in json-c, I think the length could be set as 16.  The length's pros and cons depend on the using scenes. If json data have many number or short string(1-8 bytes, like name, occupation), it will waste many mamory. if the json data have longer string(20-30 bytes), the length should be larger. We should have a choice between 8-32. 32 may be not a suitable length.
+
+In addition，I find another Interesting parameter (ARRAY_LIST_DEFAULT_SIZE) accidentally. Same principle as above. The value of default array size also depends on the using scenes. Usually the array size is not large.  
+https://github.com/dota17/json-c/blob/360d28b9611a4ee9f4312e1e76e0b5c8d674ec14/arraylist.h#L25
+32:
+![json-c-32](https://user-images.githubusercontent.com/50514813/72675965-d0d86680-3ac6-11ea-82fb-216e6adb7b1c.png)
+16:
+![json-c-16](https://user-images.githubusercontent.com/50514813/72675983-fa918d80-3ac6-11ea-98a4-371d994a90f4.png)
+8:
+![json-c-8](https://user-images.githubusercontent.com/50514813/72675985-fe251480-3ac6-11ea-9bc1-c0783539d5f0.png)
+4:
+![json-c-4](https://user-images.githubusercontent.com/50514813/72675987-01200500-3ac7-11ea-8cde-7674a5490b7a.png)
+
+Maybe the LEN_DIRECT_STRING_DATA/ARRAY_LIST_DEFAULT_SIZE set as 16/16 will get a good memory performance.
+![1616](https://user-images.githubusercontent.com/50514813/72678296-7b5c8380-3adf-11ea-8c79-b2a31ba2fa45.png)
+
+
+A kind of followup to https://github.com/json-c/json-c/issues/5:
+
+I have [gimp 2.10 crashing on startup](https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=243267) because it links both `libjson-glib-1.0.so` (direct dependency) and this library `libjson-c.so.4` and both have  `json_object_get_type()` function:
+
+````
+radziecki> objdump -T /usr/local/lib/libjson-c.so.4 | grep json_object_get_type
+0000000000005240 g    DF .text	000000000000002d  Base        json_object_get_type
+radziecki> objdump -T /usr/local/lib/libjson-glib-1.0.so | grep json_object_get_type
+0000000000014d70 g    DF .text	000000000000005b  Base        json_object_get_type
+
+````
+
+Indeed, both libraries are linked as shared ones:
+
+```
+radziecki> ldd /usr/local/bin/gimp-2.10 | grep json
+	libjson-glib-1.0.so.0 => /usr/local/lib/libjson-glib-1.0.so.0 (0x804c93000)
+	libjson-c.so.4 => /usr/local/lib/libjson-c.so.4 (0x805e0a000)
+```
+
+libjson-glib comes as a [direct dependency of GIMP](https://svnweb.freebsd.org/ports/head/graphics/gimp-app/Makefile?annotate=521242#l37) and libjson-c is pulled in via GIMP's dependency on libmypaint, which [requires this library](https://svnweb.freebsd.org/ports/head/graphics/libmypaint/Makefile?annotate=507372#l15).
+
+So I seem to getting a crash in the assertion:
+
+```
+Loading 'mypaint brush factory' data
+  Loading /usr/local/share/mypaint-data/1.0/brushes/classic/blend+paint.myb
+Assertion failed: (json_object_get_type(jso) == json_type_object), function json_object_object_add_ex, file json_object.c, line 476.
+
+Thread 1 received signal SIGABRT, Aborted.
+0x0000000807139aea in thr_kill () from /lib/libc.so.7
+(gdb) bt
+#0  0x0000000807139aea in thr_kill () at /lib/libc.so.7
+#1  0x0000000807139ab4 in __raise (s=6) at /usr/src/lib/libc/gen/raise.c:52
+#2  0x0000000807139a29 in abort () at /usr/src/lib/libc/stdlib/abort.c:65
+#3  0x00000008071b5101 in __assert (func=<optimized out>, file=<optimized out>, line=<optimized out>, failedexpr=<optimized out>) at /usr/src/lib/libc/gen/assert.c:51
+#4  0x0000000805e0fef5 in json_object_object_add_ex (jso=0x81c6fcc00, key=0x81d9ff228 "comment", val=0x81c6fcc60, opts=0) at json_object.c:476
+```
+
+Side-stepping through the debugger confirms that `json_object_get_type()` may get pulled from the other library:
+
+```
+(gdb) bt
+#0  0x000000080119d755 in _rtld_bind_start () at /usr/src/libexec/rtld-elf/amd64/rtld_start.S:155
+#1  0x0000000804ca7d70 in json_object_get_type () at /usr/local/lib/libjson-glib-1.0.so.0
+#2  0x0000000805e0fec8 in json_object_object_add_ex (jso=0x81c688680, key=0x81eb1f020 "comment", val=0x81c6886e0, opts=0) at json_object.c:476
+```
+
+We were extremely lucky if the return values from those functions from two libraries would match...
+
+Not sure anything can be done in this project, but I guess people may have unexpected crashes because of this.
+plan 2: validate utf-8 string  during parsing string.  #122 
+Validate fuction has been added into macro `PEEK_CHAR(dest, tok)` .
+
+validate utf-8 string before parse. Fix #122 
+
+Increased the test coverage of array_list.c from 73.7% to 94.7%
+
+I've enhanced the code with adding _uint64_ functions in my local branch.  This _uint64_ type is needed for my project that needs to handling a full data value of a 64-bit register from a hardware module.
+
+I would like to share my enhancements.  What are the steps for me to do to make a pull-request?
+
+--JC
+Some fixes that would be nice-to-have .. nothing is broken but bit better ?
+I would like to propose enabling the `-fPIC` CFLAGS / CXXFLAGS option by default in the build system.
+
+I'll try to explain why. Json-c appears to have some of the same symbol names in common with the jansson, json-glib, and perhaps others.  See https://gitlab.gnome.org/GNOME/json-glib/issues/33 for details.  
+
+An application which depends on a shared library that in turn depends on libjson-c may experience occasional crashes if they require a different JSON library for their own needs.  
+
+The specific issue that I'm facing is that ClamAV's libclamav.so library must link statically with libjson-c.a in order to mitigate crashes in applications that depend on libclamav.so.  However, to link a shared object with a static library, the static library must be built with `-fPIC` or else you'll get a build failure like this:
+
+```
+/usr/bin/ld: /usr/lib/gcc/x86_64-linux-gnu/7/../../../x86_64-linux-gnu/libjson-c.a(linkhash.o): relocation R_X86_64_PC32 against symbol `stdout@@GLIBC_2.2.5' can not be used when making a shared object; recompile with -fPIC
+/usr/bin/ld: final link failed: Bad value
+collect2: error: ld returned 1 exit status
+```
+
+I can't make static linking with libjson-c default in libclamav.so, unless the `-fPIC` option is default, because it will fail to compile for most people.  I would, however, prefer if Linux distributions do not provide a libclamav.so to their users which may cause occasional crashes.

@@ -1,0 +1,150 @@
+
+Some old versions of `rust-crypto` have dependencies specified with `"*"` version requirement (`rand = "*"`, `rustc-serialize = "*"`, `libc = "*"`, `gcc = "*"`, etc.).
+
+Crates with such vague dependency versions became unusable, because `*` allows picking too-new semver-incompatible dependencies.
+It also breaks Cargo's `minimal-versions` feature, because `*` requirement allows picking very very old dependencies
+that aren't compatible with Rust 1.0.
+
+Because these old versions of `rust-crypto` are unusable and cause problems for Cargo, I suggest yanking them:
+
+```bash
+cargo yank --vers 0.1.0
+cargo yank --vers 0.1.1
+```
+
+Is there a way to use pbkdf2 and get progress updates while it is deriving the key? If not, do you know of a nice way to write such a function?
+
+I guess this is quite a generic question regarding functions that take a lot of time in environment where there is only 1 thread.
+panda@panda-virtual-machine:~/rust/wasm/hello$ wasm-pack build
+[INFO]: Checking for the Wasm target...
+[INFO]: Compiling to Wasm...
+   Compiling autocfg v0.1.7
+   Compiling rustc-serialize v0.3.24
+   Compiling wasm-bindgen-macro-support v0.2.54
+error[E0046]: not all trait items implemented, missing: `encode`
+    --> /home/panda/.cargo/registry/src/mirrors.ustc.edu.cn-61ef6e0cd06fb9b8/rustc-serialize-0.3.24/src/serialize.rs:1358:1
+     |
+853  |     fn encode<S: Encoder>(&self, s: &mut S) -> Result<(), S::Error>;
+     |     ---------------------------------------------------------------- `encode` from trait
+...
+1358 | impl Encodable for path::Path {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `encode` in implementation
+
+error[E0046]: not all trait items implemented, missing: `decode`
+    --> /home/panda/.cargo/registry/src/mirrors.ustc.edu.cn-61ef6e0cd06fb9b8/rustc-serialize-0.3.24/src/serialize.rs:1382:1
+     |
+904  |     fn decode<D: Decoder>(d: &mut D) -> Result<Self, D::Error>;
+     |     ----------------------------------------------------------- `decode` from trait
+...
+1382 | impl Decodable for path::PathBuf {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `decode` in implementation
+
+   Compiling num-traits v0.2.8
+   Compiling num-integer v0.1.41
+error: aborting due to 2 previous errors
+
+For more information about this error, try `rustc --explain E0046`.
+error: could not compile `rustc-serialize`.
+warning: build failed, waiting for other jobs to finish...
+error: build failed
+Error: Compiling your crate to WebAssembly failed
+Caused by: failed to execute `cargo build`: exited with exit code: 101
+A quick PR to add some extra high level documentation.
+Dependencies
+```toml
+rand="0.7.2"
+rust-crypto = "0.2.36"
+rustc-serialize = "0.3.24"
+```
+
+```rust
+use rand;
+use crypto::aessafe::AesSafe128Encryptor;
+use crypto::symmetriccipher::BlockEncryptor;
+
+fn encrypt(key: &[u8], input: &[u8], output: &mut [u8]) {
+    let encryptor = AesSafe128Encryptor::new(key);
+
+    encryptor.encrypt_block(input, output);
+}
+
+fn main() {
+    let mut key = [0u8; 128 / 8];
+
+    for v in key.iter_mut() {
+        *v = rand::random();
+    }
+
+    let mut output = Vec::<u8>::new();
+
+    encrypt(&key, "hello".as_bytes(), &mut output);
+}
+```
+Output:
+
+```console
+user@user:~/Projects/rust/encrypt-file$ cargo run
+   Compiling encrypt-file v0.1.0 (/home/user/Projects/rust/encrypt-file)
+    Finished dev [unoptimized + debuginfo] target(s) in 0.48s
+     Running `target/debug/encrypt-file`
+thread 'main' panicked at 'assertion failed: dst.len() * 4 == input.len()', /home/user/.cargo/registry/src/github.com-1ecc6299db9ec823/rust-crypto-0.2.36/src/cryptoutil.rs:143:5
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace.
+```
+Fixes the build problem which arises when the
+* host is windows
+* target is x86_64-pc-windows-gnu
+The problem is fixed by setting the compiler to gcc.
+The crate has been deprecated for quite a while now. Time to move on. :)
+I would like to chain into a SymmetricCipherError and noticed that this trait impl was missing.
+`::reseed()` should not be a public-facing API (easy to misuse).
+
+`::reseed()` incorrectly implements SHA_d-256().  (It's missing zero blocks as initial input to the inner invocation of SHA256.)  I don't believe this has any real security impact, it's just non-compliant with the spec.
+
+Similarly, `Pool` incorrectly implements SHA_d-256() in the same way.  I don't believe this has any impact on the security properties of Fortuna, it's just non-spec.  The implementation I have worked on also has this bug, FWIW.
+
+Both `FortunaGenerator::reseed()` and `Pool::result()` must explicitly zero the old `hasher`/`self.state` iff `self.state = Sha256::new()` is a pointer-assignment rather than overwrite-in-place (not sure of Rust semantics, but if it's like Java or C++, this is broken).
+
+`reseed` and `add_random_event()` APIs must take `mut` inputs and `cryptoutil::zero()` them immediately after use to prevent leakage of RNG state.  (I'm making the assumption that cryptoutil::zero cannot be optimized out, like `explicit_bzero()` in C.  If that can be optimized out, well, it needs to be fixed.)  If the `SeedableRng::from_seed` interface requires non-`mut` `seed`, a `mut` copy of `seed` can be made and passed in to `reseed()`.
+
+Repeating RNG state on fork is a pretty bad failure mode.  I get that Rust stdlib does not expose fork, but your library may be used in programs that invoke fork and ideally your library is defensive against that possibility.  I'm not super familiar with Rust — is there any way to detect the compilation environment (i.e., POSIX target platform) and register an `atfork` suicide of some kind (zeroing the generator state, at a minimum)?  Some platforms support `minherit()` with `INHERIT_ZERO` to automatically zero out sensitive state on fork, although this may be difficult to use in Rust.
+
+It is needlessly inefficient for `::generate_blocks()` to recreate a new Aes instance every time it is invoked with the same key.  AES key scheduling is slow; you can instead save the key state in the Fortuna object.
+
+Additionally, care must be taken to explicitly zero `Encryptor` state when it is no longer used (maybe there is a destructor which does this, I did not look).
+
+Similarly, in `::generate_random_data()` (depending on Rust's semantics here — not sure if `self.key = new_key` is a pointer or array copy), one of `new_key` or the previous `key` array must be explicitly zeroed.
+
+The assertion in `::generate_random_data()` is incorrect in excluding `rem` bytes of `out.len()`.  Just use `out.len()` directly.
+
+`Fortuna::last_reseed_time` being a floating point number is kind of odd and unsuitable for embedded systems use.  Not a bug per se just a weird design choice.
+
+The second assertion in `::fill_bytes` is redundant, or should be a compile time assertion.
+
+Stylistic: in `::fill_bytes`, the `32` in `let mut hash = [0; (32 * NUM_POOLS)];` and subsequent computations should be length `sizeof(u32) * sha2.STATE_LEN`, although ideally the constant would be exported from the sha2 module with a clearer name, like `SHA256_DIGEST_LENGTH`.  No functional difference.
+
+`::next_u32` should explicitly zero `ret` to avoid leaking a generated value.
+I read the below example, can you show how to use other algorithms  usage as simple example. thanks
+
+```rust
+fn main() {
+    let message = "Hello World!";
+
+    let mut key: [u8; 32] = [0; 32];
+    let mut iv: [u8; 16] = [0; 16];
+
+    // In a real program, the key and iv may be determined
+    // using some other mechanism. If a password is to be used
+    // as a key, an algorithm like PBKDF2, Bcrypt, or Scrypt (all
+    // supported by Rust-Crypto!) would be a good choice to derive
+    // a password. For the purposes of this example, the key and
+    // iv are just random values.
+    let mut rng = OsRng::new().ok().unwrap();
+    rng.fill_bytes(&mut key);
+    rng.fill_bytes(&mut iv);
+
+    let encrypted_data = encrypt(message.as_bytes(), &key, &iv).ok().unwrap();
+    let decrypted_data = decrypt(&encrypted_data[..], &key, &iv).ok().unwrap();
+
+    assert!(message.as_bytes() == &decrypted_data[..]);
+}
+```

@@ -1,0 +1,125 @@
+I work in a crate that requires static allocation everywhere, `heapless` has been great. I do have a lot of code that looks like:
+
+```rust
+let mut heapless_vec: Vec<i32, U32> = Vec::new();
+
+heapless_vec.push(3).expect("Failed to push");
+```
+
+Now I'd like to get all these pushes on the same level of error forwarding semantics as the rest of my crate and avoid any possibility of a panic. Because `push<T>` returns a `Result<(), T>` rather than a `Result<(), &'static str>`, we can't use the brilliant `?` operator to pass errors from pushing up the error chain.
+
+Right now in order to return the error I want, I have to do something along the lines of
+
+```rust
+let mut heapless_vec: Vec<i32, U32> = Vec::new();
+
+match heapless_vec.push(3) {
+    Ok(_) => (),
+    Err(_) => return Err("failed to push onto heapless vec."),
+}
+```
+
+This is really verbose. If we had another type of `push` function that returned a `Result<(), &'static str>` then we could use `?` like this:
+
+```rust
+fn psuh_to_vec() -> Result<Vec<i32, U32>, &'static str> {
+    let mut heapless_vec: Vec<i32, U32> = Vec::new();
+
+    heapless_vec.push_msg(3)?;
+    heapless_vec
+}
+```
+
+This would represent a huge clean up and brings `heapless` more in line with encouraged Rust error handling semantics.
+
+What are your thoughts on this?
+
+`Queue` supports switching out the type to use for head and tail pointers, which can save memory (instead of 8 Bytes for 2 `usize`s, I can choose to pay only 2 Bytes for 2 `u8`s). It would be nice to have the same option for `Vec`, which currently always uses `usize`.
+Some serialization formats distinguish between arrays of bytes and byte strings.
+
+One approach is to defer to `serde-bytes`, https://github.com/serde-rs/bytes/pull/18.
+
+An alternative is that `heapless` has a specialized `Vec<u8>` wrapper type, with its own ser/de routines, but delegating everything else to `Vec`. This is probably preferable, to have all the traits available.
+
+Thoughts? I could give this a try if there is support to include such a `Bytes` type here (I have a private/non-polished POC that does the obvious thing). Maybe there are other properties it could have over a generic `Vec`, such as `Ord` or (maybe?) more efficient `extend_from_slice`, and more natural target of `String::into_bytes`.
+Closes #112
+
+Unfortunately `const` construction won't work since the `Default` or `Clone` bound on `T` can't be used then, so I've not added an internal type to `i.rs`.
+
+Let me know if you think any other traits should be implemented...
+
+The probing algorithms used in this crate for `IndexMap` are pretty rudimentary, and from my pretty unscientific benchmarks (basically just copying the benchmarks from the `hashbrown` crate, comparing `FnvHashMap` with the `fnv`-based hashmap from this crate) it seems like `IndexMap` is around 15x slower than `std::collections::HashMap`:
+
+```
+test indexmap::tests::get_remove_insert_heapless ... bench:         665 ns/iter (+/- 263)
+test indexmap::tests::get_remove_insert_std      ... bench:          43 ns/iter (+/- 19)
+```
+
+Here are the benchmarks used to get the results above. I compiled with LTO and `codegen-units = 1` in order to make sure that `std` wasn't getting benefits from being inlining where `heapless` wasn't, most notably around `std::hash` vs `hash32`. Of course, these benchmarks are for large maps and smaller maps won't give such pronounced differences. Also, the use of `hash32` will probably give a speedup on 32-bit targets that the `std` map doesn't have access to.
+
+```rust
+#[bench]
+fn get_remove_insert_heapless(b: &mut Bencher) {
+    let mut m = crate::FnvIndexMap::<_, _, U1024>::new();
+
+    for i in 1..1001 {
+        m.insert(i, i).unwrap();
+    }
+
+    let mut k = 1;
+
+    b.iter(|| {
+        m.get(&(k + 400));
+        m.get(&(k + 2000));
+        m.remove(&k);
+        m.insert(k + 1000, k + 1000).unwrap();
+        k += 1;
+    })
+}
+
+#[bench]
+fn get_remove_insert_std(b: &mut Bencher) {
+    let mut m = fnv::FnvHashMap::with_capacity_and_hasher(1024, Default::default());
+
+    for i in 1..1001 {
+        m.insert(i, i);
+    }
+
+    let mut k = 1;
+
+    b.iter(|| {
+        m.get(&(k + 400));
+        m.get(&(k + 2000));
+        m.remove(&k);
+        m.insert(k + 1000, k + 1000);
+        k += 1;
+    })
+}
+```
+
+I'm writing an embedded project that needs a hashmap, and although I do have access to an allocator avoiding it will make my performance more predictable. So I might try to put in a PR improving the performance of `IndexMap` if I get some spare time to do so.
+Please implement the `Write` trait for byte vectors. If possible, please also implement `Read`/`Write` for `Consumer`/`Producer` and other data structures.
+It is currently not possible to be generic over the index type or single core/multi core SPSC queue variants because the traits `Uxx` and `XCore` can't be declared as type parameters because they are private.
+
+If the traits were sealed so that the crate retained control over what types could implement `Uxx` and `XCore` it would be possible to write more generic code utilizing SPSC queues.
+Example:
+```
+pool!(
+    /// Pool allocator for the DMA engine running the transfers, 
+    /// where each node in the allocator is an `MyPoolNode`
+    #[allow(non_upper_case_globals)]
+    MyPool: MyPoolNode
+);
+```
+
+The attribute propagates properly, but the comment does not.
+This makes it difficult to document and show examples connected to the pool.
+I've needed a "classic" ringbuffer quite a few times now, and since it's not that hard rolled my own.  What I mean is:
+
+* fixed capacity array plus index of "head"
+* push() moves head and overwrites
+* allows random access using iterator, and some standard things like first(), last()
+* (maybe:) all items are initially filled with some default, allows getting rid of Option<>s for first() etc
+* normal `&mut` methods, no lock-free support
+
+This is nothing fancy, but seems like it falls under the mission statement of `heapless`?  I'll contribute an initial implementation PR, if yes.

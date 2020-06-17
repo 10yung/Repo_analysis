@@ -1,0 +1,139 @@
+I noticed that the benchmark tests weren't compiling due to API changes
+I came across this project and tried to use it in my engine, however, components seem to need the copy bound, which is unfortunate. Is there any good reason why this is necessary? Wouldn't clone suffice?
+I am writing a game where each servers manage (one or multiple) different (game-geographically adjacent) regions of a world, and a client connects to multiple regions of the world. How well does legion support this use case?
+
+Suppose the client is located at (0,0), and I have four servers managing the regions [0,100]x[0,100], [-100, 0]x[0,100], [-100,0]x[-100,0] and [0,100]x[-100,0] respectively. The client would have to render (and partially simulate) the events happening on all nearby regions, so it has to connect to all 4 servers at once and handle the world events as if they are in the same world.
+
+How would legion work with my use case? In particular,
+- Different processes would have different `Universe`s. But I want to transfer entities between servers. How would legion work with this, e.g. could it preserve the entity ID? This matters because it would increase the risk of data anomaly if the client has to destroy-recreate entities all the time just because they moved between servers; if the client could identify entities in a consistent manner, the risk of bugs is much lower.
+- How much of the facilities from legion could I use when processes from different mcahines cannot share the same event queue, etc.?
+- Or did I miss something? Should I simply not use legion?
+In several of the GTK applications that I write, I need to know the entity ID in advance of assigning components to the entity, so that the entity ID may be passed into GTK signals belonging to the widgets, which are later added as components. Currently using slotmap to achieve this at the moment:
+
+```rust
+// Componentless entity
+let entity = entities.insert();
+
+...
+
+revealer.connect_clicked(enclose!((sender) move |_| {
+    let _ = sender.send(UiEvent::Audit(AuditEvent::ToggleSku(entity)));
+}):
+
+button.connect_clicked(enclose!((sender) move |_| {
+    let _ = sender.send(UiEvent::Audit(AuditEvent::ToggleSku(entity)));
+}):
+
+...
+
+// Adding components after we've initialized their behaviors in advance
+revealers.insert(entity, revealer);
+buttons.insert(entity, button);
+```
+I have 2 entities with similar tags (`Layer(0)`, `Layer(1)`) when I add a component to both of them the second entity's tag changes its value to `Layer(0)`.
+
+```rust
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct Layer(pub u32);
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct Collision(pub bool);
+
+    #[test]
+    fn test_tag_change() {
+        let mut world = World::new();
+        let entity0 = *world.insert((Layer(0),), vec![()]).first().unwrap();
+        let entity1 = *world.insert((Layer(1),), vec![()]).first().unwrap();
+
+        {
+            let tag0 = world.get_tag::<Layer>(entity0).unwrap();
+            let tag1 = world.get_tag::<Layer>(entity1).unwrap();
+
+            assert_eq!(*tag0, Layer(0), "before component: tag0 failed"); // OK
+            assert_eq!(*tag1, Layer(1), "before component: tag1 failed"); // OK
+        }
+
+        world.add_component(entity0, Collision(false));
+        world.add_component(entity1, Collision(false));
+
+        {
+            let tag0 = world.get_tag::<Layer>(entity0).unwrap();
+            let tag1 = world.get_tag::<Layer>(entity1).unwrap();
+
+            assert_eq!(*tag0, Layer(0), "after component: tag0 failed"); // OK
+            assert_eq!(*tag1, Layer(1), "after component: tag1 failed"); // failed
+        }
+    }
+```
+- Added a test to ensure it doesn't happen again
+(looks like a sort-of-dupe of #12)  
+This code doesn't work:
+```rust
+use legion::prelude::*;
+
+// Define our entity data types
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Position {
+    x: f32,
+    y: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Velocity {
+    dx: f32,
+    dy: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Model(usize);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Static;
+
+fn main() {
+    // Create a world to store our entities
+    let universe = Universe::new();
+    let mut world = universe.create_world();
+
+    // Create entities with `Position` data and a tagged with `Model` data and as `Static`
+    // Tags are shared across many entities, and enable further batch processing and filtering use cases
+    let e = world.insert(
+        (Model(5), Static),
+        (0..999).map(|_| (Position { x: 0.0, y: 0.0 },)),
+    );
+    let e = e[0];
+    world.add_tag(e, Model(3));
+    world.add_tag(e, Static); // if you remove this it works
+    println!("Model = {:?}", world.get_tag::<Model>(e));
+}
+```
+This code prints `Model = Some(Model(5))`. If you remove the last `add_tag()` then the code works and prints `Model = Some(Model(3))`.
+This program results in undefined behavior:
+
+```rust
+use legion::prelude::*;
+
+fn fetcher() -> legion::resource::PreparedRead<u32> {
+    let mut resources = Resources::default();
+    resources.insert(0u32);
+
+    <Read<u32>>::fetch(&resources)
+}
+
+fn main() {
+    println!("0x{:x}", *fetcher());
+}
+```
+In spirit of this [comment](https://github.com/TomGillen/legion/issues/65#issuecomment-570707911) I experimented a bit with replacing serveral `usize` indices via the new type pattern by introducing `ArchetypeIndex`, `ChunkIndex`, `ComponentIndex` and `SetIndex` ~~as well as a `TypedIndex` trait to make it a bit nicer to use these index types for getting things out of slices. Unfortunately the `SliceIndex` trait in std isn't stable, and as it seems will never be stabilized which makes this a bit more ugly and verbose to implement than it could be and due to how name resolution works I was unable to use the `get` name for retrieving values through this new trait which is why I settled with `fetch_*` for now(though given resources use this name as well another name might be better).~~
+I also implemented a few accessor methods for the different storage kinds to make indexing nicer.
+
+While doing this I found two wrong index usages:
+- Fixed one index misuse in `query::Chunk` where a set index was partially used in place of chunk indices, the Chunk now keeps track of both indices given both are needed.
+
+- Fixed another index misuse in `DynamicTagLayout` where it was using a chunk index instead of a set index for indexing into the Tags.
+
+Let me know if this is welcome and/or if I should make any adjustments.
+This implements `clone_merge`: a copying `merge` that lets the user choose how the copy is made. It also supports transforming one component type to another during the merge operation, where the user defines the transformation.
+
+`clone_merge` will allocate new entity IDs in the dst world by default, but can be fed with an entity mapping to specify the mappings of IDs from src to dst world. A `result_mapping` can be supplied if the user wishes to know about the final mappings of src to dst world entities, which takes into account newly allocated entities as well as any replaced entities.

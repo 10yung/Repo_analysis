@@ -1,0 +1,263 @@
+Can we have a `zipWithNext` operator for Flow? Could you help me implement one?
+
+
+Hi, I use `asFlow` to convert rxjava `Flowable` to `Flow`. 
+
+```kotlin
+suspend fun main() {
+    Flowable.create<Int>({ emitter ->
+        repeat(5) {
+            emitter.onNext(it)
+            println("emit: $it")
+            Thread.sleep(100)
+        }
+    }, BackpressureStrategy.BUFFER)
+        .onErrorReturnItem(-1)
+        .subscribeOn(Schedulers.io())
+        .asFlow()
+        .collect {
+            println("collect: $it")
+        }
+}
+```
+
+The producer is slower than consumer, but the result is strange: 
+
+```
+emit: 0
+collect: 0
+emit: 1
+emit: 2
+emit: 3
+emit: 4
+collect: 1
+collect: 2
+collect: 3
+collect: 4
+```
+
+If I use `BackpressureStrategy.LATEST`，the consumer will only get 0 and 4 (the first and the last):
+
+```
+emit: 0
+collect: 0
+emit: 1
+emit: 2
+emit: 3
+emit: 4
+collect: 4
+```
+
+I finally figure out that it may be related to the `onErrorReturnItem(-1)` call. If I comment it out, the result seems as expected: 
+
+```
+emit: 0
+collect: 0
+collect: 1
+emit: 1
+collect: 2
+emit: 2
+collect: 3
+emit: 3
+collect: 4
+emit: 4
+```
+
+
+**kotlin version: 1.3.61**
+**kotlinx.coroutines version: 1.3.3**
+
+Hi, I found that `PublisherAsFlow` ignores the CoroutineContext when created. It always uses an `EmptyCoroutineContext` instead.
+
+```kotlin
+private class PublisherAsFlow<T : Any>(
+    private val publisher: Publisher<T>,
+    capacity: Int
+) : ChannelFlow<T>(EmptyCoroutineContext, capacity) {
+    // Just ignore the context, use EmptyCoroutineContext for ChannelFlow
+    override fun create(context: CoroutineContext, capacity: Int): ChannelFlow<T> =
+        PublisherAsFlow(publisher, capacity)
+    ...
+}
+```
+
+ So if I call `flowOn` on it, nothing happens.
+
+```kotlin
+Flowable.create<Int>({
+        ... // run on ui thread, io thread expected!!!
+    }, ...)
+    .asFlow()
+    .flowOn(Dispatchers.IO) // will be ignored!!!
+    .launchIn(mainScope)
+```
+
+See https://github.com/Kotlin/kotlinx.coroutines/pull/1648#issuecomment-574259404 by @Thomas-Vos
+
+I've a bit minimized it to this test:
+
+```
+    @Test
+    fun testFlowCombine() = runTest {
+        withContext(Dispatchers.Default) {
+            val flow = flowOf(1)
+            val combo = combine(flow, flow) { a, b -> a + b }
+            assertEquals(2, combo.first())
+        }
+    }
+```
+
+It crashes due to freezing on coroutine's state machine inside implementation of `combine`.
+See: https://github.com/gradle/wrapper-validation-action
+The `awaitClose` function currently throws a `JobCancellationException` if the job was canceled before calling the function. 
+
+I would have personally expected that the block passed to `awaitClose { }` gets executed without throwing this exception. 
+
+Sample code:
+
+```kotlin
+internal fun SensorManager.consumeValuesAsFlow(
+    sensor: Sensor,
+    measureInterval: Duration = 20L with TimeUnit.MilliSeconds
+): Flow<FloatArray> {
+    return callbackFlow {
+        val sensorEventListener = object : SensorEventListener {
+            override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+            override fun onSensorChanged(event: SensorEvent) {
+                catch { offer(event.values) }
+            }
+        }
+
+        registerListener(
+            sensorEventListener,
+            sensor,
+            measureInterval[TimeUnit.MicroSeconds].toInt(),
+            sensorHandler
+        )
+        try {
+            awaitClose { unregisterListener(sensorEventListener) }
+        } catch (t: Throwable) {
+            Log.e("SensorManager", "consumeValuesAsFlow", t) // called with JobCancellationException
+        }
+    }
+}
+```
+
+Coroutines version 1.3.3
+Kotlin version 1.3.61
+In our current codebase, we are using `ArrayBroadcastChannel`s to perform detailed logging. This works great since it does not conflate anything, which is what we need for our logs to be complete.
+
+Our problem is that we want to use the same BroadcastChannels to update our UI. If the UI subscriber is created after the `BroadcastChannel` is first initialized, the UI will never show values unless another broadcast would take place. This is where the `ConflatedBroadcastChannel`s would solve our UI problem when it delivers new subscribers with the latest (or even last) value. 
+
+Currently, I do not see any possible path forward except having duplicate BroadcastChannels (one being an `ArrayBroadcastChannel` for logging, and one being `ConflatedBroadcastChannel` for the UI). I was considering extending one of those classes our creating my own class to handle this situation but it seems this would be a difficult path forward with classes that I would need being marked private. 
+
+Please let me know if anyone has found a solution to a similar situation. Maybe I am missing something and this can easily be accomplished. Thanks in advance for reading this!
+Fixes #1758
+
+Introduces the `BroadcastChannelAsFlow` internal class to accumulate `onStart` callbacks and only invoke them inside `collect(...)`, after `openSubscription()` has been called.
+In the docs, we have this example of `onStart(...)`:
+
+```Kotlin
+flowOf("a", "b", "c")
+    .onStart { emit("Begin") }
+    .collect { println(it) } // prints Begin, a, b, c
+```
+
+Not just with `emit(...)`, this works with sending to a `Channel` as well.
+
+```Kotlin
+val channel = Channel<String>(4)
+
+channel.consumeAsFlow()
+    .onStart { 
+      channel.send("Begin")
+      channel.send("a")
+      // etc.
+    }
+    .collect { println(it) } // prints Begin, a, b, c
+```
+
+However, with a `BroadcastChannel` we won't get anything:
+
+```Kotlin
+val channel = broadcast {
+  send(2)
+}
+
+channel.asFlow()
+    .onStart { channel.send(1) }
+    .collect { println(it) } // prints 2
+}
+```
+
+If `onStart(...)` is primarily a callback to say that "we're collecting data", instead of a fancy way to prepend data to the `Flow`, then this feels wrong.
+
+The difference is because of how the subscription is created.  The subscription channel isn't created until the builder is reached, which is after `onStart(...)`:
+
+```Kotlin
+public fun <T> BroadcastChannel<T>.asFlow(): Flow<T> = flow {
+    emitAll(openSubscription())
+}
+```
+
+`onStart(...)` is being invoked at the same time as always, and the value is being sent, but the subscription's `ReceiveChannel` is created _afterwards_ and never gets it.
+
+### Proposed Solution
+
+Make `asFlow()` return its own internal type (`BroadcastFlow`?), and give it an `update(...)` function similar to `ChannelFlow`.  This function will just accumulate the `action`(s) and store it/them until the final `collect(...)` is called.
+
+Then make `onStart(...)` do a type check and just call `update(...)` if it's a `BroadcastFlow`.
+When it's time to start collecting, create the subscription, `then` invoke the action, then call `emitAll(...)`.
+
+```Kotlin
+public fun <T> BroadcastChannel<T>.asFlow(): Flow<T> = BroadcastFlow(this)
+
+internal class BroadcastFlow<T>(
+    private val source: BroadcastChannel<T>,
+    private val _startAction: suspend FlowCollector<T>.() -> Unit = {}
+) : Flow<T> {
+
+    fun update(
+        startAction: suspend FlowCollector<T>.() -> Unit
+    ): BroadcastFlow<T> = BroadcastFlow(channel) {
+        startAction()
+        _startAction()
+    }
+
+    override suspend fun collect(collector: FlowCollector<T>) {
+        val channel = source.openSubscription()
+        collector._startAction()
+        collector.emitAll(channel)
+    }
+}
+
+public fun <T> Flow<T>.onStart(
+    action: suspend FlowCollector<T>.() -> Unit
+): Flow<T> = if (this is BroadcastFlow) {
+    update(action)
+} else {
+    unsafeFlow {
+        // Note: unsafe flow is used here, but safe collector is used to invoke start action
+        SafeCollector<T>(this, coroutineContext).action()
+        collect(this) // directly delegate
+    }
+}
+```
+# Issue
+At the moment the intermediate operators that can extend a `Flow`, like `map` as an example, do not accept references to non-suspending methods or to properties.
+A function can still be specified as a lambda, so say `flow.map { String.length() }` works, while `flow.map(String::length)` doesn't.
+
+# Possible Solution
+We could create additional extension functions accepting `KProperty1` and `KFunction1` and then delegate to the existing one.
+
+## Example
+
+```
+fun <T, R> Flow<T>.map(property: KProperty1<T, R>): Flow<R> = map { property.get(it) }
+```
+for properties and
+
+```
+fun <T, R> Flow<T>.map(function: KFunction1<T, R>): Flow<R> = map { function.invoke(it) }
+```
+for methods.

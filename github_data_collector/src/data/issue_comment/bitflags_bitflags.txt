@@ -1,0 +1,135 @@
+This PR contains five patches. Four do modernization work. One implements a new `default()` suffix feature.
+
+I pursued modernization first because it simplified the macro structure before adding a new macro feature.
+
+My main interest is the `default()` suffix feature. The existing methods for doing `impl Default` have served us fairly well. However, their main drawback is that we don't have the opportunity to generate a `const fn default()` for use in constant contexts.
+Adds a new `iter()` method to bitflags that returns an iterator over all the enabled flags.
+
+Uses `iter::from_fn` to create the iterator to avoid having to add a new struct to the macro which would require a parameter specifying it's name.
+I was surprised to find out that matching on bitflags leads to unreachable patterns in the example below (i.e. `match_flag` always return 3). I'm assuming it conflicts with the `|` syntax in match arms, is this the intended behavior of bitflags?
+
+```
+use bitflags::bitflags;
+
+bitflags! {
+    pub struct Flag: u64 {
+        const A      = 0;
+        const B      = 1;
+        const C      = 2;
+    }
+}
+
+fn match_flag(f: Flag) -> usize {
+    let a = Flag::A;
+    let ab = Flag::A | Flag::B;
+    let abc = Flag::A | Flag::B | Flag::C;
+    match f {
+        abc => 3,
+        ab => 2,
+        a => 1,
+    }
+}
+
+fn main() {
+    let abc = Flag::A | Flag::B | Flag::C;
+    let ab = Flag::A | Flag::B;
+    let a = Flag::A;
+    
+    assert_eq!(match_flag(abc), 3);
+    assert_eq!(match_flag(ab), 2);
+    assert_eq!(match_flag(a), 2);
+}
+```
+I'm trying to create a bitflags with CamelCase naming. However adding #[allow(non_upper_case_globals)] everywhere doesn't suppress the lints.
+add `#[repr(transparent)]` for the the FFI layout, replace #184.
+This works in plain Rust
+
+```rust
+const MAMMAL: u8 = 1;
+const AQUATIC: u8 = 2;
+const SEAL: u8 = MAMMAL | AQUATIC;
+```
+
+but the equivalent when using bitflags does not
+
+```rust
+use bitflags::bitflags;
+
+bitflags! {
+    pub struct FLAGS: u8 {
+        const MAMMAL  = 1;
+        const AQUATIC = 2;
+    }
+}
+
+const SECOND_SEAL: FLAGS = FLAGS::MAMMAL | FLAGS::AQUATIC;
+```
+
+You get an error *error[E0015]: calls in constants are limited to constant functions, tuple structs and tuple variants* when trying to BITOR the two flags.
+
+It would be nice if it did, because in my program I have a large initial array of flags to create and there are many different combinations making it impractical to spell them all out inside the `bitflags!` call.
+
+Edit: Simplified the repro.
+This doesn't parse:
+
+```rust
+bitflags::bitflags! {
+    pub struct BoxFlags: u8 {
+    }
+}
+```
+I'm using `bitflags!()` on a large table of u32 status codes where the high 16-bits are a sequential number (1, 2, 3, 4 etc.) and the lower 16-bits are bit flags. Together these are OR'd together to make the code.
+
+https://github.com/locka99/opcua/blob/master/types/src/status_codes.rs
+
+This all works fine except for the default `Debug` trait implementation which doesn't work properly with sequential values. This is easiest to demonstrate with a cut-down example:
+
+```
+#[macro_use]
+extern crate bitflags;
+
+bitflags! {
+  pub struct StatusCode: u32 {
+    const IS_ERROR                = 0x8000_0000;
+    //...
+    const Good = 0;
+    //...
+    const BadEncodingError = 0x8006_0000;
+    const BadDecodingError = 0x8007_0000;
+  }
+}
+
+fn main() {
+    println!("{:?}", StatusCode::BadDecodingError);
+}
+```
+
+This outputs `IS_ERROR | BadEncodingError | BadDecodingError` which is inappropriate in my case. I assume it is just doing a bitwise OR to all the values and appending them to the output string. I would like to be able to implement my own Debug trait and not generate the default one.
+
+For example the bitflags!() macro could have a pattern or form which excludes emitting the `Debug` trait, ... `pub struct (nodebug) StatusCode`
+
+Note I can override the `fmt::Display` trait for discrete cases where I need to print the StatusCode but it doesn't help when debug dumping out structs that have StatusCode as a member.
+
+Now bitflags merely derives `PartialOrd` with the mechanism built into rustc, which compares the values numerically. But a flags type is also a Boolean lattice, so it has another natural partial order: `x ≤ y` iff `y.contains(x)`. As i can't disable deriving `PartialOrd` i can't use if the other semantics if wanted.
+
+Either option would be fine:
+• Let user disable deriving `PartialOrd` (and ergo `Ord`)
+• Let user choose the semantics of `PartialOrd` per type
+
+It would allow to use any bitflags as generic for example:
+
+```rust
+struct SomeStruct<F: BitFlags>{
+....
+}
+
+impl<F: BitFlags> SomeStruct<F>{
+    fn set_flags(&mut self, flags: F){
+        ...
+    }
+}
+```
+
+it would also allow to document the crate without need for the example_generated module
+
+I can send a PR implementing this if there's interest 

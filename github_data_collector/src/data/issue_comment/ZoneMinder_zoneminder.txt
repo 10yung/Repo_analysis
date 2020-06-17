@@ -1,0 +1,342 @@
+As you may already know, due to incompatibility between GPL and OpenSSL licenses it is illegal to link GPL-licensed software (without OpenSSL linking exception) including ZoneMinder with _libssl_.
+
+  https://people.gnome.org/~markmc/openssl-and-the-gpl
+
+This is why in Debian we build ZoneMinder against `libcurl4-gnutls-dev` to avoid dependency on `libssl-dev`.
+
+Note how `src/zm_rtsp_auth.h` and `src/zm_user.cpp` have (conditional) detection of GnuTLS that makes OpenSSL optional: 
+
+  * https://github.com/ZoneMinder/zoneminder/blob/master/src/zm_rtsp_auth.h#L25
+  * https://github.com/ZoneMinder/zoneminder/blob/master/src/zm_user.cpp#L33
+
+But ZoneMinder 1.34.0 gained direct unconditional dependency on OpenSSL in `src/zm_crypt.cpp`: https://github.com/ZoneMinder/zoneminder/blob/master/src/zm_crypt.cpp#L6
+
+To complicate this problem further, with introduction of _jwt-cpp_ that explicitly requires `openssl/evp.h` from `libssl-dev`, ZoneMinder 1.34.0 also gained dependency on OpenSSL through _jwt-cpp_.
+
+Even with `libssl-dev` vendored _jwt-cpp_ FTBFS in Debian "unstable" as follows:
+
+~~~~
+./dbuild/src/./src/jwt-cpp/include/jwt-cpp/jwt.h:142: undefined reference to `HMAC' 
+/usr/bin/ld: ./dbuild/src/./src/jwt-cpp/include/jwt-cpp/jwt.h:142: undefined reference to `HMAC' 
+~~~~
+
+Fortunately there is a GnuTLS flavour of JWT library in Debian -- [libjwt-gnutls-dev](https://tracker.debian.org/pkg/libjwt) but ZoneMinder needs some work to use the system library instead of a vendored one.
+
+Due to licensing conflict, please avoid using OpenSSL.
+
+Please consider using alternatives such as [GnuTLS](https://gnutls.org/) and/or GPL-licensed [wolfSSL](https://www.wolfssl.com/products/wolfssl/).
+
+**Describe Your Environment**
+- Version of ZoneMinder zoneminder
+  - 1.32.3-2build1 amd64
+- How you installed ZoneMinder
+  - Ubuntu package (http://us.archive.ubuntu.com/ubuntu eoan/universe amd64 Packages)
+- Full name and version of OS
+  - Ubuntu 19.10
+- Browser name and version
+  - N/A
+
+Other useful information:
+MySQL is a remote system, running mysql-server-5.7 on an Ubuntu 18.04 system.
+Other zoneminder components on this system work fine, such as the audit daemon and web interface.  This is part of a multi-server configuration, consisting of this Intel system running Ubuntu 19.10 and four Raspberry Pi 3 systems running Raspbian Buster.  The monitors technically work on the Pis, but performance is not particularly good. :)
+
+**Describe the bug**
+`zmc` fails to run, crashing repeatedly with double-free error.
+
+**To Reproduce**
+Set up a multi-server zoneminder with a remote MySQL on Ubuntu 18.04, and then:
+```
+sauer@cerberus:~$ sudo -u www-data zmc -m 2
+double free or corruption (out)
+Aborted
+```
+
+**Expected behavior**
+`zmc` doesn't crash. :)
+
+**Debug Logs**
+There isn't anything useful in the logs other than "zmc exited".  However, I've got this from gdb:
+```
+sauer@cerberus:~$ sudo gdb /usr/bin/zmc
+...
+Reading symbols from /usr/bin/zmc...
+(No debugging symbols found in /usr/bin/zmc)
+(gdb) run -m 2
+Starting program: /usr/bin/zmc -m 2
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+double free or corruption (out)
+
+Program received signal SIGABRT, Aborted.
+__GI_raise (sig=sig@entry=6) at ../sysdeps/unix/sysv/linux/raise.c:50
+50      ../sysdeps/unix/sysv/linux/raise.c: No such file or directory.
+(gdb) backtrace
+#0  __GI_raise (sig=sig@entry=6) at ../sysdeps/unix/sysv/linux/raise.c:50
+#1  0x00007ffff5798899 in __GI_abort () at abort.c:79
+#2  0x00007ffff580338e in __libc_message (action=action@entry=do_abort, fmt=fmt@entry=0x7ffff592c3a5 "%s\n") at ../sysdeps/posix/libc_fatal.c:181
+#3  0x00007ffff580b4dc in malloc_printerr (str=str@entry=0x7ffff592e0a0 "double free or corruption (out)") at malloc.c:5332
+#4  0x00007ffff580d170 in _int_free (av=0x7ffff595db80 <main_arena>, p=0x7ffff51928d0, have_lock=<optimized out>) at malloc.c:4314
+#5  0x00007ffff7cc78e0 in SSL_CTX_free () from /usr/lib/x86_64-linux-gnu/libgnutls-openssl.so.27
+#6  0x00007ffff768281f in ?? () from /usr/lib/x86_64-linux-gnu/libmysqlclient.so.21
+#7  0x00007ffff7682e7d in ?? () from /usr/lib/x86_64-linux-gnu/libmysqlclient.so.21
+#8  0x00007ffff7632871 in ?? () from /usr/lib/x86_64-linux-gnu/libmysqlclient.so.21
+#9  0x00007ffff7632c1e in ?? () from /usr/lib/x86_64-linux-gnu/libmysqlclient.so.21
+#10 0x00007ffff7636129 in mysql_real_connect () from /usr/lib/x86_64-linux-gnu/libmysqlclient.so.21
+#11 0x00005555555aaeab in zmDbConnect() ()
+#12 0x00005555555a72d8 in zmLoadConfig() ()
+#13 0x000055555559f263 in main ()
+```
+
+Looking around online, it appears that sometimes this is caused by the way mysql client is used?  It appears to be happening in the SSL negotiation based on the backtrace, but I'm not doing anything weird with the cert; it's just mysql running basically out of the box on an up-to-date  Ubuntu 10.04 LTS.  Here's the cert chain per OpenSSL, which appears to be an auto-generated self-signed certificate:
+
+```
+sauer@cerberus:~$ openssl s_client -starttls mysql -connect mysql:3306 </dev/null
+CONNECTED(00000003)
+Can't use SSL_get_servername
+depth=1 CN = MySQL_Server_5.7.28_Auto_Generated_CA_Certificate
+verify error:num=19:self signed certificate in certificate chain
+verify return:1
+depth=1 CN = MySQL_Server_5.7.28_Auto_Generated_CA_Certificate
+verify return:1
+depth=0 CN = MySQL_Server_5.7.28_Auto_Generated_Server_Certificate
+verify return:1
+---
+Certificate chain
+ 0 s:CN = MySQL_Server_5.7.28_Auto_Generated_Server_Certificate
+   i:CN = MySQL_Server_5.7.28_Auto_Generated_CA_Certificate
+ 1 s:CN = MySQL_Server_5.7.28_Auto_Generated_CA_Certificate
+   i:CN = MySQL_Server_5.7.28_Auto_Generated_CA_Certificate
+```
+
+I'm guessing this is a defect in zmc, since the other components on this machine like the web interface and perl scripts are able to connect to the MySQL server ok, and I can use the command-line mysql client fine as well.  For example (I'm using an alternate db name - `zmpi` in this cluster to separate it from a legacy install) :
+
+```
+sauer@cerberus:~$ mysql -u zoneminder -p --ssl -h mysql -e 'SHOW TABLES;' zmpi
+Enter password:
++-----------------+
+| Tables_in_zmpi  |
++-----------------+
+| Config          |
+| ControlPresets  |
+```
+Unable to connect to ZM db.could not find driver
+
+**Describe Your Environment**
+- Version of ZoneMinder [release version, development version, or commit]
+
+```
+apt-cache madison zoneminder
+zoneminder |   1.32.3-2 | http://raspbian.raspberrypi.org/raspbian buster/main armhf Packages
+```
+
+<insert debug logs here, please make sure they are within the ``` quotes so they are formatted properly>
+
+```
+● zoneminder.service - ZoneMinder CCTV recording and surveillance system
+   Loaded: loaded (/lib/systemd/system/zoneminder.service; disabled; vendor preset: enabled)
+   Active: failed (Result: exit-code) since Tue 2020-01-07 01:37:02 GMT; 2s ago
+     Docs: http://zoneminder.readthedocs.org/en/latest/
+  Process: 1360 ExecStart=/usr/bin/zmpkg.pl start (code=exited, status=255/EXCEPTION)
+
+Jan 07 01:37:02 champ zmpkg.pl[1360]: DBI connect('database=;host=','',...) failed: Access denied for user 'www-data'@'localhost' (using password: 
+NO) at /usr/share/perl5/ZoneMinder/Config.pm line 117.
+Jan 07 01:37:02 champ zmpkg.pl[1360]: Can't connect to db at /usr/share/perl5/ZoneMinder/Config.pm line 166.
+Jan 07 01:37:02 champ zmpkg.pl[1360]: BEGIN failed--compilation aborted at /usr/share/perl5/ZoneMinder/Config.pm line 166.
+Jan 07 01:37:02 champ zmpkg.pl[1360]: Compilation failed in require at /usr/share/perl5/ZoneMinder.pm line 33.
+Jan 07 01:37:02 champ zmpkg.pl[1360]: BEGIN failed--compilation aborted at /usr/share/perl5/ZoneMinder.pm line 33.
+Jan 07 01:37:02 champ zmpkg.pl[1360]: Compilation failed in require at /usr/bin/zmpkg.pl line 34.
+Jan 07 01:37:02 champ zmpkg.pl[1360]: BEGIN failed--compilation aborted at /usr/bin/zmpkg.pl line 34.
+Jan 07 01:37:02 champ systemd[1]: zoneminder.service: Control process exited, code=exited, status=255/EXCEPTION
+Jan 07 01:37:02 champ systemd[1]: zoneminder.service: Failed with result 'exit-code'.
+Jan 07 01:37:02 champ systemd[1]: Failed to start ZoneMinder CCTV recording and surveillance system.
+```
+- How you installed ZoneMinder [e.g. PPA, RPMFusion, from-source, etc]
+
+```
+apt install zoneminder
+```
+
+- Full name and version of OS
+
+rpi3 with dietPi on it (which is debian buster armhf) 
+```
+cat /etc/os-release 
+PRETTY_NAME="Raspbian GNU/Linux 10 (buster)"
+NAME="Raspbian GNU/Linux"
+VERSION_ID="10"
+VERSION="10 (buster)"
+VERSION_CODENAME=buster
+ID=raspbian
+ID_LIKE=debian
+HOME_URL="http://www.raspbian.org/"
+SUPPORT_URL="http://www.raspbian.org/RaspbianForums"
+BUG_REPORT_URL="http://www.raspbian.org/RaspbianBugs"
+```
+
+```
+uname -a
+Linux champ 4.19.75-v7+ #1270 SMP Tue Sep 24 18:45:11 BST 2019 armv7l GNU/Linux`
+```
+
+
+- Browser name and version (if this is an issue with the web interface)
+
+- ZoneMinder Source Type:
+
+**Describe the bug**
+A clear and concise description of what the bug is.
+
+installing zoneminder seems to be ignoring files in /etc/zm/cond.d/
+
+**To Reproduce**
+Steps to reproduce the behavior:
+1. Install zoneminder on debian buster on raspberry Pi
+
+**Expected behavior**
+A clear and concise description of what you expected to happen.
+
+**Debug Logs**
+
+I went ahead and created the database myself and added a test user, but still:
+
+/etc/zm/conf.d/test.conf
+```
+ZM_DB_HOST=localhost
+ZM_DB_NAME=zm
+ZM_DB_USER=test
+ZM_DB_PASS=testpass
+```
+
+which is where /etc/zm/zm.conf indicates you should place such things but I still get the above issues.
+
+**Describe Your Environment**
+- Version of ZoneMinder 1.32.3
+- How you installed ZoneMinder Iconnor's PPA
+- Full name and version of OS Ubuntu 18.04 server, Bionic 
+- Browser name and version (if this is an issue with the web interface) - various, doesnt seem to matter
+
+**If the issue concerns a camera**
+Believe this is N/A
+
+**Describe the bug**
+Hundreds of these in log:
+
+ZM log as displayed in console:
+2020-01-04 08:59:21 | web_js |   | 29424 | ERR | undefined - () | ?view=event
+
+Syslog:
+Jan  4 08:59:21 servername web_php[29420]: ERR [undefined - ()]
+
+Apache2 access log:
+[Sat Jan 04 08:59:21.826377 2020] [php7:notice] [pid 29420] [client 192.168.1.81:52859] ERR [undefined - ()], referer: https://192.168.1.126/zm/index.php?view=event&eid=2480&filter[Query][terms][0][attr]=MonitorId&filter[Query][terms][0][op]==&filter[Query][terms][0][val]=5&page=1&popup=1
+
+Explanation: 192.168.1.81 is a Windows 10 box using MS Edge, and 192.168.1.126 is the ZM server web interface.
+
+**To Reproduce**
+Steps to reproduce the behavior:
+Unknown.  Seems to occur randomly.
+
+**Expected behavior**
+No errors.
+
+**Debug Logs**
+`01/04/20 08:59:21.767904 web_php[29420].DBG [View: request Request: status Action: ] at /usr/share/zoneminder/www/index.php line 209
+01/04/20 08:59:21.824988 web_php[29420].DBG [View: request Request: log Action: ] at /usr/share/zoneminder/www/index.php line 209
+01/04/20 08:59:21.825086 web_js[29420].ERR [undefined - ()] at ?view=event line 
+01/04/20 08:59:21.888720 web_php[29420].DBG [View: view_video Request:  Action: ] at /usr/share/zoneminder/www/index.php line 209
+01/04/20 08:59:21.889680 web_php[29420].DBG [Path: /zmdata/zoneminder/events/5/2020-01-04/2480/2480-video.mp4] at /usr/share/zoneminder/www/views/view_video.php line 43
+01/04/20 08:59:21.889760 web_php[29420].DBG [Using Range bytes=0-] at /usr/share/zoneminder/www/views/view_video.php line 71
+01/04/20 08:59:21.889791 web_php[29420].DBG [Using Range 0 1970170 size: 1970171, length: 1970171] at /usr/share/zoneminder/www/views/view_video.php line 78
+01/04/20 08:59:48.227260 web_php[29420].DBG [View: request Request: log Action: ] at /usr/share/zoneminder/www/index.php line 209
+01/04/20 08:59:50.404200 web_php[29420].DBG [View: request Request: log Action: ] at /usr/share/zoneminder/www/index.php line 209
+01/04/20 08:59:54.524620 web_php[29420].DBG [View: request Request: log Action: ] at /usr/share/zoneminder/www/index.php line 209`
+
+
+In `nixpkgs` from the NixOS distribution, the default build environment for cmake projects sets both environment variables `CMAKE_INSTALL_PREFIX` and `CMAKE_INSTALL_LIBEXECDIR` to an absolute path.
+
+This line in `CMakeLists.txt` sets `ZM_CGIDIR` like so:
+https://github.com/ZoneMinder/zoneminder/blob/89844f72f49b07c90597413fb4722486441fad26/CMakeLists.txt#L143
+
+Consequently, `ZM_CGIDIR` has two absolute paths concatenated--which isn't correct.
+
+See: https://cmake.org/cmake/help/v3.16/module/GNUInstallDirs.html
+An alternative would be to use `CMAKE_INSTALL_FULL_<dir>` instead of concatenating `CMAKE_INSTALL_PREFIX` and `CMAKE_INSTALL_<dir>`.
+
+Downstream issue: https://github.com/NixOS/nixpkgs/pull/76855
+The zms code in zm_eventstream.cpp sleeps too much.  Needs to be refactored.  I have code but it needs to be finished.  
+Hello.
+how to watch online video in h265 ?
+
+```
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from '88221.mp4':
+  Metadata:
+    major_brand     : isom
+    minor_version   : 512
+    compatible_brands: isomiso2mp41
+    title           : Zoneminder Security Recording
+    encoder         : Lavf57.83.100
+  Duration: 01:00:00.56, start: 0.000000, bitrate: 651 kb/s
+    Stream #0:0(und): Video: hevc (Main) (hev1 / 0x31766568), yuvj420p(pc), 1920x1080, 650 kb/s, 10.83 fps, 20.42 tbr, 90k tbn, 90k tbc (default)
+    Metadata:
+      handler_name    : VideoHandler
+At least one output file must be specified
+```
+![IMG_8062](https://user-images.githubusercontent.com/9798924/71013485-d296bf00-2101-11ea-8bff-2fb75129fe8b.png)
+
+API: _domain/zm/api/monitors/index/GroupId:1/.json_
+
+This is function index() in zoneminder/web/api/app/Controller/MonitorsController.php
+![Screenshot from 2019-12-04 15-13-14](https://user-images.githubusercontent.com/12947223/70125112-cd208a00-16a8-11ea-8b92-6502f1f2ee43.png)
+
+This is function buildFilter() in zoneminder/web/api/app/Controller/Component/FilterComponent.php
+![Screenshot from 2019-12-04 15-12-40](https://user-images.githubusercontent.com/12947223/70125173-ef1a0c80-16a8-11ea-9706-54af76a6621a.png)
+
+
+When I passed the GroupId parameter, the array $conditions  never had the GroupId key, you turned the key into \`GroupId \`. Hope that the error can be corrected, thank you!
+
+Hello. 
+Add disk data on other servers to the database
+
+
+id | Name | Path | Type | Scheme | Server | DiskSpace | Mark
+-- | -- | -- | -- | -- | -- | -- | --
+3 | Dav | /var/cache/zoneminder/events | local | Medium | Dav | 253.06GB of 1.78TB |  
+0 | Default | /var/cache/zoneminder/events | local | Medium |   | 253.06GB of 1.78TB |  
+2 | Elg | /var/cache/zoneminder/events | local | Medium | Elg | 253.06GB of 1.78TB |  
+1 | Kur | /var/cache/zoneminder/events | local | Medium | Kur | 253.06GB of 1.78TB |  
+5 | Kur7tb | /var/cache/zoneminder/events7tb | local | Medium | Kur | 253.06GB of 1.78TB
+
+in mysql
+
+INSERT INTO `Storage` (`Id`, `Path`, `Name`, `Type`, `Url`, `DiskSpace`, `Scheme`, `ServerId`, `DoDelete`) VALUES
+(0, '/var/cache/zoneminder/events', 'Default', 'local', NULL, 0, 'Medium', NULL, 1),
+(1, '/var/cache/zoneminder/events', 'Kur', 'local', NULL, 0, 'Medium', 3, 1),
+(2, '/var/cache/zoneminder/events', 'Elg', 'local', NULL, 0, 'Medium', 4, 1),
+(3, '/var/cache/zoneminder/events', 'Dav', 'local', NULL, 127174589533, 'Medium', 2, 1),
+(5, '/var/cache/zoneminder/events7tb', 'Kur7tb', 'local', NULL, 9675922155, 'Medium', 3, 1);
+
+should be:
+dav - 1.78tb
+kur  - 145mb
+kur7tb - 7tb
+Hi 
+
+my config is EVENT_CLOSE_MODE after alarm and camera in  mocord
+
+after each pre-alam zoneminder close event and open new
+
+But i thinks zoneminder must close event just after alarm is finish ?
+
+`Nov 14 04:08:07 Serveur_Ubuntu zmc_m1[25132]: INF [zmc_m1] [Opening video storage stream /var/cache/zoneminder/events/1/2019-11-14/2482434/2482434-video.mp4 format: mp4]
+Nov 14 04:09:11 Serveur_Ubuntu zma_m1[25136]: INF [zma_m1] [devant: 243 - Closing event 2482434, continuous end,  alarm begins]
+Nov 14 04:09:11 Serveur_Ubuntu zma_m1[25136]: INF [zma_m1] [devant: 243 - Gone into prealarm state]
+Nov 14 04:09:11 Serveur_Ubuntu zma_m1[25136]: INF [zma_m1] [devant: 244 - Opening new event 2482450, section start]
+Nov 14 04:09:12 Serveur_Ubuntu zmc_m1[25132]: INF [zmc_m1] [Opening video storage stream /var/cache/zoneminder/events/1/2019-11-14/2482450/2482450-video.mp4 format: mp4]
+Nov 14 04:10:51 Serveur_Ubuntu zma_m1[25136]: INF [zma_m1] [devant: 574 - Closing event 2482450, continuous end,  alarm begins]
+Nov 14 04:10:51 Serveur_Ubuntu zma_m1[25136]: INF [zma_m1] [devant: 574 - Gone into prealarm state]
+Nov 14 04:10:51 Serveur_Ubuntu zma_m1[25136]: INF [zma_m1] [devant: 575 - Opening new event 2482473, section start]
+Nov 14 04:10:51 Serveur_Ubuntu zmc_m1[25132]: INF [zmc_m1] [Opening video storage stream /var/cache/zoneminder/events/1/2019-11-14/2482473/2482473-video.mp4 format: mp4]`
+
+Is normal or bug ?
+
+thanks for your help

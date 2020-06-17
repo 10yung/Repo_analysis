@@ -1,0 +1,141 @@
+Some GRPC test cases are seeing intermittent internal failure when running on the CI build on various platforms.
+
+Root cause on this is currently not clear and will need more research if it continues.
+
+impacted tests, across various platforms
+
+**X 
+ EventStore.Client.Streams.write_stream_meta_security.writing_meta_with_not_existing_credentials_is_not_authenticated**
+```
+Expected: typeof(EventStore.Client.AccessDeniedException)
+Actual:   typeof(Grpc.Core.RpcException): Status(StatusCode=Cancelled, Detail="")
+---- Grpc.Core.RpcException : Status(StatusCode=Cancelled, Detail="")
+```
+**X  
+EventStore.Client.Streams.append_to_stream_limits.fails_when_size_exceeds_max_append_size**
+```
+Expected: typeof(EventStore.Client.MaximumAppendSizeExceededException)
+Actual:   typeof(Grpc.Core.RpcException): Status(StatusCode=Cancelled, Detail="")
+---- Grpc.Core.RpcException : Status(StatusCode=Cancelled, Detail="")
+```
+  **X EventStore.Client.Streams.write_stream_security.writing_with_not_existing_credentials_is_not_authenticated [16ms]**
+```
+  Error Message:
+   Assert.Throws() Failure
+Expected: typeof(EventStore.Client.AccessDeniedException)
+Actual:   typeof(Grpc.Core.RpcException): Status(StatusCode=Cancelled, Detail="")
+---- Grpc.Core.RpcException : Status(StatusCode=Cancelled, Detail="")
+  Stack Trace:
+     at Grpc.Net.Client.Internal.HttpContentClientStreamWriter`2.WriteAsyncCore(TRequest message)
+   at EventStore.Client.EventStoreClient.AppendToStreamInternal(AppendReq header, IEnumerable`1 eventData, UserCredentials userCredentials, CancellationToken cancellationToken) in /home/vsts/work/1/s/src/EventStore.Client/EventStoreGrpcClient.Append.cs:line 44
+----- Inner Stack Trace -----
+   at Grpc.Net.Client.Internal.HttpContentClientStreamWriter`2.WriteAsyncCore(TRequest message)
+   at EventStore.Client.EventStoreClient.AppendToStreamInternal(AppendReq header, IEnumerable`1 eventData, UserCredentials userCredentials, CancellationToken cancellationToken) in /home/vsts/work/1/s/src/EventStore.Client/EventStoreGrpcClient.Append.cs:line 44
+```
+ **X EventStore.Client.Streams.write_stream_meta_security.writing_meta_to_no_acl_stream_is_not_authenticated_when_not_existing_credentials_are_passed [2ms]**
+  ```
+Error Message:
+   Assert.Throws() Failure
+Expected: typeof(EventStore.Client.AccessDeniedException)
+Actual:   typeof(Grpc.Core.RpcException): Status(StatusCode=Cancelled, Detail="")
+---- Grpc.Core.RpcException : Status(StatusCode=Cancelled, Detail="")
+  Stack Trace:
+     at Grpc.Net.Client.Internal.HttpContentClientStreamWriter`2.WriteAsyncCore(TRequest message)
+   at EventStore.Client.EventStoreClient.AppendToStreamInternal(AppendReq header, IEnumerable`1 eventData, UserCredentials userCredentials, CancellationToken cancellationToken) in /home/vsts/work/1/s/src/EventStore.Client/EventStoreGrpcClient.Append.cs:line 44
+----- Inner Stack Trace -----
+   at Grpc.Net.Client.Internal.HttpContentClientStreamWriter`2.WriteAsyncCore(TRequest message)
+   at EventStore.Client.EventStoreClient.AppendToStreamInternal(AppendReq header, IEnumerable`1 eventData, UserCredentials userCredentials, CancellationToken cancellationToken) in /home/vsts/work/1/s/src/EventStore.Client/EventStoreGrpcClient.Append.cs:line 44
+ ```
+ 
+In the projections system when `TransactionFileEventReader` reaches the end of the TF file it subscribes to the `Awake` to be notified of further events. 
+
+The `Awake` service does not have any history an will only notify if new events are received. 
+If in the gap between the completion of the read operation and the activation of the subscription the awake service handles a message on the stream the projection will not get notified.
+
+This race condition is somewhat self healing in that any further write past the last known position will trigger the notification.
+But in the cases where 
+- the cluster is idle the update make take an indeterminate length of time to resolve
+- and where the event is a delete further writes may happen on the stream
+
+This is seen in intermittent test case failures in the `when_running_and_events_are_indexed_but_a_stream_and_tombstone_postponed` tests.
+Projection subsystem test changes per #2234
+
+Replication Tracking Test instability fixed via adding deterministic checking on published status
+
+Read request tests fixed by adding deterministic `IndexCheckpoint` evaluation on replica nodes before attempting to read
+
+Fixing Instability due to projections race conditions #2236 is out of scope for this PR, workarounds added.
+
+Instability due to GRPC issues #2237 is also out of scope. 
+
+The test `when_projection_subsystem_restarted_twice` is unstable in the CI builds.
+
+While a useful developer test, rapid and repeated restarts of the Projection subsystem is not a system feature or goal.
+
+The test has been marked `Explicit` as a work around to avoid false negatives in the CI test runs in #2235 
+
+Requested resolution is any one of 
+- Confirm the `Explicit` designation 
+- Fix the test to be stable in CI
+- Remove the test as unwarranted
+
+
+I actually wanted to continue the discussion on this issue here https://github.com/EventStore/EventStore/issues/1975 , while the findings were that the initial request was quite slow 1.2 seconds which should still be unacceptable, the resulting performance on subsequent appends is still unacceptable. 
+
+I was testing the same thing as this other user and determined that, on avg, a single append to EventStore takes 8ms which is extremely slow in a append only design. I'm trying to determine where this is coming from and its a long shot from the proposed 10-20k the documents suggest you can achieve over TCP.
+
+Are there benchmarks anywhere showing what raw through put should be considered in a single node setup with single thread vs multiple threads?
+
+Is there a way to determine what could possibly be taking 8ms to append 50 bytes to a stream?
+
+PC specs are fairly high end but running eventstore locally with no options passed.
+Just work with ExpectedVersion = -4 producer.
+There is a possibility whereby a multi-master scenario will arise due to nodes using out of date information (from gossip) during elections to propose or accept a node as a master candidate.
+
+The gossip carries with it the Epoch Number which is used to determine whether a master candidate is a legitimate master candidate. In the following example, a master proposal with a higher epoch number could result in a node accepting a new master candidate even if its current master is still alive.
+
+The above means that if a node gets a master proposal before it received a gossip from it's master after an election, the master proposal is accepted.
+
+### Example:
+1. 5 node cluster (**Node 1** through to **Node 5**)
+2. **Node 1** is elected master
+3. An election is started because **Node 2** is restarted
+4. **Node 2** is the leader of the elections
+5. **Node 2** proposes **Node 3** as the master as according to it, it's the best master candidate (it might have not received a gossip from the current master node)
+6. **Node 2** _accepts_ it's proposal
+7. **Node 1** _rejects_ the proposal as it's the **master** and it has the most up to date information about itself (Epoch Number included) and it's still alive
+8. **Node 3** _accepts_ the proposal because even though it has a previously elected master, it hasn't received a gossip from the master (**Node1**) with the updated **Epoch Number** whereas the proposal has a higher Epoch Number than the current master (**Node1**) at this point
+9. **Node 4** _rejects_ the proposal as it received a gossip from the current master (**Node1**)
+10. **Node 5** _accepts_ the proposal because it also hasn't received a gossip from the current master (**Node1**)
+
+The above results in multiple masters existing in the same cluster without a network partition having occurred.
+
+Once this happens, a series of elections will take place.
+
+
+
+Hi,
+
+I have a question regarding backup order of *.chk files themselves.
+
+If I understand various bits of info from documentation, Github issues and Google Groups, content of chaser.chk is pointer to position (in chunk files "continuum") reached by chaser process, while writer.chk is pointer to position reached by writer process. Chaser process should always be behind the writer (or at the same point), never ahead of it.
+Does it make sense to copy chaser.chk before writer.chk when performing backup?
+The docs only say that all *.chk files should be copied before all other files (index and data chunks), but does not specify ordering between various *.chk files. From what I understand, if writer.chk is copied before chaser.chk, it might be possible that copied chaser.chk contains pointer that is after (larger than) value in copied writer.chk, which might be a problem (not sure if EventStore can recover from this during startup).
+Also, another unclear point: what is the purpose of epoch.chk and its relation to writer.chk and chaser.chk? Does it matter if it is copied before or after writer/chaser chk files? (Info on epoch.chk is particularly hard to find online).
+As for truncate.chk, it will be overwritten by chaser.chk during restore, so it really doesn't matter when it gets copied (or if at all).
+
+To sum it up in one question: what should the order of copying chk files during backup be so that backup consistency is ensured? (Explicit ordered list would be really helpful and reassuring).
+It would be ideal if backup page in docs elaborated on this a bit.
+
+Note that I'm mostly interested in single-node setup.
+We need to find a suitable replacement for the `sys.cpu` (System CPU %) cross platform.
+Once https://github.com/EventStore/EventStore/pull/2204 is merged, the `sys.cpu` will only be available via Windows as it still uses Performance Counters there.
+**Is your feature request related to a problem? Please describe.**
+Scavenging Ptables can take a considerable amount of time as a database grows bigger. In some cases, multiple days.
+
+**Describe the solution you'd like**
+To add a flag to explicitly specify if scavenging of ptables needs to be skipped
+
+**Describe alternatives you've considered**
+At the moment it is possible send a stop scavenge request to stop scavenging when scavenging of Ptables has started. However, this needs to be done after chunks have been scavenged and it is highly likely that scavenging of at least one Ptable has already started in the meantime.
+

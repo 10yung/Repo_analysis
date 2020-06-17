@@ -1,0 +1,80 @@
+Get-DSCParamType uses ForEach-Object loops. ForEach-Object doesn't break/end the function when return is called because it gets the next item from the pipeline. Under the right circumstances, an array will be returned. Subsequently, get-dscBlock will fail to work properly as the returned paramType  won't match as intended. 
+
+How to reproduce: 
+```powershell
+$DSCModule = Get-Module -Name xWebAdministration -ListAvailable
+$DSCPath = $DSCModule | Select-Object -ExpandProperty modulebase 
+$modulePath = $DSCPath + "\DSCResources\MSFT_xWebsite\MSFT_xWebsite.psm1"
+
+$paramType = Get-DSCParamType -ModulePath $ModulePath -ParamName "`$BindingInfo"
+
+"Microsoft.Management.Infrastructure.CimInstance[]" -eq $paramType #Returns False 
+
+"Microsoft.Management.Infrastructure.CimInstance[]" -eq $paramType[0] #Returns True 
+
+#$paramType is an array which equals @("Microsoft.Management.Infrastructure.CimInstance[]", "")
+````
+
+To Resolve: (use foreach instead of foreach-object)
+```powershell
+function Get-DSCParamType
+{
+    [CmdletBinding()]
+    param(
+        [parameter(Mandatory = $true)] [System.String] $ModulePath,
+        [parameter(Mandatory = $true)] [System.String] $ParamName
+    )
+
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($ModulePath, [ref] $tokens, [ref] $errors)
+    $functions = $ast.FindAll( {$args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst]}, $true)
+
+    ForEach($function in $functions){
+        if ($function.Name -eq "Set-TargetResource")
+        {
+            $functionAst = [System.Management.Automation.Language.Parser]::ParseInput($function.Body, [ref] $tokens, [ref] $errors)
+
+            $parameters = $functionAst.FindAll( {$args[0] -is [System.Management.Automation.Language.ParameterAst]}, $true)
+            ForEach($parameter in $parameters){
+                if ($parameter.Name.Extent.Text -eq $ParamName)
+                {
+                    $attributes = $parameter.Attributes
+                    ForEach($attribute in $attributes){
+                        if ($attribute.TypeName.FullName -like "System.*")
+                        {
+                            return $attribute.TypeName.FullName
+                        }
+                        elseif ($attribute.TypeName.FullName.ToLower() -eq "microsoft.management.infrastructure.ciminstance")
+                        {
+                            return "System.Collections.Hashtable"
+                        }
+                        elseif ($attribute.TypeName.FullName.ToLower() -eq "string")
+                        {
+                            return "System.String"
+                        }
+                        elseif ($attribute.TypeName.FullName.ToLower() -eq "boolean")
+                        {
+                            return "System.Boolean"
+                        }
+                        elseif ($attribute.TypeName.FullName.ToLower() -eq "bool")
+                        {
+                            return "System.Boolean"
+                        }
+                        elseif ($attribute.TypeName.FullName.ToLower() -eq "string[]")
+                        {
+                            return "System.String[]"
+                        }
+                        elseif ($attribute.TypeName.FullName.ToLower() -eq "microsoft.management.infrastructure.ciminstance[]")
+                        {
+                            return "Microsoft.Management.Infrastructure.CimInstance[]"
+                        }
+                    }
+                }
+            }
+        }
+     }
+ }
+````
+
+We would like to use ReverseDSC to help newcomers to DSC get a leg up on setting up their service. Primary use case would be to run ReverseDSC on a new, unconfigured system with no reference DSC to get ALL of the configurations. Then the admin sets the system up in the 'old' way and re-runs ReverseDSC. Then I could take the 2 output files and find the deltas, which should contain the DSC specific to setting up their service with the settings they need, and gives them a way to start 85% to the finish line.

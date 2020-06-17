@@ -1,0 +1,138 @@
+Reproducible example:
+
+```rust
+extern crate coio;
+extern crate env_logger;
+
+use coio::Scheduler;
+
+fn main() {
+    env_logger::init();
+
+    Scheduler::new()
+        .run(|| {
+            struct A;
+
+            impl Drop for A {
+                fn drop(&mut self) {
+                    Scheduler::sched();
+                }
+            }
+
+            let _a = A;
+
+            panic!("PANICKED in coroutine");
+        }).unwrap();
+}
+```
+
+While the coroutine is unwinding, `Drop` of `A` will be called. Coroutine is yield in the `drop()` function. Coroutine is now suspended, which means that the currently thread is still in panicking status, but execution process is now be switched to another coroutine. If the other coroutine panic, too, then it will definitely cause panic while panicking!.
+If I understand it correctly, the coroutines here can move from thread to thread.
+
+Now imagine I have something that is not `Send` for whatever reason. And I don't mean something like `Rc` (which could cause havoc if I put it into TLS, but that's another issue), but something like Zero-MQ socket which is promised to crash the whole application if ever touched from a different thread. But it is on the stack, so it passes all compile time checks.
+
+Moving the coroutine to another thread would now cause an UB while the user used only safe Rust.
+This bug was originally found in #53 . The reason was: stdlib uses a `PANIC_COUNT` in TLS to ensure no panic while panicking in runtime. But obviously, Coroutines in coio can be migrated between threads, which means that it turns out to cause data race (because compiler still think that we are running in the same thread, so we may access to the other thread's TLS without any synchronization method).
+
+We wanted to solve this `PANIC_COUNT` partially in https://github.com/rust-lang/rust/pull/33408, but because stdlib relies heavily on TLS (such as `println!`), it will also causes SIGSEGV randomly:
+
+``` rust
+println!("Before");
+Scheduler::sched(); // Switch out
+// Well, now, this Coroutine may already been stolen by the other thread
+// And then resumed by the other thread
+println!("After");
+```
+
+Rust's compiler don't know that we have switched to another thread, so it may inline those TLS calls.
+
+We are looking for a solution for this bug, discussing in [here](https://github.com/rust-lang/rust/issues/33368), if you have any idea, please help.
+
+`coroutine_unwind` was doing undefined things.  
+
+I've replaced it with an AtomicBool flag triggering the same unwind code moved to `yield_with`.  This isn't optimal yet (I'll try to get it passing through the `data` field as zonyitoo suggests) but it does pass all tests even with `#[inline(always)]`
+
+Still needs:
+- [x] `data` field
+- [ ] decide on proper inline attribute
+- [x] out-line the cold branch (probably)
+- [x] delete commented-out code
+
+Now we can only add `#[inline(never)]` on the `Coroutine::yield_with` method.
+
+You can reproduce it anytime by replacing it with `#[inline(always)]`, and then call `cargo test --release`, you will see the `coroutine_unwinds_on_drop` test will fail.
+
+```
+$ cargo test --release
+...
+test coroutine::test::coroutine_unwinds_on_drop ... FAILED
+...
+
+failures:
+
+---- coroutine::test::coroutine_unwinds_on_drop stdout ----
+    thread 'coroutine::test::coroutine_unwinds_on_drop' panicked at 'assertion failed: `(left == right)` (left: `0`, right: `1`)', src/coroutine.rs:593
+note: Run with `RUST_BACKTRACE=1` for a backtrace.
+
+
+failures:
+    coroutine::test::coroutine_unwinds_on_drop
+
+test result: FAILED. 26 passed; 1 failed; 0 ignored; 0 measured
+
+error: test failed
+```
+
+Now in Coio, Coroutine is the minimum execution routine. It would be nice if we can have a `coroutine_local!` macro implementation just like `thread_local!` in `std`.
+
+Implementation detail will be discussed later.
+
+Minimal test case:
+
+``` rust
+extern crate coio;
+
+use coio::Scheduler;
+use coio::sync::mpsc;
+
+fn main() {
+    Scheduler::new().run(|| {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let h = Scheduler::spawn(move|| {
+            tx.send(1).unwrap();
+        });
+
+        assert_eq!(rx.recv().unwrap(), 1);
+
+        h.join().unwrap();
+    }).unwrap();
+}
+```
+
+The program would panic with message:
+
+```
+thread 'Processor #0' panicked at 'called `Result::unwrap()` on an `Err` value: RecvError', ../src/libcore/result.rs:746
+note: Run with `RUST_BACKTRACE=1` for a backtrace.
+thread '<main>' panicked at 'called `Result::unwrap()` on an `Err` value: Any', ../src/libcore/result.rs:746
+```
+
+All I/O operations needs to support a timeout parameters, including `read_timeout` and `write_timeout`. This issue was related to #24 and I have implemented an experimental version in branch `experimental-io_timeout`.
+
+But because of #22 , we may got a new implementation of runtime. So this issue will be solved after the main part of new designed runtime is settle down.
+
+Right now `Processor`s will wait forever in its own channel until got notified by `ProcMessage`. So it won't try to steal jobs from the other `Processor`s!
+
+So we have to add something to achieve:
+1. `Processor` won't spin itself when it has nothing to do.
+2. `Processor` can process the `ProcMessage`s in time.
+3. `Processor` can steal jobs from the other `Processor`s.
+
+Please add comments below :)
+
+Hi Zonytoo,
+
+I'd like to use coio in a public-facing service accepting anonymous TCP connections.
+If only to avoid file descriptors exhaustion, there has to be a limit on the maximum amount of open connections.
+While just closing a socket after having accepted it if we get close to the limit is an option, a better practice is to close the oldest connection instead.
+However, I didn't see any obvious ways to do this when using coio. How would you do TCP reuse?

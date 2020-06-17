@@ -1,0 +1,134 @@
+假设：product表与order表通过product_relate表形成多对多关系
+表结构：
+product:id,product_name
+order:id,order_number
+product_relate:id,order_id,product_id
+
+这里因为product_relate也有id字段，tp5.1在组装查询语句时，强制使用了join，
+并且还没给主表字段指定表名，导致组装出来的语句在MySQL中会报：Column 'id' in where clause is ambiguous错误
+```
+$product = new Product();
+$product = $product->where('id',1)->select;
+$product->order
+```
+我在使用多对多查询的时候发现了这个问题，我看了框架最终组装的sql语句，框架正确的拿到了主表名称，但是就是没有组装主表表名进去，这个设计请问是因为基于其他原因的考虑？如果不是，请问能加上主表表名吗？不然一但要查询多对多关系表时，查询条件就必须加上表名了，如：`$product->where('product.id',1)`
+I found a lot of such code in our extensive penetration test.
+
+`$sql=$Data->query("select * from users where id=$id");
+$sql=$Data->where("id=$id")->select();`
+
+Such code is not pre-processed by sql during preprocessing. can be seen
+
+`protected function parseSql($sql,$parse) {
+    if(true === $parse) {
+        $options =  $this->_parseOptions();
+        $sql    =   $this->db->parseSql($sql,$options);
+    }elseif(is_array($parse)){ // SQL预处理
+        $parse  =   array_map(array($this->db,'escapeString'),$parse);
+        $sql    =   vsprintf($sql,$parse);
+    }else{
+        $sql    =   strtr($sql,array('__TABLE__'=>$this->getTableName(),'__PREFIX__'=>C('DB_PREFIX')));
+    }
+    $this->db->setModel($this->name);
+    return $sql;
+}`
+
+or
+
+`public function where($where,$parse=null){
+    if(!is_null($parse) && is_string($where)) {
+        if(!is_array($parse)) {
+            $parse = func_get_args();
+            array_shift($parse);
+        }
+        $parse = array_map(array($this->db,'escapeString'),$parse);
+        $where =   vsprintf($where,$parse);
+    }elseif(is_object($where)){
+        $where  =   get_object_vars($where);
+    }
+    if(is_string($where) && '' != $where){
+        $map    =   array();
+        $map['_string']   =   $where;
+        $where  =   $map;
+    }     
+    if(isset($this->options['where'])){
+        $this->options['where'] =   array_merge($this->options['where'],$where);
+    }else{
+        $this->options['where'] =   $where;
+    }
+    
+    return $this;
+} `
+
+And the official website also has a lot of such writings.http://www.thinkphp.cn/extend/246.html
+Are all wrong demonstrations that will cause more SQL injection
+Sql injection can also be performed in the MODEL.class.php limit function and the order function.
+
+`public function limit($offset,$length=null){
+    $this->options['limit'] =   is_null($length)?$offset:$offset.','.$length;
+    return $this;
+}
+$sql=$Data->where("id=$id")->order($id);`
+
+
+
+在php7.1环境下，扩展类String报错；Cannot use 'String' as class name as it is reserved；ThinkPHP\Library\Org\Util\String.class.php 　LINE: 13。
+使用以下关联查询
+```php
+HomeworkModel::withJoin([
+    'user' =>	['name', 'id'],
+    'attachment' => ['name'],
+    ], 'LEFT')
+->withCount('file')
+->selectOrFail();
+```
+生成了以下sql
+```sql
+SELECT 
+`homework_model`.`id`,
+`homework_model`.`title`,
+`homework_model`.`desc`,
+`user`.`name` AS `user__name`,
+`user`.`id` AS `user__id`,
+`attachment`.`name` AS `attachment__name`,
+
+(SELECT COUNT(*) AS tp_count 
+FROM `hw_file` `count_table` 
+WHERE  ( `count_table`.`hid` = hw_homework.id ) LIMIT 1)
+
+AS `file_count` 
+FROM `hw_homework` `homework_model` 
+
+LEFT JOIN `hw_user` `user` ON `homework_model`.`uid`=`user`.`id` 
+LEFT JOIN `hw_file` `attachment` ON `homework_model`.`attachment_id`=`attachment`.`id` LIMIT 100
+```
+
+报错 `1054 - Unknown column 'hw_homework.id' in 'where clause'`
+原因 在**from**语句后已重命名`hw_homework`表为 `homework_model` 
+再子查询就会找不到`hw_homework`
+尝试过更换`withJoin()`位置，没有生效。
+
+
+使用`with()`代替`withJoin()`，但没办法使用查询多个需要关联的模型。
+```php
+HomeworkModel::with([
+    'user' =>	['name', 'id'],
+    'attachment' => ['name'],
+    ])
+->withCount('file')
+->selectOrFail();
+```
+报错`Too few arguments to function think\db\Query::name(), 0 passed and exactly 1 expected`
+检查sql语句，生成如下
+```sql
+SELECT *,(SELECT COUNT(*) AS tp_count FROM `hw_file` `count_table` WHERE ( `count_table`.`hid` =hw_homework.id ) LIMIT 1) AS `file_count` FROM `hw_homework`
+```
+
+www下执行composer create-project topthink/think tp5 --prefer-dist 
+出现如下问题
+[Composer\Downloader\TransportException]
+  Content-Length mismatch, received 15136 bytes out of the expected 1020631
+如题，期望得到的结果应该是, 字段 => false, 而不是 字段不存在
+版本号为3.2.5 
+再windows下。开启生产模式，字段缓存文件缓存的内容有问题。a表的缓存文件里面的的内容解析之后是b表的字段。请问什么原因会导致这个问题呢。
+增加XA事务支持

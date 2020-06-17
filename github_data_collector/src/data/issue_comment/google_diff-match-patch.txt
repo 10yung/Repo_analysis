@@ -1,0 +1,166 @@
+This is a great library! Unfortunately it has been ambiguous about what input it wants to accept and what it wants to output. That is, while we know that it's ["character based"](https://github.com/google/diff-match-patch/wiki/Unidiff) we don't have a definition of "character." The Lua library even makes it clear that since Lua is unaware of Unicode then it will treat content as "as a series of bytes, not a series of characters."
+
+This ambiguity has caused numerous problems for folks wanting to interchange delta strings and gets us into tricky situations when dealing with emoji and other characters which are encoded as surrogate pairs in UTF16.
+
+Consider this example:
+
+```
+A: 🅰🅰
+B: 🅰a🅰
+```
+
+We can all agree that what happened is that we entered a `a` in between the two existing `🅰` characters.
+
+Some libraries produce this delta: `=1\t+a\t=1`
+ - Python3
+ - Python2 when compiled in wide mode
+
+Most libraries produce this delta: `=2\t+a\t=2`
+ - Python2 when compiled in narrow mode
+ - JavaScript
+ - Objective-C
+ - Java
+
+I didn't check the others. This seems like enough to highlight the disparity in indexing and length calculations.
+
+**I propose a new non-breaking change to indicate what the index and length values are measured in.**
+
+In my own work in #80 I discovered that clients are fine decoding in `fromDelta()` a blank insertion group.
+
+Therefore I propose that we **send blank insertion groups at the front of a delta to indicate what the indexing and length values correspond to**.
+
+There are only three realistic measurement units:
+ - Unicode code points (probably what would have been most ideal to use from the start)
+ - UTF-16 code units (because most platforms and languages use this internally)
+ - bytes (because that's the most agnostic way of measuring this)
+
+In addition we should point out that the legacy behavior is to not report measurement units.
+
+In my proposal we'd stick a number of empty insertion groups at the front of a delta to indicate which of those measurement units we'd want, in the order above: one group to indicate Unicode (since unicode is the nominal way to think about text here); two groups to indicate UTF-16 code units (since these are two-byte characters); three groups to indicate bytes (because I don't know what to do about Lua other than to make it obvious); and no groups to indicate an unreported measurement (identical to all existing deltas).
+
+| Measurement units | Delta |
+|---|---|
+| Unicode code points | `+\t=1\t+a\t=1` |
+| UTF-16 code units | `+\t+\t=2\t+a\t=2` |
+| Bytes | `+\t+\t+\t=4+a\t=4` |
+| Unspecified | one of the above without the prefix |
+
+Note that these diffs should (might?) work in all existing libraries to produce the same result as they would without the leading `+` groups. However, this gives us a chance to update `fromDelta()` to support the denoted measurement units and then we can slowly migrate the client libraries to support returning their deltas in a requested unit.
+I'm reading the line diff and word diff section of the wiki. It is stated to "make a copy of linesToChars" and call it "linesToWords"... it would be great if this was built into the library already. But for now, is there a sample implementation of linesToWords in JavaScript?
+
+
+
+Fixes https://github.com/google/diff-match-patch/issues/10, https://github.com/google/diff-match-patch/issues/59, https://github.com/google/diff-match-patch/issues/68
+Alternate to https://github.com/google/diff-match-patch/pull/69
+
+Fixes for **Java**, **JavaScript**, **Objective C**, **Python2**, **Python3**
+
+## Status
+ - Please scrutinize the code and think of any test cases not covered already in this patch.
+ - We've deployed these changes in Simplenote and are uncovering any issues we can find.
+ - Please let us know your thoughts on the direction here. This is a _pragmatic_ patch in that it's addressing the problem where it's at and tries to impose no new constraints on the library where possible.
+
+## Major changes
+ - in `toDelta()` we no longer attempt to create URI-encoded strings with split surrogates. this was either crashing client applications or corrupting the data, depending on which platform was in use.
+ - in `fromDelta()` we are recovering when possible from corrupted delta strings produced by unpatched versions of this library. there are two fixes:
+   - sometimes we encode surrogate-pair halves as if they were valid Unicode (they aren't). we'll now decode those anyway because after applying a diff with these invalid code points we should re-join the surrogate halves and get valid Unicode out
+   - in unpatched ObjectiveC libraries we might have created invalid diffs where we send `(null)` in between two surrogate halves. this is caused by the original bug and we might receive these sequences in a delta string: (high surrogate)`(null)`(low surrogate). If we leave these in here then diff-match-patch will operate fine but it will send invalid Unicode _that it created_ onto the consuming application. in this patch I've added guards against this very specific pattern so that we can remove the unintentionally injected `(null)` and re-join the surrogate halves. this means that we're mangling the input _but that input would have already been mangled anyway_ and presumably it'd be "impossible" to send the same sequence of code units to diff-match-patch since something would have had to send invalid Unicode in the first place.
+
+Working on this bug has surfaced a bigger question about what diff-match-patch expects. All of the Simplenote applications work at the level of UTF-16 code units and a large part of that is because this is how most of the diff-match-patch platforms work.
+
+Something seems ideal about referencing Unicode code points in diff-match-patch instead of any particular encoding, but to change now seems like it would break way more than it would fix. I'd like to propose that we think about creating a new output version which could be selected to specify that diffs do that.
+
+```
+diff_toDelta(
+  diff_main( "🅰🅲", "🅰🅱🅲" )
+  // no specification means existing behavior
+) // "=2	+%F0%9F%85%B1	=2";
+
+diff_toDelta(
+  diff_main( "🅰🅲", "🅰🅱🅲" ),
+  { unit: 'native' } // existing behavior - whatever the unit of a string is
+) // "=?	+%F0%9F%85%B1	=?";
+
+diff_toDelta(
+  diff_main( "🅰🅲", "🅰🅱🅲" ),
+  { unit: 'ucs2' } // make UCS2 the "default" since most libraries used it already, or something
+) // "=2	+%F0%9F%85%B1	=2";
+
+diff_toDelta(
+  diff_main( "🅰🅲", "🅰🅱🅲" ),
+  { unit: 'codePoint' } // empty addition group at the beginning to denote Unicode indices
+) // "+	=1	+%F0%9F%85%B1	=1"; // empty group ignored by old clients
+```
+
+---
+
+Sometimes we can find a common prefix that runs into the middle of a
+surrogate pair and we split that pair when building our diff groups.
+
+This is fine as long as we are operating on UTF-16 code units. It
+becomes problematic when we start trying to treat those substrings as
+valid Unicode (or UTF-8) sequences.
+
+When we pass these split groups into `toDelta()` we do just that and the
+library crashes. In this patch we're post-processing the diff groups
+before encoding them to make sure that we un-split the surrogate pairs.
+
+The post-processed diffs should produce the same output when applying
+the diffs. The diff string itself will be different but shouldn't change
+that much - only by a single character at surrogate boundaries.
+
+**Notes**
+
+ - This is my first contribution to this repo and I'm obviously not familiar with the style and this patch is obviously incomplete. My purpose is to propose code with working tests to demonstrate the change and I expect to clean up any remaining details that need resolving.
+ - I've pulled in [the surrogate tests](https://github.com/google/diff-match-patch/pull/69#issuecomment-525834911) that @josephrocca added and they are all passing. In #69 the issue causing these failed tests was using `isSurrogate()` for all cases when we should have been using `isHighSurrogate()` and `isLowSurragate()` depending on the context.
+
+Thanks for any and all help and feedback.
+I tried to use python version diff-match-patch to visualize my ocr experiment result. aka difference between gt and prediction. If I just follow the instruction 
+`
+
+    dmp = dmp_module.diff_match_patch()
+
+    diff = dmp.diff_main(file1, file2)
+
+    html = dmp.diff_prettyHtml(diff)`
+The result doesn't make sense at all,
+Just now I realize the reason is that the default timeout is set to 1 second, and files I'm trying to compare are too long. I only need to add
+`
+    dmp.Diff_Timeout = 0
+
+`
+to make the code work.
+It's kind of strange that there was no notification that told me the operation was timed out. I feel that at least the code should notify user that your last operation timed out if it happened.
+Without the notification, I suspected that the problem was on the encoding of strings to be compared and wasted a lot of time debugging 
+Ported the Javascript version of diff_match_patch into Typescript.
+- [x] I ported the JavaScript tests. All tests passing.
+- [x] I checked in the generated Typings declaration (dts)
+- [x] I also checked in the compiled UMD binary for those wanting to directly import that into their projects.
+
+To run tests:
+```
+cd typescript/tests/
+tsc
+node ./built/tests/diff_match_patch_test.js
+node ./built/tests/speedtest.js
+```
+Did anyone use this with angular 7?
+The following PR makes the JS algorithm aware of surrogate pairs and will avoid splitting a pair into two different Diff objects.
+
+I think there might be more places which needs to be surrogate-pair-aware, but I haven't been able to find test cases to confirm this.
+
+Fixes #59, #68, #10
+encodeURI blows up for some patch_obj:
+https://github.com/google/diff-match-patch/blob/a6367d7866833ac037fbdefcdbcbee4def86e326/javascript/diff_match_patch_uncompressed.js#L2186
+
+Example:
+```js
+let diff_match_patch = require("diff-match-patch");
+
+let text1 = "🅱";
+let text2 = "🅰";
+
+let diff = new diff_match_patch();
+console.log(diff.patch_toText(diff.patch_make(text1, text2)));
+```
+using STL string/container to replace QT code, add Make file and all tests passed

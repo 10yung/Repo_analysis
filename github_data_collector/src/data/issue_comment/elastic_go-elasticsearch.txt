@@ -1,0 +1,256 @@
+Greetings,
+
+The documentation (and issue tracker, see #118) seems to imply that HTTP connections should be reused, but that doesn't seem to be the case. Here is a small app:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"strings"
+
+	"github.com/elastic/go-elasticsearch/v7"
+	"github.com/elastic/go-elasticsearch/v7/esapi"
+)
+
+func main() {
+	es, err := elasticsearch.NewClient(elasticsearch.Config{
+		Addresses: []string{"http://localhost:9200"},
+		//Transport: &http.Transport{MaxIdleConns: 8, MaxIdleConnsPerHost: 8, MaxConnsPerHost: 16, IdleConnTimeout: 10 * time.Second},
+	})
+	if err != nil {
+		panic(err)
+	}
+	for i := 0; i < 1000; i++ {
+		func() {
+			log.Printf("Saving %d\n", i)
+			req := esapi.IndexRequest{
+				Index:      "test",
+				DocumentID: fmt.Sprintf("%d", i),
+				Body:       strings.NewReader(`{}`),
+				Refresh:    "true",
+			}
+			res, err := req.Do(context.Background(), es)
+			if err != nil {
+				log.Println(err)
+			}
+			defer func() {
+				err := res.Body.Close()
+				if err != nil {
+					log.Println(err)
+				}
+			}()
+			if res.IsError() {
+				log.Println(res.Status())
+			}
+		}()
+	}
+}
+```
+Before running the app `netstat -an | grep 9200` shows:
+
+```
+tcp4       0      0  127.0.0.1.9200         *.*                    LISTEN     
+tcp6       0      0  ::1.9200               *.*                    LISTEN     
+```
+
+If I then execute `netstat -an | grep 9200 | awk '{print $6}' | sort | uniq -c` while the app is running, the number of connections in TIME_WAIT state keeps growing. Running it immediately after the app finishes:
+
+```
+   2 LISTEN
+1000 TIME_WAIT
+```
+
+Reproduced on both linux and MacOS with Elasticsearch 7.5.1, go 1.13.6 and elastic/go-elasticsearch 7.5.0.
+
+Many thanks,
+damjan
+
+
+
+Would save a lot of time.
+```
+res, err := es.Count(
+		es.Count.WithIndex(idx),
+		es.Count.WithDocumentType("event"),
+		es.Count.WithIgnoreUnavailable(true),
+	)
+```
+The third parameter will add _?ignore_unavailable=true_ to the request. The fasthttp example is not setting the Content-Type and fasthttp will assume _application/x-www-form-urlencoded_ and therefore not allowing query parameters:
+> When Content-Type:application/x-www-form-urlencoded, URL cannot include query-string parameters (after '?'): '/4dcd04c11d9148d2aa5ed100d38726f9/event/_count?ignore_unavailable=true'
+
+Adding _dst.Header.SetContentType("application/json")_ to the copyRequest function will solve this problem.
+Hello
+
+unfortunately, fasthttp does not support a body when using GET: https://github.com/valyala/fasthttp/issues/651
+
+That's why fasthttp is not working with es.Search.WithBody(&buf)
+
+Please add an option to switch the search request method to POST.
+
+Alex
+I cannot find a way to make a conditional bulk insert , I don't know if you support it yet and if not i think it should be a feature ,
+if you do support I would like to have a simple example with params aswell ( document as params) because I couldn't find anywhere a way to do it .
+
+
+Fyi I would like to do a condition on the field that holds a epoch time and if its newer to insert it and delete the old one (not updating just one field but whole doc)
+something like this :
+https://discuss.elastic.co/t/python-elasticsearch-bulk-conditional-upsert/71573
+I am still feeling like it's too hard to do what I feel are common things with this client.
+
+In order to use tokens, you have to implement a custom RoundTripper which is pretty deep and awkward within Go, especialy if you're a developer who just wants to "use elasticsearch" and move on; implementing a custom RoundTripper or custom Transport is tedious.
+
+In order to use custom ssl certs, you have to modify the TLSClientConfig of the transport. This is still pretty deep within net/http as compared to the abstraction layer "elasticsearch client library" ; deeper than I'd prefer.
+
+I was unable to find any solid examples of setting both custom headers (for tokens) and setting custom CA certs.
+
+To that end, here's what I found works; this code requires Go 1.13 for http.Transport.Clone()
+
+```
+package main
+
+import (
+	"crypto/x509"
+	"fmt"
+	"github.com/elastic/go-elasticsearch/v8"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"os"
+)
+
+type CustomRoundTripper struct {
+	http.RoundTripper
+	Custom func(*http.Request) (*http.Response, error)
+}
+
+func (crt CustomRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return crt.Custom(req)
+}
+
+func main() {
+	esurl := os.Args[1]
+	token := os.Args[2]
+	cafile := os.Args[3]
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+
+	var err error
+	transport.TLSClientConfig.RootCAs, err = x509.SystemCertPool()
+
+	b, err := ioutil.ReadFile(cafile)
+	if err != nil {
+		log.Printf("Error reading additional ca certs in path %s / error %s", cafile, err)
+		os.Exit(1)
+	}
+
+	ok := transport.TLSClientConfig.RootCAs.AppendCertsFromPEM(b)
+	if !ok {
+		log.Printf("No certs were found in the additional ca cert path: %s", cafile)
+		os.Exit(1)
+	}
+
+	crt := CustomRoundTripper{
+		Custom: func(req *http.Request) (*http.Response, error) {
+			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+			return transport.RoundTrip(req)
+		},
+	}
+
+	config := elasticsearch.Config{
+		Addresses: []string{esurl},
+		Transport: crt,
+	}
+
+	es, err := elasticsearch.NewClient(config)
+	if err != nil {
+		log.Printf("Error creating ES client: %s", err)
+		os.Exit(1)
+	}
+
+	resp, err := es.Ping()
+	if err != nil {
+		fmt.Printf("Error pinging ES: %s\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Response: %s\n", resp)
+
+}
+```
+
+Could we provide some kind of helper function in this library to help users generate their custom Transport? Something like:
+
+```
+elasticsearch.NewClient(elasticsearch.Config{
+    Transport: happyHttpHelper{
+        Headers: { ... },
+        AdditionalCARoots: ...
+    }
+})
+```
+
+Especially as tokens are becoming more prominent in Elasticsearch (API tokens, etc), it would improve things if we made it less code to achieve this; especially if that "less code" removes areas of Go that, I assume, people do not commonly travel (DIY Transport implementations, etc)
+# Issue
+
+When using an asterisk as part of the index name like: `some-events-*` to match different indexes like:
+```
+some-events-foo
+some-events-bar
+some-events-20191118
+```
+the url encodes the `*`
+
+Sample code:
+```
+esIndexName := "some=events-*"
+esResp, err := c.ESClient.Search(
+  c.ESClient.Search.WithContext(ctx),
+  c.ESClient.Search.WithIndex("some-events-*"),
+  c.ESClient.Search.WithBody(&buf),
+  c.ESClient.Search.WithErrorTrace(),
+)
+if err != nil {
+  // Not err
+}
+defer esResp.Body.Close()
+if esResp.IsError() {
+  // It's a 403 like:
+  // [403 Forbidden] <html><body><h1>403 Forbidden</h1>\nRequest forbidden by administrative rules.\n</body></html>\n
+  return fmt.Errorf("%s", esResp.String())
+}
+```
+
+And I can see the logs in Elastic like:
+```
+Timestamp ... 200 ... "GET /some-events-%2A/_search?error_trace=true HTTP/1.1"
+```
+
+# Expected
+```
+Timestamp ... 200 ... "GET /some-events-*/_search?error_trace=true HTTP/1.1"
+```
+
+# Root cause
+- Index name gets appended here: https://github.com/elastic/go-elasticsearch/blob/v7.4.1/esapi/api.search.go#L112
+- Request is formed here https://github.com/elastic/go-elasticsearch/blob/v7.4.1/esapi/api.search.go#L307
+- Path is parsed here: https://github.com/elastic/go-elasticsearch/blob/v7.4.1/esapi/esapi.request.go#L36
+
+Behavior: https://play.golang.org/p/zhxBAT5hHUc
+
+# Additional info
+- Version from `go.mod`: `github.com/elastic/go-elasticsearch/v7 v7.4.1`
+- Golang URL Parser: https://stackoverflow.com/a/13821803/1755300
+pkg.go.dev is live now and successfully serves this repo as https://pkg.go.dev/github.com/elastic/go-elasticsearch/
+
+Reference: https://github.com/golang/go/issues/33654
+
+Fixes #74
+The three methods, `setURL`, `setAuthorization` and `setUserAgent `, are all intended to help update the request header (in-place given pointers are used). The return value is not used/referenced anywhere.
+
+It may be worth removing these unused returns to reduce footprint of these methods.
+Based on [the Delete By Query API documentation](https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-delete-by-query.html#docs-delete-by-query-picking-slices), the `slices` field may be set to `auto`.
+
+The `DeleteByQueryRequest` struct [only allows `*int` as input](https://github.com/elastic/go-elasticsearch/blob/ea052088db25bb87db9ce22b8191a5205665ee99/esapi/api.delete_by_query.go#L60), as does the `DeleteByQuery` method, so there does not currently appear to be a way to set that value using this library.

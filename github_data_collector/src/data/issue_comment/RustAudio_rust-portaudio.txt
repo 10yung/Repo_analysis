@@ -1,0 +1,216 @@
+As found in `RustAudio/synth` -> https://github.com/RustAudio/synth/issues/50
+
+At [this line of the example](https://github.com/RustAudio/synth/blob/master/examples/test.rs#L100) whenever a synth is started sounds never stop playing as the time and the counter do not flow:
+```
+TIMER >>>>>>>> 0.0
+TIME >>>>>>> OutputCallbackTimeInfo { current: 0.0, buffer_dac: 0.0016780045351473924 }
+TIMER >>>>>>>> 0.0
+TIME >>>>>>> OutputCallbackTimeInfo { current: 0.0, buffer_dac: 0.00022675736961451248 }
+TIMER >>>>>>>> 0.0
+TIME >>>>>>> OutputCallbackTimeInfo { current: 0.0, buffer_dac: 0.0016780045351473924 }
+TIMER >>>>>>>> 0.0
+TIME >>>>>>> OutputCallbackTimeInfo { current: 0.0, buffer_dac: 0.00022675736961451248 }
+TIMER >>>>>>>> 0.0
+TIME >>>>>>> OutputCallbackTimeInfo { current: 0.0, buffer_dac: 0.0016780045351473924 }
+TIMER >>>>>>>> 0.0
+TIME >>>>>>> OutputCallbackTimeInfo { current: 0.0, buffer_dac: 0.00022675736961451248 }
+TIMER >>>>>>>> 0.0
+TIME >>>>>>> OutputCallbackTimeInfo { current: 0.0, buffer_dac: 0.0016780045351473924 }
+TIMER >>>>>>>> 0.0
+TIME >>>>>>> OutputCallbackTimeInfo { current: 0.0, buffer_dac: 0.00022675736961451248 }
+TIMER >>>>>>>> 0.0
+TIME >>>>>>> OutputCallbackTimeInfo { current: 0.0, buffer_dac: 0.0016780045351473924 }
+TIMER >>>>>>>> 0.0
+```
+I experienced an issue where portaudio is not detected during the build process (even if pkgconfig and portaudio), which results in an attempt to build portaudio, which fails on systems with newer versions of xcode installed. Having been chasing myself around in circles for a few hours, I have determined that the issue was that PKG_CONFIG_PATH was not properly set, meaning that pkgconfig could not find the version of portaudio installed by brew. This problem was solved by setting PKG_CONFIG_PATH=/usr/local/lib/pkgconfig. It might be useful to either set this in the build script, or to mention it as a solution in the documentation.
+Hi all!
+
+I no longer have the time or motivation to manage the rust-portaudio crate. These days, most of my efforts have been going into [CPAL](https://github.com/tomaka/cpal) - a pure-Rust alternative. As a result, I find it difficult to prioritise issues and PRs here.
+
+If anyone would like to step in as the maintainer for the crate they would be more than welcome. I'd be happy to add them as an administrator to the RustAudio organisation if they are not already so.
+Portaudio was installed by `cargo` while building RustAudio `synth`. It produced a linker error, which I traced back to portaudio. Building `portaudio` requires the Ubuntu package `portaudio19-dev` to be installed first.
+
+OS is Ubuntu-derived 16.04LTS.
+
+I'm new to Rust and Cargo, and not aware of how cargo resolves or detects these dependencies, or if it is able to. If possible, a more comprehensible explanation of the error would be nice, rather than about 80 'undefined reference' messages. Better still, suggest (or even install) the package!   :)
+use portaudio for hw access 
+use hound::WavWriter for encoding stream to wav
+This may simply serve as an example how to build portaudio using the cc crate. I added the portaudio sources from latest release directly in the project. I don't know how others feel about that, but it is by far the most convenient and safest way.
+
+macOS and Windows (msvc) builds work well. I have not tested on linux yet.
+On Win 8.1, using a build script override for `portaudio`, I get this warning:
+```
+     Running `rustc --crate-name portaudio_sys rust-portaudio-sys\src\lib.rs --c
+rate-type rlib --emit=dep-info,link -C debuginfo=2 -C metadata=3b728bd95cd452ea
+-C extra-filename=-3b728bd95cd452ea --out-dir D:\projects\forks\rust-portaudio\t
+arget\debug\deps -L dependency=D:\projects\forks\rust-portaudio\target\debug\dep
+s -L D:\3rdparty\_rustlibs\64bit -l portaudio`
+warning: redundant linker flag specified for library `portaudio`
+```
+Hello, stream.close() for non blocking streams occasionally hangs. I have only seen it happen when the code is not optimized, usually after many buffer xrun. Haven't seen happening in ```--release``` builds (no xrun).
+
+I'm running the entire audio system in a separate thread, if it helps.
+
+```rust
+impl SoundSystem for ThreadedSoundSystem {
+	fn new() -> Result<ThreadedSoundSystem, self::Error> {
+		let portaudio = pa::PortAudio::new()?;
+		info!("Detected {:?} devices", portaudio.device_count());
+		let settings = portaudio.default_output_stream_settings::<f32>(
+			CHANNELS,
+			SAMPLE_HZ,
+			FRAMES,
+		)?;
+		let (tx, rx) = channel();
+
+		let dsp = Arc::new(Mutex::new(multiplexer::Multiplexer::new()));
+		let dsp_handle = dsp.clone();
+
+		let callback = move |pa::OutputStreamCallbackArgs { buffer, .. }| {
+			let buffer: &mut [[f32; CHANNELS as usize]] =
+				buffer.to_frame_slice_mut().unwrap();
+			sample::slice::equilibrium(buffer);
+			// uhm what?
+			dsp_handle.lock().unwrap().audio_requested(buffer, SAMPLE_HZ as f64);
+			pa::Continue
+		};
+		let mut stream = portaudio.open_non_blocking_stream(settings, callback)
+			.expect("Unable to open audio stream, failure in audio thread");
+		let sound_thread = thread::Builder::new().name("SoundControl".to_string()).spawn(move || {
+			let thread_id = thread_native_id();
+			assert!(set_thread_priority(thread_id,
+										ThreadPriority::Max,
+										ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Normal)).is_ok());
+
+			info!("Started sound control thread");
+			stream.start().expect("Unable to start audio stream");
+			'sound_main: loop {
+				match rx.recv() {
+					Ok(SoundEffect::Eof) => {
+						info!("Requested termination, exiting");
+						break 'sound_main;
+					}
+					Ok(sound_effect) => {
+						dsp.lock().unwrap().trigger(sound_effect)
+					}
+					Err(msg) => {
+						warn!("Received error {:?}", msg);
+						break 'sound_main;
+					}
+				}
+			}
+			info!("Closing audio stream");
+			match stream.close() { // <--- this line often hangs
+				Err(msg) => error!("Unable to close audio stream: {:?}", msg),
+				Ok(_) => info!("Close audio stream"),
+			}
+			info!("Terminating portaudio system");
+			portaudio.terminate().expect("Unable to terminate portaudio session");
+			info!("Terminated sound control thread");
+		})?;
+
+		Ok(ThreadedSoundSystem {
+			sound_thread: Some(sound_thread),
+			trigger: tx,
+		})
+	}
+
+	fn open(&mut self) -> Result<(), self::Error> {
+		Ok(())
+	}
+
+	fn close(&mut self) -> Result<(), self::Error> {
+		self.trigger.send(SoundEffect::Eof).ok();
+		let result = self.sound_thread.take().unwrap().join();
+		match result {
+			Ok(_) => Ok(()),
+			Err(_) => Err(self::Error::ThreadJoin),
+		}
+	}
+}
+```
+
+Here's the stack trace for all running threads:
+
+```
+Thread 6 (Thread 0x7fffd9bff700 (LWP 23804)):
+#0  0x00007ffff6b40147 in pthread_cond_wait@@GLIBC_2.3.2 () from /lib/x86_64-linux-gnu/libpthread.so.0
+#1  0x00007fffee5e0c98 in pa_threaded_mainloop_wait () from /usr/lib/x86_64-linux-gnu/libpulse.so.0
+#2  0x00007fffea9fa004 in pulse_wait_operation () from /usr/lib/x86_64-linux-gnu/alsa-lib/libasound_module_pcm_pulse.so
+#3  0x00007fffea9f897c in ?? () from /usr/lib/x86_64-linux-gnu/alsa-lib/libasound_module_pcm_pulse.so
+#4  0x00007ffff70ec362 in ?? () from /usr/lib/x86_64-linux-gnu/libasound.so.2
+#5  0x00007ffff70a6230 in snd_pcm_drop () from /usr/lib/x86_64-linux-gnu/libasound.so.2
+#6  0x0000555555adf4bb in AlsaStop (stream=stream@entry=0x7ffff5a31c00, abort=<optimized out>) at src/hostapi/alsa/pa_linux_alsa.c:3037
+#7  0x0000555555ae1dba in OnExit (data=0x7ffff5a31c00) at src/hostapi/alsa/pa_linux_alsa.c:3388
+#8  0x0000555555ae5d17 in CallbackThreadFunc (userData=0x7ffff5a31c00) at src/hostapi/alsa/pa_linux_alsa.c:4180
+#9  0x00007ffff6b3a494 in start_thread () from /lib/x86_64-linux-gnu/libpthread.so.0
+#10 0x00007ffff645fabf in clone () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 5 (Thread 0x7fffda1f4700 (LWP 23803)):
+#0  0x00007ffff6b3b6cd in pthread_join () from /lib/x86_64-linux-gnu/libpthread.so.0
+#1  0x0000555555addaad in PaUnixThread_Terminate (self=self@entry=0x7ffff5a31d98, wait=<optimized out>, exitResult=exitResult@entry=0x7fffda1f2f5c) at src/os/unix/pa_unix_util.c:441
+#2  0x0000555555ae1cfc in RealStop (stream=0x7ffff5a31c00, abort=<optimized out>) at src/hostapi/alsa/pa_linux_alsa.c:3097
+#3  0x0000555555add442 in Pa_CloseStream (stream=0x7ffff5a31c00) at src/common/pa_front.c:1349
+#4  0x000055555564a298 in portaudio::stream::{{impl}}::close<portaudio::stream::NonBlocking,portaudio::stream::Output<f32>> (self=0x7fffda1f3650) at /home/nico/.cargo/registry/src/github.com-1ecc6299db9ec823/portaudio-0.7.0/src/stream.rs:1036
+#5  0x0000555555735c7b in rust_oids::frontend::audio::{{impl}}::new::{{closure}} () at src/frontend/audio/mod.rs:214
+#6  0x0000555555685a03 in std::sys_common::backtrace::__rust_begin_short_backtrace<closure,()> (f=...) at /checkout/src/libstd/sys_common/backtrace.rs:134
+#7  0x000055555576a727 in std::thread::{{impl}}::spawn::{{closure}}::{{closure}}<closure,()> () at /checkout/src/libstd/thread/mod.rs:402
+#8  0x000055555567e6b3 in std::panic::{{impl}}::call_once<(),closure> (self=..., _args=0) at /checkout/src/libstd/panic.rs:300
+#9  0x0000555555646512 in std::panicking::try::do_call<std::panic::AssertUnwindSafe<closure>,()> (data=0x7fffda1f3938 "") at /checkout/src/libstd/panicking.rs:480
+#10 0x0000555555b26b6f in panic_unwind::__rust_maybe_catch_panic () at /checkout/src/libpanic_unwind/lib.rs:99
+#11 0x00005555556462ad in std::panicking::try<(),std::panic::AssertUnwindSafe<closure>> (f=...) at /checkout/src/libstd/panicking.rs:459
+#12 0x00005555556863a8 in std::panic::catch_unwind<std::panic::AssertUnwindSafe<closure>,()> (f=...) at /checkout/src/libstd/panic.rs:365
+#13 0x000055555576a591 in std::thread::{{impl}}::spawn::{{closure}}<closure,()> () at /checkout/src/libstd/thread/mod.rs:401
+#14 0x000055555576e84b in alloc::boxed::{{impl}}::call_box<(),closure> (self=0x7fffefaf93a0, args=0) at /checkout/src/liballoc/boxed.rs:762
+#15 0x0000555555b1d22c in alloc::boxed::{{impl}}::call_once<(),()> () at /checkout/src/liballoc/boxed.rs:772
+#16 std::sys_common::thread::start_thread () at /checkout/src/libstd/sys_common/thread.rs:24
+#17 std::sys::imp::thread::{{impl}}::new::thread_start () at /checkout/src/libstd/sys/unix/thread.rs:90
+#18 0x00007ffff6b3a494 in start_thread () from /lib/x86_64-linux-gnu/libpthread.so.0
+#19 0x00007ffff645fabf in clone () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 4 (Thread 0x7fffe69f5700 (LWP 23802)):
+#0  0x00007ffff6b3c594 in __pthread_mutex_lock_full () from /lib/x86_64-linux-gnu/libpthread.so.0
+#1  0x00007fffee37ddce in pa_mutex_lock () from /usr/lib/x86_64-linux-gnu/pulseaudio/libpulsecommon-11.1.so
+#2  0x00007fffee5e06bb in ?? () from /usr/lib/x86_64-linux-gnu/libpulse.so.0
+#3  0x00007fffee5d2070 in pa_mainloop_poll () from /usr/lib/x86_64-linux-gnu/libpulse.so.0
+#4  0x00007fffee5d2700 in pa_mainloop_iterate () from /usr/lib/x86_64-linux-gnu/libpulse.so.0
+#5  0x00007fffee5d2790 in pa_mainloop_run () from /usr/lib/x86_64-linux-gnu/libpulse.so.0
+#6  0x00007fffee5e05f9 in ?? () from /usr/lib/x86_64-linux-gnu/libpulse.so.0
+#7  0x00007fffee37ec58 in ?? () from /usr/lib/x86_64-linux-gnu/pulseaudio/libpulsecommon-11.1.so
+#8  0x00007ffff6b3a494 in start_thread () from /lib/x86_64-linux-gnu/libpthread.so.0
+#9  0x00007ffff645fabf in clone () from /lib/x86_64-linux-gnu/libc.so.6
+
+Thread 1 (Thread 0x7ffff7fc3340 (LWP 23796)):
+#0  0x00007ffff6b3b6cd in pthread_join () from /lib/x86_64-linux-gnu/libpthread.so.0
+#1  0x0000555555b1d2f0 in std::sys::imp::thread::{{impl}}::join () at /checkout/src/libstd/sys/unix/thread.rs:176
+#2  0x000055555576a7d5 in std::thread::{{impl}}::join<()> (self=0x7fffffff81c0) at /checkout/src/libstd/thread/mod.rs:1196
+#3  0x000055555576ac98 in std::thread::{{impl}}::join<()> (self=...) at /checkout/src/libstd/thread/mod.rs:1318
+#4  0x000055555573649b in rust_oids::frontend::audio::{{impl}}::close (self=0x7fffffffd340) at src/frontend/audio/mod.rs:235
+#5  0x00005555557341dc in rust_oids::frontend::audio::{{impl}}::close<rust_oids::frontend::audio::ThreadedSoundSystem> (self=0x7fffffffd340) at src/frontend/audio/mod.rs:99
+#6  0x000055555573483c in rust_oids::frontend::audio::{{impl}}::drop<rust_oids::frontend::audio::ThreadedSoundSystem> (self=0x7fffffffd340) at src/frontend/audio/mod.rs:152
+#7  0x0000555555595415 in core::ptr::drop_in_place<rust_oids::frontend::audio::SoundSystemAlertPlayer<rust_oids::frontend::audio::ThreadedSoundSystem>> () at /checkout/src/libcore/ptr.rs:59
+#8  0x000055555577db1e in rust_oids::app::main::main_loop (minion_gene_pool=..., fullscreen=..., width=..., height=...) at src/app/main.rs:177
+#9  0x000055555572d53e in rust_oids::app::run (args=...) at src/app/mod.rs:95
+#10 0x00005555556ac40f in rust_oids::main () at src/main.rs:70
+#11 0x0000555555b26b6f in panic_unwind::__rust_maybe_catch_panic () at /checkout/src/libpanic_unwind/lib.rs:99
+#12 0x0000555555b1eadc in std::panicking::try<(),closure> () at /checkout/src/libstd/panicking.rs:459
+#13 std::panic::catch_unwind<closure,()> () at /checkout/src/libstd/panic.rs:365
+#14 std::rt::lang_start () at /checkout/src/libstd/rt.rs:59
+#15 0x00005555556ac5de in main ()
+#16 0x00007ffff63972e1 in __libc_start_main () from /lib/x86_64-linux-gnu/libc.so.6
+#17 0x000055555558730a in _start ()
+```
+
+```
+Hi folks. I was fiddling with the library and implemented an example of doing the input and output streams separately. I thought it would be nice to offer it back as an example, since I don't see any other examples using a pure input stream (they're all either output streams or duplex streams).
+
+This shows how audio might be handled in a context where it's being sent to a file, or where it needs to do some processing that can't fit into the strict time requirements of the callbacks.
+
+This is heavily based on the existing non_blocking example, and inspired by the C Portaudio recording example (http://portaudio.com/docs/v19-doxydocs/paex__record_8c_source.html).
+
+I'm open for feedback on how to make the example better.
+
+Looks like it would be relevant to #23
+Running `cargo build` with the toolchain `stable-i686-pc-windows-msvc` results in "The application was unable to start correctly (0xc000007b)" when the build process tries to run build-script-build.exe. build-script-build.exe seems to link against 64bit libraries while being 32bit itself.
+
+I might be missing something here about the Windows development environment, as I am gratendly not overtly familiar with it, but I've 32-bit versions of MSVC and VC++ redistributables installed.

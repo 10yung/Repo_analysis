@@ -1,0 +1,132 @@
+```
+import com.sksamuel.scrimage.Image
+
+object RscInterpolator extends contextual.Interpolator {
+  override type Input = String
+  override type Output = Image
+
+  override def contextualize(interpolation: StaticInterpolation): Seq[ContextType] = {
+    val head = interpolation.literals.head
+    if (interpolation.macroContext.classPath.map(_.toString).contains(head)) Nil
+    else interpolation.abort(Literal(0, head), 0, "Can't find image on classpath.")
+  }
+
+  def evaluate(interpolation: RuntimeInterpolation): Output =
+    Image.fromResource(interpolation.literals.head)
+}
+```
+
+the above code is intended to check at compile time for existence of files on class path. however, it doesn't compile for unclear reason:
+
+```
+[error] /Users/crimson/IdeaProjects/wmh-randomizer/macros/src/com/crimzie/wmh/util/RscInterpolator.scala:12:9: Symbol 'type scala.reflect.macros.whitebox.Context' is missing from the classpath.
+[error] This symbol is required by 'value contextual.Interpolator.StaticInterpolation.macroContext'.
+```
+```
+package com.mobimeo.ticketissuer.primitives
+
+import contextual._
+
+object Test  {
+  val NonEmptyString = NonEmptyStringModule.Instance
+  type NonEmptyString = NonEmptyString.Type
+
+  sealed abstract class NonEmptyStringModule {
+    type Type <: String
+
+    def apply(string: String): Option[NonEmptyString] =
+      NonEmptyStringParser.check(string).toOption
+  }
+
+  object NonEmptyStringModule {
+    val Instance: NonEmptyStringModule = new NonEmptyStringModule {
+      type Type = String
+    }
+  }
+
+  object NonEmptyStringParser extends Verifier[NonEmptyString] {
+    def check(string: String): Either[(Int, String), NonEmptyString] =
+      if (string.isEmpty()) Left(0 -> "string must not be empty") else Right(string.asInstanceOf[NonEmptyString])
+  }
+
+  implicit class NonEmptyStringContext(sc: StringContext) {
+    val n = Prefix(NonEmptyStringParser, sc)
+  }
+
+  n"foo"
+
+}
+```
+
+This gives me an `Error:(31, 3) macro has not been expanded
+  n"foo"`
+
+It did work in Scala 2.12.x
+Contextual seems to need a rebuild for Scala 2.12.9 due to an incompatible change in the reflect ast
+`scala-compiler` shouldn't be a compile dependency for a macro library. You probably meant to mark it (and, possibly, `scala-reflect`) as `Provided`, which is what [circe does](https://github.com/circe/circe/blob/899bbd96c5b2904e867db7e6ecf544bed53fde4e/build.sbt#L216-L217).
+I really like to use your lib to do syntax checks on SQL/HQL queries.  However, my queries are not pure strings, but rather interpolated strings with parameters, e.g.:
+```#!scala
+val id = 1
+val query = q"from User where id = $id"
+```
+Would that be possible with `contextual`?  Is there any working example for such an interpolated string with arguments?  So far I could only find the section `Embedded Types` on https://propensive.com/opensource/contextual/#a-simple-example, but that's only very few information about how this works, and the example is unfortunately incomplete.  A complete example would already help a lot.
+In neither the README nor https://propensive.com/opensource/contextual are there any usage instructions, like maven coordinates.
+README's website URL is outdated. Fortunately one in repo description is up to date so I was able to find it.
+This PR adds support for holes in the binary example. This was done in scope of Scala Swarm's Scala Center Hackathon.
+
+The implemented strategy tries to check as much as possible during compile time and only falls back to runtime checks when dynamic parts are used.
+
+I was unable to avoid adding an `Embedder` typeclass, even though it doesn't seem necessary. Is it possible to avoid it?
+Results in a `ClassCastException` at compile time at the usage site if the `StringContextOps` is defined in test files.
+This looked promising:
+
+```
+class SqlInterpolator[T[_[_]]:BirecursiveT] {
+  object Expr extends StaticInterpolator[T[Sql]] {
+    def parse(s: String): String \/ T[Sql] =
+      parser[T].parseExpr(Query(s)).leftMap(parseError => s"Not a valid SQL expression: $parseError")
+  }
+}
+```
+
+along with:
+
+```
+implicit class SqlStringContext(sc: StringContext) {
+  def sqlE[T[_[_]]: BirecursiveT] = Prefix((new SqlInterpolator[T]).Expr, sc)
+  def sqlB[T[_[_]]: BirecursiveT] = Prefix((new SqlInterpolator[T]).Blob, sc)
+}
+```
+This particular example is attempting to define a String interpolator for a SQL AST defined in fix point style (for use with [matryoshka](https://github.com/slamdata/matryoshka)) but really I think it illustrates the inability to make any kind of generic interpolator using contextual which is unfortunate because this is supported by Scala despite certain weird behaviors surrounding supplying a type parameter: https://stackoverflow.com/questions/44663377/is-it-possible-to-specify-type-parameters-for-string-interpolation-in-scala
+This is the error that is generated at compile time with the above example:
+
+`java.lang.ClassNotFoundException: quasar.sql.SQLSpec.<local SQLSpec>.query.interpolator.type$`
+
+Presumably, caused by the macro implementation having trouble accessing the object inside the class. Maybe it's fundamentally impossible to get this to work in which case I think it should be clearly documented.
+This is the definition of `StaticInterpolator` not that it matters all that much to demonstrate the above point (as a side note this is pretty generic and could be added to `contextual` itself minus the use of `scalaz`):
+
+```
+trait StaticInterpolator[A] extends Interpolator {
+  def parse(s: String): String \/ A
+
+  def contextualize(interpolation: StaticInterpolation) = {
+    interpolation.parts.foreach {
+      case lit@Literal(_, string) =>
+        parse(string) match {
+          case -\/(msg) => interpolation.abort(lit, 0, msg)
+          case _        => ()
+        }
+
+      case hole@Hole(_, _) =>
+        interpolation.abort(hole, "substitutions are not supported")
+    }
+
+    Nil
+  }
+
+  // A String that would not parse should not have made it past compile time
+  def evaluate(interpolation: RuntimeInterpolation): A =
+    parse(interpolation.parts.mkString).valueOr(errMsg =>
+      scala.sys.error(s"Something terribly wrong happened. Failed to parse something at runtime that we checked at compile time. Reason: $errMsg. This is either because the `parse` function of this `StaticInterpolator` is not pure or could (less likely) be a bug with `StaticInterpolator`"))
+}
+```

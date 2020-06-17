@@ -1,0 +1,233 @@
+I want to detect file integrity changes from alerts, When one&some changes detected by ossec , it retrieve alerts frequently.  How can I stop this alarm which was alerted before?
+
+![Capture](https://user-images.githubusercontent.com/24323882/72593180-c5960700-391d-11ea-8144-ce8cf5157b99.PNG)
+
+Hi folks,
+
+I spent some free time recently auditing OSSEC. I was primarily focused on a threat model where an OSSEC agent is compromised (e.g. the agent key and assoc. counters are known) and used to attack the OSSEC server (primarily `ossec-remoted` and `ossec-analysisd`). Given the problem domain of OSSEC and HIDS generally I think this is fair game. Since these are post-auth bugs and there isn't guidance on vulnerability disclosure in the README I thought it was acceptable to post information full-disclosure to the repo.
+
+I found a handful of bugs and have done my best to address the root cause, the affected versions, the impact and potential fixes in the issues I've filed. I will request CVEs for the security relevant bugs later on. 
+
+In terms of rough risk levels I'd categorize the findings as follows:
+
+Informational:
+* os_regex-empty-pcre2-off-by-one - https://github.com/ossec/ossec-hids/issues/1811
+* rootcheck-check-rc-if-shell-injection-risk - https://github.com/ossec/ossec-hids/issues/1812
+
+Low:
+* analysisd-syscheck-decoder-msg-location-path-injection - https://github.com/ossec/ossec-hids/issues/1813
+* analysisd-OS_CleanMSG-allows-control-chars-in-msg - https://github.com/ossec/ossec-hids/issues/1814
+* analysisd-OS_CleanMSG-bad-location-segfault - https://github.com/ossec/ossec-hids/issues/1815
+* ~analysisd-syscheck-decoder-off-by-one-read - https://github.com/ossec/ossec-hids/issues/1819~ (_Edit: I made a mistake in my analysis here, it's not a bug_).
+
+Med:
+* analysisd-OS_CleanMSG-off-by-one-syslog - https://github.com/ossec/ossec-hids/issues/1816
+* analysisd-OS_ReadMSG-use-after-free-ossecalert - https://github.com/ossec/ossec-hids/issues/1817
+* analysisd-OS_ReadMSG-use-after-free-syscheck - https://github.com/ossec/ossec-hids/issues/1818
+
+High:
+* analysisd-rootcheck-decoder-heap-overflow - https://github.com/ossec/ossec-hids/issues/1820
+
+Some caveats/context to add:
+
+1) I'm not a professional C coder, w.r.t suggested fixes YMMV!
+2) I don't write exploits for a living. My assessments of exploitability/risk should be considered lower bounds.
+3) This wasn't an extensive audit. I followed my nose and used some fuzzing.
+4) OSSEC 2.7 seems to be the earliest tag in the Github repo. I didn't dig deeper into history to see if any of these bugs affect older releases (some likely do).
+
+If you would be interested in trying to adopt fuzzing as part of your CI (or as an integration with oss-fuzz, etc) I'd be happy to try and provide some notes but likely don't have the resources to implement it myself to a merge-able standard of work.
+
+Thanks! You can close this top-level issue as you see appropriate.
+
+The `ossec-analysisd`'s `OS_ReadMSG` function calls `OS_CleanMSG` at the start of processing a message read from the ossec queue UNIX domain socket.
+
+In `src/analysisd/cleanevent.c` the `OS_CleanMSG` function populates the `lf` struct, setting fields like `log`, `hostname` and `program_name` to substrings of the `lf->full_log` buffer.
+
+After cleaning any syscheck messages are given to the syscheck decoder for further processing.
+
+After processing a syscheck msg from a client the syscheck decoder will free the `lf->full_log` pointer in two places. One place is if the message indicated a change in an existing tracked file:
+
+https://github.com/ossec/ossec-hids/blob/60cf8d2e941bcded8a05810d87cb906ff771df92/src/analysisd/decoders/syscheck.c#L572-L576
+
+Another place is if the message indicated a new file to track:
+
+https://github.com/ossec/ossec-hids/blob/60cf8d2e941bcded8a05810d87cb906ff771df92/src/analysisd/decoders/syscheck.c#L601-L604
+
+In both cases the syscheck decoder replaces the existing `lf->log` and `lf->full_log` pointers with pointers to new messages after first freeing the old `lf->full_log`. Afterwards the `DB_Search`, and `DecodeSyscheck` functions return 1 to `OS_ReadMSG`.
+
+Since the decoder returned 1, the `OS_ReadMSG` function will continue processing the event, it will not jump to `CLMEM`:
+
+https://github.com/ossec/ossec-hids/blob/60cf8d2e941bcded8a05810d87cb906ff771df92/src/analysisd/analysisd.c#L762-L765
+
+If any subsequent processing rules access the `lf->hostname` or `lf->program_name` fields set by `OS_CleanMSG` they will be accessing memory of a freed heap chunk previously containing `lf->full_log`.
+
+I believe the bug was introduced in 8672fa0d5acd1087c285e664804bfa455e9cfd07 on Nov 18, 2006 and affects OSSEC v2.7+.
+
+This code path is triggerable via an authenticated client through the `ossec-remoted`. The client needs only write a valid syscheck message that will have the `program_name` or `hostname` set during `OS_CleanMSG`.
+
+I don't have a strong sense for the possibility of exploitation. I suspect this may be turned into an out of bounds read of heap memory accessing `program_name` or `hostname` during rule processing if the area pointed to after the syscheck decoder free isn't null terminated.
+
+One possible fix would be for the syscheck decoder to `os_strdup` the `lf->hostname` and `lf->program_name` before freeing `full_log`.
+
+The `ossec-analysisd`'s `OS_ReadMSG` function calls `OS_CleanMSG` at the start of processing a received message from the ossec queue UNIX domain socket.
+
+In `src/analysisd/cleanevent.c` the `OS_CleanMSG` function populates the `lf` struct, setting fields like `log`, `hostname` and `program_name` to substrings of the `lf->full_log` buffer.
+
+After cleaning any messages that meet the ossec-alert decoder's criteria are given to that decoder for further processing.
+
+After processing an ossec alert msg from a client the ossec alert decoder will free the `lf->full_log` pointer at the end of its processing, replacing it with a new pointer and populating `lf->generated_rule`:
+
+https://github.com/ossec/ossec-hids/blob/abb36d4460b9f44ee90790d1138192bb01a2b21c/src/analysisd/decoders/plugins/ossecalert_decoder.c#L184-L191
+
+Though the `OSSECAlert_Decoder_Exec` function returns `NULL` and not `1` further rule processing of the `lf` struct occurs during `OS_ReadMSG` because of the `lf->generated_rule` set by the decoder before freeing `lf->full_log`.
+
+https://github.com/ossec/ossec-hids/blob/abb36d4460b9f44ee90790d1138192bb01a2b21c/src/analysisd/analysisd.c#L872-L879
+
+If any subsequent processing associated with the generated rule accesses the `lf->hostname` or `lf->program_name` fields set by `OS_CleanMSG` they will be accessing memory of a freed heap chunk previously containing the `lf->full_log`.
+
+I believe the bug was introduced in fcca01326255d66fa2b3f75357cda3780169c86d on July 23, 2008 and affects OSSEC v2.7+.
+
+This is triggerable via an authenticated client through the `ossec-remoted`. The client needs only write a ossecalert message that will have the `program_name` or `hostname` set during `OS_CleanMSG`.
+
+I don't have a strong sense for the possibility of exploitation. I suspect this may be turned into an out of bounds read of heap memory accessing `program_name` or `hostname` during rule processing if the area pointed to after the syscheck decoder free isn't null terminated.
+
+One possible fix would be for the ossecalert decoder to `os_strdup` the `lf->hostname` and `lf->program_name` before freeing `full_log`.
+
+The `ossec-analysisd`'s `OS_CleanMSG` function doesn't remove or encode terminal control characters or newlines from processed log messages. In many cases those control characters/newline are later logged.
+
+There have been cases where allowing arbitrary control characters in log messages has led to command execution with specific terminal emulator implementations. As a result many pieces of software (e.g. [Apache HTTPD](https://nvd.nist.gov/vuln/detail/CVE-2013-1862)) have added escaping of control characters in log messages. It may also be possible to abuse terminal control characters to hide previous messages in a log, tricking system administrators into missing events.
+
+Similarly, because newlines (`\n`) are permitted in messages processed by `ossec-analysisd` it may be possible to inject nested events to the ossec log. This may result in system administrators being tricked into thinking alerts fired that did not.
+
+The `ossec-analysisd`'s syscheck decoder (`src/analysisd/decoders/syscheck.c`) performs unsafe path handling using the received agent name when trying to get the agent file. The `DB_File` function uses the agent name unsanitized when building a file name to be used with `fopen`.
+
+https://github.com/ossec/ossec-hids/blob/abb36d4460b9f44ee90790d1138192bb01a2b21c/src/analysisd/decoders/syscheck.c#L212-L216
+
+Processing a syscheck message like `8:a/../../etc/shared/test.txt:aaaaaaa aaaa'` from an agent named `test` sending from localhost results in an `open` for `queue/syscheck/(test) 127.0.0.1->a/../../etc/shared/test.txt`
+
+This will fail with `ENOTDIR` because the part of the path the attacker can't control remotely (`(test) 127.0.0.1->a`) is not a directory. Creating it first by sending a message like `8:a:aaaaaaa aaaa` seems like a potential solution at first but won't work because while the file `queue/syscheck/(test) 127.0.0.1->a` will be created it won't be created as a *directory* but a regular file.
+
+I suspect this means that the bug is only useful to local attackers (that can write directly to the ossec queue). Writing directly to the queue allows full control of the `lf->location` used as the `agent` argument to `fopen` and can cause the syscheck DB file to be created in an attacker controlled location within the `chroot`. Remote attackers can not control the full `lf->location` since the `ossec-remoted` ensures the prefix of agent name and source IP is always present.
+
+Likely the best fix is to use the `w_ref_parent_folder` function from `src/shared/file_op.c` on the location field populated by `OS_CleanMSG` and rejecting any values that have a `1` return from that function.
+
+The rootcheck component of `ossec-syscheckd` (also capable of being run independently) has an optional `check_if` feature (enabled by default). Because of the nature of the rootcheck requirements this tool is typically run with root privileges (unlike many other OSSEC components that drop privileges).
+
+The code for this feature (`src/rootcheck/check_rc_if.c`) looks for promiscuous interfaces by iterating the ifreq structs returned by the `SIGOCGIFCONF` `ioctl`:
+
+https://github.com/ossec/ossec-hids/blob/abb36d4460b9f44ee90790d1138192bb01a2b21c/src/rootcheck/check_rc_if.c#L73
+
+When an interface with the `IFF_PROMISC` flag bits set is found, the rootcheck component invokes the libc `system` function (`man 3 system`) to run an `ifconfig ... | grep` pipeline to try and verify that `ifconfig` reports the interface as promiscuous, matching the IF flags.
+
+Critically the `const char *command` provided to `system` includes potentially attacker controlled data without sanitization by way of the interface name used as the `%s` format argument:
+
+https://github.com/ossec/ossec-hids/blob/abb36d4460b9f44ee90790d1138192bb01a2b21c/src/rootcheck/check_rc_if.c#L30
+
+Linux imposes almost no restrictions on interface names except that they be <=15 characters long. They may include `;`, `{`, `>` and many other shell metacharacters that will be improperly evaluated by the `system` call.
+
+Non-root users can make Linux interfaces with controlled names if they're in the `docker` group, or if LXC is configured appropriately. While LXC filters the allowed characters Docker does not allowing a non-root user to make an interface with shell metacharacters. E.g. creating an interface named `;{echo,oops}` on the Docker host via:
+
+`docker network create --opt com.docker.network.bridge.name=';{echo,oops}' test-net`
+
+I believe this is **presently** not a viable local root privilege escalation because the `ifconfig` call is only made for interfaces found with `IFF_PROMISC` flags and I don't know of a way to set these flags without being root or in group `netadm`. This may be a viable escalation from `netadm` -> `root`.
+
+I think this code was added with https://github.com/ossec/ossec-hids/commit/ee484485ecf19e7ec4ae7b056490a09e28b1febd and has been present since v2.7+.
+
+Even though this may not be exploitable today having root code invoke `system` is very risky. It would be better to find an alternative means for double checking promisc. interfaces or to rewrite the code to avoid `system` (e.g. forking and using `execve`).
+
+Installation or upgrade to ossec-hids-agent (3.5.0-9609buster) fails for me with an error
+
+`chown: invalid user: ossec:ossec`
+
+when installing packages from
+
+`https://updates.atomicorp.com/channels/atomic/debian`
+
+The problem can be fixed with 
+
+`sudo adduser ossec --system --gid 124 --home /var/ossec`
+
+and installing again.
+
+Though this PR is some rough points, this successfully create a deb package for arm64.
+I want to merge this PR but I noticed current `generate_ossec.sh` doesn't work well now.
+So before I blush up this I ask you how to improve this PR.
+
+fix #1073
+Hello, I have some custom decoders that work well but there is some problem with the arguments to the active-response scripts. The srcip is visible in the email and logtest but not in the active-response action.
+
+Normal Decoder (ssh) to active-response:
+
+```Mon Dec 30 13:28:22 UTC 2019 /var/ossec/active-response/bin/notify.sh add xxxx 2.2.2.2 1577712502.169531 100001 /var/log/secure - ```
+
+Custom decoder to active-response:
+
+``` Fri Jan  3 17:18:03 UTC 2020 /var/ossec/active-response/bin/openvpn.sh add - - 1578071883.922668 100101 /var/log/openvpn.log - ```
+
+Only dashes on srcip!
+
+openvpn.sh 
+```
+#!/bin/sh 
+echo "`date` $0 $1 $2 $3 $4 $5 $6 $7 $8" >> /var/ossec/logs/active-responses.log
+```
+
+Decoder:
+
+```
+   <decoder name="openvpn-tls-event">
+   <parent>openvpn</parent>
+   <prematch_pcre2 offset="after_parent">TLS: Initial packet from </prematch_pcre2>
+   <pcre2 offset="after_prematch">(\d+.\d+.\d+.\d+):(\d+)</pcre2>
+   <order>srcip,srcport</order>
+   </decoder>
+```
+
+
+Rule:
+```
+<rule id="100101" level="10">
+  <if_sid>100100</if_sid>
+  <match>TLS: Initial packet from</match>
+  <description>TLS initial packet to the VPN</description>
+  <group>connection_established,</group>
+</rule>
+
+```
+Ossec-logtest:
+
+```
+ Jan  3 17:18:01 server openvpn: 1.1.1.1:56515 TLS: Initial packet from [AF_INET]2.2.2.2:56515, sid=1c13g418 c4161513
+ **Phase 1: Completed pre-decoding.
+        full event: 'Jan  3 17:18:01 server openvpn: 1.1.1.1:56515 TLS: Initial packet from [AF_INET]2.2.2.2:56515, sid=1c13g418 c4161513'
+        hostname: 'server'
+        program_name: 'openvpn'
+        log: '1.1.1.1:56515 TLS: Initial packet from [AF_INET]2.2.2.2:56515, sid=1c13g418 c4161513'
+ **Phase 2: Completed decoding.
+        decoder: 'openvpn'
+        srcip: '2.2.2.2'
+        srcport: '56515'
+ **Phase 3: Completed filtering (rules).
+        Rule id: '100101'
+        Level: '10'
+       Description: 'TLS initial packet to the VPN'
+**Alert to be generated.
+
+```
+
+Email:
+```
+ OSSEC HIDS Notification.
+ 2020 Jan 03 17:18:03
+ Received From: server->/var/log/openvpn.log
+ Rule: 100101 fired (level 10) -> "TLS initial packet to the VPN"
+ Src IP: 2.2.2.2
+ Portion of the log(s):
+ Jan  3 17:18:01 server openvpn: 1.1.1.1:56515 TLS: Initial packet from [AF_INET]2.2.2.2:56515, sid=1c13g418 c4161513
+
+```
+Ossec version:
+ossec-hids-server-3.5.0-9609.el7.art.x86_64
+ossec-hids-3.5.0-9609.el7.art.x86_64
+
+Any ideas? :)

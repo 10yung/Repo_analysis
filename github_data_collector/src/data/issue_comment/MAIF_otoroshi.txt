@@ -1,0 +1,272 @@
+
+Hello
+
+I installed a new instance of Otoroshi and took the latest version of dependencies : 
+- Otoroshi : 1.4.10
+- Elastic Search : 7.3.2
+
+I experienced issues with 7.x version and didn't find compatibility requirement for Elastic Search in the documentation so I'm reporting what I've found.
+
+With Elastic Search 7.x - I tried multiple versions, I'll explain below - analytics seems to be broken, at least partially.
+
+## How to reproduce
+
+For Elastic Search, I used a docker version : 
+
+```sh
+docker run -p "9200:9200" -e "discovery.type=single-node" docker.elastic.co/elasticsearch/elasticsearch:7.3.1
+
+# also did tests with first 7.x release
+docker run -p "9200:9200" -e "discovery.type=single-node" docker.elastic.co/elasticsearch/elasticsearch:7.0.1
+
+# and latest 6.x version
+docker run -p "9200:9200" -e "discovery.type=single-node" docker.elastic.co/elasticsearch/elasticsearch:6.8.3
+```
+
+For Otoroshi, I just run it, using the default configuration : 
+
+```sh
+java -Dapp.domain=foo.bar -jar otoroshi.jar
+```
+
+Note : I've configured `/etc/hosts` with relevant domains.
+
+Otoroshi is then configured to use Elastic Search :
+
+```sh
+curl -X PATCH http://otoroshi-api.foo.bar:8080/api/globalconfig \
+        -H Otoroshi-Client-Id:admin-api-apikey-id \
+        -H Otoroshi-Client-Secret:admin-api-apikey-secret \
+        -H Content-Type:application/json \
+        -d \
+        '
+        [
+                {
+                        "op": "add",
+                        "path": "/elasticWritesConfigs/-",
+                        "value": {
+                                "clusterUri": "http://127.0.0.1:9200",
+                                "index": "analytics",
+                                "type": "analytics"
+                        }
+                },
+                {                                                
+                        "op": "add",                             
+                        "path": "/elasticReadsConfig",
+                        "value": {
+                                "clusterUri": "http://127.0.0.1:9200",
+                                "index": "analytics",
+                                "type": "analytics"
+                        }
+                }
+        ]'
+```
+
+To check if the analytics works fine, I log in Otoroshi in a browser and navigate a little, analytic events are pushed to Elastic Search and should be visible in "service OTOROSHI-ADMIN-API > Events".
+
+## Latest working version of Elastic Search
+
+The lastest version I could use without problems is version 6.8.3.
+
+I see the events in Otoroshi ui and everything is created in Elastic Search - both template `otoroshi-tpl` and indices `analytics-*`.
+
+## Problems with 7.x version
+
+Problems starts with the next major release : 7.0.1.
+
+### Failure to create the template
+
+When Otoroshi tries to write events in Elastic Search, an error is logged : 
+
+```
+[error] otoroshi-analytics-writes-elastic - Error creating template 400:  {
+     "error": {
+         "root_cause": [{
+             "type": "mapper_parsing_exception",
+             "reason": "Root mapping definition has unsupported parameters:  [_default_ : {dynamic_templates=[{string_template={mapping={fielddata=true, type=text}, match_mapping_type=string, match=*}}], date_detection=false, properties={@created={type=date}, @timestamp={type=date}, @env={type=keyword}, @product={type=keyword}, @type={type=keyword}, @serviceId={type=keyword}, @id={type=keyword}, @service={type=keyword}}}]"
+         }],
+         "type": "mapper_parsing_exception",
+         "reason": "Failed to parse mapping [_doc]: Root mapping definition has unsupported parameters:  [_default_ : {dynamic_templates=[{string_template={mapping={fielddata=true, type=text}, match_mapping_type=string, match=*}}], date_detection=false, properties={@created={type=date}, @timestamp={type=date}, @env={type=keyword}, @product={type=keyword}, @type={type=keyword}, @serviceId={type=keyword}, @id={type=keyword}, @service={type=keyword}}}]",
+         "caused_by": {
+             "type": "mapper_parsing_exception",
+             "reason": "Root mapping definition has unsupported parameters:  [_default_ : {dynamic_templates=[{string_template={mapping={fielddata=true, type=text}, match_mapping_type=string, match=*}}], date_detection=false, properties={@created={type=date}, @timestamp={type=date}, @env={type=keyword}, @product={type=keyword}, @type={type=keyword}, @serviceId={type=keyword}, @id={type=keyword}, @service={type=keyword}}}]"
+         }
+     },
+     "status": 400
+ }
+```
+
+The problem seems to be with a breaking change in templates in Elastic Search, which make Otoroshi fail at creating the one it uses ([Otoroshi template](https://github.com/MAIF/otoroshi/blob/master/otoroshi/app/events/impl/ElasticAnalytics.scala#L24))
+
+I think the deprecation notice from Elastic Search is described in this page : https://www.elastic.co/guide/en/elasticsearch/reference/6.5/removal-of-types.html
+
+The issue does not seem to be blocking writes in Elastic Search as the index is created in Elastic Search : 
+
+```sh
+$ curl http://localhost:9200/_cat/indices
+yellow open analytics-2019-09-18 Jn0plIJQSOWkiiJb1EBz2g 1 1 55 0 119.6kb 119.6kb
+
+$ curl http://localhost:9200/analytics-2019-09-18/_count
+{"count":55,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0}}
+```
+
+### Nothing in the events report
+
+When using a 7.x Elastic Search, nothing is shown in events (for example, service OTOROSHI-ADMIN-API > Events).
+
+I don't see any error in Otoroshi so I'm not completly sure what is the problem.
+
+Errors are shown in Elastic Search logs but I'm not sure it's related : 
+
+```
+{"type": "server", "timestamp": "2019-09-18T16:00:00,922+0000", "level": "DEBUG", "component": "o.e.a.b.TransportShardBulkAction", "cluster.name": "docker-cluster", "node.name": "639767f7e36a", "cluster.uuid": "8knOD0aCRoKs3PbcSfbF7g", "node.id": "ziD_Zt0DTPO95jof0fJohw",  "message": "[analytics-2019-09-18][0] failed to execute bulk item (index) index {[analytics-2019-09-18][analytics][JT4aRW0BQEEOoDIKF-Jl], source[n/a, actual length: [6.4kb], max length: 2kb]}" ,
+"stacktrace": ["java.lang.IllegalArgumentException: mapper [headersOut.value] of different type, current_type [date], merged_type [text]",
+"at org.elasticsearch.index.mapper.FieldMapper.doMerge(FieldMapper.java:330) ~[elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.index.mapper.DateFieldMapper.doMerge(DateFieldMapper.java:559) ~[elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.index.mapper.FieldMapper.merge(FieldMapper.java:317) ~[elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.index.mapper.FieldMapper.merge(FieldMapper.java:52) ~[elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.index.mapper.DocumentParser.createDynamicUpdate(DocumentParser.java:223) ~[elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.index.mapper.DocumentParser.parseDocument(DocumentParser.java:83) ~[elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.index.mapper.DocumentMapper.parse(DocumentMapper.java:267) ~[elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.index.shard.IndexShard.prepareIndex(IndexShard.java:770) ~[elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.index.shard.IndexShard.applyIndexOperation(IndexShard.java:747) ~[elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.index.shard.IndexShard.applyIndexOperationOnPrimary(IndexShard.java:719) ~[elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.action.bulk.TransportShardBulkAction.lambda$executeIndexRequestOnPrimary$3(TransportShardBulkAction.java:452) ~[elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.action.bulk.TransportShardBulkAction.executeOnPrimaryWhileHandlingMappingUpdates(TransportShardBulkAction.java:475) ~[elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.action.bulk.TransportShardBulkAction.executeIndexRequestOnPrimary(TransportShardBulkAction.java:450) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.action.bulk.TransportShardBulkAction.executeBulkItemRequest(TransportShardBulkAction.java:218) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.action.bulk.TransportShardBulkAction.performOnPrimary(TransportShardBulkAction.java:161) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.action.bulk.TransportShardBulkAction.performOnPrimary(TransportShardBulkAction.java:153) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.action.bulk.TransportShardBulkAction.shardOperationOnPrimary(TransportShardBulkAction.java:141) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.action.bulk.TransportShardBulkAction.shardOperationOnPrimary(TransportShardBulkAction.java:79) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.action.support.replication.TransportReplicationAction$PrimaryShardReference.perform(TransportReplicationAction.java:1033) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.action.support.replication.TransportReplicationAction$PrimaryShardReference.perform(TransportReplicationAction.java:1011) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.action.support.replication.ReplicationOperation.execute(ReplicationOperation.java:104) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.action.support.replication.TransportReplicationAction$AsyncPrimaryAction.runWithPrimaryShardReference(TransportReplicationAction.java:413) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.action.support.replication.TransportReplicationAction$AsyncPrimaryAction.lambda$doRun$0(TransportReplicationAction.java:359) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.action.ActionListener$1.onResponse(ActionListener.java:61) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.index.shard.IndexShardOperationPermits.acquire(IndexShardOperationPermits.java:269) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.index.shard.IndexShardOperationPermits.acquire(IndexShardOperationPermits.java:236) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.index.shard.IndexShard.acquirePrimaryOperationPermit(IndexShard.java:2513) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.action.support.replication.TransportReplicationAction.acquirePrimaryOperationPermit(TransportReplicationAction.java:970) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.action.support.replication.TransportReplicationAction$AsyncPrimaryAction.doRun(TransportReplicationAction.java:358) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.common.util.concurrent.AbstractRunnable.run(AbstractRunnable.java:37) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.action.support.replication.TransportReplicationAction$PrimaryOperationTransportHandler.messageReceived(TransportReplicationAction.java:313) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.action.support.replication.TransportReplicationAction$PrimaryOperationTransportHandler.messageReceived(TransportReplicationAction.java:305) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.xpack.security.transport.SecurityServerTransportInterceptor$ProfileSecuredRequestHandler$1.doRun(SecurityServerTransportInterceptor.java:251) [x-pack-security-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.common.util.concurrent.AbstractRunnable.run(AbstractRunnable.java:37) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.xpack.security.transport.SecurityServerTransportInterceptor$ProfileSecuredRequestHandler.messageReceived(SecurityServerTransportInterceptor.java:309) [x-pack-security-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.transport.RequestHandlerRegistry.processMessageReceived(RequestHandlerRegistry.java:63) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.transport.TransportService$7.doRun(TransportService.java:693) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.common.util.concurrent.ThreadContext$ContextPreservingAbstractRunnable.doRun(ThreadContext.java:751) [elasticsearch-7.0.1.jar:7.0.1]",
+"at org.elasticsearch.common.util.concurrent.AbstractRunnable.run(AbstractRunnable.java:37) [elasticsearch-7.0.1.jar:7.0.1]",
+"at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1128) [?:?]",
+"at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:628) [?:?]",
+"at java.lang.Thread.run(Thread.java:835) [?:?]"] }
+```
+
+I tried to give you all the informations I could.
+
+Thanks for the great work you're putting in the tool 👍 
+Like in GCP IAP. The idea here is to provide a client that will expose a local port for TCP connections. This client will wrap every tcp packet in an https connection and send it to Otoroshi. Otoroshi will verify if the connection is okay (user, etc ...) and then unwrap packet and forward it to the target tcp service.
+
+To do that we need to
+
+* write a client (node js or rust) based on https://github.com/mathieuancelin/node-httptunnel
+  * can establish a connection with a public service
+  * can establish a connection with a private service (apikey)
+  * can establish a connection with a secured service (auth. modules)
+* write the logic to unwrap packets and send it to target service in `handler.scala`
+  * add special event log with identity
+  * possible strategies
+    * Websocket wrapping
+    * Classic GET / POST / PUT / DELETE, but we need to handle the loadbalancing issue (client side ?)
+      * need to check if we can enforce sticky on nginx or haproxy or whatever
+    * Stateful and distributed with db and pubsub stuff
+    * Http tunnel with CONNECT (not sure play can handle it)
+    * the crappy way using http streams
+    * we need to encode the logic in an external module usage by all these strategies
+* support private app session id extraction from places other than cookies (#202)
+  * header
+  * query param
+  * config. will be set in auth. module config.
+* Support private apps redirection to `urn:ietf:wg:oauth:2.0:oob` (#297)
+* Support full OAuth2 lifecyle through private apps (#298)
+* TCP forwarding over https will allow to
+  * setup a target address and port (tls flag)
+  * get address and or port from headers or query params (flag)
+
+## Tasks for MVP
+
+* [x] add TCP tunneling flag in descriptor
+* [x] authorize only routes for `/.well-known/otoroshi/me` and `/.well-known/otoroshi/tunnel`
+* [x] write basic client
+* [x] write handler with TCP client based on Websocket tunneling
+* [x] support multiple token extraction (from header and query param) (#202)
+* [x] support private app redirection for cli  (#297)
+
+## Tasks for stable version
+
+* [ ] Support full OAuth2 lifecyle through private apps (#298)
+* [x] TCP forwarding flags 
+
+## Docs 
+
+* https://cloud.google.com/blog/products/identity-security/cloud-iap-enables-context-aware-access-to-vms-via-ssh-and-rdp-without-bastion-hosts
+* https://cloud.google.com/iap/docs/using-tcp-forwarding
+* https://cloud.google.com/solutions/building-internet-connectivity-for-private-vms
+Sometimes, requests like the following fails
+
+```sh
+curl \
+  --data-binary @./itemss.json \
+  -X POST "https://api.oto.tools:8080/api/_init" \
+  -H 'Accept: application/json' \
+  -H 'Content-Type: application/json' \
+  -u "clientId:clientSecret" --include
+```
+The request is sent and hangs forever. But it doesn't hang with akka-http client. The target is a play app. Need to investigate
+at least for the exchange protocol
+
+see https://tools.ietf.org/html/rfc7516
+* Service Descriptor
+  * a list of matched domains
+  * a list of targets (with all nice features coming from 1.4.9)
+  * an array of consumers ref
+    * apikey id
+    * group id
+  * an array of module configuration 
+    * a lot of modules will be provided out of the box to match with current otoroshi feature set 
+  * in ui, each module can be added from a select box
+    * each module can be configured using a raw json editor
+  * cleanup
+    * no more env => tags
+    * no more domain and subdomain
+
+* Api key
+  * no more grouping if not needed
+  * meta and tags
+  * one or two secrets
+  * a consumption plan
+    * can handle routing for instance
+  * an array of module configuration
+    * can be specific to apikeys
+    * can override service descriptor config on some points
+  * transformer like script to allow or not the access (and provide additional informations)
+
+* Public and private apps consumption will use special apikeys
+  * can handle quotas management, etc ...
+
+* Rewritten using akka-http only
+* Simplified datastore layer
+* Admin api listening on a second port (only on 127.0.0.1) with a default service to forward
+* All entities should support multi tenant
+
+With a selector and a page to store apikeys and urls
+Like private apps but fully backed by OIDC / OAuth2 with a response header containing the current `access_token`
+Lot of things are outdated. Also
+
+* #357: Update U2F documentation
+* #356: Document tcp tunneling
+
+

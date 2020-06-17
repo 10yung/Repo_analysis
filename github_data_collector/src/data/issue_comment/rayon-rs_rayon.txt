@@ -1,0 +1,170 @@
+https://docs.rs/rayon/1.3.0/rayon/iter/trait.ParallelIterator.html#method.map_init
+
+The example has a comment " // get the thread-local RNG" . This makes it sound like init() is called once per thread, which is what would be ideal in my use-case, but actually this is far from true.
+
+I found by benchmarking that my code spends a lot of time in my init function. I am processing 4000 items and init() gets called about ~2000 times (on average, varies per run). That means only about 2 items processed per init call which results in poor scaling - it spends too much time in init and not enough in processing.
+
+Possible questions
+- should I be using something other than map_init
+- am I supposed to do something with TLS or using a syncpool to manually cache items
+- is this by design or can/should it be improved (I don't understand why it needs to create so many instances)
+ - should documentation be updated to avoid confusion
+
+
+Using the `Result` impl for `FromParallelIterator`, one can already collect the result of many fallible operations into a `Result<Vec<_>, _>`. However, AFAICT, it is currently impossible to do this multiple times while reusing the same results buffer, which is possible for infallible operations using `collect_into_vec`. It would be nice if this was supported. I'd expect the semantics around errors to be the same as those for `try_for_each`, with the backing `Vec` additionally being cleared if an `Err` is encountered.
+
+Is this just something that hasn't been implemented yet, or have I missed something that makes this impossible to implement? Would a PR for this be accepted if it can be done? (I haven't previously contributed to rayon and don't know whether I'd be able to do it, but I might try at least)
+Using the checked out crate, tests behave normally when run in "debug" profile, but when run with any kind of optimization, this test fails:
+
+```
+$ RUSTFLAGS="-Copt-level=1" cargo test --test stack_overflow_crash 
+    Finished test [unoptimized + debuginfo] target(s) in 0.08s
+     Running target/debug/deps/stack_overflow_crash-af2c60bd7036713e
+thread 'main' panicked at 'assertion failed: `(left == right)`
+  left: `Some(0)`,
+ right: `None`', tests/stack_overflow_crash.rs:56:13
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace.
+error: test failed, to rerun pass '--test stack_overflow_crash'
+$ echo $?
+101
+```
+```
+$ RUSTFLAGS="-Copt-level=0" cargo test --test stack_overflow_crash 
+    Finished test [unoptimized + debuginfo] target(s) in 0.03s
+     Running target/debug/deps/stack_overflow_crash-af2c60bd7036713e
+
+thread '<unknown>' has overflowed its stack
+fatal runtime error: stack overflow
+$ echo $?
+0
+```
+
+
+Backtrace with -Coptlevel=1 is as follows:
+<details>
+    <summary>though it doesn't look very helpful to me</summary>
+
+```
+   0: backtrace::backtrace::libunwind::trace
+             at /cargo/registry/src/github.com-1ecc6299db9ec823/backtrace-0.3.40/src/backtrace/libunwind.rs:88
+   1: backtrace::backtrace::trace_unsynchronized
+             at /cargo/registry/src/github.com-1ecc6299db9ec823/backtrace-0.3.40/src/backtrace/mod.rs:66
+   2: std::sys_common::backtrace::_print_fmt
+             at src/libstd/sys_common/backtrace.rs:84
+   3: <std::sys_common::backtrace::_print::DisplayBacktrace as core::fmt::Display>::fmt
+             at src/libstd/sys_common/backtrace.rs:61
+   4: core::fmt::write
+             at src/libcore/fmt/mod.rs:1030
+   5: std::io::Write::write_fmt
+             at src/libstd/io/mod.rs:1412
+   6: std::sys_common::backtrace::_print
+             at src/libstd/sys_common/backtrace.rs:65
+   7: std::sys_common::backtrace::print
+             at src/libstd/sys_common/backtrace.rs:50
+   8: std::panicking::default_hook::{{closure}}
+             at src/libstd/panicking.rs:188
+   9: std::panicking::default_hook
+             at src/libstd/panicking.rs:205
+  10: std::panicking::rust_panic_with_hook
+             at src/libstd/panicking.rs:464
+  11: std::panicking::continue_panic_fmt
+             at src/libstd/panicking.rs:373
+  12: std::panicking::begin_panic_fmt
+             at src/libstd/panicking.rs:328
+  13: stack_overflow_crash::main
+             at tests/stack_overflow_crash.rs:0
+  14: std::rt::lang_start::{{closure}}
+             at /rustc/5c5b8afd80e6fa1d24632153cb2257c686041d41/src/libstd/rt.rs:61
+  15: std::rt::lang_start_internal::{{closure}}
+             at src/libstd/rt.rs:48
+  16: std::panicking::try::do_call
+             at src/libstd/panicking.rs:287
+  17: __rust_maybe_catch_panic
+             at src/libpanic_unwind/lib.rs:86
+  18: std::panicking::try
+             at src/libstd/panicking.rs:265
+  19: std::panic::catch_unwind
+             at src/libstd/panic.rs:395
+  20: std::rt::lang_start_internal
+             at src/libstd/rt.rs:47
+  21: std::rt::lang_start
+             at /rustc/5c5b8afd80e6fa1d24632153cb2257c686041d41/src/libstd/rt.rs:61
+  22: __libc_start_main
+             at ../csu/libc-start.c:308
+  23: _start
+```
+
+</details>
+
+I tried single-stepping though the program with lldb, but nothing obvious happens :/
+I am implementing a parallel L-system algorithm. This means that threads turn a small vector of symbols into a larger vector of symbols by looking up each symbol's "result symbols" in a hashmap, and finally split the larger vector in chunks which are then re-offered as tasks for later consumption/stealing, until a desired depth is reached.
+
+However, when this desired depth is reached, I want to sort the resulting vectors (which are all chunks/slices of the desired output) and finally end up with these vectors in order. (So I have a `Vec<(Id, Vec<Symbol>)>` that needs sorting)
+
+Now I could:
+1. Use a datastructure like `crossbeam-skiplist` to handle this (although it is currently still experimental).
+2. Use a shared `Vec<(Id, Vec<Symbol>)>` with either a lock around reading/writing it, or maybe an atomic variant, or another MPSC collection type, and when all threads are done, start Rayon's `par_sort` (or `par_sort_unstable`) on it.
+
+The first thing `par_sort` then does is split the collection into subslices again and divide the work across threads. 
+
+I am therefore wondering if these two steps (writing the final work to a global collection and waiting until this is done, and then splitting this work back up across threads) might not be combined in some way. What is possible here?
+Hi all
+Just feedback from a real-world workload (non-public system), upgraded from `1.0.3` to `1.2.0` and got a free 150% performance boost. Great work!
+
+Please feel free to close :)
+
+I am trying to create a (local) ThreadPool:
+```
+        let pool = ThreadPoolBuilder::new()
+            .build()
+            .expect("EntityContainer::load_entities_internal: cannot create thread pool");
+```
+Also [in context](https://gitlab.com/tobias47n9e/wikibase_rs/blob/rayon/src/entity_container.rs#L124)
+
+This compiles fine, and runs fine on MacOS. It compiles on Linux, but crashes:
+```
+thread '<unnamed>' panicked at 'EntityContainer::load_entities_internal: cannot create thread pool: ThreadPoolBuildError 
+{ kind: IOError(Os { code: 11, kind: WouldBlock, message: "Resource temporarily unavailable" }) }'
+, src/libcore/result.rs:1084:5
+```
+
+Earlier errors also included the global thread pool not being initialized, but after some fiddling that went away.
+
+Tried the 1.2.0 crate and current git master, no joy.
+
+Tried Rust stable (1.37.0), beta (1.38.0) and nightly (1.39.0), no joy.
+
+
+I've been benching a program of mine that uses rayon, and I noticed I get much more "clean" results if I set the number of cpus to be the physical number instead of the logical number.
+
+Here is a comparison:
+https://imgur.com/a/SaLArz2 (y axis is actually time taken. I mislabeled it)
+
+I think it is related to hyper-threading. Is it possible hyper-threading doesn't actually improve anything when used with rayon, or maybe my operating system just isn't optimized to use hyperthreading (i'm using a dell precision 5530 pre-installed with linux). 
+As a start to improving our sleep system, this PR does a refactoring to how tickle works. We used to tickle the registry after each job executed: the idea was that executing a job would set some latch, and we needed to wake up any threads that might be blocked, waiting on that latch. However, this was a bit overapproximated: for example, the latch might've been a `LockLatch`, which indicates a thread from outside the pool, in which case there is no need to tickle threads at all. 
+
+In this PR, the latches themselves track the registry that they must tickle when they are set. In the case of a `Countdown` latch, they are given it from the outside; this is because countdown latches are sometimes owned by the registry itself, so it would be impossible for them to have a reference to the registry.
+
+I'd like to work towards a scenario where we know not only the *registry* that must be awoken but the exact helper thread. This could avoid needless wakeups. But this refactoring is as far as I got for now.
+I'm using rayon 1.2.0 on Windows 10 and rustc 1.36.0 stable. I'm not sure how to best report this bug and I don't even know if it is a bug in rayon at all, but I thought it's better when someone has a look at this. I can provide additional information as requested.
+
+I've written the following code:
+
+```rust
+use jwalk::WalkDir;
+
+let entries = WalkDir::new(path).into_iter().par_bridge().map(|entry| {
+    entry.unwrap().path().display().to_string()
+}).collect::<Vec<_>>();
+```
+
+I'm using jwalk 0.4.0; it uses rayon internally.
+
+If I run this code on a big folder (`C:\Users\Home` or `C:\`) it _sometimes_ hangs indefinitely in the `par_bridge.rs`. It tries to aquire the lock on line 165, but always continues with the `Err(TryLockError::WouldBlock)` match arm.
+Is there a way to get "chunks"-like functionality but with striping/stepping instead of contiguous memory?
+
+I.e., if you have some data in a slice, and every nth element of this slice is part of the same independent workload, you could split up the buffer for processing on multiple threads in such a way that the data for each thread would interleaved with the other threads' data.
+
+This doesn't seem to be the semantics of `interleave`, `windows`, `step_by`, or any of the other functions I've found so far in the documentation.
+
+I am told that such an access pattern is common in image processing.

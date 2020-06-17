@@ -1,0 +1,231 @@
+I'm created the ability to provide `mainViewController` as UINavigationController.
+I needed to implement the ability to use `mainViewController` to custom shows.
+Now, we can use it like this:
+`let navigationController = DBDebugToolkit.mainViewController()`
+
+Rewire delegate to UISearchBar instance. UISearchController is deprecated and is raising warning when compiling our code. It also breaks Catalyst builds.
+My initial setup for DBDebugToolkit is:
+
+```
+let shakeTrigger = DBShakeTrigger()
+            DBDebugToolkit.setup(with: [shakeTrigger])
+            DBDebugToolkit.setupCrashReporting()
+            DBDebugToolkit.addClearDataShortcutItem()
+            let clearDefaultsAction = DBCustomAction(name: "Clear User Defaults") {
+                DBDebugToolkit.clearUserDefaults()
+            }
+            DBDebugToolkit.add(clearDefaultsAction)
+```
+
+The issue i have: no crash reports are being made.
+
+I have intentionally crashed the app, and even purposefully loaded large images and created OOM errors and there have been no crash logs being logged.  
+
+Did i miss some obvious configuration setup?
+Added JsonViewer feature to conveniently view received or sent JSON
+
+![Simulator Screen Shot - iPhone X - 2019-04-14 at 18 11 52](https://user-images.githubusercontent.com/6798398/56095928-f86c2400-5ee1-11e9-87db-66e7095007a6.png)
+![Simulator Screen Shot - iPhone X - 2019-04-14 at 18 11 57](https://user-images.githubusercontent.com/6798398/56095929-f86c2400-5ee1-11e9-9f1d-f86fc561e1b2.png)
+![Simulator Screen Shot - iPhone X - 2019-04-14 at 18 12 01](https://user-images.githubusercontent.com/6798398/56095930-f86c2400-5ee1-11e9-81d5-5bf85ca09923.png)
+![Simulator Screen Shot - iPhone X - 2019-04-14 at 18 12 10](https://user-images.githubusercontent.com/6798398/56095931-f86c2400-5ee1-11e9-84cc-aa2f468cea3c.png)
+
+There is a weird bug related to custom `URLSession` and `URLCache`.
+
+### Project setup
+
+Here is my `AppDelegate` that enables `DBDebugToolkit`.
+```
+class AppDelegate: UIResponder, UIApplicationDelegate {
+
+    var window: UIWindow?
+
+    func application(_ application: UIApplication,
+                     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
+
+        DBDebugToolkit.setup()
+
+        let window = UIWindow(frame: UIScreen.main.bounds)
+        self.window = window
+        window.backgroundColor = UIColor.white
+        window.rootViewController = ViewController()
+
+        window.makeKeyAndVisible()
+        return true
+    }
+}
+```
+
+In my `ViewController`, I have a button that loads an url with `Cache-Control` header set, meaning the system should cache the response.
+```
+class ViewController: UIViewController {
+
+    private lazy var button: UIButton = {
+        let button = UIButton(type: .system)
+        button.setTitle("Load", for: .normal)
+        button.addTarget(self, action: #selector(load), for: .touchUpInside)
+        return button
+    }()
+
+    // Custom URLSession with custom cache and custom diskPath
+    private lazy var session: URLSession = {
+        let memoryCapacity = 500 * 1024 * 1024 // 500 MB
+        let diskCapacity = 500 * 1024 * 1024 // 500 MB
+
+        let cache = URLCache(
+            memoryCapacity: memoryCapacity,
+            diskCapacity: diskCapacity,
+            diskPath: "com.xxxxx.yyyyy"
+        )
+
+        let configuration = URLSessionConfiguration.default
+        configuration.urlCache = cache
+
+        return URLSession(
+            configuration: configuration,
+            delegate: self,
+            delegateQueue: nil
+        )
+    }()
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.addSubview(button)
+        button.frame = view.bounds
+    }
+
+    // MARK: - Private
+
+    @objc private func load() {
+        // A ~130 KB image, small enough to be cached by the default URLSession session
+        let url = URL(string: "https://images.unsplash.com/photo-1518791841217-8f162f1e1131?ixlib=rb-1.2.1&auto=format&fit=crop&w=1000&q=80")!
+        session.dataTask(with: url).resume()
+    }
+}
+
+extension ViewController: URLSessionDataDelegate {
+
+    // MARK: - URLSessionDataDelegate
+
+    func urlSession(_ session: URLSession,
+                    dataTask: URLSessionDataTask,
+                    willCacheResponse proposedResponse: CachedURLResponse,
+                    completionHandler: @escaping (CachedURLResponse?) -> Void) {
+        print("session:willCacheResponse:")
+        completionHandler(proposedResponse)
+    }
+
+    func urlSession(_ session: URLSession,
+                    dataTask: URLSessionDataTask,
+                    didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        print("dataTask:didReceive response")
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession,
+                    dataTask: URLSessionDataTask,
+                    didReceive data: Data) {
+        print("data = \(data)")
+    }
+}
+```
+
+### With DBDebugToolKit activated
+
+When I first clic on the load button, the request is sent to the server, and the logs are the following :
+```
+dataTask:didReceive response
+data = 129408 bytes
+```
+
+When I clic a second time, the request is not sent to the server, the cached image is used and the logs are the same.
+
+We can note that the log `print("session:willCacheResponse:")` is never called even it should be.
+
+The cache folder structure is : ![Wrong cache structure](https://i.imgur.com/yLxMKos.png) 
+
+Note the duplication of the `Cache.db` files. What's more the `fsCachedData` folder, that contains the cached image, is at the wrong location. That means the image is saved in the default `URLCache` and not in the custom one I defined in my sesssion.
+
+### Without DBDebugToolKit activated
+
+If I trash the app and remove the line `DBDebugToolkit.setup()` in the `AppDelegate`, when I first clic on the image, the request is sent to the server and the logs are the following:
+```
+dataTask:didReceive response
+data = 16384 bytes
+data = 16384 bytes
+data = 16384 bytes
+data = 16383 bytes
+data = 16384 bytes
+data = 16384 bytes
+data = 16384 bytes
+data = 14721 bytes
+session:willCacheResponse:
+```
+
+Note that this time the logs are correct and `session:willCacheResponse:` is printed !
+
+The cache folder structure is ![Correct cache structure](https://i.imgur.com/GJIRLJE.png)
+This time there is only one `Cache.db` file, and the `fsCachedData` folder is under the `com.xxxxx.yyyyy` directory. Which is the expected behavior.
+
+### Issue
+
+So the issue is that a custom url session with a custom url cache is never taken into account with `DBDebugToolkit` activated. What's more the `URLSessionDataDelegate` method `urlSession(_:, dataTask:, willCacheResponse:, completionHandler:)` is not called.
+Due to the way DBRequestModel intercepts requests progress block is never called when using file upload task for a multi-part request from AFNetworking.
+
+**Example code:**
+```
+NSMutableURLRequest *request = [[AFHTTPRequestSerializer serializer] multipartFormRequestWithMethod:@"POST" URLString:@"http://example.com/upload" parameters:nil constructingBodyWithBlock:^(id<AFMultipartFormData> formData) {
+        [formData appendPartWithFileURL:[NSURL fileURLWithPath:@"file://path/to/image.jpg"] name:@"file" fileName:@"filename.jpg" mimeType:@"image/jpeg" error:nil];
+    } error:nil];
+
+AFURLSessionManager *manager = [[AFURLSessionManager alloc] initWithSessionConfiguration:[NSURLSessionConfiguration defaultSessionConfiguration]];
+
+NSURLSessionUploadTask *uploadTask;
+uploadTask = [manager
+              uploadTaskWithStreamedRequest:request
+              progress:^(NSProgress * _Nonnull uploadProgress) {
+                  // This block is never called after installing DBDebugToolkit
+                  dispatch_async(dispatch_get_main_queue(), ^{
+                      //Update the progress view
+                      [progressView setProgress:uploadProgress.fractionCompleted];
+                  });
+              }
+              completionHandler:^(NSURLResponse * _Nonnull response, id  _Nullable responseObject, NSError * _Nullable error) {
+                  if (error) {
+                      NSLog(@"Error: %@", error);
+                  } else {
+                      NSLog(@"%@ %@", response, responseObject);
+                  }
+              }];
+
+[uploadTask resume];
+```
+
+This issue caused us a lot of problems related to disappearing file upload progress bars etc. and we tracked the problem to be related with DBDebugToolkit. We can't use it anymore because just calling `[DBDebugToolkit setup];` results in our app being unstable and behaving differently than it used to.
+
+In my opinion, if it's impossible to intercept multi-part upload request without breaking its documented behavior, such a requests shouldn't be intercepted and logged at all (logging such requests should be opt-in), or at least we should have a way to disable it.
+
+text/event-stream requests are "chunked" requests with double newline breaks. Because of the way DBURLProtocol intercepts requests, what ends up happening is all response chunks are batched up until the end and then forwarded to the original response handler. Any ideas how to fix this other than disabling interception altogether?
+We use AFNetworking and have code like the following
+
+```swift
+let httpSessionManager = AFHTTPSessionManager(baseURL: baseURL)
+httpSessionManager.setTaskWillPerformHTTPRedirectionBlock { urlSession, task, response, request in
+  return someCheck
+    ? request
+    : nil // Stop following redirect
+}
+```
+
+After we integrated `DBDebugToolkit` we noticed that this block was not getting called anymore. Disabling networking logging via `DBDebugToolkit.setNetworkRequestsLoggingEnabled(false)` fixes the issue.
+
+I looked at AFNetworking's related code ([part 1](https://github.com/AFNetworking/AFNetworking/blob/a101152743e281eef6d90715e54b28c0d1a1d0b7/AFNetworking/AFURLSessionManager.m#L884-L886), [part 2](https://github.com/AFNetworking/AFNetworking/blob/a101152743e281eef6d90715e54b28c0d1a1d0b7/AFNetworking/AFURLSessionManager.m#L1004-L1021)) and it does not seem to do anything special which leads me to believe that this is a general issue.
+
+Please let me know if additional information is needed to reproduce this behavior.
+Hi,
+
+it is sometimes helpful to be able to edit NSUserDefaults and Keychain items within the app. Do you plan to add this feature?
+
+Thanks,
+
+Jidrich

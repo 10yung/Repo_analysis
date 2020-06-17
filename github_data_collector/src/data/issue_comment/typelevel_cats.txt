@@ -1,0 +1,75 @@
+addresses #3143
+
+
+Right now the Scala.js `FutureTests` use the `runNow` execution context, which was deprecated in Scala.js 0.6 and removed in 1.0. In #3246 I replace `runNow` with an equivalent implementation, since I want to unblock 1.0 compatibility, but this isn't a real solution (see e.g. [this issue](https://github.com/scala-js/scala-js/issues/2102) for discussion).
+addresses #3143
+The analogous function on `Free` is simply `foldMap`, but `FreeT` has an extra (monadic) suspension functor which cannot be manipulated through the same mechanism. `mapK` already exists; this simply provides a way of doing a `mapK`-like transformation where the resulting `N` is *itself* a `FreeT`. This can be useful when you want to manipulate the structure of the interpretation in a composable fashion.
+Follow-up on a (rebased) https://github.com/typelevel/cats/pull/2318
+
+We also add some unused (and deprecated) methods, with the `Ord` as a non-implicit, which avoid source ambiguity but keeps binary compatibility.
+Closes #3220.
+
+I was surprised to see binary compatibility errors when I put the instance inside `InvariantMonoidalInstances`:
+
+```
+sbt:cats> coreJVM/mimaReportBinaryIssues
+[info] Compiling 1 Scala source to /Users/kubukoz/IdeaProjects/cats/core/.jvm/target/scala-2.12/classes ...
+[info] Compiling 4 Scala sources to /Users/kubukoz/IdeaProjects/cats/core/.jvm/target/scala-2.12/classes ...
+[error]  * abstract synthetic method cats$instances$InvariantInstances$_setter_$catsInvariantNumeric_=(cats.Invariant)Unit in interface cats.instances.InvariantInstances is inherited by class AllInstances in current version.
+[error]    filter with: ProblemFilters.exclude[InheritedNewAbstractMethodProblem]("cats.instances.AllInstances.cats$instances$InvariantInstances$_setter_$catsInvariantNumeric_=")
+[error]  * abstract method catsInvariantNumeric()cats.Invariant in interface cats.instances.InvariantInstances is inherited by class AllInstances in current version.
+[error]    filter with: ProblemFilters.exclude[InheritedNewAbstractMethodProblem]("cats.instances.AllInstances.catsInvariantNumeric")
+[error]  * abstract synthetic method cats$instances$InvariantInstances$_setter_$catsInvariantNumeric_=(cats.Invariant)Unit in interface cats.instances.InvariantInstances is inherited by class InvariantMonoidalInstances in current version.
+[error]    filter with: ProblemFilters.exclude[InheritedNewAbstractMethodProblem]("cats.instances.InvariantMonoidalInstances.cats$instances$InvariantInstances$_setter_$catsInvariantNumeric_=")
+[error]  * abstract method catsInvariantNumeric()cats.Invariant in interface cats.instances.InvariantInstances is inherited by class InvariantMonoidalInstances in current version.
+[error]    filter with: ProblemFilters.exclude[InheritedNewAbstractMethodProblem]("cats.instances.InvariantMonoidalInstances.catsInvariantNumeric")
+[error] stack trace is suppressed; run last coreJVM / mimaReportBinaryIssues for the full output
+[error] (coreJVM / mimaReportBinaryIssues) Cats core: Binary compatibility check failed!
+[error] Total time: 4 s, completed Dec 21, 2019, 2:39:27 PM
+```
+
+So I added a workaround (another trait). If anyone has a better idea I'm open for suggestions :)
+Here's a ready instance one can use:
+
+```scala
+implicit val invariantNumeric: Invariant[Numeric] = new Invariant[Numeric] {
+
+  def imap[A, B](fa: Numeric[A])(f: A => B)(g: B => A): Numeric[B] = new Numeric[B] {
+    def compare(x: B, y: B): Int = fa.compare(g(x), g(y))
+    def plus(x: B, y: B): B = f(fa.plus(g(x), g(y)))
+    def minus(x: B, y: B): B = f(fa.minus(g(x), g(y)))
+    def times(x: B, y: B): B = f(fa.times(g(x), g(y)))
+    def negate(x: B): B = f(fa.negate(g(x)))
+    def fromInt(x: Int): B = f(fa.fromInt(x))
+    def toInt(x: B): Int = fa.toInt(g(x))
+    def toLong(x: B): Long = fa.toLong(g(x))
+    def toFloat(x: B): Float = fa.toFloat(g(x))
+    def toDouble(x: B): Double = fa.toDouble(g(x))
+  }
+}
+```
+
+Feel free to grab it if you have time before I do.
+`NonEmptyMap` is a bit annoying to use due to some inconsistencies:
+- Although it has a `.keys` method like `Map` does, it doesn't have a corresponding `.values` method. There's something similar possible with `.toNonEmptyList` (from `NonEmptyTraverse`), but that's not very discoverable. I suggest we add `def values: NonEmptyList[A] = this.toNonEmptyList`.
+- It has a `.toNel` method that produces a NEL of pairs. This is inconsistent with `.toList` and (which is especially silly) with `.toNonEmptyList`. I suggest we rename `toNel` to `pairs` or something like that.
+It seems like it should be possible for `reduceLeftM` to short-circuit, since e.g. `foldLeftM` does:
+
+```scala
+scala> import cats.data.NonEmptyStream, cats.implicits._
+import cats.data.NonEmptyStream
+import cats.implicits._
+
+scala> def f(i: Int): Either[Int, Int] = if (i < 100000) Right(i) else Left(i)
+f: (i: Int)Either[Int,Int]
+
+scala> val s = NonEmptyStream(0, Stream.from(1))
+s: cats.data.package.NonEmptyStream[Int] = OneAnd(0,Stream(1, ?))
+
+scala> s.foldLeftM(0)((b, a) => f(a).map(_ + b))
+res3: scala.util.Either[Int,Int] = Left(100000)
+
+scala> s.reduceLeftM(f)((b, a) => f(a).map(_ + b)) // hangs forever.
+```
+
+This is probably related to #3200, which isn't itself a bug, but if we had a working `reduceLeftM` we could write `reduceMapM` in terms of it.

@@ -1,0 +1,166 @@
+Previously this was unset, and used the system default
+According to the documentation starting from Java 11 it should be possible to use signatures with PS256 algorithm, but when I try this it gives an error unless BouncyCastle is used. But I though that starting from Java 11 BouncyCastle would just not be necessary anymore.
+Any tips?
+`.signWith(signKey, SignatureAlgorithm.PS256)`
+gives
+`io.jsonwebtoken.security.SignatureException: Unavailable RSA Signature algorithm 'SHA256withRSAandMGF1'. This is not a standard JDK algorithm. Try including BouncyCastle in the runtime classpath.
+`
+Looks like by using PS256 it tries Signature algorithm SHA256withRSAandMGF1 which seems BouncyCastle specific ?
+I added a claim with the Long type value `"code":26469708576325829` but when it is encoded in the class `DefaultJwtBuilder.java` by the method `base64UrlEncode(Object o, String errMsg)` calling `TextCodec.BASE64URL.encode(bytes)`, it returns a token that the value of the claim is `"code": 26469708576325828`. The only last digit is changed!!!
+
+A simple test:
+
+Map<String, Object> publicClaims = new HashMap<>();
+publicClaims.put("code", 26469708576325829L);
+
+ObjectMapper objectMapper = new ObjectMapper();
+byte[] bytes = objectMapper.writeValueAsBytes(publicClaims);
+
+String token = TextCodec.BASE64URL.encode(bytes);
+
+Token response is: `eyJzZXNzaW9uX25hbWUiOiJuYW1lIiwiY29kZSI6MjY0Njk3MDg1NzYzMjU4MjksIm5hbWUiOiJhZG1pbiJ9`
+
+If I decode it with TextCodec, the response is correct, like:
+
+String tokenDecoded = TextCodec.BASE64URL.decodeToString(token);
+
+If I use String type, it is correct in the encode and decode!!! But I would like to use the true type Long.
+**Context**
+We are currently implementing [RFC 8555](https://tools.ietf.org/html/rfc8555) which requires requests authenticated through JWS object payloads.
+It suggests using signed [POST-AS-GET requests with empty JWS bodies](https://tools.ietf.org/html/rfc8555#page-13) for authenticating GET requests. When using jjwt library for the JWS handling we found that empty bodies are disallowed quite explicitly in `DefaultJwtParser` when parsing JWSs.
+
+**Solution**
+We added flag `allowEmptyBody`, alongside JwtParserBuilder fields and methods, to the DefaultJwtParser. This way the empty body check can still be used if required and allowing them is an intentional call.
+
+To successfully parse empty-body JWS objects the parsed payload is accepted in a null-safe way (DefaultJWTParser lines 300 & 324). When proactively checking for and mapping json in line 335 we added a simple empty check for the payload.
+java.util.map cannot be inherited with different type arguments 'String and null'
+
+https://github.com/jwtk/jjwt/blob/master/impl/src/main/java/io/jsonwebtoken/impl/DefaultJwsHeader.java
+
+Error here:
+
+public class DefaultJwsHeader extends DefaultHeader implements JwsHeader {
+
+how to fix this?
+
+Note, without fixing it will return always null
+
+thx
+Simple testcase:
+
+```
+import java.time.LocalDate;
+import java.time.ZoneOffset;
+import java.util.Date;
+
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
+
+import io.jsonwebtoken.CompressionCodecs;
+import io.jsonwebtoken.Jwt;
+import io.jsonwebtoken.Jwts;
+
+public class JjwtDeflateCompatibilityTest {
+
+    @Test
+    public void testJjwt0_10_6() {
+
+        String jwt = Jwts.builder().setIssuer("me").setSubject("user")
+                .setIssuedAt(Date.from(LocalDate.of(2000, 1, 1).atStartOfDay().toInstant(ZoneOffset.UTC)))
+                .setExpiration(Date.from(LocalDate.of(2100, 1, 1).atStartOfDay().toInstant(ZoneOffset.UTC)))
+                .compressWith(CompressionCodecs.DEFLATE).compact();
+
+        Jwt<?, ?> parsed = Jwts.parser().parse(jwt);
+
+        // Same token as above, but created with 0.10.6
+        String jwt0_10_6 = "eyJhbGciOiJub25lIiwiemlwIjoiREVGIn0.eNqqVsosLlayUspNVdJRKi5NAjJLi1OLgJzMxBIlK0sTMzMLEwsDAx2l1IoCJSsTQwMjExOQQC0AAAD__w.";
+        Jwt<?, ?> parsed2 = Jwts.parser().parse(jwt0_10_6);
+
+        Assertions.assertEquals(parsed.toString(), parsed2.toString()); // fails currently
+    }
+}
+```
+
+Fails currently with:
+
+```
+io.jsonwebtoken.CompressionException: Unable to decompress bytes.
+	at io.jsonwebtoken.impl.compression.AbstractCompressionCodec.decompress(AbstractCompressionCodec.java:114)
+	at io.jsonwebtoken.impl.DefaultJwtParser.parse(DefaultJwtParser.java:294)
+...
+Caused by: java.io.EOFException: Unexpected end of ZLIB input stream
+	at java.util.zip.InflaterInputStream.fill(InflaterInputStream.java:240)
+	at java.util.zip.InflaterInputStream.read(InflaterInputStream.java:158)
+	at java.io.FilterInputStream.read(FilterInputStream.java:107)
+	at io.jsonwebtoken.impl.compression.AbstractCompressionCodec.readAndClose(AbstractCompressionCodec.java:51)
+	at io.jsonwebtoken.impl.compression.DeflateCompressionCodec.doDecompress(DeflateCompressionCodec.java:52)
+	at io.jsonwebtoken.impl.compression.AbstractCompressionCodec.decompress(AbstractCompressionCodec.java:112)
+	... 55 more
+```
+    /**
+     * Returns the JWT <a href="https://tools.ietf.org/html/draft-ietf-oauth-json-web-token-25#section-4.1.6">
+     * <code>iat</code></a> (issued at) timestamp or {@code null} if not present.
+     *
+     * <p>If present, this value is the timestamp when the JWT was created.</p>
+     *
+     * @return the JWT {@code nbf} value or {@code null} if not present.
+     */
+    Date getIssuedAt();
+--------------------
+referencing {@code nbf} but should be {@code iat}
+"exp" claim should be number, however jjwt supports parsing the string as a number, and as last fallback parsing string as a ISO_8601 formatted date.
+
+In io.jsonwebtoken.lang.DateFormats 
+there are following patterns
+
+    private static final String ISO_8601_PATTERN = "yyyy-MM-dd'T'HH:mm:ss'Z'";
+
+    private static final String ISO_8601_MILLIS_PATTERN = "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'";
+
+So they are named here as ISO_8601 and if can't parse the exception says it is not ISO_8601 formatted.
+
+    private static Date parseIso8601Date(String s, String name) throws IllegalArgumentException {
+        try {
+            return DateFormats.parseIso8601Date(s);
+        } catch (ParseException e) {
+            String msg = "'" + name + "' value does not appear to be ISO-8601-formatted: " + s;
+            throw new IllegalArgumentException(msg, e);
+        }
+    }
+
+Despite  that ISO_8601 allows you to have the offset
+
+    The offset from UTC is appended to the time in the same way that 'Z' was above, in the form ± 
+     [hh]:[mm], ±[hh][mm], or ±[hh]
+
+https://en.wikipedia.org/wiki/ISO_8601
+
+The patterns from DateFormats will accept only 'Z' value.
+
+Therefore values like 2019-11-26T15:54:13.100-0800 are not accepted, resulting in ParseException->IllegalArgumentException.
+
+Another point is that it throws IllegalArgumentException, which does not inherit from JwtException, not intuitively this may result in non-caught exception.
+
+
+-------------------------
+
+In my understanding the fix would be to change the patterns to following (removing the single quotes around Z letter) :
+
+    private static final String ISO_8601_PATTERN = "yyyy-MM-dd'T'HH:mm:ssZ";
+
+    private static final String ISO_8601_MILLIS_PATTERN = "yyyy-MM-dd'T'HH:mm:ss.SSSZ";
+
+
+and throwing MalformedSpecificationClaimException extends JwtException instead of IllegalArgumentException.
+
+
+
+Due to old implementations (before JJWT was modularized), the `io.jsonwebtoken.lang` package in the `api` module contains a lot of classes and methods that aren't needed by JJWT users.
+
+For 1.0, as many of these classes and methods as possible should be moved to the `impl` module since they're almost exclusively used by JJWT implementation classes.
+
+Note that anything used by any of the extensions or in the `api` module itself would need to remain in the `api` module.  But this number should be relatively minor.
+
+If this opens a can of worms, we can leave these classes alone, but per the open-closed principle, it'd be best to not expose anything that's not absolutely critical for using the `api`.
+
+Setting for the 1.0 milestone as semver dictates this can't be done without incrementing the major version number.

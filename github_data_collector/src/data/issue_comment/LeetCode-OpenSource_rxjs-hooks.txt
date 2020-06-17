@@ -1,0 +1,306 @@
+See `useRx` and `useRxTap` [here](https://medium.com/@dmitrydoronin/react-spa-with-rxjs-hooks-dbc250fcd030)
+
+```ts
+import { useEffect, useState } from "react";
+import { Observable, Subscription } from "rxjs";
+import { tap } from 'rxjs/operators';
+
+/**
+ * Reactive Hook that returns a tuple of resolved value and error.
+ * @param { Observable<T> } observable$
+ * @param { T } defaultValue
+ */
+export function useRx<T>(
+  observable$: Observable<T>,
+  defaultValue: T | (() => T)
+): [T, any?] {
+  const [x, setX] = useState(defaultValue);
+  const [error, setError] = useState();
+
+  let subscription: Subscription;
+  useEffect(() => {
+    if (!subscription) {
+      subscription = observable$.subscribe(setX, setError);
+    }
+    return () => subscription.unsubscribe();
+  }, [observable$]);
+
+  return [x, error];
+}
+
+/**
+ * Reactive Hook that triggers callbacks on observable updates.
+ * @param { Observable<T> } observable$
+ * @param { T } defaultValue
+ */
+export function useRxTap<T>(
+  observable$: Observable<T>,
+  next?: (x: T) => void, 
+  error?: (e: any) => void, 
+  complete?: () => void
+): void {
+  let subscription: Subscription;
+  useEffect(() => {
+    if (!subscription) {
+      subscription = observable$.pipe(tap(next, error, complete)).subscribe();
+    }
+    return () => subscription.unsubscribe();
+  }, [observable$]);
+}
+```
+
+Example usage:
+
+```ts
+export default function History({ last5$ }) {
+    ...
+    const [items, error] = useRx(last5$, []);
+    return (
+        <ul>
+            {items.map(item => (
+                <li key={item.id}>{item.id}</li>
+             ))}
+       </ul>
+   );
+}
+```
+
+Also related to #2 
+
+When passing in many inputs, it's awkward to remember the indexes inside the input tuple when you're trying to read/destructure a specific input, e.g:
+
+```ts
+useObservable(
+  input$ => {
+    const dispatch$ = input$.pipe(
+      map(input => input[5]),
+      distinctUntilChanged(),
+    );
+
+    /* … */
+  },
+  200,
+  [
+    props.shouldDisableInfiniteScroll,
+    props.isDoneFetching,
+    props.fetchDataParams,
+    props.fetchDataAndBuildActions,
+    props.dispatch,
+    props.history,
+  ],
+);
+```
+
+If the inputs were represented as an object instead, they would be much easier to destructure.
+
+```ts
+useObservable(
+  input$ => {
+    const dispatch$ = input$.pipe(
+      map(({ dispatch }) => dispatch),
+      distinctUntilChanged(),
+    );
+
+    /* … */
+  },
+  200,
+  pick(
+    props,
+    "shouldDisableInfiniteScroll",
+    "isDoneFetching",
+    "fetchDataParams",
+    "fetchDataAndBuildActions",
+    "dispatch",
+    "history",
+  ),
+);
+```
+Sometimes we want to use an observable not to create state but rather just to perform side effects.
+
+This is possible using `useObservable`:
+
+```ts
+import React from 'react';
+import { EMPTY } from 'rxjs';
+import { useObservable } from 'rxjs-hooks';
+import { map, mergeMapTo, tap } from 'rxjs/operators';
+
+declare const sideEffect: (number: number) => void;
+
+const MyComponent: React.FC<{ foo: number }> = props => {
+  useObservable(
+    input$ =>
+      input$.pipe(
+        map(([foo]) => foo),
+        tap(sideEffect),
+        mergeMapTo(EMPTY),
+      ),
+    props.foo,
+    [props.foo],
+  );
+
+  return <div>Hello, World!</div>;
+};
+```
+
+… but it's a bit awkward for a few reasons:
+
+- We are forced to return an `Observable` of a certain type (`State`), when the type doesn't matter to us, since the result is not being used outside of the hook. We need to do `mergeMapTo(EMPTY)` at the end of the chain, to satisfy the return type.
+- We are forced to provide an initial state, but again we are not using `State` here.
+
+What do you think about another hook which is specifically designed for this use case, to avoid the problems above?
+
+```ts
+useObservableSideEffect(
+  input$ =>
+    input$.pipe(
+      map(([foo]) => foo),
+      tap(sideEffect),
+    ),
+  [props.foo],
+);
+```
+
+I'm sure we can find a better name… 😄 
+Opening mainly to see if this is a good idea or now! Happy to clean up the API/examples if it is.
+
+Basically I needed a way to restart the observable on dependency changes. I've added another argument to `userObservable` which allows you to set the dependencies of `useEffect`. Let me know what you think!
+
+```tsx
+import React from 'react'
+import ReactDOM from 'react-dom'
+import { useObservable } from 'rxjs-hooks'
+import { from } from 'rxjs'
+import { map, take } from 'rxjs/operators'
+function App(props: { foo: number }) {
+  const value = useObservable(() => from([1, 2, 3, 4]).pipe(
+    map(val => val + props.foo)
+  ), 200, [props.foo])
+  return (
+    // render four times
+    // 2, 4, 5, 6
+    <h1>{value}</h1>
+  )
+}
+ReactDOM.render(<App foo={1} />, document.querySelector('#app'))
+ReactDOM.render(<App foo={2} />, document.querySelector('#app'))
+```
+useObservable is never use in useEffect, but i wanna calc the dom size without some event 
+Hi, thank you for the inspiration and make this awesome libs. I have the following RFC proposed:
+
+## Suggestion
+Remove the overlapping of state management in `useEventCallback`, as we have `useObservable`, `useState`, and `useReducer` already, making this hook just purely for the async event management. This hook is best to be treated as an adaptor to convert DOMEvent to DOMEvent stream.
+
+## Why
+After using it for a while, I always think `useEventCallback` is not so intuitive to use.  It accepts up to 3 arguments: `callback`, `initialState`, and `inputs`. Why we need this `initialState` if we want to introduce prop dependencies? At the current implementation, what this hook would returns is not just a memorized event handler as a callback, but a tuple of handler + the observed state, which makes me feel this hook is doing too much, IMHO.
+
+Ideally, what I have in mind is to have a similar interface as in the the native `useCallback`. But what can make this hook so useful is to convert the event object to an observable. Then we can manage DOMEvent as a stream easily.
+
+If we need to performance side effects, like to update state, we should use `tap` operator instead. For example:
+
+```js
+const deps = /* some dependencies, could be state, or props */
+const [state, setState] = useState();
+
+const onClick = useEventCallback(
+  (event$, deps$) => event$.pipe(
+    filter((e) => e.type === 'click'),
+    map(({ target }) => target.value),
+    tap((v) => setState(v))    // * re-render explicitly requested by the user.
+    withLatestFrom(deps$),
+    /* do something with dependencies */
+  ),
+  [deps] // optional
+)
+```
+
+The `deps` would be any props or local state dependencies that is reactively emitted and passed as the second props to the callback. And we can think this like an epic in `redux-observable`. This way we decouple the state management part out of this hook. And this hook is never going to trigger re-render by itself, it will have to be introduced by the user.
+
+## Implementation
+
+Here is the suggested implementation:
+
+```ts
+const createEvent$ = <T>() => {
+  return new Subject<T>();
+};
+
+const createDeps$ = <D extends unknown[]>(deps: D) => {
+  return deps.length ? new BehaviorSubject(deps) : undefined;
+};
+
+export const useEventCallback = <E = any, D extends unknown[] = never>(
+  callback: (event$: Observable<E>, deps$: Observable<D>) => Observable<unknown>,
+  deps: D = [] as never
+) => {
+  const event$ = useMemo(() => createEvent$<E>(), []);
+  const deps$ = useMemo(() => createDeps$<D>(deps), []);
+
+  useEffect(() => {
+    const subscriber = callback(event$, deps$ as Observable<D>).subscribe();
+
+    return () => {
+      subscriber.unsubscribe();
+      event$.complete();
+
+      if (deps$) {
+        deps$.complete();
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (deps$) {
+      deps$.next(deps);
+    }
+  }, deps);
+
+  return useCallback((e: E) => event$.next(e), []);
+};
+```
+
+And perhaps, it should be called as `useEvent$Callback` to make it more obvious what this hook is doing.
+Hi, thank you for creating this amazing library!
+
+I've noticed there are some performance improvements can be done by using `useMemo` in `useEventCallback` hook.  The change basically leverage the lazy evaluations and reduce new object creations at run-time.
+
+Thank you!
+I was trying write something like
+
+```typescript
+const [callback, flag] = useEventCallback<
+  React.MouseEvent<HTMLElement> | boolean,
+  boolean
+>($events => $events.pipe(mapTo(false)), false)
+
+callback(true)
+```
+
+And there was type error.
+
+```
+Argument of type 'true' is not assignable to parameter of type 'false & true & MouseEvent<HTMLElement, MouseEvent>'.
+  Type 'true' is not assignable to type 'false'.ts(2345)
+```
+
+Checking the source
+
+https://github.com/LeetCode-OpenSource/rxjs-hooks/blob/2b781f12d0c54a079cca9e419153e50e0388fcb0/src/use-event-callback.ts#L6
+
+It seems like for example
+
+```typescript
+type Callback = VoidableEventCallback<string | boolean>
+```
+
+will be resolved as
+
+```typescript
+type Callback = ((e: string) => void) | ((e: false) => void) | ((e: true) => void)
+```
+
+which means `e` has to be `string & boolean`. Is this a bug or am I missing something here?
+
+Currently Subject state$ and input$ are always created. How about checking the `length` of the callback argument and only create the Subjects that are used by the callback.
+
+One caveat of this approach is the `length` check does not recognize spread arguments and the use of `arguments` object. But I think it is rare to use callback this way.

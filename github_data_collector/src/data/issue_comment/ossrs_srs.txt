@@ -1,0 +1,195 @@
+**描述(Description)**
+
+> 描述你遇到了什么问题(Please description your issue here)
+
+1. SRS版本(Version): `xxxxxx`
+1. SRS的日志如下(Log):
+```
+xxxxxxxxxxxx
+```
+
+**重现(Replay)**
+
+> 重现Bug的步骤(How to replay bug?)
+
+1. `xxxxxx`
+1. `xxxxxx`
+1. `xxxxxx`
+
+**期望行为(Expect)**
+
+> 描述你期望发生的事情(Please describe your expectation)
+
+为了简单处理，SRS并不会在停止推流时清理内存对象，因为流可能会重推。如果需要清理，会导致需要非常复杂和小心的处理Source对象，不利于问题的简化。
+
+不清理Source对象，会造成内存的持续上涨，对于一般推流少播放多的场景可能问题不明显，对于推流很多比如监控和会议场景，那么流的清理就变成了非常必要的事情。参考：
+
+1. #1568 由Nobody2提交的Source清理的PR，讨论了需要清理的各种场景。当然Nobody2提交的PR做得很好，这个问题本身过于复杂。
+1. #1509 #1271 #1507  线上报的由于Source没有清理导致内存泄漏和OOM。
+
+目前已经做了部分优化，缓解了这个问题：
+
+* 解决coroutine问题：https://github.com/ossrs/srs/commit/857c783efcf42bb11a9cb9e90f395f6b1dca5796
+* 降低source内存使用：https://github.com/ossrs/srs/commit/7240fe304092a91c97bc36fb3f0c1d34f41f506c
+
+同时还在思考最稳定和容易的解决方案。有另外一个思路，让SRS支持平滑退出和平滑升级，大致是：
+
+1. 关闭PID文件的独占，允许启动新的SRS。
+1. 使用REUSEPORT开启一个新的SRS，新老SRS同时提供服务，使用同一个PID文件。
+1. 老的SRS不再接收新的连接，关闭API端口。服务完现有客户端后，或者一定时间比如12小时后，老SRS退出。
+
+这样老的SRS可以简单，安全的释放创建的Sources，以及潜在的其他内存问题。用户可以根据自己的业务情况，在业务低峰期定时的平滑升级和退出SRS，这对用户的影响也最小。
+
+唯一的问题就在于：新老SRS提供服务时，API是由新的SRS提供，这时候系统人数是不准确的，老SRS在服务的人数会被漏掉。
+
+> Remark: 如果是源站集群，流是在老的SRS上，会导致无法发现流，这种情况需要强制断开推流；客户端需要支持重试才能平滑支持，可以在源站之前放一个Edge，这样用Edge重试的方式来支持。
+场景：  有2个摄像机照着同一个地方，使用ffmpeg推流到srs，时间长了以后，两个流的视频会不同步 ，这个要怎么解决
+**需求场景：**
+
+用户推流上来后后转码成多种分辨率，只需要对指定的一种分辨率或几种分辨率进行录制和切片，比如超高清的分辨率并不需要切片，低分辨率的也不需要录制，只要录制一个高分辨率或者只转码编码的流，目前如果是直接在 origin 中进行录制和切片就会按照转码相关的配置完整的录制和切片所有分辨率，不符合需求，而如果 forward 出去到另一台机器，那这个 forward 出去的也是完整的所有分辨率的流，没有找到单独 forward 某种分辨率的流，即 forward 无法在 transcode 的 engine 作用域下工作的方式。
+
+目前我有一个粗暴的办法：多转一路，输出到其他专门只开启录制的 srs 中去，这样只会录制到我想要的分辨率，切片同理。
+
+```
+    transcode {
+        enabled     on;
+        ffmpeg      ./objs/ffmpeg/bin/ffmpeg;
+
+
+        engine 720p {
+            enabled         on;
+            vfilter {
+                v           quiet;
+            }
+            vcodec          libx264;
+            vbitrate        2000;
+            vfps            25;
+            vwidth          1280;
+            vheight         720;
+            vthreads        12;
+            vprofile        main;
+            vpreset         ultrafast;
+            vparams {
+            }
+            acodec          libfdk_aac;
+            aparams {
+            }
+            output          rtmp://127.0.0.1:[port]/[app]?vhost=[vhost]/[stream]_[engine];
+        }
+
+        engine 720p_dvr {
+            enabled         on;
+            vfilter {
+                v           quiet;
+            }
+            vcodec          libx264;
+            vbitrate        2000;
+            vfps            25;
+            vwidth          1280;
+            vheight         720;
+            vthreads        12;
+            vprofile        main;
+            vpreset         ultrafast;
+            vparams {
+            }
+            acodec          libfdk_aac;
+            aparams {
+            }
+            output          rtmp://10.16.0.4:1937/[app]?vhost=[vhost]/[stream]_[engine];
+        }
+    }
+```
+
+这样的方式应该是重复浪费 CPU 去多切一份，而且在集群中不知道还会不会造成影响，不知道正确的姿势应该是什么样的。
+
+**期望：**
+
+* 录制和切片能够配置成对指定的 engine 开启
+* forward 能够转发指定的 engine 流
+* 录制或切片有相关的 callback api 去由业务端来返回开启关闭哪个，但这样可能会导致 srs 变成有状态的了
+
+以上实现一种就可以实现需求了，如果是现在尚不支持，要看看有什么样的方案去实现更好，或者说是否现在已经有方法可以实现只是我没理解到希望有人指出。
+
+学习下Nginx在哪些地方做得比SRS好，值得学习的地方。
+运行环境
+1.运行环境是 docker run -p 1935:1935 -p 1985:1985 -p 8080:8080 ossrs/srs:2
+2.使用ffmpeg推流,ffmpeg -i rtsp://admin:admin@192.168.1.94:554/Streaming/Channels/101  -c copy -f flv rtmp://localhost/live/s1
+出现问题
+1.刚开始可以正常推流,但过一段时间推流就自动断了.
+  Metadata:
+    title           : HIK Media Server V3.4.104
+    comment         : HIK Media Server Session Description : standard
+  Duration: N/A, start: 0.320000, bitrate: N/A
+    Stream #0:0: Video: h264 (High), yuvj420p(pc, bt709, progressive), 1920x1200, 25 fps, 25 tbr, 90k tbn, 50 tbc
+Output #0, flv, to 'rtmp://localhost/live/s1':
+  Metadata:
+    title           : HIK Media Server V3.4.104
+    comment         : HIK Media Server Session Description : standard
+    encoder         : Lavf58.35.101
+    Stream #0:0: Video: h264 (High) ([7][0][0][0] / 0x0007), yuvj420p(pc, bt709, progressive), 1920x1200, q=2-31, 25 fps, 25 tbr, 1k tbn, 90k tbc
+Stream mapping:
+  Stream #0:0 -> #0:0 (copy)
+Press [q] to stop, [?] for help
+[rtsp @ 0000014654f699c0] max delay reached. need to consume packet
+[rtsp @ 0000014654f699c0] RTP: missed 15 packets
+av_interleaved_write_frame(): Unknown errortime=00:00:39.60 bitrate=4113.9kbits/s speed=1.03x
+[flv @ 000001465501d880] Failed to update header with correct duration.
+[flv @ 000001465501d880] Failed to update header with correct filesize.
+Error writing trailer of rtmp://localhost/live/s1: Error number -10053 occurred
+frame= 1007 fps= 25 q=-1.0 Lsize=   20191kB time=00:00:40.04 bitrate=4130.9kbits/s speed=   1x
+video:20189kB audio:0kB subtitle:0kB other streams:0kB global headers:0kB muxing overhead: 0.012997%
+Conversion failed!
+get http://localhost:1985/api/v1/streams
+结果：{"code":0,"server":49635,"streams":[{"id":49640,"name":"livestream","vhost":49636,"app":"HDxzzKjQGWT0TYKc9jsgiJNBhg41gzXuUVOtoR62yU0rl4pavDHwMQAGYhixSIJRajUBWaffDx3MDGq9wN8QQEtN19GCpUHjRSWrznSn4GPk5cm64jte6kNT8b4Ia0Zo/live","live_ms":1578883698442,"clients":1,"frames":25177,"send_bytes":3984,"recv_bytes":147834247,"kbps":{"recv_30s":1073,"send_30s":0},"publish":{"active":true,"cid":-38},"video":{"codec":"H264","profile":"High","level":"3.1","width":1296,"height":512},"audio":{"codec":"AAC","sample_rate":44100,"channel":2,"profile":"LC"}}]}
+
+delete http://localhost:1985/api/v1/clients/-38
+结果：{"code":2049}
+单台电脑上测试
+
+I want to know if there is a fast way to password protect a stream.
+
+Thank you.
+Regards.
+srs2.0 录像怎么配置？
+
+srs.conf文件配置如下：
+
+vhost __defaultVhost__ {
+	dvr {
+        enabled             on;
+        dvr_path            ./objs/nginx/html/[app]/[stream]/[2006]/[01]/[02]/[15].[04].[05].[999].flv;
+        dvr_plan            session;
+        dvr_duration        30;
+        dvr_wait_keyframe   on;
+    }
+	http_remux {
+		enabled     on;
+		mount [vhost]/[app]/[stream].flv;
+		hstrs	on;
+	}
+	
+	http_hooks {
+        enabled         on;
+        on_dvr          http://127.0.0.1:8085/api/v1/dvrs;
+    }
+}
+
+编译：
+./configure --with-dvr && make
+
+./objs/srs -c conf/srs.conf
+
+没有产生flv 文件，请教各位大神，望指点！谢谢
+
+为了使各个srs边缘切出来的ts保持一致，我尝试开启了atc。会出现以下异常。关闭atc则正常。
+1、vlc播放会出现画面，但是会卡好半天，然后才开始正常播放。是必现的，请问这个是正常的吗
+2、如果推流的音频格式为mp3，则有概率出现ffmpeg拉流失败。 并且无论是否成功，都会报错：
+报错来自这个函数 avformat_find_stream_info(ifmt_ctx, NULL);
+
+ Could not find codec parameters for stream 2 (Audio: aac, 44100 Hz, stereo, 128 kb/s): unspecified sample format
+Consider increasing the value for the 'analyzeduration' and 'probesize' options
+
+
+1. SRS版本(Version): 2和3都试过了
+1. SRS的日志如下(Log): 推拉流都没有报错
+

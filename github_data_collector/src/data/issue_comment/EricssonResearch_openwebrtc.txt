@@ -1,0 +1,707 @@
+Hi,
+I tried connecting to the demo.openwebrtc webpage using test_client.c but it doesn't work (it says "Failed to connect to the server").
+So I literally haven't a single working sample code for reference and for helping me out with developing my openwebrtc application (I'm trying to build a simple sender/receiver application on linux).
+Can someone help me?
+Hello,
+I'm trying to build a simple sender and receiver using c language and your openwebrtc libraries. 
+The sender and the receiver exchanges candidates correctly and my video session goes into "ready" state, but my stream won't start. Or at least, i see nothing on `the` screen where the receiver is running. It seems that no fatal errors occurs judging from libnice-debug output and from bus messages sent by transport_agent and media_session. Can someone help me?
+
+Here is the sender.c code:
+`
+```
+int write_code(int sock, guint code){
+	char *conv = (char *)&code;
+	int len = sizeof(guint);
+
+	return write(sock, conv, len);
+}
+
+
+void exchange_candidates(OwrSession *session){
+	int sock, ret;
+	gint code;
+	struct sockaddr_in receiver;
+	gchar *address, *baseAddress, *foundation, *password, *ufrag, *msg;
+	guint basePort, port, priority, compType, transportType, type;
+	GList *candidates, *elem;
+
+	// Create client socket for signaling
+	sock = socket(PF_INET, SOCK_STREAM, 0);
+	if (sock < 0){
+		printf("Error in creating socket: [%d]:[%s]", errno, strerror(errno));
+		return;
+	}
+	receiver.sin_family = AF_INET;
+	receiver.sin_port = htons(RCV_SOCK_PORT);
+	receiver.sin_addr.s_addr = inet_addr(remote_addr);
+
+	if (connect(sock, (struct sockaddr *) &receiver, sizeof(struct sockaddr_in)) < 0 ){
+		g_warning("Error while trying to connect to receiver: [%d]:[%s]", errno, strerror(errno));
+		return;
+	}
+	msg = malloc(sizeof(char) * MSG_MAX_LEN);
+
+	// Wait until receiver has accepted our connection
+	if (read(sock, &code, sizeof(guint)) < 0){
+		g_warning("Error while reading from socket: [%d]:[%s]", errno, strerror(errno));
+		return;
+	}
+
+	if (code != ACCEPTED){
+		printf("Socket: Wrong message sequence!\n");
+		return;
+	}
+
+	printf("Connection accepted\n");
+	ret = 1;
+	candidates = g_object_steal_data(G_OBJECT(session), "local-candidates");
+	for (elem = candidates; elem; elem = elem->next){
+		int len;
+		OwrCandidate *cand = elem->data;
+		print_candidate_info(cand, "CAND:\n");
+		g_object_get(G_OBJECT(cand), "address", &address, "base-address", &baseAddress,
+				"base-port", &basePort, "component-type", &compType, "foundation", &foundation,
+				"password", &password, "port", &port, "priority", &priority, "transport-type", &transportType,
+				"type", &type, "ufrag", &ufrag, NULL);
+		// using write/gets functions, so need to be careful about buffers size
+		/** every candidate information message begin with a number indicating in wich field we want to store
+		 * the value that follows. when reading, we proceed to the next candidate when we encounter the
+		 * "END" value integer. if a field is a string, we first send the buffer size, then the string.
+		 *
+		 * here we duplicate some code for the purpose of a more readable one.
+		 * if at least one of the reads returns -1 (error), ret will be 0.
+		 * Send Component type and CandidateType because they are needed to initialize the candidate
+		 **/
+
+		ret = ret * 1+write_code(sock, COMPONENT_TYPE);
+		ret = ret * 1+write_code(sock, compType);
+
+		ret = ret * 1+write_code(sock, TYPE);
+		ret = ret * 1+write_code(sock, type);
+
+		ret = ret * 1+write_code(sock, ADDRESS);
+		len = strlen(address) * sizeof(char) + 1;
+		ret = ret * 1+write_code(sock, len);
+		ret = ret * 1+write(sock, address, len);
+
+		ret = ret * 1+write_code(sock, BASE_ADDRESS);
+		len = strlen(baseAddress) * sizeof(char) + 1;
+		ret = ret * 1+write_code(sock, len);
+		ret = ret * 1+write(sock, baseAddress, len);
+
+		ret = ret * 1+write_code(sock, BASE_PORT);
+		ret = ret * 1+write(sock, &basePort, sizeof(guint));
+
+		ret = ret * 1+write_code(sock, FOUNDATION);
+		len = strlen(foundation) * sizeof(char) + 1;
+		ret = ret * 1+write_code(sock, len);
+		ret = ret * 1+write(sock, foundation, len);
+
+		ret = ret * 1+write_code(sock, PASSWORD);
+		len = strlen(password) * sizeof(char) + 1;
+		ret = ret * 1+write_code(sock, len);
+		ret = ret * 1+write(sock, password, len);
+
+		ret = ret * 1+write_code(sock, PORT);
+		ret = ret * 1+write_code(sock, port);
+
+		ret = ret * 1+write_code(sock, PRIORITY);
+		ret = ret * 1+write_code(sock, priority);
+
+		ret = ret * 1+write_code(sock, TRANSPORT_TYPE);
+		ret = ret * 1+write_code(sock, transportType);
+
+		ret = ret * 1+write_code(sock, UFRAG);
+		len = strlen(ufrag) * sizeof(char) + 1;
+		ret = ret * 1+write_code(sock, len);
+		ret = ret * 1+write(sock, ufrag, len);
+
+		ret = ret * 1+write_code(sock, END);
+
+	}
+	ret = ret * 1+write_code(sock, END_OF_CANDIDATES);
+	printf("End of candidates\n");
+
+	if (ret <= 0){
+		printf("Error while writing on socket: [%d]:[%s]", errno, strerror(errno));
+		return;
+	}
+
+	ret = 1;
+	// Read receiver's candidates
+	ret = ret * 1+read(sock, &code, sizeof(guint));
+
+	while(code != END_OF_CANDIDATES){
+		// initialize candidate with default values. eventually those values will be replaced
+		OwrCandidate *cand = NULL;
+		guint len;
+		gboolean hasCT = FALSE, hasT = FALSE;
+		OwrCandidateType t;
+		OwrComponentType ct;
+		OwrTransportType tt;
+
+
+		// wait until we have component_type and candidate_type for initializing candidate.
+		while (!cand){
+			if (code == COMPONENT_TYPE){
+				ret = ret * 1+read(sock, &compType, sizeof(guint));
+				ct = compType;
+				hasCT = TRUE;
+			}
+			if (code == TYPE){
+				ret = ret * 1+read(sock, &type, sizeof(guint));
+				t = type;
+				hasT = TRUE;
+			}
+			if (hasCT & hasT)
+				cand = owr_candidate_new(t, ct);
+			// read next code
+			ret = ret * 1+read(sock, &code, sizeof(guint));
+		}
+
+		while (code != END){
+			switch (code){
+			case ADDRESS:
+				ret = ret * 1+read(sock, &len, sizeof(guint));
+				ret = ret * 1+read(sock, address, len);
+				g_object_set(cand, "address", address, NULL);
+				break;
+			case BASE_ADDRESS:
+				ret = ret * 1+read(sock, &len, sizeof(guint));
+				ret = ret * 1+read(sock, baseAddress, len);
+				g_object_set(cand, "base-address", baseAddress, NULL);
+				break;
+			case BASE_PORT:
+				ret = ret * 1+read(sock, &basePort, sizeof(guint));
+				g_object_set(cand, "base-port", basePort, NULL);
+				break;
+			case FOUNDATION:
+				ret = ret * 1+read(sock, &len, sizeof(guint));
+				ret = ret * 1+read(sock, foundation, len);
+				g_object_set(cand, "foundation", foundation, NULL);
+				break;
+			case PASSWORD:
+				ret = ret * 1+read(sock, &len, sizeof(guint));
+				ret = ret * 1+read(sock, password, len);
+				g_object_set(cand, "password", password, NULL);
+				break;
+			case PORT:
+				ret = ret * 1+read(sock, &port, sizeof(guint));
+				g_object_set(cand, "port", port, NULL);
+				break;
+			case PRIORITY:
+				ret = ret * 1+read(sock, &priority, sizeof(guint));
+				g_object_set(cand, "priority", priority, NULL);
+				break;
+			case TRANSPORT_TYPE:
+				ret = ret * 1+read(sock, &transportType, sizeof(guint));
+				tt = transportType;
+				g_object_set(cand, "transport-type", tt, NULL);
+				break;
+			case UFRAG:
+				ret = ret * 1+read(sock, &len, sizeof(guint));
+				ret = ret * 1+read(sock, ufrag, len);
+				g_object_set(cand, "ufrag", ufrag, NULL);
+				break;
+			}
+			// read next code
+			ret = ret * 1+read(sock, &code, sizeof(guint));
+		}// End when code == END
+		owr_session_add_remote_candidate(session, cand);
+		print_candidate_info(cand, "RECEIVED CANDIDATE:\n");
+		// read code of the next candidate (or end of stream)
+		ret = ret * 1+read(sock, &code, sizeof(guint));
+	}// End when code == END_OF_CANDIDATES
+	if (ret <= 0){
+		printf("Error while writing on socket: [%d]:[%s]", errno, strerror(errno));
+		return;
+	}
+	printf("All candidates received successfully\n");
+	// TODO: rendere un po' piu' "guardabile" il modo in cui si gestiscono gli errori tramite la variabile ret
+
+	close(sock);
+	free(msg);
+
+	return;
+}
+
+
+
+static void got_candidate(OwrMediaSession *sessionA, OwrCandidate *candidate, gpointer data){
+	GList *localCandidates;
+
+	//print_candidate_info(candidate, "Got candidate");
+	//force_candidate_port(candidate);
+	localCandidates = g_object_get_data(G_OBJECT(sessionA), "local-candidates");
+	localCandidates = g_list_append(localCandidates, candidate);
+	g_object_set_data(G_OBJECT(sessionA), "local-candidates", localCandidates);
+}
+
+
+static void gathering_done(OwrSession *session, gpointer data){
+
+	g_object_set_data(G_OBJECT(session), "gathering-done", GUINT_TO_POINTER(1));
+	exchange_candidates(session);
+}
+
+
+
+void print_source_info(OwrMediaSource *src){
+	OwrMediaType mediaType;
+	gchar *name = NULL;
+	OwrSourceType sourceType;
+
+	g_object_get(src, "name", &name, "type", &sourceType, "media-type", &mediaType, NULL);
+
+	g_print("[%s/%s] %s\n", mediaType == OWR_MEDIA_TYPE_AUDIO ? "audio" : "video",
+		sourceType == OWR_SOURCE_TYPE_CAPTURE ? "capture" : sourceType == OWR_SOURCE_TYPE_TEST ? "test" : "unknown",
+		name);
+}
+
+/**
+void force_candidates(OwrSession *mediaSession){
+
+	GList *candidates;
+	OwrCandidate *remote_rtp, *remote_rtcp;
+
+	// Setting up RTP and RTCP candidates
+	remote_rtp = owr_candidate_new(OWR_CANDIDATE_TYPE_HOST, OWR_COMPONENT_TYPE_RTP);
+	g_object_set(remote_rtp, "address", remote_addr, "password", stun_pass,
+			"port", RCV_PORT_RTP, "ufrag", remote_addr, NULL);
+	remote_rtcp = owr_candidate_new(OWR_CANDIDATE_TYPE_HOST, OWR_COMPONENT_TYPE_RTCP);
+	g_object_set(remote_rtcp, "address", remote_addr, "password", stun_pass,
+			"port", RCV_PORT_RTCP, "ufrag", remote_addr, NULL);
+
+	owr_session_add_remote_candidate(mediaSession, remote_rtp);
+	owr_session_add_remote_candidate(mediaSession, remote_rtcp);
+
+	// Forcing candidates pairs
+	for (candidates = g_object_get_data(G_OBJECT(mediaSession), "local-candidates"); candidates;
+			candidates = g_list_next(candidates)){
+		OwrCandidate *localCnd = candidates->data, *remoteCnd;
+		OwrComponentType ctype;
+		guint port = 0, rport = 0;
+		gchar *r_addr;
+
+		g_object_get(localCnd, "port", &port, "component-type", &ctype, NULL);
+
+		// +++++ printing pairing info
+		if (ctype == OWR_COMPONENT_TYPE_RTP) type = "RTP";
+		else if (ctype == OWR_COMPONENT_TYPE_RTCP) type = "RTCP";
+		else type = "Unknown";
+		g_object_get(G_OBJECT(localCnd), "address", &l_addr, NULL);
+		g_object_get(G_OBJECT(remote_rtp), "address", &r_addr, "port", &rport, NULL);
+		g_object_get(G_OBJECT(remote_rtcp), "address", &r_addrc, "port", &rcport, NULL);
+		printf("trying to pair:\nlocal %s = %s:%d\nremoteRTP= %s:%d\nremoteRTCP= %s:%d\n\n",
+				type, l_addr, port, r_addr, rport, r_addrc, rcport);
+		// ----- finished printing pairing info
+
+
+		if (port == SEND_PORT_RTP && ctype == OWR_COMPONENT_TYPE_RTP)
+			remoteCnd = remote_rtp;
+		else if (port == SEND_PORT_RTCP && ctype == OWR_COMPONENT_TYPE_RTCP)
+			remoteCnd = remote_rtcp;
+		else continue; //TODO: trovare il modo di fare a meno di questo continue
+
+
+		g_object_get(G_OBJECT(remoteCnd), "address", &r_addr, "port", &rport, NULL);
+
+		owr_session_force_candidate_pair(mediaSession, ctype, localCnd, remoteCnd);
+
+	}
+}
+**/
+
+
+static void got_sources(GList *sourcesList, gpointer data){
+	OwrMediaSource *src;
+	OwrVideoRenderer *renderer;
+	gboolean haveVideo = FALSE;
+
+	g_assert(sourcesList);
+
+	while (sourcesList && (src = sourcesList->data)){
+		OwrMediaType mediaType;
+
+		g_assert(OWR_IS_MEDIA_SOURCE(src));
+
+		print_source_info(src);
+
+		g_object_get(src, "media-type", &mediaType, NULL);
+
+		if (!haveVideo && mediaType == OWR_MEDIA_TYPE_VIDEO){
+
+			haveVideo = TRUE;
+
+			// preparing the payload for sending
+			pl = owr_video_payload_new(codec_type, 103, 8000, TRUE, FALSE);
+
+			g_object_set(pl, "width", WIDTH, "height", HEIGHT, "framerate", FRATE, NULL);
+
+			// Setting up session and transport agent
+			owr_media_session_set_send_payload(videoSession, pl);
+			owr_media_session_set_send_source(videoSession, src);
+			//owr_transport_agent_add_session(sendingAgent, OWR_SESSION(videoSession));
+
+			// show in self view
+
+			renderer = owr_video_renderer_new(NULL);
+			g_assert(renderer);
+			g_object_set(renderer, "width", WIDTH, "height", HEIGHT, "max-framerate", FRATE, NULL);
+			owr_media_renderer_set_source(OWR_MEDIA_RENDERER(renderer), src);
+
+			//videoRenderer = OWR_MEDIA_RENDERER(renderer);
+
+
+
+			// If a reference to the video source is needed,uncomment this(and declare variable videoSource)
+			//videoSource = g_object_ref(src);
+		}
+
+		sourcesList = sourcesList->next;
+	}
+
+}
+
+
+int main(int argc, char **argv){
+	GList *sessionList;
+
+	owr_init(NULL);
+
+	// creating the bus for message handling (not used for now)
+	bus = owr_bus_new();
+	owr_bus_set_message_callback(bus, (OwrBusMessageCallback)bus_message_cb, translate_message_origin, NULL);
+
+	// Setting up Sending Transport Agent
+	sendingAgent = owr_transport_agent_new(TRUE);
+	g_assert(OWR_IS_TRANSPORT_AGENT(sendingAgent));
+	//owr_transport_agent_set_local_port_range(sendingAgent, PORT_MIN, PORT_MAX);
+	owr_transport_agent_add_local_address(sendingAgent, local_addr);
+	owr_transport_agent_add_helper_server(sendingAgent, OWR_HELPER_SERVER_TYPE_STUN,
+		                stunServer, stunPort, NULL, NULL);
+	//Uncomment if you want a TURN server as well
+	owr_transport_agent_add_helper_server(sendingAgent, OWR_HELPER_SERVER_TYPE_TURN_UDP,
+			"192.158.29.39", 3478, "28224511:1379330808", "JZEOEt2V3Qb0y27GRntt2u2PAYA=");
+
+	// Creating video session
+	videoSession = owr_media_session_new(USE_DTLS);
+	sessionList = g_object_get_data(G_OBJECT(videoSession), "media-sessions");
+	sessionList = g_list_append(sessionList, videoSession);
+	g_object_set_data(G_OBJECT(videoSession), "media-sessions", sessionList);
+	owr_transport_agent_add_session(sendingAgent, OWR_SESSION(videoSession));
+	//force_candidates();
+
+
+	// adding message origins to bus
+	owr_bus_add_message_origin(bus, OWR_MESSAGE_ORIGIN(sendingAgent));
+	owr_bus_add_message_origin(bus, OWR_MESSAGE_ORIGIN(videoSession));
+
+	// Candidate gathering
+	g_signal_connect(videoSession, "on-new-candidate", G_CALLBACK(got_candidate), NULL);
+	g_signal_connect(videoSession, "on-candidate-gathering-done", G_CALLBACK(gathering_done), NULL);
+
+	// Capturing video source with got_sources Callback
+	owr_get_capture_sources(OWR_MEDIA_TYPE_VIDEO, got_sources, NULL);
+
+	owr_run();
+
+	g_free(bus);
+	g_free(sendingAgent);
+	g_free(videoSession);
+
+
+	return 0;
+}
+```
+`
+Hello,
+
+I am using openwebrtc for android and I am faced with a strange issue where the stream is sometimes dropped without any error in the log (this happens in my code as well as in the original demo code).
+Google suggests that when there is too much data transmitted this can happens and that the solution is to drop the fps.
+
+Thankfully there is a variable for that in the library:
+
+` PeerConnectionParameters params = new PeerConnectionParameters(
+                true, false, displaySize.x, displaySize.y, fps, 1, VIDEO_CODEC_VP9, true, 1, AUDIO_CODEC_OPUS, true);
+        webRtcClient = new WebRtcClient((WebRtcClient.RtcListener) mWebRtcContext, mSocketAddress, params, VideoRendererGui.getEGLContext()); `
+
+PeerConnectionParameters takes a fps value. Unfortunately this value seems to be ignored by webrtc - even setting it to 1 does not change anything. Indeed, commenting out the entire parameter setting in the demo code of WebRtcClient does not change anything:
+
+`private void setCamera() {
+        localMS = factory.createLocalMediaStream("ARDAMS");
+        if (pcParams.videoCallEnabled) {
+            MediaConstraints videoConstraints = new MediaConstraints();
+           //comment out to see what happens
+            //videoConstraints.mandatory.add(new MediaConstraints.KeyValuePair("maxHeight", Integer.toString((pcParams.videoHeight))));
+            //videoConstraints.mandatory.add(new MediaConstraints.KeyValuePair("maxWidth", Integer.toString((pcParams.videoWidth))));
+            //videoConstraints.mandatory.add(new MediaConstraints.KeyValuePair("maxFrameRate", Integer.toString(pcParams.videoFps)));
+            //videoConstraints.mandatory.add(new MediaConstraints.KeyValuePair("minFrameRate", Integer.toString(pcParams.videoFps)));
+
+            VideoCapturer videoCapturer = getVideoCapturer();
+            videoSource = factory.createVideoSource(videoCapturer, videoConstraints);
+            localMS.addTrack(factory.createVideoTrack("ARDAMSv0", videoSource));
+        }
+
+        //AudioSource audioSource = factory.createAudioSource(new MediaConstraints());
+        //localMS.addTrack(factory.createAudioTrack("ARDAMSa0", audioSource));
+
+        mListener.onLocalStream(localMS);
+    }`
+
+Having found that the settings are ignored, how can I change the fps? I tried to follow the trail to see where the video settings are decided but after going through several wrapper classes I was unable to find out. My only hint is this in the log:
+
+`V/MediaCodecVideoEncoder: setRates: 1992 kbps. Fps: 30`
+
+Hundreds of lines like this one, but searching for MediaCodecVideoEncoder in the path did not yield anything, so I suppose it is somewhere in the binaries?
+Hi,
+
+I am compiling openwebrtc on ubuntu14.04 with instructions from wiki of this project. Got the below message for recipe intltool. Any work around for this or any patches to apply to this recipe?
+
+
+Fetching tarball https://launchpad.net/intltool/trunk/0.51.0/%2Bdownload/intltool-0.51.0.tar.gz to /home/ret/cerbero/build/sources/local/intltool-0.51.0/intltool-0.51.0.tar.gz
+Downloading https://launchpad.net/intltool/trunk/0.51.0/%2Bdownload/intltool-0.51.0.tar.gz
+Running command 'wget https://launchpad.net/intltool/trunk/0.51.0/%2Bdownload/intltool-0.51.0.tar.gz -O /home/ret/cerbero/build/sources/local/intltool-0.51.0/intltool-0.51.0.tar.gz '
+wget: /opt/openwebrtc-0.3/lib/libcrypto.so.1.0.0: no version information available (required by wget)
+wget: /opt/openwebrtc-0.3/lib/libssl.so.1.0.0: no version information available (required by wget)
+--2017-12-18 17:07:33--  https://launchpad.net/intltool/trunk/0.51.0/%2Bdownload/intltool-0.51.0.tar.gz
+Resolving launchpad.net (launchpad.net)... 91.189.89.223, 91.189.89.222
+Connecting to launchpad.net (launchpad.net)|91.189.89.223|:443... connected.
+ERROR: cannot verify launchpad.net's certificate, issued by ‘/C=US/O=DigiCert Inc/OU=www.digicert.com/CN=DigiCert SHA2 Extended Validation Server CA’:
+  Unable to locally verify the issuer's authority.
+To connect to launchpad.net insecurely, use `--no-check-certificate'.
+Downloading https://gstreamer.freedesktop.org/src/mirror/intltool-0.51.0.tar.gz
+Running command 'wget https://gstreamer.freedesktop.org/src/mirror/intltool-0.51.0.tar.gz -O /home/ret/cerbero/build/sources/local/intltool-0.51.0/intltool-0.51.0.tar.gz '
+wget: /opt/openwebrtc-0.3/lib/libcrypto.so.1.0.0: no version information available (required by wget)
+wget: /opt/openwebrtc-0.3/lib/libssl.so.1.0.0: no version information available (required by wget)
+--2017-12-18 17:07:34--  https://gstreamer.freedesktop.org/src/mirror/intltool-0.51.0.tar.gz
+Resolving gstreamer.freedesktop.org (gstreamer.freedesktop.org)... 131.252.210.176, 2610:10:20:722:a800:ff:feda:470f
+Connecting to gstreamer.freedesktop.org (gstreamer.freedesktop.org)|131.252.210.176|:443... connected.
+ERROR: cannot verify gstreamer.freedesktop.org's certificate, issued by ‘/C=US/O=Let's Encrypt/CN=Let's Encrypt Authority X3’:
+  Unable to locally verify the issuer's authority.
+To connect to gstreamer.freedesktop.org insecurely, use `--no-check-certificate'.
+
+Recipe 'intltool' failed at the build step 'fetch'
+Select an action to proceed:
+[0] Enter the shell
+[1] Rebuild the recipe from scratch
+[2] Rebuild starting from the failed step
+[3] Skip recipe
+[4] Abort
+
+
+Thanks,
+Hari.
+I've had a glance at your code and it seems you're not handling the `MSG_EOR` flag which means you will treat incoming partial SCTP messages as whole messages, thus violating the message-oriented principle of SCTP (and data channels). This is a widespread issue in many implementations we're currently trying to clean up.
+
+If you need help, you can look at the [relevant section in RAWRTC's code](https://github.com/rawrtc/rawrtc/blob/master/src/librawrtc/sctp_transport.c#L1406) or at [Mozilla's implementation](https://dxr.mozilla.org/comm-central/source/mozilla/netwerk/sctp/datachannel/DataChannel.cpp#1737). I'm the author of RAWRTC and I've also worked on Mozilla's data channel code, so feel free to ping me if you have any questions.
+
+Tracked (and resolved) for Firefox in [bug 979417](https://bugzilla.mozilla.org/show_bug.cgi?id=979417). For Chromium, this is tracked in [issue 7774](https://bugs.chromium.org/p/webrtc/issues/detail?id=7774).
+Hi everyone.
+I'm trying to build a C application that gets video from a webcam using OpenWebRTC and then send this stream to a known address via UDP using udpsink but i can't find a way to get a reference to the media_source's bin.
+Can you please help me?
+I've followed these instructions for building: https://github.com/EricssonResearch/openwebrtc/wiki/Building-OpenWebRTC
+```
+$ cd ~/cerbero \
+> && ./cerbero-uninstalled -c config/linux.cbc fetch-package --full-reset --reset-rdeps openwebrtc
+```
+```
+WARNING: Error importing command bundlesource:
+ No module named setuptools.sandbox
+WARNING: Using default configuration because /home/****/.cerbero/cerbero.cbc is missing
+WARNING: Error loading recipe in file /home/****/cerbero/recipes/glib.recipe 
+***** Error running 'fetch-package' command:
+Recipe 'glib' not found
+```
+
+Environment: Ubuntu 17.10
+
+I tried both the 0.3.0 release and the latest master, same result.
+Hi everyone. I have some questions for usage of openwebrtc.
+
+Now I install openwebrtc through cerbero and installtion dicerctory is ``/opt/openwebrtc-0.3``. Then I do not do next.
+
+My idea is that I have a remote device which connect to internet through Mobile Network. I need control this device through remote client and get the video stream in the device. There is no GUI tools in remote device and I only run some scripts like python or compiled C++ program. The remote operate client could send data to the device like command etc. And the remote operate client should get the video stream on the device. Maybe the remote operator see the video through brower like Chrome.
+
+So I should do next after installation of openwebrtc?
+
+Another question is that how I use the example in test directory? I can not see any makefile or configure. Can give some assistance about usage?
+I follow the command in `https://github.com/EricssonResearch/openwebrtc/wiki/Building-OpenWebRTC` and build the openwebrtc.
+
+while I run the command ``./cerbero-uninstalled -c config/linux.cbc package -f openwebrtc``, there was an error like below:
+```
+WARNING: Using default configuration because /home/wangyawei/.cerbero/cerbero.cbc is missing
+Building the following recipes: libffi zlib glib orc bzip2 openssl gobject-introspection libjpeg-turbo libpng gtk-doc-lite gstreamer-1.0 opus gst-plugins-base-1.0 libvpx gst-plugins-good-1.0 openh264 libsrtp graphene gst-plugins-bad-1.0 libnice libunwind gettext libusrsctp openwebrtc-gst-plugins intltool gnome-js-common icu javascriptcoregtk seed json-glib libxml2 gmp nettle libtasn1 gnutls glib-networking libsoup openwebrtc
+[(1/38) libffi -> already built ]
+[(2/38) zlib -> already built ]
+[(3/38) glib -> already built ]
+[(4/38) orc -> already built ]
+[(5/38) bzip2 -> already built ]
+[(6/38) openssl -> already built ]
+[(7/38) gobject-introspection -> already built ]
+[(8/38) libjpeg-turbo -> already built ]
+[(9/38) libpng -> already built ]
+[(10/38) gtk-doc-lite -> already built ]
+[(11/38) gstreamer-1.0 -> already built ]
+[(12/38) opus -> already built ]
+[(13/38) gst-plugins-base-1.0 -> already built ]
+[(14/38) libvpx -> already built ]
+[(15/38) gst-plugins-good-1.0 -> already built ]
+[(16/38) openh264 -> already built ]
+[(17/38) libsrtp -> already built ]
+[(18/38) graphene -> already built ]
+[(19/38) gst-plugins-bad-1.0 -> already built ]
+[(20/38) libnice -> already built ]
+[(21/38) libunwind -> already built ]
+[(22/38) gettext -> already built ]
+[(23/38) libusrsctp -> already built ]
+[(24/38) openwebrtc-gst-plugins -> already built ]
+[(25/38) intltool -> already built ]
+[(26/38) gnome-js-common -> already built ]
+[(27/38) icu -> already built ]
+[(28/38) javascriptcoregtk -> already built ]
+[(29/38) seed -> already built ]
+[(30/38) json-glib -> already built ]
+[(31/38) libxml2 -> already built ]
+[(32/38) gmp -> already built ]
+[(33/38) nettle -> already built ]
+[(34/38) libtasn1 -> already built ]
+[(35/38) gnutls -> already built ]
+[(36/38) glib-networking -> already built ]
+[(37/38) libsoup -> already built ]
+[(38/38) openwebrtc -> already built ]
+WARNING: No specific packager available for the distro version ubuntu_xenial, using generic packager for distro debian
+-----> Creating package for openwebrtc
+-----> Creating debian package structure at /home/wangyawei/cerbero/build/tmplfN_3k/openwebrtc-0.3.0 for package openwebrtc
+-----> Packing dependency base-system-1.0 for package openwebrtc
+-----> Creating debian package structure at /home/wangyawei/cerbero/build/tmplfN_3k/openwebrtc-base-system-1.0-1.13.0.1 for package base-system-1.0
+-----> Creating package for base-system-1.0
+dpkg-buildpackage: source package openwebrtc-base-system-1.0
+dpkg-buildpackage: source version 1.13.0.1-1
+dpkg-buildpackage: source distribution unstable
+dpkg-buildpackage: source changed by OpenWebRTC <packages@openwebrtc.org>
+dpkg-buildpackage: host architecture amd64
+ dpkg-source --before-build openwebrtc-base-system-1.0-1.13.0.1
+ fakeroot debian/rules clean
+dh_testdir
+dh_testroot
+rm -f build-stamp
+dh_clean
+ debian/rules build
+dh_testdir
+touch build-stamp
+ fakeroot debian/rules binary
+dh_testdir
+dh_testroot
+dh_prep
+dh_installdirs
+dh_installdocs
+dh_install
+dh_testdir -a
+dh_testroot -a
+dh_strip -a --dbg-package=openwebrtc-base-system-1.0-dbg 
+dh_link -a
+dh_compress -a
+dh_fixperms -a
+dh_makeshlibs -a -V
+dh_installdeb -a
+dh_shlibdeps -a
+dh_gencontrol -a
+dh_md5sums -a
+dh_builddeb -a
+dpkg-deb: building package 'openwebrtc-base-system-1.0' in '../openwebrtc-base-system-1.0_1.13.0.1-1_amd64.deb'.
+dpkg-deb: building package 'openwebrtc-base-system-1.0-dbg' in '../openwebrtc-base-system-1.0-dbg_1.13.0.1-1_amd64.deb'.
+dpkg-deb: building package 'openwebrtc-base-system-1.0-dev' in '../openwebrtc-base-system-1.0-dev_1.13.0.1-1_amd64.deb'.
+ dpkg-genchanges -b >../openwebrtc-base-system-1.0_1.13.0.1-1_amd64.changes
+dpkg-genchanges: binary-only upload (no source code included)
+ dpkg-source --after-build openwebrtc-base-system-1.0-1.13.0.1
+dpkg-buildpackage: binary-only upload (no source included)
+-----> Copying generated shlibs file /home/wangyawei/cerbero/build/tmplfN_3k/openwebrtc-base-system-1.0-1.13.0.1/debian/openwebrtc-base-system-1.0/DEBIAN/shlibs to /home/wangyawei/cerbero/build/tmplfN_3k/openwebrtc-base-system-1.0-shlibs
+-----> Packing dependency gstreamer-1.0-core for package openwebrtc
+-----> Creating debian package structure at /home/wangyawei/cerbero/build/tmplfN_3k/openwebrtc-gstreamer-1.0-core-1.13.0.1 for package gstreamer-1.0-core
+WARNING: Some files required by this package are missing in the prefix:
+lib/gstreamer-1.0/libgstpulse.so
+-----> Creating package for gstreamer-1.0-core
+WARNING: Some files required by this package are missing in the prefix:
+lib/gstreamer-1.0/libgstpulse.so
+-----> Copying generated shlibs file /home/wangyawei/cerbero/build/tmplfN_3k/openwebrtc-base-system-1.0-shlibs for dependency base-system-1.0 to /home/wangyawei/cerbero/build/tmplfN_3k/openwebrtc-gstreamer-1.0-core-1.13.0.1/debian/shlibs.local
+dpkg-buildpackage: source package openwebrtc-gstreamer-1.0-core
+dpkg-buildpackage: source version 1.13.0.1-1
+dpkg-buildpackage: source distribution unstable
+dpkg-buildpackage: source changed by OpenWebRTC <packages@openwebrtc.org>
+dpkg-buildpackage: host architecture amd64
+ dpkg-source --before-build openwebrtc-gstreamer-1.0-core-1.13.0.1
+ fakeroot debian/rules clean
+dh_testdir
+dh_testroot
+rm -f build-stamp
+dh_clean
+ debian/rules build
+dh_testdir
+touch build-stamp
+ fakeroot debian/rules binary
+dh_testdir
+dh_testroot
+dh_prep
+dh_installdirs
+dh_installdocs
+dh_install
+dh_testdir -a
+dh_testroot -a
+dh_strip -a --dbg-package=openwebrtc-gstreamer-1.0-core-dbg 
+dh_link -a
+dh_compress -a
+dh_fixperms -a
+dh_makeshlibs -a -V
+dh_installdeb -a
+dh_shlibdeps -a
+dpkg-shlibdeps: error: no dependency information found for /usr/lib/nvidia-375/libEGL.so.1 (used by debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgstgl-1.0.so.0.1300.0)
+Hint: check if the library actually comes from a package.
+dh_shlibdeps: dpkg-shlibdeps -Tdebian/openwebrtc-gstreamer-1.0-core.substvars debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/bin/gst-device-monitor-1.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/bin/gst-play-1.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/bin/gst-discoverer-1.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/bin/gst-launch-1.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/bin/gst-inspect-1.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/bin/gst-typefind-1.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/libexec/gstreamer-1.0/gst-ptp-helper debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/libexec/gstreamer-1.0/gst-plugin-scanner debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libopenh264.so.3 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstsrtp.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstudp.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstvideoscale.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgsttypefindfunctions.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstaudioresample.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstvideoparsersbad.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstrtpmanager.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstrtp.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstmulaw.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstopus.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstaudioconvert.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstapp.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstdecklink.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstvideocrop.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstnice.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstaudiotestsrc.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstopenh264.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstvideofilter.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstopengl.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstvolume.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstinter.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstvideoconvert.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstaudiorate.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstvideorate.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstdtls.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstalaw.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstvideotestsrc.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstcoreelements.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstvpx.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/gstreamer-1.0/libgstvideo4linux2.so debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgstcheck-1.0.so.0.1300.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libopus.so.0.5.3 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgstpbutils-1.0.so.0.1300.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgstrtp-1.0.so.0.1300.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgstbadbase-1.0.so.0.1300.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libnice.so.10.6.2 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libsrtp.so.1 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgstnet-1.0.so.0.1300.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgstbadallocators-1.0.so.0.1300.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgstbadvideo-1.0.so.0.1300.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgstbase-1.0.so.0.1300.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgraphene-1.0.so.0.400.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgstfft-1.0.so.0.1300.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgstapp-1.0.so.0.1300.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgstriff-1.0.so.0.1300.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libunwind.so.8.0.1 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgstcodecparsers-1.0.so.0.1300.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libvpx.so.4.0.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgstvideo-1.0.so.0.1300.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgstrtsp-1.0.so.0.1300.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgstsdp-1.0.so.0.1300.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgstgl-1.0.so.0.1300.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgstreamer-1.0.so.0.1300.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgsttag-1.0.so.0.1300.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgstcontroller-1.0.so.0.1300.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgstaudio-1.0.so.0.1300.0 debian/openwebrtc-gstreamer-1.0-core/opt/openwebrtc-0.3/lib/libgstallocators-1.0.so.0.1300.0 returned exit code 2
+debian/rules:31: recipe for target 'binary-arch' failed
+make: *** [binary-arch] Error 2
+dpkg-buildpackage: error: fakeroot debian/rules binary gave error exit status 2
+Traceback (most recent call last):
+  File "./cerbero/main.py", line 105, in run_command
+    res = commands.run(command, self.config, self.args)
+  File "./cerbero/commands/__init__.py", line 78, in run
+    return _commands[command].run(config, args)
+  File "./cerbero/commands/package.py", line 89, in run
+    args.force, args.keep_temp)
+  File "./cerbero/packages/linux.py", line 57, in pack
+    self.pack_deps(output_dir, tmpdir, force)
+  File "./cerbero/packages/linux.py", line 115, in pack_deps
+    packager.pack(output_dir, self.devel, force, True, True, tmpdir)
+  File "./cerbero/packages/linux.py", line 78, in pack
+    paths = self.build(output_dir, tarname, tmpdir, packagedir, srcdir)
+  File "./cerbero/packages/debian.py", line 282, in build
+    shell.call('dpkg-buildpackage -rfakeroot -us -uc -D -b', srcdir)
+  File "./cerbero/utils/shell.py", line 154, in call
+    raise FatalError(_("Error running command: %s") % cmd)
+FatalError
+***** Error running 'package' command:
+
+usage: cerbero-uninstalled [-h] [-c CONFIG]
+                           {add-recipe,rdeps,tag,genxcconfig,genlibfiles,check,list-packages,show-config,add-package,build,genvsprops,shell,run,cleanone,packageinfo,bundle-source,buildone,wipe,debug-packages,package,bootstrap,list,checkpackage,deps,gensdkshell,fetch-package,fetch}
+                           ...
+```
+Should I do to solve this problem? Anysomebody can give advices?
+I've built as manual follow https://github.com/EricssonResearch/openwebrtc/wiki/Building-OpenWebRTC for linux target.
+
+![image](https://user-images.githubusercontent.com/3623889/30769405-827a8df8-a052-11e7-929c-94ba5d760993.png)
+
+I still have problem with above errors, also I've installed tempermonkey. 
+
+![image](https://user-images.githubusercontent.com/3623889/30769416-b4333886-a052-11e7-931c-9f508e88300c.png)
+
+```
+var script = document.createElement("script");
+script.src = "http://localhost:10717/owr.js";
+document.head.appendChild(script);
+```
+
+how do I run openwebrtc(linux-webcam-client, another browser)?
+
+thank you, in advance.
+
+

@@ -1,0 +1,113 @@
+https://github.com/Celtoys/Remotery/blob/38a9a7a06c937b9c2819e3d710cb1eb81b977028/lib/Remotery.c#L3599
+The bug occurs in the following scenario, typically with many unique names being sampled (dynamic namings).
+
+The profiled-thread calls **StringTable_Insert->Buffer_Write->Buffer_Grow** to insert a new name.
+While at the same time the remotery-thread handles messages and calls **Remotery_ReceiveMessage->case GSMP**. Then the later accesses a buffer (the name string), which is currently being grown in the profiled thread and not in a defined state. Thus causing a memory access violation.
+
+The proposed solution works practically all the time in all my scenarios. Though not guaranteed to work always. More changes or explicit synchronization would be needed therefore.
+I am using:
+- Windows 10
+- Microsoft Visual Studio 2019 Preview 4.0
+- 64-bits build
+- Debug build
+
+I build remotery (and the rest of my code) statically with the following defines:
+- RMT_USE_OPENGL=1
+- RMT_ENABLED=1
+
+There are two scenarios.
+
+SCENARIO 1:
+This works fine.
+1. Main thread initializes Remotery: rmt_CreateGlobalInstance(&rmt);
+2. Various threads are started that do work using rmt_ScopedCPUSample. One of those threads is a renderer thread, which does rmt_BindOpenGL after activating the context, then uses rmt_ScopedOpenGLSample, and finally when shutting down calls rmt_UnbindOpenGL, and the deactivates the OpenGL context
+3. When all threads are gone but the main thread, the main thread calls rmt_DestroyGlobalInstance(rmt);
+
+SCENARIO 2:
+In this scenario the crash happens.
+1. Main thread initializes Remotery: rmt_CreateGlobalInstance(&rmt);
+2. Various threads are started that do work using rmt_ScopedCPUSample. One of those threads is a renderer thread, which does rmt_BindOpenGL after activating the context, then uses rmt_ScopedOpenGLSample, and finally when shutting down calls rmt_UnbindOpenGL, and the deactivates the OpenGL context
+3. A new set of threads is started, with a new renderer, but reusing the old OpenGL context
+4. As before in step 2, one of the new threads is the renderer thread, so it makes the OpenGL context current, calls rmt_BindOpenGL, and starts rendering. When shutting down, as before in 2, it calls rmt_UnbindOpenGL and then deactivates the OpenGL context.
+5. When all threads are gone but the main thread, the main thread calls rmt_DestroyGlobalInstance(rmt);
+
+In this second scenario, the crash happens in the second rmt_UnbindOpenGL call in step 4, which is the second time I'm calling it. The call relevant callstack is short:
+>	!FlattenSampleTree(Sample * sample, unsigned int * nb_samples) Line 4237	C
+>	!FlattenSampleTree(Sample * sample, unsigned int * nb_samples) Line 4242	C
+>	!FreeSampleTree(Sample * sample, ObjectAllocator * allocator) Line 4260	C
+> 	!FreePendingSampleTrees(Remotery * rmt, SampleType sample_type, Buffer * flush_samples) Line 5520	C
+>	!_rmt_UnbindOpenGL() Line 6891	C
+
+This is in the following code:
+```
+static ObjectLink* FlattenSampleTree(Sample* sample, rmtU32* nb_samples)
+{
+    Sample* child;
+    ObjectLink* cur_link = &sample->Link;
+
+    assert(sample != NULL);
+    assert(nb_samples != NULL);
+
+    *nb_samples += 1;
+    sample->Link.next = (ObjectLink*)sample->first_child;  // CRASH HERE (!!!)
+
+    // Link all children together
+    for (child = sample->first_child; child != NULL; child = child->next_sibling)
+    {
+        ObjectLink* last_link = FlattenSampleTree(child, nb_samples);
+        last_link->next = (ObjectLink*)child->next_sibling;
+        cur_link = last_link;
+    }
+
+    // Clear child info
+    sample->first_child = NULL;
+    sample->last_child = NULL;
+    sample->nb_children = 0;
+
+    return cur_link;
+}
+```
+
+The exception thrown is on the line marked "// CRASH HERE (!!!)"
+> Exception thrown: read access violation. **sample** was 0xFFFFFFFFFFFFFFD7.
+
+According to the debugger, the Sample* sample variable going in is 0xdddddddddddddddd, indicating the memory was already freed.
+
+It seems somehow rmt_UnbindOpenGL doesn't expect to be called more than once?
+All that's needed to make remotery compatible is to add 
+        `#include <sys/select.h>`
+inside the `#if defined(RMT_PLATFORM_POSIX)` block.
+While trying to use Remotery (@ 589ded3f2e09) on my Linux app, I get a crash every time the browser connects on the app.
+
+I managed to trace the issue to `TCPSocket_PollStatus` which corrupts the stack.
+
+It seems that the crash is provoked by [the `select` call](https://github.com/Celtoys/Remotery/blob/589ded3f2e09bb5d0b86642e929bff8c491e0f5c/lib/Remotery.c#L2356), which is known to cause memory corruptions when the given `fd` is larger than 1024... see https://sigquit.wordpress.com/2009/12/24/stack-corruption-improper-use-of-fd_set/
+
+I've put an `assert(tcp_socket->socket+1<FD_SETSIZE);` before the `select`call, which fires right before the crash occurs.
+
+Hey,
+
+I've added remotery to my project to use for profiling. I ran into one issue that I can not solve in a nice way. I think this is more of a VS2017 issue, but I thought I'd mention it anyway:
+
+> ...\remotery\lib\remotery.c : fatal error C1853: 'x64\Debug\SomeSharedLib.pch' precompiled header file is from a previous version of the compiler, or the precompiled header is C++ and you are using it from C (or vice versa)
+
+I think I have tried pretty much everything related to precompiled headers (except for turning them off completely). The only thing that worked was renaming `remotery.c` to `remotery.cpp`. This is obviously not ideal. If anyone happens to have a good idea, I am all ears.
+Would be awesome if we could use Remotery to profile C/C++ emscripten games.
+
+Challenges:
+
+1) Websocket server. We can't start a websocket server from an emscripten game. One workaround is to use a native websocket server as a proxy. Another solution is have emscripten directly send the data to another browser tab (`postMessage`)
+
+2) Timer accuracy. Browsers have recently reduced the accuracy of `performance.now` because of security and privacy reasons. I have heard that soon high-accuracy will be re-enabled, and some browsers allow to manually enable it through settings.
+Hi, All
+
+I have a case when trace labels get corrupted. Instead I see random numbers.
+![image](https://user-images.githubusercontent.com/2250561/38202178-86b347ba-36a3-11e8-9817-d228e5c93628.png)
+
+In some cases it may fix itself, but mostly not.
+Should be fairly straight-forward, requiring steps:
+
+1. Server increments base port number on failure to `bind`.
+2. Client continuously polls a range of ports for connection.
+3. Create a time sync between all connections.
+I'm suprised nobody's suggested this yet...

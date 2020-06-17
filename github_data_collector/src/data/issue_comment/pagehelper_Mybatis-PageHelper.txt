@@ -1,0 +1,213 @@
+
+
+Mybatis基础的Interceptor有一个接口是public Object plugin(Object target),用于判断是否需要使用该拦截器包装。它的默认实现是
+```java
+default Object plugin(Object target) {
+    return Plugin.wrap(target, this);
+}
+```
+但是我发现，这个Plugin.wrap方法每次都要拿到Interceptor上的注解@Intercepts和里面的注解@Signature来判断是否返回代理对象，和代理对象是否代理该方法。
+而您的分页浏览器的配置，其实只会作用于Executor这一个接口的实现，而且，只会在调用两个query方法时才进行代理。恰巧这两个query方法就是Executor接口下所有叫做query的方法。
+所以我认为这里其实可以优化一下。其伪代码示意如下：
+```java
+private Interceptor interceptor = this;
+
+private Class<?>[] interfaces = new Class<?>[] { Executor.class };
+
+public Object plugin(Object target) {
+    if (target instanceof Executor) {
+        return Proxy.newProxyInstance(target.getClass().getClassLoader(), interfaces, (InvocationHandler) (proxy, method, args) -> {
+            if (method.getName().equals("query")) {
+                return interceptor.intercept(new Invocation(target, method, args));
+            }
+            return method.invoke(target, args);
+        });
+    } else {
+        return target;
+    }
+}
+```
+When I try to upgrade pagehelper from 5.1.8 to the latest version 5.1.11. The following code breaks.
+```
+public class Demo {
+    
+    public static Expression notLike(Column column, Expression value) {
+        LikeExpression exp = new LikeExpression();
+        exp.setNot(true);
+        exp.setLeftExpression(column);
+        exp.setRightExpression(value);
+        return exp;
+    }
+}
+```
+The code should pass, but it throws an error:
+```
+Demo.java:[18,12] method setNot in class net.sf.jsqlparser.expression.BinaryExpression cannot be applied to given types;
+```
+
+
+用于数据库查询出来的对象和前端返回的对象列表不一致的情况
+ [-] 我已在 [issues](https://github.com/pagehelper/Mybatis-PageHelper/issues) 搜索类似问题，并且不存在相同的问题.
+
+## 异常模板
+
+Bug：当ResultMap中包含带有sql语句的TypeHandler的Result时，total返回有误（返回的是TypeHandler中sql count）
+
+### 使用环境
+
+* PageHelper 版本: com.github.pagehelper:pagehelper-spring-boot-starter:1.2.13
+* 数据库类型和版本: mysql8
+* JDBC_URL:
+
+### SQL 解析错误
+
+#### 分页参数
+
+```java
+PageHelper.startPage(1, 10);
+xxMapper.select(model);
+```
+
+#### 原 SQL
+
+```sql
+@Select("SELECT * FROM audit")
+    @Results(id = "AuditResultMap", value = { @Result(property = "auditee", column = "auditee_id", one = @One(select = Mybatis.USER_SIMPLE)),
+            @Result(property = "object", javaType = Object.class, column = "object_id", jdbcType = JdbcType.INTEGER, typeHandler = ObjectTypeHandler.class),
+            @Result(property = "path", column = "{type=object_type,auditeeId=auditee_id}", one = @One(select = Mybatis.AUDITEE_AUDIT_PATH)),
+            @Result(property = "records", column = "id", many = @Many(select = Mybatis.AUDIT_RECORDS)),
+            @Result(property = "objectType", column = "object_type", jdbcType = JdbcType.NVARCHAR, id = false),
+            @Result(property = "objectId", column = "object_id", jdbcType = JdbcType.INTEGER, id = false),
+            @Result(property = "id", column = "id", jdbcType = JdbcType.INTEGER, id = true) })
+    List<Audit> search();
+
+@Slf4j
+@MappedTypes(Object.class)
+@MappedJdbcTypes(JdbcType.INTEGER)
+public class ObjectTypeHandler extends BaseTypeHandler<Object> {
+
+    @Override
+    public void setNonNullParameter(PreparedStatement ps, int i, Object object, JdbcType jdbcType) throws SQLException {
+        ps.setString(i, "");
+    }
+
+    @Override
+    public Object getNullableResult(ResultSet rs, String columnName) throws SQLException {
+        return convert(rs.getString("object_type"), rs.getInt("object_id"));
+    }
+
+    @Override
+    public Object getNullableResult(ResultSet rs, int columnIndex) throws SQLException {
+        return convert(rs.getString("object_type"), rs.getInt("object_id"));
+    }
+
+    @Override
+    public Object getNullableResult(CallableStatement cs, int columnIndex) throws SQLException {
+        return convert(cs.getString("object_type"), cs.getInt("object_id"));
+    }
+
+    private Object convert(String objectType, Integer objectId) {
+        try {
+            Object service = FieldUtils.readField(ServiceContainer.serviceContainer, objectType + "Service", true);
+            return MethodUtils.invokeMethod(service, "getProfileById", objectId);
+        } catch (IllegalAccessException | NoSuchMethodException | InvocationTargetException exception) {
+            log.error("get audit object error!", exception);
+            return null;
+        }
+    }
+
+}
+
+```
+
+#### 期望的结果：
+
+返回Audit的数量（假设有100条Audit记录，每条Audit包含一个Object）
+但是返回的是ObjectTypeHandler中的含有的sql语句的count
+ObjectTypeHandler中的含有的sql语句： SELECT * FROM materiial WHERE id=#{id} LIMIT 1
+观察到countSql会生成两条，一条是count Audit（=100），一条count Material （=1）
+total返回为1，即第二条count Material覆盖了第一条count Audit
+
+### 完整异常信息
+
+```
+无
+```
+
+### 其他类型的错误
+
+## 功能建议
+
+public JSONObject getProfileById(Integer id) throws JsonProcessingException {
+        Material material = materialRepository.searchProfileById(id);
+        String string = new ObjectMapper().setPropertyNamingStrategy(PropertyNamingStrategy.SNAKE_CASE).writeValueAsString(material);
+        JSONObject data = JSON.parseObject(string);
+        JSONObject extra = new JSONObject();
+        List<Terminal> terminals = terminalService.getByMaterial(id);
+        JSONArray extraTerminals = new JSONArray();
+        for (Terminal terminal : terminals)
+            extraTerminals.add(
+                    new JSONObject().fluentPut("id", terminal.getId()).fluentPut("name", terminal.getName()).fluentPut("mac", terminal.getMac()));
+        extra.fluentPut("url", material.getUrl()).fluentPut("terminals", extraTerminals);
+        data.put("extra", extra);
+        return data;
+    }
+
+getProfileById 包含多条sql语句。
+
+## 结论
+
+PageHelper对TypeHandler支持有Bug
+
+
+
+- [ ] 我已在 [issues](https://github.com/pagehelper/Mybatis-PageHelper/issues) 搜索类似问题，并且不存在相同的问题.
+
+## 异常模板
+
+### 使用环境
+
+* PageHelper 版本: xxx
+* 数据库类型和版本: xxx
+* JDBC_URL: xxx
+
+### SQL 解析错误
+
+#### 分页参数
+
+```java
+PageHelper.startPage(1, 10);
+xxMapper.select(model);
+```
+
+#### 原 SQL
+
+```sql
+select * from xxx where xxx = xxx
+```
+
+#### 期望的结果：
+
+```sql
+select * from xxx where xxx = xxx limit 10
+```
+
+### 完整异常信息
+
+```
+异常信息放在这里
+```
+
+### 其他类型的错误
+
+## 功能建议
+
+详细说明，尽可能提供(伪)代码示例。
+
+用于将PageInfo< S >转换为PageInfo< T >
+也可以选择不改动PageInfo 将该静态方法移动至工具类
+解决Oracle特定场景下，分页效率问题。比如子查询中有join等多表操作时，效率差距明显。
+
+[https://github.com/pagehelper/Mybatis-PageHelper/commit/0e794f7fff772272236f5295c9d202724f3c4191#commitcomment-36532326](https://github.com/pagehelper/Mybatis-PageHelper/commit/0e794f7fff772272236f5295c9d202724f3c4191#commitcomment-36532326)
+**大神,达梦数据库的helperDialect是什么?**
+1，pageHelper有没有深度分页的解决方案？如果有，那么能否稍微提示下怎么用；如果没有，大佬有没有开发的计划？

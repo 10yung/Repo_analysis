@@ -1,0 +1,253 @@
+I want to use `cargo tree -d` in a CI. It would be nice if cargo-tree exit with success (exit code 0) when there are no duplicates and exit with failure (exit code 1) when duplicates are found.
+This implements a wishlist item from #77, cc @najamelan.
+
+Before:
+
+```
+error: There are multiple `regex` packages in your project, and the specification `regex` is ambiguous.
+Please re-run this command with `-p <spec>` where `<spec>` is one of the following:
+  regex:0.2.2
+  regex:1.0.2
+```
+
+After:
+
+```
+regex v0.2.2
+├── env_logger v0.5.6
+│   └── pretty_env_logger v0.2.2
+│       └── linky v0.1.6 (/home/sanxiyn/github/linky)
+└── linky v0.1.6 (/home/sanxiyn/github/linky) (*)
+
+regex v1.0.2
+└── publicsuffix v1.5.2
+    └── cookie_store v0.7.0
+        └── reqwest v0.9.17
+            └── linky v0.1.6 (/home/sanxiyn/github/linky)
+```
+Uses the {f} format specifier.
+Adds the `-D <DEPTH>`/`--depth <DEPTH>` option.
+
+Closes #60
+
+Example:
+```
+❯ cargo tree -D 1
+
+cargo-tree v0.27.0 (~/Developer/cargo-tree)
+├── cargo v0.39.0
+├── env_logger v0.7.0
+├── failure v0.1.5
+├── petgraph v0.4.13
+└── structopt v0.3.2
+```
+
+Things to consider:
+- This PR is technically a breaking change because now dependencies are truncated if they are farther down the dependency tree instead of if they were already printed, i.e. deciding if we should truncate a dependency is breadth first. Technically the dependencies are still actually printed depth first but I thought it was pretty weird to have deps printing out that were deeper than the specified limit, only to have a `*` printed later on. This might lead to confusing behavior when used with the `--duplicate` option though?
+- Right now this treats packages specified by `--package` as the "root" package, i.e. instead of erroring:
+	```
+	❯ cargo tree -D1 -p syn:0.15.44
+	error: package syn v0.15.44 not found
+	```
+	because `syn` is a transitive dependency with a depth `>1`, it prints out the dependencies of `syn` that have a depth `<=1` from `syn` (not the real package root):
+	```
+	syn v0.15.44
+	├── proc-macro2 v0.4.30
+	├── quote v0.6.13
+	└── unicode-xid v0.1.0
+	```
+	Is this the desired behavior?
+- Should we print out a `*` when truncating a dependency whose children are not being printed because they are above the `--depth` limit *and* is also a duplicate?
+```
+    Updating `git://mirrors.ustc.edu.cn/crates.io-index` index
+    Updating git repository `https://github.com/paritytech/parity-ethereum`
+    Updating git repository `https://github.com/paritytech/hidapi-rs`
+    Updating git repository `https://github.com/paritytech/libusb-rs`
+    Updating git repository `https://github.com/paritytech/trezor-sys`
+    Updating git repository `https://github.com/paritytech/app-dirs-rs`
+    Updating git repository `https://github.com/paritytech/libusb-sys`
+error: failed to select a version for `ring`.
+    ... required by package `parity-crypto v0.3.0`
+    ... which is depended on by `mycrate v0.1.1`
+    ... which is depended on by `myprogram v0.1.0`
+versions that meet the requirements `^0.14.3` are: 0.14.6, 0.14.5, 0.14.4, 0.14.3
+
+the package `ring` links to the native library `ring-asm`, but it conflicts with a previous package which links to `ring-asm` as well:
+package `ring v0.13.5`
+    ... which is depended on by `parity-crypto v0.2.0`
+    ... which is depended on by `ethcore v1.12.0 (https://github.com/paritytech/parity-ethereum?tag=v2.3.0#10657d96)`
+    ... which is depended on by `myprogram v0.1.0`
+
+failed to select a version for `ring` which could resolve this conflict
+```
+
+I've checked the options but none of them seems to help.
+When cross-compiling, it's useful to know which crates are compiled for the host and which for the target. The `[build-dependencies]` and `[dev-dependencies]` sections are already useful for filtering some of this information. However, proc_macro crates are shown as regular dependencies.
+For example, `--depth=2` to only show my dependencies and their direct dependencies.
+Similar to the `--no-dev-dependencies` option, it would be useful to be able to filter out build dependencies.
+I tried running cargo-tree on my workspace's top level crate:
+```
+> cargo tree -i -p fs2
+error: There are multiple `fs2` packages in your project, and the specification `fs2` is ambiguous.
+Please re-run this command with `-p <spec>` where `<spec>` is one of the following:
+  fs2:0.2.5
+  fs2:0.4.3
+
+
+> cargo tree -i -p fs2:0.2.5
+thread 'main' panicked at 'no entry found for key', libcore\option.rs:914:5
+stack backtrace:
+
+
+> cargo tree -i -p fs2:0.4.3
+fs2 v0.4.3
+└── rustbreak v1.3.0 (https://github.com/TheNeikos/rustbreak?rev=561c203#561c2031)
+    ├── db v0.1.0 (file:///D:/projects/myproject/db)
+    │   ├── core_types v0.1.0 (file:///D:/projects/myproject/core_types)
+    │   │   ├── myproject v0.1.0 (file:///D:/projects/myproject)
+    │   │   ├── webui v0.1.0 (file:///D:/projects/myproject/webui)
+    │   │   │   └── myproject v0.1.0 (file:///D:/projects/myproject) (*)
+    │   │   └── window v0.1.0 (file:///D:/projects/myproject/window)
+    │   │       └── myproject v0.1.0 (file:///D:/projects/myproject) (*)
+    │   ├── similar_tracks v0.1.0 (file:///D:/projects/myproject/similar_tracks)
+    │   │   └── myproject v0.1.0 (file:///D:/projects/myproject) (*)
+    │   ├── myproject v0.1.0 (file:///D:/projects/myproject) (*)
+    │   └── window v0.1.0 (file:///D:/projects/myproject/window) (*)
+    └── myproject v0.1.0 (file:///D:/projects/myproject) (*)
+```
+
+---
+
+But in Cargo.lock, I have:
+
+```toml
+
+[[package]]
+name = "window"
+version = "0.1.0"
+dependencies = [
+ "bidir-map 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "core_types 0.1.0",
+ "db 0.1.0",
+ "derive-new 0.5.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "enum_primitive 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "escapi 0.1.0 (git+https://github.com/Boscop/escapi-rs)",
+ "fps-loop 0.1.0",
+ "glium 0.17.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "lazy_static 0.2.11 (registry+https://github.com/rust-lang/crates.io-index)",
+ "mozjpeg-sys 0.5.13 (registry+https://github.com/rust-lang/crates.io-index)",
+ "num-traits 0.1.43 (registry+https://github.com/rust-lang/crates.io-index)",
+ "palette 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde 1.0.70 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde_derive 1.0.70 (registry+https://github.com/rust-lang/crates.io-index)",
+ "shortmsg 0.1.0",
+ "smart-default 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "type-name 0.1.0",
+]
+
+[[package]]
+name = "glium"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "backtrace 0.3.9 (registry+https://github.com/rust-lang/crates.io-index)",
+ "fnv 1.0.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "gl_generator 0.5.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "glutin 0.9.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "lazy_static 0.2.11 (registry+https://github.com/rust-lang/crates.io-index)",
+ "smallvec 0.4.5 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "glutin"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "android_glue 0.2.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "cgl 0.2.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "cocoa 0.9.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "core-foundation 0.4.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "core-graphics 0.8.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "dwmapi-sys 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "gdi32-sys 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "gl_generator 0.5.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "kernel32-sys 0.2.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "lazy_static 0.2.11 (registry+https://github.com/rust-lang/crates.io-index)",
+ "libc 0.2.42 (registry+https://github.com/rust-lang/crates.io-index)",
+ "objc 0.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "osmesa-sys 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "shared_library 0.1.9 (registry+https://github.com/rust-lang/crates.io-index)",
+ "shell32-sys 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "user32-sys 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "wayland-client 0.9.10 (registry+https://github.com/rust-lang/crates.io-index)",
+ "winapi 0.2.8 (registry+https://github.com/rust-lang/crates.io-index)",
+ "winit 0.7.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "x11-dl 2.18.1 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "winit"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "android_glue 0.2.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "cocoa 0.9.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "core-foundation 0.4.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "core-graphics 0.8.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "dwmapi-sys 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "gdi32-sys 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "kernel32-sys 0.2.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "lazy_static 0.2.11 (registry+https://github.com/rust-lang/crates.io-index)",
+ "libc 0.2.42 (registry+https://github.com/rust-lang/crates.io-index)",
+ "objc 0.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "shared_library 0.1.9 (registry+https://github.com/rust-lang/crates.io-index)",
+ "shell32-sys 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tempfile 2.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "user32-sys 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "wayland-client 0.9.10 (registry+https://github.com/rust-lang/crates.io-index)",
+ "wayland-kbd 0.9.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "wayland-protocols 0.9.10 (registry+https://github.com/rust-lang/crates.io-index)",
+ "wayland-window 0.7.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "winapi 0.2.8 (registry+https://github.com/rust-lang/crates.io-index)",
+ "x11-dl 2.18.1 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "wayland-kbd"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "bitflags 0.7.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "dlib 0.3.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "lazy_static 0.2.11 (registry+https://github.com/rust-lang/crates.io-index)",
+ "memmap 0.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "wayland-client 0.9.10 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "memmap"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "fs2 0.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "kernel32-sys 0.2.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "libc 0.2.42 (registry+https://github.com/rust-lang/crates.io-index)",
+ "winapi 0.2.8 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+```
+
+So clearly, fs2 0.2.5 is used by winit, glutin, glium etc.! 
+Btw, glium is used by the `window` sub crate, not by the workspace's top level crate (`myproject`).
+So why can't cargo-tree detect this tree? :)
+
+Using the feature of rust-lang/cargo#4953 to rename a dependency in order to use parts from two versions of same crate, results in the following error when attempting to use `cargo tree`:
+
+> error: failed to parse manifest at `/home/david/src/bar/Cargo.toml`
+>
+> Caused by:
+>    Dependency 'foo' has different source paths depending on the build target. Each 
+> dependency must have a single canonical source path irrespective of build target.
+
+This is of course an interesting case to want to see the dependency tree and check duplicates!
+
+I will share an actual Cargo.toml that exhibits the problem, shortly.

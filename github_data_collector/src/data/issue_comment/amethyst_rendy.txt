@@ -1,0 +1,124 @@
+Fixes: https://github.com/amethyst/rendy/issues/201
+Reported in https://github.com/gfx-rs/wgpu-rs/issues/149
+
+>    VALIDATION [VUID-VkDescriptorPoolCreateInfo-poolSizeCount-arraylength (0)] : vkCreateDescriptorPool: parameter pCreateInfo->poolSizeCount must be greater than 0. The Vulkan spec states: poolSizeCount must be greater than 0 (https://www.khronos.org/registry/vulkan/specs/1.1-extensions/html/vkspec.html#VUID-VkDescriptorPoolCreateInfo-poolSizeCount-arraylength)
+    object info: (type: UNKNOWN, hndl: 0)
+
+Way to reproduce:
+```
+git clone https://github.com/gfx-rs/wgpu-rs
+cd wgpu-rs
+cargo run --example hello-triangle
+```
+I have to do repeated copies from the cpu to gpu buffers, with a known max size bound. I'm trying to keep a persistent staging buffer that's allocated to this max size, and then only use a section of it for each upload. Currently, `Factory::upload_from_staging_buffer` doesn't have any way to specify the size and instead just uses the size of the entire staging buffer.
+
+I think this function should be modified to accept the size of the copied region, although this would be a breaking change.
+I see tags for v0.3.0 and v0.4.0, but not v0.3.1 or v0.3.2, both of which have cargo releases. I'm trying to backport some changes.
+
+Does anyone know what revision hashes were released, and can they tag them?
+MeshBuilder is a convenient way of storing mesh data on the CPU, since it supports a
+wide variety of formats due to using arbitrary vertex attributes. However it does
+not have any way to read the data stored inside of it.
+
+This patch adds functionality for reading the mesh stored inside of the buffers:
+
+* `MeshBuilder::view_attr` finds an attribute in the stored buffers by name and returns a view
+  into the buffer that reads that attribute. It can also be iterated over.
+* `MeshBuffer::iter_index` iterates over elements in the index buffer, or from 0..numvertices if there
+  is no index buffer.
+* Various getters for `MeshBuffer` and `RawVertexBuffer`
+* `FromVertexBuffer` defines how to read a type from a vertex buffer and convert it from the vertex
+  format its in (ex. normalizing and scaling integer values into floating-point).
+
+Wrote this as part of amethyst/amethyst#2076
+
+Rendy's [map](https://docs.rs/rendy-memory/0.5.2/rendy_memory/trait.Block.html#tymethod.map) method tries to be too smart and ends up invalidating the range, even when the user simply intends to write data to it. Invalidation is not free - https://github.com/gfx-rs/gfx/issues/3099 , but most importantly - we should have a way to avoid it here entirely.
+
+One idea is to have the user specifying explicitly what the memory is mapped for: read, write, or both. That requires API changes, unless you want to expose this as a separate method (even something like `map_discard` would do).
+Current design of rendering graph assumes that graph is rarely, if ever, rebuilt. The scheduling process is really designed as one-off thing. The lack of dynamism manifests by things like resizing the window require a full rebuild. Creating resources like depth map images on demand is also very hard. The only way to accomplish it without rebuilds is through sharing via Aux type and manual synchronization, but this basically circumvents any usefulnes of graph in the first place. On top of that we don't really support subpasses and have severe problems with oversynchronization. There are also some challanges with the implementation, like rendy-chain being quite far out from what graph is doing, or rendering directly to surface image requiring a complex separate code path in every render node that wants to support it.
+
+To solve those problems, the internal graph scheduler and render node API must be reworked to assume that things are dynamic. Additional goal is to be able to serialize the graph setup and hot-reload it on the fly.
+
+# Proposed high level design
+
+The rendering graph lifecycle would effectively be split into three phases:
+
+- building: we take a node builder and make a real node struct out of it.
+- construction: The render nodes declare the resources that are going to be used and declares a "rendering execution" closure it wants to run later
+- execution: The registered rendering executions are evaluated in parallel, with the gpu-side synchronization taken care of by the graph
+
+## Graph building
+
+A big difference between existing and proposed design is that rendering nodes are themselves declaring the resources that graph should create for them. The nodes can also produce and accept parameters which can contain arbitrary data types, including just a resource id. All dependencies between nodes are automatically infered based on read and written data.
+
+A simple example of this would be a ``PresentNode`` declaring the output image resource, which  then potentially multiple rendering nodes would be able to accept as their render target. 
+
+```rust
+let mut builder = GraphBuilder::new();
+
+// Add present node that provides a "color" image for others to render to
+// The type is only for demonstration. Compiler is fully able to infer it.
+let color: Parameter<ImageId> = builder.add(Present::new());
+
+// CreateDepth node creates a suitable depth image that matches color image in size.
+// It doesn't contribute to the actual rendering job in any way, but that's allowed.
+let depth = builder.add(CreateDepth::new(color, gfx_hal::format::Format::R32Sfloat));
+
+// Perform some compute job, returning a buffer resource that other nodes can use
+let some_buffer = builder.add(ComputeReticulatingSplines::new());
+
+// render shadow data into separate set of images/buffers, using some data
+// from previous node. The data type is arbitrary, anything will work
+// as long as other nodes can accept it as input.
+let shadow_maps: Parameter<ShadowsData> = builder.add(RenderShadows::new(some_buffer));
+
+// render something to the color image and use the provided shadows and depth buffer
+builder.add(ForwardRender::new(color, depth, shadow_maps));
+
+// create a resized copy of color image and use it to perform some post effects
+let resized_color = builder.add(Resize::new(color, 0.5));
+builder.add(BloomPostEffect::new(color, resized_color);
+```
+
+The code above runs basically only once, or extremally infrequently. The builder can be swapped out, but there is rarely need for this. Most of the dynamism can be accomplished by logic of render nodes at construction phase.
+
+## Graph construction and evaluation
+
+Every node declares the resource it will use during the task it performs. The usage can be as simple as saying "i will use the image given to me as a color attachment on slot 0". More complex nodes can also declared arbitrary `use_image` or `use_buffer`, and later reference those resources. This happens **every frame** and has access to `aux` data.
+```rust
+// `self.color` can come from an argument passed into the node builder.
+// It is of type `Parameter<ImageId>`.
+let color = *ctx.get_parameter(self.color)?;
+ctx.use_color(0, color)?;
+let depth = *ctx.get_parameter(self.depth)?;
+ctx.use_depth(depth, true)?; // true here means write access
+
+let some_image = *ctx.get_parameter(self.some_image)?;
+let image_usage = ctx.use_image(some_image, ImageUsage::Sampled(ShaderUsage::FRAGMENT));
+```
+
+Later the node returns the outputs it declared (in this case `()`) and the actual rendering job it actually performs (the closure is what is later used in execution phase).
+
+```rust
+Ok(((), NodeExecution::pass(|ctx, aux| {
+    let image_object = ctx.get_image(&image_usage);
+    // perform the rendering job here,
+    // including writing descriptor set or recording commands into command buffer
+}))
+```
+
+The code here is essentially equivalent to existing render groups. There are also other `NodeExecution` types that are more suited for other cases like presenting, image transfers or compute nodes.
+
+All resources used exclusively by this node are still managed by it. The node state itself is persistent (up until the `GraphBuilder` as a whole isn't replaced). If there is a descriptor set needed, the node is able to create it in build phase and use during evaluation phase.
+
+The difference is that the resources taken from graph (like `image_object` in example above) cannot be assumed to be the same across frames. They can MOSTLY be the same between the same "frame_in_flight", but this can change at arbitrary time due to logic happening in other nodes. Rendy can provide a set of utility types/functions to make it easier to deal with in common cases.
+
+Once all nodes have finished their construction phase and declared all resources, the graph can be optimized and scheduled. The optimization/reduction passes can take care of things like merging multiple declared `NodeExecution::pass` instances into single subpass, and then multiple subpasses into single render pass with the right subpass dependencies. This also allows for easy derivation of optimal `LoadOp` and `StoreOp` settings and putting barriers only where it's needed. After the internal single-frame graph is fully reduced, the executions are scheduled for parallel execution.
+fixes #226
+
+i'm not quite sure how features should be handled in both `examples` and `rendy`; if there's a better way to handle that than what i've done, let me know
+
+the examples don't actually run for me on dx12, both on master and after these changes, because the assert at https://github.com/gfx-rs/gfx/blob/3d5db15661127c8cad8d85522a68ec36c82f6e69/src/backend/dx12/src/pool.rs#L102 fails.
+
+EDIT: they run for a short time on vulkan and then crash with a `STATUS_ACCESS_VIOLATION`, but that shouldn't be a result of any of this.
+All examples should support execution in web browser. Except those that require compute capabilities.

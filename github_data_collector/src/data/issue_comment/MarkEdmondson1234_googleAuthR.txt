@@ -1,0 +1,567 @@
+## What goes wrong
+
+I deployed my application on shinyapps.io.
+It works properly locally, but it doesn't work online, it seems like I have a bug with gar_set_client()
+
+## Steps to reproduce the problem
+
+
+```
+#global.R
+library(shiny)
+library(googleAuthR)
+library(searchConsoleR)
+library(googleAnalyticsR)
+library(ggplot2)
+library(urltools)
+library(dplyr)
+
+
+#options(googleAuthR.redirect = "https://campels.shinyapps.io/")
+
+options(
+  googleAuthR.scopes.selected = c(
+    "https://www.googleapis.com/auth/webmasters",
+    "https://www.googleapis.com/auth/analytics",
+    "https://www.googleapis.com/auth/analytics.readonly"
+  )
+)
+
+
+#options(googleAuthR.webapp.client_id = "XXX")
+#options(googleAuthR.webapp.client_secret = "XXX")
+
+gar_set_client(web_json = "gcp_client.json")
+
+#server.R
+source("global.R")
+
+
+Server <- function(input, output, session) {
+
+  ## Create access token and render login button
+  access_token <- callModule(googleAuth_js, "js_token")
+  
+  ## Create access token and render login button
+  #connect_api <- callModule(googleAuth, "loginButton")
+  
+  ##################### Position_ctr #######################
+  
+  Position_ctr <- function(){
+    
+    site <- input$url
+    gAid <- input$ga_id
+    
+    
+    
+    ## date range to fetch
+    plage = input$sdl
+    start <- as.character(Sys.Date() - plage)
+    end <- as.character(Sys.Date() - 3)
+    
+    ## Using new GA v4 API
+    ## GAv4 filters
+    google_seo <- filter_clause_ga4(list(
+      dim_filter("medium",
+                 "EXACT",
+                 "organic"),
+      dim_filter("source",
+                 "EXACT",
+                 "google")
+    ),
+    operator = "AND")
+    
+    max_results <- input$results
+    
+    ## Getting the GA data
+    gadata <- google_analytics(
+      gAid,
+      date_range = c(start, end),
+      metrics = c("sessions",
+                  "pageviews"),
+      dimensions = c("landingPagePath"),
+      dim_filters = google_seo,
+      max = max_results
+    )
+    
+    ## Getting the Search Console data
+    scdata <- search_analytics(
+      siteURL = site,
+      startDate = start,
+      endDate = end,
+      dimensions = c("page", "query"),
+      rowLimit = max_results,
+      aggregationType = "byPage",
+      walk_data = "byBatch"
+    )
+    
+    
+    ## get urls in same format
+    ## gadata has urls www.example.com/pagePath
+    ## scdata has urls in http://www.example.com/pagePath
+    domainparse <- url_parse(scdata[1, ]$page)
+    domainname <-
+      paste0(domainparse["scheme"], "://", domainparse["domain"])
+    scdata$page <- gsub(domainname, "", scdata$page)
+    
+    ## % of SEO traffic to each page per keyword
+    scdata <- scdata %>%
+      
+      group_by(page) %>%
+      mutate(clickPage = clicks / sum(clicks)) %>%
+      ungroup()
+    
+    ## join data on page
+    joined_data <- gadata %>%
+      left_join(scdata, by = c(landingPagePath = "page")) %>%
+      mutate(sessionEst = clickPage * sessions,
+             accuracyEst = ((sessionEst / clicks) - 1))
+    
+    ## we only want clicks over 0, and get rid of a few columns.
+    tidy_data <- joined_data %>%
+      filter(clicks > 0) #%>%
+    #select(-sessions)
+    
+    tidy_data$position <- round(tidy_data$position)
+    
+    click_curve <- tidy_data %>%
+      group_by(position) %>%
+      summarise(
+        CTRmean = mean(ctr),
+        n = n(),
+        click.sum = sum(clicks),
+        impressions.sum = sum(impressions),
+        sd = sd(ctr),
+        E = poisson.test(click.sum)$conf.int[2] / poisson.test(impressions.sum)$conf.int[1],
+        lower = CTRmean - E / 2,
+        upper = CTRmean + E / 2
+      ) %>% ungroup()
+    
+    
+    ## add % increase to position 1
+    ## could also include other positions
+    click_curve <- click_curve %>%
+      mutate(
+        CTR1 = CTRmean[1] / CTRmean,
+        CTR1.upper = upper[1] / upper,
+        CTR1.lower = lower[1] / lower
+      )
+    
+    
+    sitename <- paste("Mon Site (", nrow(scdata), " requêtes )")
+    
+    
+    hh <-
+      ggplot(click_curve, aes(position, CTRmean)) + theme_minimal()
+    
+    hh <-
+      hh + geom_line(linetype = 2) + coord_cartesian(xlim = c(1, 10), ylim = c(0, 1))
+    hh <-
+      hh + geom_ribbon(aes(position, ymin = lower, ymax = upper),
+                       alpha = 0.2,
+                       fill = "orange")
+    hh <- hh + scale_y_continuous(labels = scales::percent)
+    hh <-
+      hh + geom_point() + geom_label(aes(label = scales::percent(CTRmean)))
+    hh <- hh + labs(title = sitename)
+    hh <- hh + labs(x = "position", y = "ctr moyen")
+    
+    return(hh)
+    
+    
+    print(hh)
+  }
+  
+  Position_ctr_output <- eventReactive(input$submit1, {
+    ## wrap existing function with_shiny
+    ## pass the reactive token in shiny_access_token
+    ## pass other named arguments
+    with_shiny(f = Position_ctr, 
+               shiny_access_token = access_token())
+    
+  })
+  
+  output$Position_ctr <- renderPlot({
+    
+    Position_ctr_output()
+    
+  })
+}
+
+```
+Code has been cut, to give you an overview
+
+## Actual output
+
+```
+2019-11-27T09:13:39.680648+00:00 shinyapps[1528437]: 2019-11-27 09:13:39> Default Google Project for googleAnalyticsR is set.  
+2019-11-27T09:13:39.680651+00:00 shinyapps[1528437]:  If making a lot of API calls, please: 
+2019-11-27T09:13:39.680651+00:00 shinyapps[1528437]:  visit: https://bit.ly/2Evk6hn 
+2019-11-27T09:13:39.680652+00:00 shinyapps[1528437]:  for instructions on setting your own Google Project 
+2019-11-27T09:13:39.680650+00:00 shinyapps[1528437]:  This is shared with all googleAnalyticsR users. 
+2019-11-27T09:13:39.680652+00:00 shinyapps[1528437]: 
+2019-11-27T09:13:39.688585+00:00 shinyapps[1528437]: Warning: Error in : The default Google Cloud Project for googleAnalyticsR is intended 
+2019-11-27T09:13:39.688588+00:00 shinyapps[1528437]: Please set your own client.id and client.secret via googleAuthR::gar_set_client()
+2019-11-27T09:13:39.688586+00:00 shinyapps[1528437]:            
+2019-11-27T09:13:39.688587+00:00 shinyapps[1528437]: for evalutation only, not production scripts.  
+2019-11-27T09:13:39.688588+00:00 shinyapps[1528437]:            
+2019-11-27T09:13:39.688588+00:00 shinyapps[1528437]: or otherwise as suggested on the website.
+2019-11-27T09:13:39.688588+00:00 shinyapps[1528437]:            
+2019-11-27T09:13:39.697250+00:00 shinyapps[1528437]:   227: google_analytics
+2019-11-27T09:13:39.697249+00:00 shinyapps[1528437]:   228: stop
+2019-11-27T09:13:39.697266+00:00 shinyapps[1528437]:   196: hybrid_chain
+2019-11-27T09:13:39.697250+00:00 shinyapps[1528437]:   226: f [/srv/connect/apps/test3/server.R#81]
+2019-11-27T09:13:39.697275+00:00 shinyapps[1528437]:   194: .func
+2019-11-27T09:13:39.697251+00:00 shinyapps[1528437]:   225: with_shiny
+2019-11-27T09:13:39.697275+00:00 shinyapps[1528437]:   191: contextFunc
+2019-11-27T09:13:39.697251+00:00 shinyapps[1528437]:   224: eventReactiveHandler [/srv/connect/apps/test3/server.R#183]
+2019-11-27T09:13:39.697276+00:00 shinyapps[1528437]:   190: env$runWith
+2019-11-27T09:13:39.697251+00:00 shinyapps[1528437]:   222: handlerFunc
+2019-11-27T09:13:39.697276+00:00 shinyapps[1528437]:   183: ctx$run
+2019-11-27T09:13:39.697252+00:00 shinyapps[1528437]:   209: func
+2019-11-27T09:13:39.697276+00:00 shinyapps[1528437]:   182: self$.updateValue
+2019-11-27T09:13:39.697274+00:00 shinyapps[1528437]:   195: <reactive:eventReactive(input$submit1)>
+2019-11-27T09:13:39.697278+00:00 shinyapps[1528437]:   123: <reactive:plotObj>
+2019-11-27T09:13:39.697278+00:00 shinyapps[1528437]:   137: drawPlot
+2019-11-27T09:13:39.697278+00:00 shinyapps[1528437]:   107: drawReactive
+2019-11-27T09:13:39.697278+00:00 shinyapps[1528437]:    94: origRenderFunc
+2019-11-27T09:13:39.697252+00:00 shinyapps[1528437]:   207: f
+2019-11-27T09:13:39.697276+00:00 shinyapps[1528437]:   180: Position_ctr_output
+2019-11-27T09:13:39.697265+00:00 shinyapps[1528437]:   206: Reduce
+2019-11-27T09:13:39.697277+00:00 shinyapps[1528437]:   179: renderPlot [/srv/connect/apps/test3/server.R#190]
+2019-11-27T09:13:39.697265+00:00 shinyapps[1528437]:   197: do
+2019-11-27T09:13:39.697277+00:00 shinyapps[1528437]:   177: func
+2019-11-27T09:13:39.697279+00:00 shinyapps[1528437]:    93: output$Position_ctr
+2019-11-27T09:13:39.697283+00:00 shinyapps[1528437]:    13: runApp
+2019-11-27T09:13:39.697284+00:00 shinyapps[1528437]:    12: fn
+2019-11-27T09:13:39.697291+00:00 shinyapps[1528437]:     5: eval
+2019-11-27T09:13:39.697284+00:00 shinyapps[1528437]:     7: connect$retry
+2019-11-27T09:13:39.697284+00:00 shinyapps[1528437]:     6: eval
+```
+
+
+He tells me to use gar_set_client (), but that's what I already do, I don't understand anymore
+
+
+## Session Info
+
+Please run `sessionInfo()` so we can check what versions of packages you have installed
+
+```
+R version 3.6.1 (2019-07-05)
+Platform: x86_64-w64-mingw32/x64 (64-bit)
+Running under: Windows 10 x64 (build 18362)
+
+Matrix products: default
+
+locale:
+[1] LC_COLLATE=French_France.1252  LC_CTYPE=French_France.1252    LC_MONETARY=French_France.1252 LC_NUMERIC=C                   LC_TIME=French_France.1252    
+
+attached base packages:
+[1] stats     graphics  grDevices utils     datasets  methods   base     
+
+other attached packages:
+[1] dplyr_0.8.3            urltools_1.7.3         ggplot2_3.2.1          googleAnalyticsR_0.7.1 searchConsoleR_0.4.0   googleAuthR_1.1.1      shiny_1.4.0           
+
+loaded via a namespace (and not attached):
+ [1] Rcpp_1.0.2       compiler_3.6.1   pillar_1.4.2     later_1.0.0      tools_3.6.1      zeallot_0.1.0    digest_0.6.23    packrat_0.5.0    gtable_0.3.0     jsonlite_1.6    
+[11] memoise_1.1.0    gargle_0.4.0     tibble_2.1.3     lifecycle_0.1.0  pkgconfig_2.0.3  rlang_0.4.1      rstudioapi_0.10  curl_4.2         fastmap_1.0.1    withr_2.1.2     
+[21] httr_1.4.1       askpass_1.1      fs_1.3.1         vctrs_0.2.0      triebeard_0.3.0  grid_3.6.1       tidyselect_0.2.5 glue_1.3.1       R6_2.4.1         purrr_0.3.3     
+[31] tidyr_1.0.0      magrittr_1.5     scales_1.0.0     backports_1.1.5  promises_1.1.0   htmltools_0.4.0  rsconnect_0.8.15 assertthat_0.2.1 colorspace_1.4-1 mime_0.7        
+[41] xtable_1.8-4     httpuv_1.5.2     openssl_1.4.1    lazyeval_0.2.2   munsell_0.5.0    crayon_1.3.4 
+```
+## What goes wrong
+I want to authenticate via `googleAuthR` package using my client to then use the token to read a sheet from using `googlesheets4`. It seems that `sheets_auth` doesn't "understand" the token produced by `googleAuthR` and the app still wants to authenticate via "Tidyverse API package" client before loading the app.
+
+## Steps to reproduce the problem
+```
+options("googleAuthR.scopes.selected" = c("https://www.googleapis.com/auth/spreadsheets.readonly"))
+options("googleAuthR.webapp.client_id" = "<MY_CLIENT_ID>")
+options("googleAuthR.webapp.client_secret" = "<MY_CLIENT_SECRET>")
+options(shiny.port = 8787)
+
+library(googleAuthR)
+library(googlesheets4)
+library(shinyjs)
+
+ui <- shinyUI(navbarPage(title = 'sample_app',
+                         tabPanel(
+                           useShinyjs(),
+                           googleAuthUI('gauth_login'),
+                           tableOutput('test')
+                         )
+))
+
+server <- function(input, output, session) {
+  access_token <- callModule(googleAuth, "gauth_login")
+  read_my_sheet <- function() {
+    fil <- access_token()
+    sheets_auth(token = fil, scopes = "https://www.googleapis.com/auth/spreadsheets.readonly",
+                cache = FALSE, use_oob = FALSE)
+    read_sheet("<MY_SHEET_ID>")
+  }
+  output$test <- renderTable({
+    read_my_sheet()
+  })
+}
+
+shinyApp(ui, server)
+```
+
+## Expected output
+I would like to be able to launch the app so that no authentication by `googlesheets4` was popping up at the very beginning. The flow should be - load the app, click the button for auth via `googleAuthR`, and if that succeeds, read a sheet. 
+
+## Actual output
+Pop up window asking for authentication via `googlesheets4` package.
+
+## `options(googleAuthR.verbose=2)` 
+
+```
+Listening on http://127.0.0.1:8787
+2019-11-27 08:56:03> Auth Token URL: https://accounts.google.com/o/oauth2/auth?response_type=code&client_id=<MY_CLIENT_ID>&redirect_uri=http%3A%2F%2Flocalhost%3A8787&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fspreadsheets.readonly&state=lpX7UhTRtxUBkZUWNlRH&access_type=online&approval_prompt=auto
+Waiting for authentication in browser...
+Press Esc/Ctrl + C to abort
+Authentication complete.
+Reading from '<MY SHEET NAME>'
+```
+## Session Info
+
+```
+R version 3.5.3 (2019-03-11)
+Platform: x86_64-w64-mingw32/x64 (64-bit)
+Running under: Windows >= 8 x64 (build 9200)
+
+Matrix products: default
+
+locale:
+[1] LC_COLLATE=Polish_Poland.1250  LC_CTYPE=Polish_Poland.1250    LC_MONETARY=Polish_Poland.1250
+[4] LC_NUMERIC=C                   LC_TIME=Polish_Poland.1250    
+
+attached base packages:
+[1] stats     graphics  grDevices utils     datasets  methods   base     
+
+other attached packages:
+[1] shinyjs_1.0         googlesheets4_0.1.0 googleAuthR_0.8.1   shiny_1.4.0        
+
+loaded via a namespace (and not attached):
+ [1] Rcpp_1.0.2       rstudioapi_0.10  magrittr_1.5     xtable_1.8-4     R6_2.4.0         rlang_0.4.0     
+ [7] fastmap_1.0.1    httr_1.4.1       tools_3.5.3      htmltools_0.4.0  yaml_2.2.0       assertthat_0.2.1
+[13] digest_0.6.21    tibble_2.1.3     gargle_0.4.0     crayon_1.3.4     purrr_0.3.2      later_1.0.0     
+[19] fs_1.3.1         promises_1.1.0   rsconnect_0.8.15 curl_4.2         memoise_1.1.0    glue_1.3.1      
+[25] mime_0.7         pillar_1.4.2     compiler_3.5.3   cellranger_1.1.0 jsonlite_1.6     httpuv_1.5.2    
+[31] pkgconfig_2.0.3 
+```
+
+Hi, I'm working on a google cloud storage package and would like to make it compatible with the existing packages, specifically  `googleCloudStorageR`. The main issue is that my package uses a python library which requires a JASON credential file.   `googleCloudStorageR` does use the JASON file but I cannot find a way to retrieve the file location from neither `googleCloudStorageR` nor `googleAuthR`. Since `googleCloudStorageR` depends on `googleAuthR` to do the authentification, I think this might be a good place to ask. Is there any way to get the location of the JASON file? If not, is it possible to store the file location in a place for the other package to use? 
+
+Best,
+Jiefei
+Blaz in Slack suggests adding this so it can be used for Firebase
+
+> Hey all,
+I just implemented Firebase into my app, and for that you need to authenticate the user, using his google tooken by posting its id_token string. I managed to add it to the the function which builds the token, but I am still curious why it is not included as default? (the token was created using googleAuth to login)
+```
+Token2.0$new(app = gar_app,
+               endpoint = oauth_endpoints("google"),
+               credentials = list(access_token = token$access_token,
+                                  token_type = token$token_type,
+                                  expires_in = token$expires_in,
+                                  refresh_token = token$refresh_token,
+                                  id_token = token$id_token),  # I added this line!
+               params = list(scope = scope_list, type = NULL,
+                             use_oob = FALSE, as_header = TRUE),
+               cache_path = FALSE)
+```
+Looks like some help setting this up could be covered
+https://github.com/MarkEdmondson1234/plumber_oauth2
+This allows to pass any parameter to any of the default functions used by `token_fetch`, for instance it works with offline refresh tokens as follows
+
+```
+gar_auth_configure(app = oauth_app("google", key = client.id, secret = client.secret))
+gar_auth(credentials = list(refresh_token = "1//refresh-token-here"))
+```
+
+## What goes wrong
+
+An error message is seen when parsing objects generated via `gar_api_discovery`.  `jsonlite::toJSON()` does not have an S3 method for the new class name
+
+## Fix?
+
+Either add "list" to the object class or create a new S3 method for `jsonlite::toJSON()`
+Hi there,
+
+We discussed the OAuth token before in the googleCloudStorageR repo, but given that it has to do with authentication I figured this repo is a better spot to discuss it.
+
+## Steps to reproduce the problem
+When using the upload function of googleCloudStorageR (gcs_upload) I encounter a long freeze during which an attempt is made to refresh the OAuth token. This happens consistently after 60 minutes after the googleCloudStorageR is loaded with it's respective environment variables.
+
+## Verbose Setting
+
+I did not run the verbose option before, given our setup and the 60 minute period for the bug to occur it is not straightforward to do that. Happy to do it if it helps significantly with debugging.
+
+## Session Info
+
+I cannot share the entire sessionInfo(), but hopefully the following is helpful already.
+
+```
+R version 3.5.3 (2019-03-11)
+Platform: x86_64-pc-linux-gnu (64-bit)
+Running under: Debian GNU/Linux 9 (stretch)
+
+> packageVersion('googleAuthR')
+[1] ‘1.1.1.9000’
+> packageVersion('googleCloudStorageR')
+[1] ‘0.5.1.9000’
+> packageVersion('gargle')
+[1] ‘0.4.0.9000’
+```
+
+Best regards,
+
+Michael
+
+## What goes wrong
+
+Sometimes the API returns a nextPageToken URL, but there is not data e.g. 1 to 66 results only out of 1000 pageLimit, but a nextPageToken URL is present.  This means that the next page returns no results, and raises an error
+
+## Steps to reproduce the problem
+
+Noticed for deleting account links such as at this URL:
+ https://developers.google.com/apis-explorer/#search/analytics/analytics/v3/analytics.management.accountUserLinks.list?accountId=18570029&max-results=1000&start-index=1001&_h=2&
+
+## Expected output
+
+No error
+
+## Actual output
+
+```r
+Error in UseMethod("select_") :
+ nicht anwendbare Methode für 'select_' auf Objekt der Klasse "NULL" angewendet
+Fehler: API Data failed to parse.
+```
+
+Debug response:
+
+Note the empty list for responses:
+
+```r
+ .. ..$ items       : list()
+```
+
+```r
+List of 3
+$ request       :List of 4
+ ..$ req_url     : chr “https://www.googleapis.com/analytics/v3/management/accounts/18570029/entityUserLinks?start-index=1001&max-results=1000”
+ ..$ request_type: chr “GET”
+ ..$ the_body    : NULL
+ ..$ customConfig: NULL
+$ response      :List of 3
+ ..$ data_parse_args: list()
+ ..$ data_parse_func:function (x)
+ ..$ content        :List of 6
+ .. ..$ kind        : chr “analytics#entityUserLinks”
+ .. ..$ totalResults: int 78
+ .. ..$ startIndex  : int 1001
+ .. ..$ itemsPerPage: int 1000
+ .. ..$ previousLink: chr “https://www.googleapis.com/analytics/v3/management/accounts/18570029/entityUserLinks?start-index=1&max-results=1000"
+ .. ..$ items       : list()
+$ authentication:List of 1
+ ..$ token:Classes ‘Gargle2.0’, ‘Token2.0’, ‘Token’, ‘R6’ <Gargle2.0>
+ Inherits from: <Token2.0>
+ Public:
+   app: oauth_app
+   cache: function ()
+   cache_path: /Users/rsiegenthaler/.R/gargle/gargle-oauth
+   can_refresh: function ()
+   clone: function (deep = FALSE)
+   credentials: list
+   email: reto.siegenthaler@jobcloud.ch
+   endpoint: oauth_endpoint
+   hash: function ()
+   init_credentials: function ()
+   initialize: function (email = gargle_oauth_email(), app = gargle_app(), package = “gargle”,
+   load_from_cache: function ()
+   package: googleAuthR
+   params: list
+   print: function (...)
+   private_key: NULL
+   refresh: function ()
+   revoke: function ()
+   sign: function (method, url)
+   validate: function ()
+- attr(*, “class”)= chr “gar_parse_error”
+2019-08-21 12:09:49> - Attempting data parsing
+$request
+$request$req_url
+[1] “https://www.googleapis.com/analytics/v3/management/accounts/18570029/entityUserLinks?start-index=1001&max-results=1000"
+$request$request_type
+[1] “GET”
+$request$the_body
+NULL
+$request$customConfig
+NULL
+$response
+$response$data_parse_args
+list()
+$response$data_parse_func
+function (x)
+{
+   x %>% management_api_parsing(“analytics#entityUserLinks”) %>%
+       select(-userRef.kind, -ends_with(“kind”), -ends_with(“href”)) %>%
+       rename(linkId = id)
+}
+<bytecode: 0x7f8e9388fa80>
+<environment: namespace:googleAnalyticsR>
+$response$content
+$response$content$kind
+[1] “analytics#entityUserLinks”
+$response$content$totalResults
+[1] 78
+$response$content$startIndex
+[1] 1001
+$response$content$itemsPerPage
+[1] 1000
+$response$content$previousLink
+[1] “https://www.googleapis.com/analytics/v3/management/accounts/18570029/entityUserLinks?start-index=1&max-results=1000"
+$response$content$items
+list()
+$authentication
+$authentication$token
+<Token (via gargle)>
+ <oauth_endpoint> google
+            <app> googleAuthR.client_id=289759286325-
+          <email> reto.siegenthaler@jobcloud.ch
+         <scopes> ...analytics, ...analytics.edit, ...analytics.manage.users, ...analytics.manage.users.readonly, ...analytics.readonly, ...analytics.user.deletion, ...userinfo.email
+    <credentials> access_token, expires_in, refresh_token, scope, token_type, id_token
+---
+attr(,“class”)
+[1] “gar_parse_error”
+```
+
+## 'API Data failed to parse' diagnostics
+
+If you have an error starting with:
+
+`API Data failed to parse.`
+
+* Please install googleAuthR >v0.7.9000:
+
+```r
+remotes::install_github("MarkEdmondson1234/googleAuthR")
+```
+
+* Restart the R session and run your bugged code.
+* It should write a file called `gar_parse_error.rds` to your working directory.
+* Run the below to output some diagnostic information and paste the response here.
+
+```r
+googleAuthR::gar_debug_parsing("gar_parse_error.rds")
+```
+
+## Session Info
+
+Unknown.
+
+Maybe fix in `googleAuthR`
+Refer to `gargle` website where possible e.g. https://gargle.r-lib.org/articles/how-gargle-gets-tokens.html

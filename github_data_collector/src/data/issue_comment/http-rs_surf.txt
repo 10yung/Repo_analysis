@@ -1,0 +1,151 @@
+Closes https://github.com/http-rs/surf/issues/97. Thanks!
+:wave: I'm looking to use surf to communicate with a unix domain socket (and maybe a windows named pipe someday but not anytime soon).
+
+I figured this would work "out of the box" since the default client seems to be based on libcurl, and libcurl can handle unix sockets. However to my dismay this seems to not work:
+
+```rust
+surf::get("unix://var/run/docker.sock:0/v1.30/version")
+```
+
+Specifically it fails with logs like:
+
+```
+Jan 08 00:30:28.069 DEBUG clean:docker_api_get{path="/version" timeout=None}: dev_loop::executors::docker: URL for get will be: unix://var/run/docker.sock:0/v1.30/version
+Jan 08 00:30:28.069 DEBUG clean:docker_api_get{path="/version" timeout=None}: isahc::agent: agent waker listening on 127.0.0.1:48125    
+Jan 08 00:30:28.070 DEBUG isahc::agent: agent took 924.736µs to start up    
+Jan 08 00:30:28.070 DEBUG isahc::agent: agent ready    
+Jan 08 00:30:28.070  INFO clean:docker_api_get{path="/version" timeout=None}: surf::middleware::logger::native: sending request    
+Jan 08 00:30:28.070 DEBUG isahc::handler: initializing handler for request [id=0]    
+Jan 08 00:30:28.070 DEBUG isahc::curl: Protocol "unix" not supported or disabled in libcurl    
+Jan 08 00:30:28.070 DEBUG isahc::curl: Closing connection -1    
+Jan 08 00:30:28.070 DEBUG isahc::handler: curl error: [1] Unsupported protocol    
+Jan 08 00:30:28.070  WARN isahc::handler: request completed with error [id=AtomicCell { value: 0 }]: Curl("Unsupported protocol"): Unsupported protocol    
+Jan 08 00:30:28.071 DEBUG isahc::agent: agent shutting down    
+Jan 08 00:30:28.071  WARN clean: dev_loop::executors::docker: Failed to reach out to docker engine api: [Failed to send docker API Request due to: [Curl("Unsupported protocol")]]
+```
+
+Is there a known way to get this to work currently?
+```
+let res = surf::get("abc").recv_string(data).await;
+```
+As above, this will cause the program to crash.
+Continuation of #113 to resolve #86.
+
+In my commit I changed all instances of `BoxError` with `Error`.  I also added `impl From`'s for `log::SetLoggerError` and `std::io::Error`
+```rust
+use surf::http::StatusCode;
+use surf::Response;
+use serde::{Deserialize, Serialize};
+
+pub(crate) struct FreshAccount<'a> {
+    pub username: &'a str,
+    pub password: &'a str,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LoginForm<'a> {
+    ig_sig_key_version: &'a str,
+    signed_body: &'a str
+}
+
+pub(crate) async fn login(fresh: FreshAccount<'_>) -> Option<(&str, &str)> {
+    println!("Attempting to login with credentials ({}:{})", fresh.username, fresh.password);
+
+    let mut csrf_token: &str = "";
+    let mut session_id: &str = "";
+
+    let uri: &str = "https://i.instagram.com/api/v1/accounts/login/";
+
+    let fresh_uuid = uuid::Uuid::new_v4().to_hyphenated();
+
+    let body: String = format!("fa61f4be32e827c7152e38a075e3614\
+        2d8313ba582d6437f07539b00a03f454e.{{\"reg_login\":\"0\",\"password\":\"{}\",\"device_id\":\
+        \"{}\",\"username\":\"{}\",\"adid\":\"FE4FD084-9DCB-481A-A248-57E0E32E25ED\",\
+        \"login_attempt_count\":\"0\",\"phone_id\":\"{}\"}}", fresh.password, fresh_uuid, fresh.username, fresh_uuid);
+
+    println!();
+    println!("Signed body is {}", body);
+
+    let mut res: Response = surf::post(uri)
+        .set_header("Accept-Language", "en-us en q=0.9")
+        .set_header("Accept-Encoding", "gzip, deflate, br")
+        .set_header("Content-Type", "application/x-www-form-urlencoded")
+        .set_header("Connection", "keep-alive")
+        .set_header("User-Agent", "Instagram 44.0.0.17.95 (iPhone9,3; iOS 12_0; en_US; en-US; scale=2.00; gamut=wide; 750x1334) AppleWebKit/420+")
+        .body_form(&LoginForm{ig_sig_key_version: "5", signed_body: &body}).unwrap().await.expect("Unwrap for response of login request failed..");
+
+    let status: StatusCode = res.status();
+
+    println!();
+    if status == 200 {
+        // get from headers
+        csrf_token = "csrftokenhere";
+        session_id = "sessionidhere";
+    } else {
+        println!("Unexpected status code {}", status.as_str());
+        println!("{}", res.body_string().await.unwrap());
+    }
+
+    // Failed == session_id is empty
+    Some((csrf_token, session_id))
+}
+```
+Golang code: https://pastebin.com/9C1HUkTV
+
+I'm getting a 400 response code (bad request), golang is giving me a 200 response code for the same request
+Rather than passing `http::Request` and `http::Response` through the middleware, we should pass `surf::Request` and `surf::Response` through. This should significantly reduce the API surface we expose, and make it so folks no longer have to learn two different sets of APIs to write against.
+Currently the `middleware` function is under `Request`.
+
+I am trying to create and reuse a client, a sign will be calculated base on the url path and query. 
+Is it possible that I can create a http client with applied middleware before know about any uri and http methods?
+
+Basically it's request/response interceptor.
+
+for example:
+```rust
+let client = surf::Client::new();
+let client = client.middleware(...)  // no middleware func exist in the client
+
+let request = Request { client }
+
+// the middleware func will be executed before sending out the request
+request.client.get("https://httpbin.org/get").recv_string(); 
+```
+
+
+
+
+Currently, Surf doesn't have way to configure the client.   Instead, it would be better if we can pass configured native client.  For example
+```
+let native_client = HttpClient::builder()
+      ... do various configuration...;
+let client = surf::Client::new(native_client);
+let req1 = client.get("https://httpbin.org/get").recv_string();
+```
+Using `surf 1.0.3` from crates.io, rustc 1.39.0 (4560ea788 2019-11-04) on Mac OS and this program:
+
+```rust
+#[async_std::main]
+async fn main() {
+    env_logger::init();    
+    let rv = surf::get("https://www.spiegel.de/schlagzeilen/index.rss")
+        .recv_bytes()
+        .await;
+    match rv {
+        Ok(_) => (),
+        Err(e) => println!("{:?}", e),
+    }
+}
+```
+
+I get 100% of the time `NoResponse` as error. However if I do `curl 'https://www.spiegel.de/schlagzeilen/index.rss'` on the commandline or use `reqwest` with tokio equivalently, I do get the expected content.
+
+I tried using the `hyper-client` feature, but unfortunately that did not compile for me.
+I currently have an `http::header::HeaderMap` that I want to use with my surf request, but I'm having a lot of trouble getting this to work. I tried a few approaches, but for one reason or another they just aren't feasible
+
+1. Accessing the internal `http::Request` type doesn't work because `surf::Request::request()` returns a non-mutable reference. It doesn't seem possible to do what surf does internally (calling `self.req.as_mut().unwrap().headers_mut().insert(key, value)`)
+1. Iterating over the `HeaderMap` doesn't seem to work because `surf::Request::set_header()` expects a `&'static str` for the key, but my `HeaderMap` has a non-static lifetime
+
+Are there any suggestions on how this could be addressed? I could use a different type in place of `HeaderMap`, but I want to avoid this because surf will panic if the header value does not parse cleanly
+
+It seems like surf deliberately lacks this API because it's more complicated than the current `set_header` API (I totally agree), but would it be possible to maybe add a `surf::Request::request_mut()` or `surf::Request::set_headers_from_map()`?

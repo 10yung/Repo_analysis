@@ -1,0 +1,580 @@
+Ensure the TCG exit flag is cleared at the end of cpu_exec. This ensures
+that subsequent calls are not polluted by the prior call to request an
+early exit. The symptoms of the problem being addressed here are that
+after a cpu_exit call triggered within a hook there may still be a
+pending tcg_exit_req flag set. This then causes a block to start its
+execution and then be aborted (from which point it'll continue because
+there's no other condition to service). The start of the execution
+causes the block hook to be called, no actual code to be run, and then
+the block started again with another block hook call.
+
+This change is discussed in ticket 1193:
+    https://github.com/unicorn-engine/unicorn/issues/1193
+I'm seeing problem with the block hook being called twice (with no intervening code execution) when the emulation was stopped in the previous emulation cycle. That seems rather difficult to explain, so I'll give a sequence that causes it:
+
+1. Register a block hook.
+2. Register an exception hook (UC_HOOK_INTR)
+3. Start execution of code (emu_start)
+4. Our block hook is called to say that we're executing our code
+5. When an exception instruction is executed, the hook issues an emu_stop to request that the system return.
+6. We return from emu_start, and do whatever we need to do to handle the exception.
+7. Start execution of code again.
+8. Our block hook is called to say that we execute the instructions after the exception instruction.
+9. Our block hook is called AGAIN, with the same block.
+10. Execution continues.
+
+That's the sequence that happens in the failure case, and if we insert hooks for code, we see that between the block hook being called at step 8 and step 9, no code is executed (or at least, no code hook is executed, and by constructing the code in known ways, it is clear that the code is not executed.
+
+Actual example code that exhibits this issue:
+
+```python
+# Demonstrate the repeated block hooks being called.
+
+from capstone import *
+import capstone.arm_const
+
+from unicorn import *
+import unicorn.arm_const as arm
+
+# The bit pattern that is used here is intended to expose execution issues:
+#  * If an instruction is executed twice, there's a gap in the bit pattern that
+#    will be filled (ie odd bits should never be set in normal execution)
+#  * If a block is executed twice, multiple bits will be affected.
+armcode = """
+    8000 : .... : E3A00902 : MOV     r0,#&8000
+    8004 : .... : E2800001 : ADD     r0,r0,#&1 ; = 1
+    8008 : .... : E2800004 : ADD     r0,r0,#&4 ; = 4
+    800C : .... : EF000001 : SWI     1
+    8010 : .... : E2800010 : ADD     r0,r0,#&10 ; = 16
+    8014 : @... : E2800040 : ADD     r0,r0,#&40 ; = 64
+    8018 : .... : EF000002 : SWI     2
+    801C : .... : E2800C01 : ADD     r0,r0,#&100 ; = 256
+    8020 : .... : E3A0F000 : MOV     pc,#&0
+"""
+
+md = Cs(CS_ARCH_ARM, CS_MODE_ARM)
+md.detail = True
+md.syntax = CS_OPT_SYNTAX_NOREGNAME
+
+code = []
+lines = armcode.splitlines()
+for line in lines:
+    if line:
+        # Change the little-endian string to a set of characters
+        inst = line[18:26]
+        chars = list(inst.decode('hex'))
+        chars.reverse()
+        code.extend(chars)
+
+code = ''.join(code)
+
+def diss(codeword, address):
+    for i in md.disasm(codeword, address):
+        print("0x%08x: %-8s %s" %(i.address, i.mnemonic, i.op_str))
+
+def hook_block(uc, address, size, user_data):
+    print("Block execution at 0x%08x + %x" % (address, size))
+
+def hook_code(uc, address, size, user_data):
+    codeword = uc.mem_read(address, 4)
+    diss(codeword, address)
+
+def hook_intr(uc, intno, user_data):
+    print("CPU Exception %i" % (intno,))
+    # Request that the emulation stops
+    uc.emu_stop()
+
+
+reg_map = [
+        arm.UC_ARM_REG_R0,
+        arm.UC_ARM_REG_R1,
+        arm.UC_ARM_REG_R2,
+        arm.UC_ARM_REG_R3,
+        arm.UC_ARM_REG_R4,
+        arm.UC_ARM_REG_R5,
+        arm.UC_ARM_REG_R6,
+        arm.UC_ARM_REG_R7,
+        arm.UC_ARM_REG_R8,
+        arm.UC_ARM_REG_R9,
+        arm.UC_ARM_REG_R10,
+        arm.UC_ARM_REG_R11,
+        arm.UC_ARM_REG_R12,
+        arm.UC_ARM_REG_SP,
+        arm.UC_ARM_REG_LR,
+        arm.UC_ARM_REG_PC,
+    ]
+
+
+# Base for the code
+ADDRESS = 0x8000
+
+# Initialize emulator in ARM mode
+mu = Uc(UC_ARCH_ARM, UC_MODE_ARM)
+
+# map 4K memory for this emulation
+mu.mem_map(ADDRESS, 4 * 1024)
+
+# Write the code to memory.
+mu.mem_write(ADDRESS, code)
+
+# Trace execution with a block, code hook and interrupt
+mu.hook_add(UC_HOOK_BLOCK, hook_block, begin=ADDRESS, end=ADDRESS + 4 * 1024)
+mu.hook_add(UC_HOOK_CODE, hook_code, begin=ADDRESS, end=ADDRESS + 4 * 1024)
+mu.hook_add(UC_HOOK_INTR, hook_intr, begin=ADDRESS, end=ADDRESS + 4 * 1024)
+
+mu.reg_write(arm.UC_ARM_REG_PC, ADDRESS)
+while True:
+    try:
+        pc = mu.reg_read(arm.UC_ARM_REG_PC)
+        print("Begin execution at 0x%08x" % (pc,))
+        mu.emu_start(pc, ADDRESS + len(code))
+    except UcError as exc:
+        print("Exception: %s (errno=%i)" % (exc, exc.errno))
+        if exc.errno == UC_ERR_FETCH_UNMAPPED:
+            # That branch through 0 at the end of the code means that we're done
+            break
+
+        if exc.errno == UC_ERR_EXCEPTION:
+            # An unhandled exception (which never happens, because we trap them in the hook)
+            print("Unhandled CPU exception")
+            pass
+
+print("Finished, now print the registers")
+for regnum, regcode in enumerate(reg_map):
+    regvalue = mu.reg_read(reg_map[regnum])
+    print("  r%-2i : %08x / %-3i" % (regnum, regvalue, regvalue))
+
+# Show the bits to check that we actually have the right ones set
+print("Bits in R0")
+r0 = mu.reg_read(reg_map[0])
+for bit in range(16):
+    value = 1<<bit
+    state = 'SET' if r0 & value else '0'
+    print("Bit %2i (% 8x) : %s" % (bit, value, state))
+```
+
+This displays the following output, which shows that the block hook is being called twice, although no actual execution occurs.
+
+```
+Begin execution at 0x00008000
+Block execution at 0x00008000 + 10
+0x00008000: mov      r0, #0x8000
+0x00008004: add      r0, r0, #1
+0x00008008: add      r0, r0, #4
+0x0000800c: svc      #1
+CPU Exception 2
+Begin execution at 0x00008010
+Block execution at 0x00008010 + c
+Block execution at 0x00008010 + c
+0x00008010: add      r0, r0, #0x10
+0x00008014: add      r0, r0, #0x40
+0x00008018: svc      #2
+CPU Exception 2
+Begin execution at 0x0000801c
+Block execution at 0x0000801c + 8
+Block execution at 0x0000801c + 8
+0x0000801c: add      r0, r0, #0x100
+0x00008020: mov      pc, #0
+Exception: Invalid memory fetch (UC_ERR_FETCH_UNMAPPED) (errno=8)
+Finished, now print the registers
+  r0  : 00008155 / 33109
+  r1  : 00000000 / 0  
+  r2  : 00000000 / 0  
+  r3  : 00000000 / 0  
+  r4  : 00000000 / 0  
+  r5  : 00000000 / 0  
+  r6  : 00000000 / 0  
+  r7  : 00000000 / 0  
+  r8  : 00000000 / 0  
+  r9  : 00000000 / 0  
+  r10 : 00000000 / 0  
+  r11 : 00000000 / 0  
+  r12 : 00000000 / 0  
+  r13 : 00000000 / 0  
+  r14 : 00000000 / 0  
+  r15 : 00000000 / 0  
+Bits in R0
+Bit  0 (       1) : SET
+Bit  1 (       2) : 0
+Bit  2 (       4) : SET
+Bit  3 (       8) : 0
+Bit  4 (      10) : SET
+Bit  5 (      20) : 0
+Bit  6 (      40) : SET
+Bit  7 (      80) : 0
+Bit  8 (     100) : SET
+Bit  9 (     200) : 0
+Bit 10 (     400) : 0
+Bit 11 (     800) : 0
+Bit 12 (    1000) : 0
+Bit 13 (    2000) : 0
+Bit 14 (    4000) : 0
+Bit 15 (    8000) : SET
+```
+
+I suspect that something about the state is causing an abort of the block compile because the `emu_stop` had been detected (or something hung off it), and then it clears that state, and re-executes, but because of the hook being present we see two block executions.
+
+There were TONS of changes since:
+- An upcoming https://wiki.qemu.org/ChangeLog/5.0
+- https://wiki.qemu.org/ChangeLog/4.2
+- https://wiki.qemu.org/ChangeLog/4.1
+- https://wiki.qemu.org/ChangeLog/4.0
+- https://wiki.qemu.org/ChangeLog/3.1
+- https://wiki.qemu.org/ChangeLog/3.0
+- https://wiki.qemu.org/ChangeLog/2.8
+- https://wiki.qemu.org/ChangeLog/2.7
+- https://wiki.qemu.org/ChangeLog/2.6
+- https://wiki.qemu.org/ChangeLog/2.5
+- https://wiki.qemu.org/ChangeLog/2.4
+- https://wiki.qemu.org/ChangeLog/2.3
+
+Unicorn (qemu?) is unable to emulate the dbf instruction depicted below. The result is a `UC_ERR_EXCEPTION`.
+
+![image](https://user-images.githubusercontent.com/14361933/72214121-0c24d500-34ca-11ea-9ab1-4cfc6cd2bf62.png)
+
+make test disabled for msys2/MinGW for now.
+I cannot find UC_X86_REG_GS_BASE UC_X86_REG_FS_BASE  in the master branch.what is going on?How can i set the kernel gs base?
+When running [the simple test harness of afl unicorn](https://github.com/Battelle/afl-unicorn/blob/master/unicorn_mode/samples/simple/simple_test_harness.py)  (without any afl patches!) using Unicorn 1.0.2rc1 on the Raspberri PI, the following line crashes with segmentation fault:
+https://github.com/unicorn-engine/unicorn/blob/24f55a7973278f20f0de21b904851d99d4716263/qemu/target-mips/op_helper.c#L2277
+
+The stack is completely bogus when it crashes. No clue what's going on, sadly. It works fine on x86...
+
+Command line:
+```bash
+➜  simple git:(master) python simple_test_harness.py sample_inputs/sample1.bin
+Loading data input from sample_inputs/sample1.bin
+Starting the AFL forkserver by executing 1 instruction
+[1]    20476 segmentation fault  python simple_test_harness.py sample_inputs/sample1.bin
+```
+$ ./make.sh ios_arm64
+make.sh - The build script for unicorn engine
+USAGE:
+    $ ./make.sh [OPTIONS]
+OPTIONS:
+                            Build the project
+    asan                    Build for ASan
+    install                 Install the project
+    uninstall               Uninstall the project
+    macos-universal         Build universal binaries on macOS
+    macos-universal-no      Build non-universal binaries that includes only 64-bit code on macOS
+    cross-win32             Cross-compile Windows 32-bit binary with MinGW
+    cross-win64             Cross-compile Windows 64-bit binary with MinGW
+    cross-android_arm       Cross-compile for Android Arm
+    cross-android_arm64     Cross-compile for Android Arm64
+    linux32                 Cross-compile Unicorn on 64-bit Linux to target 32-bit binary
+    msvc_update_genfiles    Generate files for MSVC projects
+
+When unicorn uses the timeout function, there are two competing bugs.
+example 1：
+When timeout is set and an interrupt is triggered, there is a certain probability that the UC_ERR_EXCEPTION abnormal behavior is triggered.
+poc:
+```
+from unicorn import *
+from unicorn.arm_const import *
+
+def hook_intr(uc, intno, user_data):
+    global intr_num, last_pc
+    intr_num += 1
+    pc = mu.reg_read(UC_ARM_REG_PC)
+    last_pc = pc
+    print("intr pc is : 0x%x" % pc)
+
+def hook_code(mu, addr, size, data):
+    pc = mu.reg_read(UC_ARM_REG_PC)
+    print("hook pc is : 0x%x" % pc)
+
+CODE_ADDRESS = 0x8000
+code = '''
+    mov r0, 0
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    swi 0
+'''
+code = b'\x00\x00\xa0\xe3' + b'\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x00\x00\x00\xef' * 40
+
+try_number = 0x2000
+
+while True:
+    try:
+        try_number -= 1
+        if try_number == 0:
+            break
+        global intr_num
+        global last_pc
+
+        intr_pc = [0x804c, 0x8094, 0x80dc, 0x8124, 0x816c, 0x81b4, 0x81fc, 0x8244, 0x828c, 0x82d4, 0x831c, 0x8364, 0x83ac, 0x83f4, 0x843c, 0x8484, 0x84cc, 0x8514, 0x855c, 0x85a4, 0x85ec, 0x8634, 0x867c, 0x86c4, 0x870c, 0x8754, 0x879c, 0x87e4, 0x882c, 0x8874, 0x88bc, 0x8904, 0x894c, 0x8994, 0x89dc, 0x8a24, 0x8a6c, 0x8ab4, 0x8afc, 0x8b44]
+
+        intr_num = 0
+        mu = Uc(UC_ARCH_ARM, UC_MODE_ARM)
+        mu.mem_map(CODE_ADDRESS, 2 * 1024 * 1024)
+        mu.mem_write(CODE_ADDRESS, code)
+
+        mu.hook_add(UC_HOOK_INTR, hook_intr)
+        # mu.hook_add(UC_HOOK_CODE, hook_code)
+
+        print("Starting emulation")
+
+        mu.emu_start(CODE_ADDRESS, CODE_ADDRESS + len(code), timeout = 1000)
+
+        print("Emulation done")
+
+        pc = mu.reg_read(UC_ARM_REG_PC)
+
+        print(">>> pc: 0x%x" % (pc))
+        print("intr number is : ", intr_num)
+
+        del mu
+    except UcError as e:
+        print("ERROR: %s" % e)
+        pc = mu.reg_read(UC_ARM_REG_PC)
+
+        print(">>> pc: 0x%x" % (pc))
+        print("intr number is : ", intr_num)
+        break
+
+if try_number == 0:
+    print("good job!")
+```
+
+result:
+```
+intr pc is : 0x8244
+intr pc is : 0x828c
+intr pc is : 0x82d4
+intr pc is : 0x831c
+intr pc is : 0x8364
+intr pc is : 0x83ac
+ERROR: Unhandled CPU exception (UC_ERR_EXCEPTION)
+>>> pc: 0x83f4
+intr number is :  13
+```
+Cause Analysis:When setting timeout, there is a certain probability that emu_stop () will be triggered in the following code snippet.
+```
+                    bool catched = false;
+#if defined(CONFIG_USER_ONLY)
+                    /* if user mode only, we simulate a fake exception
+                       which will be handled outside the cpu execution
+                       loop */
+#if defined(TARGET_I386)
+                    cc->do_interrupt(cpu);
+#endif
+                    ret = cpu->exception_index;
+                    break;
+#else
+                    if (uc->stop_interrupt && uc->stop_interrupt(cpu->exception_index)) {
+                        // Unicorn: call registered invalid instruction callbacks
+                        HOOK_FOREACH_VAR_DECLARE;
+                        HOOK_FOREACH(uc, hook, UC_HOOK_INSN_INVALID) {
+                            catched = ((uc_cb_hookinsn_invalid_t)hook->callback)(uc, hook->user_data);
+                            if (catched)
+                                break;
+                        }
+                        if (!catched)
+                            uc->invalid_error = UC_ERR_INSN_INVALID;
+                    } else {
+                        // Unicorn: call registered interrupt callbacks
+                        HOOK_FOREACH_VAR_DECLARE;
+                        HOOK_FOREACH(uc, hook, UC_HOOK_INTR) {
+                            ((uc_cb_hookintr_t)hook->callback)(uc, cpu->exception_index, hook->user_data);
+                            catched = true;
+                        }
+                        if (!catched)
+                            uc->invalid_error = UC_ERR_EXCEPTION;
+                    }
+```
+After the emu_stop () is triggered, the HOOK program will not be executed again, which causes catched to fail, so the UC_ERR_EXCEPTION exception is triggered.
+
+example 2：
+After unicorn set timeout, there is a probability that the interrupt instruction has been executed, but hook_interrupt has not been executed.
+poc:
+```
+from unicorn import *
+from unicorn.arm_const import *
+
+def hook_intr(uc, intno, user_data):
+    global intr_num, last_pc
+    intr_num += 1
+    pc = mu.reg_read(UC_ARM_REG_PC)
+    last_pc = pc
+    print("intr pc is : 0x%x" % pc)
+
+def hook_code(mu, addr, size, data):
+    pc = mu.reg_read(UC_ARM_REG_PC)
+    print("hook pc is : 0x%x" % pc)
+
+CODE_ADDRESS = 0x8000
+code = '''
+    mov r0, 0
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    add r0, 1
+    swi 0
+'''
+code = b'\x00\x00\xa0\xe3' + b'\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x01\x00\x80\xe2\x00\x00\x00\xef' * 40
+
+try_number = 0x2000
+
+while True:
+    try:
+        try_number -= 1
+        if try_number == 0:
+            break
+        global intr_num
+        global last_pc
+
+        intr_pc = [0x804c, 0x8094, 0x80dc, 0x8124, 0x816c, 0x81b4, 0x81fc, 0x8244, 0x828c, 0x82d4, 0x831c, 0x8364, 0x83ac, 0x83f4, 0x843c, 0x8484, 0x84cc, 0x8514, 0x855c, 0x85a4, 0x85ec, 0x8634, 0x867c, 0x86c4, 0x870c, 0x8754, 0x879c, 0x87e4, 0x882c, 0x8874, 0x88bc, 0x8904, 0x894c, 0x8994, 0x89dc, 0x8a24, 0x8a6c, 0x8ab4, 0x8afc, 0x8b44]
+
+        intr_num = 0
+        mu = Uc(UC_ARCH_ARM, UC_MODE_ARM)
+        mu.mem_map(CODE_ADDRESS, 2 * 1024 * 1024)
+        mu.mem_write(CODE_ADDRESS, code)
+
+        mu.hook_add(UC_HOOK_INTR, hook_intr)
+        # mu.hook_add(UC_HOOK_CODE, hook_code)
+
+        print("Starting emulation")
+
+        mu.emu_start(CODE_ADDRESS, CODE_ADDRESS + len(code), timeout = 1000)
+
+        print("Emulation done")
+
+        pc = mu.reg_read(UC_ARM_REG_PC)
+
+        print(">>> pc: 0x%x" % (pc))
+        print("intr number is : ", intr_num)
+        
+        if (pc in intr_pc) and last_pc != pc:
+            break
+
+        del mu
+    except UcError as e:
+        print("ERROR: %s" % e)
+        pc = mu.reg_read(UC_ARM_REG_PC)
+
+        print(">>> pc: 0x%x" % (pc))
+        print("intr number is : ", intr_num)
+        break
+
+if try_number == 0:
+    print("good job!")
+```
+The program returns to the soft interrupt of the hook arm and processes the soft interrupt. When unicorn processes the interrupt in the program, it will execute the interrupted instruction first, and then execute the interrupted processing program after executing the instruction. This also causes the pc value obtained in the re-interrupt to be the next instruction of the interrupt instruction.
+The intr_pc in the code stores the next instruction of all soft interrupts. It ends when the program triggers to the execution of the interrupt instruction, but does not capture the interrupt instruction.
+
+result:
+```
+Starting emulation
+intr pc is : 0x804c
+intr pc is : 0x8094
+intr pc is : 0x80dc
+intr pc is : 0x8124
+intr pc is : 0x816c
+intr pc is : 0x81b4
+intr pc is : 0x81fc
+intr pc is : 0x8244
+intr pc is : 0x828c
+intr pc is : 0x82d4
+intr pc is : 0x831c
+intr pc is : 0x8364
+intr pc is : 0x83ac
+intr pc is : 0x83f4
+intr pc is : 0x843c
+intr pc is : 0x8484
+intr pc is : 0x84cc
+intr pc is : 0x8514
+intr pc is : 0x855c
+intr pc is : 0x85a4
+intr pc is : 0x85ec
+intr pc is : 0x8634
+intr pc is : 0x867c
+intr pc is : 0x86c4
+intr pc is : 0x870c
+intr pc is : 0x8754
+Emulation done
+>>> pc: 0x879c
+intr number is :  26
+```
+As can be seen from the results of the program, the 27th interrupt was executed, but it was not captured.
+The root cause is that when an interrupt is triggered, unicorn will execute cpu_loop_exit (cpu), and this will jump to the following code snippet:
+```
+if (sigsetjmp(cpu->jmp_env, 0) == 0) {
+            if (uc->stop_request || uc->invalid_error) {
+                break;
+            }
+```
+If emu_stop is called before this, stop_request will be set to true, which will directly jump out of the large loop here, resulting in interrupts that cannot be captured.
+The fix here is that unicorn can be ended only when the cpu exits.
+Therefore, a new flag bit timeout_request is created. When the CPU exits, the flag bit will be detected to determine whether to end the simulation.
+> `Building wheel for unicorn (setup.py) ... error
+  ERROR: Command errored out with exit status 1:
+   command: /data/data/com.termux/files/usr/bin/python3 -u -c 'import sys, setuptools, tokenize; sys.argv[0] = '"'"'/data/data/com.termux/files/usr/tmp/pip-install-s05smeqb/unicorn/setup.py'"'"'; __file__='"'"'/data/data/com.termux/files/usr/tmp/pip-install-s05smeqb/unicorn/setup.py'"'"';f=getattr(tokenize, '"'"'open'"'"', open)(__file__);code=f.read().replace('"'"'\r\n'"'"', '"'"'\n'"'"');f.close();exec(compile(code, __file__, '"'"'exec'"'"'))' bdist_wheel -d /data/data/com.termux/files/usr/tmp/pip-wheel-tk1khx0w --python-tag cp37
+       cwd: /data/data/com.termux/files/usr/tmp/pip-install-s05smeqb/unicorn/
+  Complete output (12 lines):
+  running bdist_wheel
+  running build
+  Building C extensions
+  cd qemu && \
+  ./configure --cc="cc" --extra-cflags="-DUNICORN_HAS_X86 -DUNICORN_HAS_ARM -DUNICORN_HAS_ARMEB -DUNICORN_HAS_M68K -DUNICORN_HAS_ARM64 -DUNICORN_HAS_MIPS -DUNICORN_HAS_MIPSEL -DUNICORN_HAS_MIPS64 -DUNICORN_HAS_MIPS64EL -DUNICORN_HAS_SPARC -fPIC -fvisibility=hidden" --target-list="x86_64-softmmu, arm-softmmu, armeb-softmmu, m68k-softmmu, aarch64-softmmu, mips-softmmu, mipsel-softmmu, mips64-softmmu, mips64el-softmmu, sparc-softmmu,sparc64-softmmu,"
+
+  ERROR: Cannot use 'python', Python 2.4 or later is required.
+         Note that Python 3 or later is not yet supported.
+         Use --python=/path/to/python to specify a supported Python.
+
+  make: *** [Makefile:214: qemu/config-host.h-timestamp] Error 1
+  error: [Errno 2] No such file or directory: 'libunicorn.so'
+  ----------------------------------------
+  ERROR: Failed building wheel for unicorn
+  Running setup.py clean for unicorn
+Successfully built pwntools
+Failed to build unicorn
+Installing collected packages: unicorn, pwntools
+  Running setup.py install for unicorn ... error
+    ERROR: Command errored out with exit status 1:
+     command: /data/data/com.termux/files/usr/bin/python3 -u -c 'import sys, setuptools, tokenize; sys.argv[0] = '"'"'/data/data/com.termux/files/usr/tmp/pip-install-s05smeqb/unicorn/setup.py'"'"'; __file__='"'"'/data/data/com.termux/files/usr/tmp/pip-install-s05smeqb/unicorn/setup.py'"'"';f=getattr(tokenize, '"'"'open'"'"', open)(__file__);code=f.read().replace('"'"'\r\n'"'"', '"'"'\n'"'"');f.close();exec(compile(code, __file__, '"'"'exec'"'"'))' install --record /data/data/com.termux/files/usr/tmp/pip-record-0q84nzqq/install-record.txt --single-version-externally-managed --compile
+         cwd: /data/data/com.termux/files/usr/tmp/pip-install-s05smeqb/unicorn/
+    Complete output (12 lines):
+    running install
+    running build
+    Building C extensions
+    cd qemu && \
+    ./configure --cc="cc" --extra-cflags="-DUNICORN_HAS_X86 -DUNICORN_HAS_ARM -DUNICORN_HAS_ARMEB -DUNICORN_HAS_M68K -DUNICORN_HAS_ARM64 -DUNICORN_HAS_MIPS -DUNICORN_HAS_MIPSEL -DUNICORN_HAS_MIPS64 -DUNICORN_HAS_MIPS64EL -DUNICORN_HAS_SPARC -fPIC -fvisibility=hidden" --target-list="x86_64-softmmu, arm-softmmu, armeb-softmmu, m68k-softmmu, aarch64-softmmu, mips-softmmu, mipsel-softmmu, mips64-softmmu, mips64el-softmmu, sparc-softmmu,sparc64-softmmu,"
+
+    ERROR: Cannot use 'python', Python 2.4 or later is required.
+           Note that Python 3 or later is not yet supported.
+           Use --python=/path/to/python to specify a supported Python.
+
+    make: *** [Makefile:214: qemu/config-host.h-timestamp] Error 1
+    error: [Errno 2] No such file or directory: 'libunicorn.so'
+    ----------------------------------------
+ERROR: Command errored out with exit status 1: /data/data/com.termux/files/usr/bin/python3 -u -c 'import sys, setuptools, tokenize; sys.argv[0] = '"'"'/data/data/com.termux/files/usr/tmp/pip-install-s05smeqb/unicorn/setup.py'"'"'; __file__='"'"'/data/data/com.termux/files/usr/tmp/pip-install-s05smeqb/unicorn/setup.py'"'"';f=getattr(tokenize, '"'"'open'"'"', open)(__file__);code=f.read().replace('"'"'\r\n'"'"', '"'"'\n'"'"');f.close();exec(compile(code, __file__, '"'"'exec'"'"'))' install --record /data/data/com.termux/files/usr/tmp/pip-record-0q84nzqq/install-record.txt --single-version-externally-managed --compile Check the logs for full command output.`
+
+> 

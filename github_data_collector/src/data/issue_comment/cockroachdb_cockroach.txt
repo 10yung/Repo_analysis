@@ -1,0 +1,265 @@
+Add a docker-compose test that spins up postgres and cockroach servers for differential testing. Run some sqlsmith on them and verify the output is identical. Has already found a few incorrectness bugs. The test framework is written in such a way that, although a single query is generated per run, each connection can have different mutations (which shouldn't change the output) applied. In addition, two cockroach servers are started so that they can be configured differently to ensure output doesn't change when, say, there's different vectorized settings (there's no tests yet that do this, but the framework is here for them to be added).
+
+The cmpconn package has been changed to remove its go routines and test row-by-row instead of fetching all of the rows. This is because there was a bug that sometimes messed up the order of the rows. It is possibly slower due to not using multiple goroutines for comparison, but I have not seen any false positives since this change.
+
+TODO: This PR is a WIP and should not be merged until the following issues are fixed. I have run out of time to do this so am leaving this PR and note here so that others can finalize the work if they desire.
+
+- The test is currently written as acceptance, but that's just because it needs docker to run. It's not really an acceptance test though since it doesn't test for a specific thing. It should just run for X minutes per night like the RSG tests, but it also needs docker. I think we could add like a new pkg/compose directory to dump these kinds of docker-compose nightly tests. Or maybe there's some other good way to do this, but I'm not aware of something that does what we need here that we already have.
+Previously, all projecting operators (those that append columns) were
+not allowed to short-circuit (i.e. to exit from Next() method) when they
+receive a zero-length batch. The problem is that the planning code
+assigns each operator an "output index" for the columns and operators
+would only append a column if the width of the batch they receive equals
+to their assigned output index. In case some projecting operator
+short-circuits and doesn't append a column, the downstream operator
+would also not append its output column which would lead to an internal
+error.
+
+The problem is solved by allowing operators to append as many "unknown"
+zero-length columns until the batch becomes of the desired width and
+then appending their output column. Now all projecting operators track
+the status of whether the column was appended. In a case, when
+a projecting operator that previously short-circuited wants to add
+a column, but the width of the batch is higher than the operator's
+output index (meaning that an "unknown" column was added in that place),
+that "unknown" zero-length column is replaced with the full-sized column
+of the desired type. All this logic is placed into the Allocator. This
+behavior allows us to have short-circuiting logic in-place but also
+reduces the amount of allocated memory (if a projecting operator
+actually never outputs anything).
+
+Additionally, coldata.ZeroBatch is now implemented by a special wrapper
+around coldata.MemBatch that prohibits modifications of the zero batch.
+This was prompted by a bug with merge joiner in which we relied on the
+width of the zero batch to decide whether to unwrap a vector.
+
+Release note: None
+[(roachtest).sqlsmith/setup=empty/setting=no-mutations failed](https://teamcity.cockroachdb.com/viewLog.html?buildId=1698212&tab=buildLog) on [master@2559992b91b6823110c5a7ef8bc0d61395ca6f28](https://github.com/cockroachdb/cockroach/commits/2559992b91b6823110c5a7ef8bc0d61395ca6f28):
+
+```
+WITH
+			with_6046 (col_33105)
+				AS (SELECT * FROM (VALUES (e'+\x06\bej':::STRING), (e'Eg+f\t':::STRING)) AS tab_19109 (col_33105)),
+			with_6047 (col_33106)
+				AS (
+					SELECT
+						*
+					FROM
+						(VALUES (ARRAY[]:::INT2[]), (ARRAY[4759:::INT8]), (ARRAY[1422:::INT8,18183:::INT8]), (NULL))
+							AS tab_19110 (col_33106)
+				),
+			with_6048 (col_33107)
+				AS (
+					SELECT
+						*
+					FROM
+						(
+							VALUES
+								(176975447:::OID),
+								(3124131824:::OID),
+								(3219361074:::OID),
+								(1986188815:::OID),
+								(1424600692:::OID)
+						)
+							AS tab_19111 (col_33107)
+				)
+		SELECT
+			cte_ref_1778.col_33107 AS col_33109,
+			(
+				WITH
+					with_6049 (col_33110)
+						AS (
+							SELECT
+								*
+							FROM
+								(
+									VALUES
+										('13:38:44.588764':::TIME),
+										('02:50:57.947329':::TIME),
+										('09:58:51.531021':::TIME),
+										(current_time():::TIME::TIME)
+								)
+									AS tab_19113 (col_33110)
+						)
+				SELECT
+					tab_19114.col_33111 AS col_33112
+				FROM
+					(VALUES (tab_19112.col_33108)) AS tab_19114 (col_33111), with_6049 AS cte_ref_1780
+				LIMIT
+					1:::INT8
+			)
+				AS col_33113,
+			cte_ref_1778.col_33107 AS col_33114
+		FROM
+			with_6048 AS cte_ref_1778,
+			with_6048 AS cte_ref_1779,
+			(VALUES (B'0101'), (B'0000'), (NULL), (B'1000'), (B'0010'), (B'1111')) AS tab_19112 (col_33108)
+		ORDER BY
+			cte_ref_1778.col_33107 ASC
+		LIMIT
+			81:::INT8;
+```
+
+<details><summary>Repro</summary><p>
+
+
+Artifacts: [/sqlsmith/setup=empty/setting=no-mutations](https://teamcity.cockroachdb.com/viewLog.html?buildId=1698212&tab=artifacts#/sqlsmith/setup=empty/setting=no-mutations)
+[roachdash](https://roachdash.crdb.dev/?filter=status%3Aopen+t%3A.%2Asqlsmith%2Fsetup%3Dempty%2Fsetting%3Dno-mutations.%2A&sort=title&restgroup=false&display=lastcommented+project)
+
+<sub>powered by [pkg/cmd/internal/issues](https://github.com/cockroachdb/cockroach/tree/master/pkg/cmd/internal/issues)</sub></p></details>
+
+1) if there was a test failure already, we don't want to muck with the
+test cluster because it may be unavailable at that point.  It's better
+to fail directly with the first error and start collecting artifacts
+than run into a hard timeout of the test runner and not be able to
+collect anything.
+
+2) when collecting th artifacts, collect the zip after everything
+else. Only the zip is subject to deadlock. Everything else
+can be collected earlier and in a timely fashion.
+
+Release note: None
+Consider the following test case:
+
+```sql
+CREATE TABLE t0(c0 STRING UNIQUE);
+INSERT INTO t0 (c0) VALUES ('\a');
+SELECT * FROM t0 WHERE c0 LIKE '\a'; -- unexpected: row is fetched
+```
+
+Unexpectedly, the query fetches a row. When removing the `UNIQUE` constraint, no row is fetched. That the predicate should evaluate to `FALSE` is also demonstrated by the following query:
+
+```sql
+SELECT c0 LIKE '\a' FROM t0; -- FALSE
+```
+I built CockroachDB from source (commit `55c0e012b9539a327640e42ceaaf556b7a0e7b10`) on Ubuntu 19.04.
+When dealing with customer issues, it is frequently useful to know which release contains a certain PR. You can do it manually each time but it is a bit tedious. It would be awesome if we had a script that periodically adds a tag or comment to merged PRs with the earliest released version that contains the commits in the PR.
+This issue was autofiled by Sentry. It represents a crash or reported error on a live cluster with telemetry enabled.
+
+Sentry link: https://sentry.io/organizations/cockroach-labs/issues/1452979209/?referrer=webhooks_plugin
+
+Panic message:
+
+>*errors.errorString
+*safedetails.withSafeDetails: unexpected error from the vectorized runtime: %+v (1)
+error.go:70: *withstack.withStack (2)
+*assert.withAssertionFailure
+(check the extra data payloads)
+
+
+<details>
+<summary>Stacktrace (expand for inline code snippets):</summary>
+
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/colexec/execerror/error.go#L69-L71 in pkg/sql/colexec/execerror.CatchVectorizedRuntimeError.func1
+/usr/local/go/src/runtime/panic.go#L521-L523 in runtime.gopanic
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/colexec/execerror/error.go#L154-L156 in pkg/sql/colexec/execerror.VectorizedInternalPanic
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/colflow/colrpc/inbox.go#L282-L284 in pkg/sql/colflow/colrpc.(*Inbox).Next.func2
+/usr/local/go/src/runtime/panic.go#L521-L523 in runtime.gopanic
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/colexec/execerror/error.go#L154-L156 in pkg/sql/colexec/execerror.VectorizedInternalPanic
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/colflow/colrpc/inbox.go#L319-L321 in pkg/sql/colflow/colrpc.(*Inbox).Next
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/colexec/orderedsynchronizer.go#L120-L122 in pkg/sql/colexec.(*OrderedSynchronizer).Next
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/colexec/fn_op.go#L34-L36 in pkg/sql/colexec.fnOp.Next
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/colexec/distinct.eg.go#L579-L581 in pkg/sql/colexec.(*sortedDistinctBytesOp).Next
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/colexec/distinct.eg.go#L1903-L1905 in pkg/sql/colexec.(*sortedDistinctInt64Op).Next
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/colexec/bool_vec_to_sel.go#L35-L37 in pkg/sql/colexec.(*boolVecToSelOp).Next
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/colexec/materializer.go#L148-L150 in pkg/sql/colexec.(*Materializer).next
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/colexec/materializer.go#L139-L141 in pkg/sql/colexec.(*Materializer).nextAdapter
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/colexec/execerror/error.go#L90-L92 in pkg/sql/colexec/execerror.CatchVectorizedRuntimeError
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/colexec/materializer.go#L176-L178 in pkg/sql/colexec.(*Materializer).Next
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/execinfra/base.go#L168-L170 in pkg/sql/execinfra.Run
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/execinfra/processorsbase.go#L724-L726 in pkg/sql/execinfra.(*ProcessorBase).Run
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/flowinfra/flow.go#L374-L376 in pkg/sql/flowinfra.(*FlowBase).Run
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/distsql_running.go#L371-L373 in pkg/sql.(*DistSQLPlanner).Run
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/distsql_running.go#L996-L998 in pkg/sql.(*DistSQLPlanner).PlanAndRun
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/conn_executor_exec.go#L824-L826 in pkg/sql.(*connExecutor).execWithDistSQLEngine
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/conn_executor_exec.go#L716-L718 in pkg/sql.(*connExecutor).dispatchToExecutionEngine
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/conn_executor_exec.go#L415-L417 in pkg/sql.(*connExecutor).execStmtInOpenState
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/conn_executor_exec.go#L97-L99 in pkg/sql.(*connExecutor).execStmt
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/conn_executor.go#L1242-L1244 in pkg/sql.(*connExecutor).execCmd
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/conn_executor.go#L1171-L1173 in pkg/sql.(*connExecutor).run
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/conn_executor.go#L443-L445 in pkg/sql.(*Server).ServeConn
+https://github.com/cockroachdb/cockroach/blob/3cbd05602d4aeaebbccea18d66ad0fdf8db482a5/pkg/sql/pgwire/conn.go#L583-L585 in pkg/sql/pgwire.(*conn).processCommandsAsync.func1
+/usr/local/go/src/runtime/asm_amd64.s#L1336-L1338 in runtime.goexit
+</details>
+
+```
+pkg/sql/colexec/execerror/error.go in pkg/sql/colexec/execerror.CatchVectorizedRuntimeError.func1 at line 70
+/usr/local/go/src/runtime/panic.go in runtime.gopanic at line 522
+pkg/sql/colexec/execerror/error.go in pkg/sql/colexec/execerror.VectorizedInternalPanic at line 155
+pkg/sql/colflow/colrpc/inbox.go in pkg/sql/colflow/colrpc.(*Inbox).Next.func2 at line 283
+/usr/local/go/src/runtime/panic.go in runtime.gopanic at line 522
+pkg/sql/colexec/execerror/error.go in pkg/sql/colexec/execerror.VectorizedInternalPanic at line 155
+pkg/sql/colflow/colrpc/inbox.go in pkg/sql/colflow/colrpc.(*Inbox).Next at line 320
+pkg/sql/colexec/orderedsynchronizer.go in pkg/sql/colexec.(*OrderedSynchronizer).Next at line 121
+pkg/sql/colexec/fn_op.go in pkg/sql/colexec.fnOp.Next at line 35
+pkg/sql/colexec/distinct.eg.go in pkg/sql/colexec.(*sortedDistinctBytesOp).Next at line 580
+pkg/sql/colexec/distinct.eg.go in pkg/sql/colexec.(*sortedDistinctInt64Op).Next at line 1904
+pkg/sql/colexec/bool_vec_to_sel.go in pkg/sql/colexec.(*boolVecToSelOp).Next at line 36
+pkg/sql/colexec/materializer.go in pkg/sql/colexec.(*Materializer).next at line 149
+pkg/sql/colexec/materializer.go in pkg/sql/colexec.(*Materializer).nextAdapter at line 140
+pkg/sql/colexec/execerror/error.go in pkg/sql/colexec/execerror.CatchVectorizedRuntimeError at line 91
+pkg/sql/colexec/materializer.go in pkg/sql/colexec.(*Materializer).Next at line 177
+pkg/sql/execinfra/base.go in pkg/sql/execinfra.Run at line 169
+pkg/sql/execinfra/processorsbase.go in pkg/sql/execinfra.(*ProcessorBase).Run at line 725
+pkg/sql/flowinfra/flow.go in pkg/sql/flowinfra.(*FlowBase).Run at line 375
+pkg/sql/distsql_running.go in pkg/sql.(*DistSQLPlanner).Run at line 372
+pkg/sql/distsql_running.go in pkg/sql.(*DistSQLPlanner).PlanAndRun at line 997
+pkg/sql/conn_executor_exec.go in pkg/sql.(*connExecutor).execWithDistSQLEngine at line 825
+pkg/sql/conn_executor_exec.go in pkg/sql.(*connExecutor).dispatchToExecutionEngine at line 717
+pkg/sql/conn_executor_exec.go in pkg/sql.(*connExecutor).execStmtInOpenState at line 416
+pkg/sql/conn_executor_exec.go in pkg/sql.(*connExecutor).execStmt at line 98
+pkg/sql/conn_executor.go in pkg/sql.(*connExecutor).execCmd at line 1243
+pkg/sql/conn_executor.go in pkg/sql.(*connExecutor).run at line 1172
+pkg/sql/conn_executor.go in pkg/sql.(*Server).ServeConn at line 444
+pkg/sql/pgwire/conn.go in pkg/sql/pgwire.(*conn).processCommandsAsync.func1 at line 584
+/usr/local/go/src/runtime/asm_amd64.s in runtime.goexit at line 1337
+```
+
+| Tag | Value |
+|---|---|
+| Cockroach Release | `v19.2.2` |
+| Cockroach SHA: | 3cbd05602d4aeaebbccea18d66ad0fdf8db482a5 |
+| Platform | linux amd64 |
+| Distribution | CCL |
+| Environment | v19.2.2 |
+| Command | server |
+| Go Version | `go1.12.12`|
+| # of CPUs |8 |
+| # of Goroutines |264 |
+
+[(sql/colexec).TestRouterOutputNext failed](https://viewLog.html?buildId=1697835&tab=buildLog) on [master@13af75f3d1376fff31d1419df2951c2d8a810efd](https://github.com/cockroachdb/cockroach/commits/13af75f3d1376fff31d1419df2951c2d8a810efd):
+
+```
+=== RUN   TestRouterOutputNext
+--- FAIL: TestRouterOutputNext (0.01s)
+=== RUN   TestRouterOutputNext/AddBatchDoesntBlockWhenOutputIsBlocked
+    --- FAIL: TestRouterOutputNext/AddBatchDoesntBlockWhenOutputIsBlocked (0.00s)
+        routers_test.go:283: unexpectedly still unblocked
+
+```
+
+<details><summary>Repro</summary><p>
+Parameters:
+
+- GOFLAGS=-json
+
+```
+make stressrace TESTS=TestRouterOutputNext PKG=./pkg/sql/colexec TESTTIMEOUT=5m STRESSFLAGS='-timeout 5m' 2>&1
+```
+
+[roachdash](https://roachdash.crdb.dev/?filter=status%3Aopen+t%3A.%2ATestRouterOutputNext.%2A&sort=title&restgroup=false&display=lastcommented+project)
+
+<sub>powered by [pkg/cmd/internal/issues](https://github.com/cockroachdb/cockroach/tree/master/pkg/cmd/internal/issues)</sub></p></details>
+
+Every new db gets privileges for the `root` user specifically and the `admin` group.
+
+See: ` NewDefaultPrivilegeDescriptor()` in `sqlbase`
+
+However if there are multiple users in the admin group, we probably want the user that's running the CREATE to get the grant instead of `root`.
+
+This becomes even more important if CockroachDB is extended to enable other roles than `admin` to create databases. In that case we can't just use the same privileges for all databases.
+
+
+The auto-init behavior of `cockroach start` without `--join` was marked as deprecated in 19.2. Remove it in 20.1.
+
+Informs (and simplifies) #26722 

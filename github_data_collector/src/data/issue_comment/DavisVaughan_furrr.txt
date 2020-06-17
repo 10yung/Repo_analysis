@@ -1,0 +1,163 @@
+I found the reason accounting for a large part of the lower performance of furrr vs purrr:
+All libraries are loaded in each individual furrr::future_map process, e.g.:
+```
+Loading required package: dplyr
+Attaching package: ‘dplyr’
+```
+I understand that each furrr process requires loading the libraries, but my more pressing question is: 
+_Why can't furrr access the libraries loaded in the global environment?_
+
+Or in other words:
+_Is there a way to assign libraries to the multicore/multisession/multiprocess cluster analoge to how `multidplyr` does it?_
+The `multidplyr` is rather intuitive for that:
+```
+cluster <- new_cluster(8)
+cluster_library(cluster, "dplyr")
+```
+They are quite hard to suppress, see #96 
+
+Should it be message()? Investigate other packages like `progress`
+https://github.com/r-lib/progress/blob/b146a6a74d14c1cf4a3689ae745a0c0f38a355d2/R/progress.R#L508
+It seems like when you use furrr as part of a package development process you need to reinstall the package to pass the right functions down  to the workers. I've set up an example package to demonstrate this  behaviour, as a user my expectation is that the version of the function passed to the worker is the same one that I have  loaded after running `devtools::load_all()`
+
+https://github.com/GShotwell/furrr_bug/blob/bug_report/vignettes/bug.Rmd
+
+Thanks for the great package!
+I have 16 available cores and even when set explicitly to use most of them (15), I still see activity in only every other one. 
+
+```
+availableCores()
+system 
+    16 
+require(furrr); plan(multiprocess, workers = 15)
+```
+
+![image](https://user-images.githubusercontent.com/25590353/70164192-f7a91d80-167d-11ea-893d-2896cc5ef667.png)
+
+
+Is this due to the way Mac OS X reports, or am I doing something wrong with how I'm specifying how furrr should run?
+
+MacOS Mojave
+> sessionInfo()
+R version 3.6.0 (2019-04-26)
+Platform: x86_64-apple-darwin15.6.0 (64-bit)
+Running under: macOS Mojave 10.14.5
+OS: Windows 10
+R 3.6.1
+furrr: 0.1.0.9002
+future: 1.15.1
+
+Putting a function into a list and then passing it into `future_map` apparently causes it to not find functions appropriately.
+
+``` r
+library(extraDistr)
+suppressPackageStartupMessages(library(purrr))
+suppressPackageStartupMessages(library(furrr))
+
+plan(multiprocess)
+
+# Innermost function which uses something from a package
+inner_fun <- function() rbern(10, 0.5) # from extraDistr
+
+# A function that calls another which is passed to it in a list
+wrapper_fun <- function(fun_list) {
+  fun_list$sim_fun()
+}
+
+# A list of functions
+list_of_funs <- list(sim_fun = inner_fun)
+
+# Will work
+map(
+  1:2, 
+  function(i) wrapper_fun(list_of_funs)
+)
+#> [[1]]
+#>  [1] 1 0 0 1 0 0 1 0 0 0
+#> 
+#> [[2]]
+#>  [1] 1 1 0 1 0 0 0 0 1 0
+
+# Will fail to find rbern
+future_map(
+  1:2, 
+  function(i) wrapper_fun(list_of_funs)
+)
+#> Error in rbern(10, 0.5): could not find function "rbern"
+```
+
+<sup>Created on 2019-11-27 by the [reprex package](https://reprex.tidyverse.org) (v0.3.0)</sup>
+
+
+I am currently using map_dfr on a jsonlite::fromJSON command.  I was able to run my script from the Rstudio IDE, from the command line, and scheduling a cron job that runs the API alone by itself.
+
+However, when I put the API call inside a function to call from future_map_dfr, it failed, but the same call was successful with just map_dfr.  
+
+Any insights about this issue would be helpful.
+I know its bad practice to alter the working directory but sometimes folks do and its causing problems with one of our packages that generates and saves files to the working directory using furrr::future_map.
+
+The problem appears to be because getwd() in future_map refers to the wrong directory as evidenced by the fact that getwd() in future_map refers to a different directory than getwd() in purrr::map
+```r
+dir <- file.path(tempdir(), "sub")
+
+setwd(dir)
+print(dir)
+purrr::map(1, .f = function(x) { getwd() })
+furrr::future_map(1, .f = function(x) { getwd() })
+print(getwd())
+```
+
+
+I encounter this basic pattern all the time:
+- I want to iterate over a large queue, each item yielding an output that I want to eventually write to a file (eg lines of JSON or CSV, chunks to HDF5, etc). 
+- The output is large so I don't want to keep the accumulating returned values in memory, and writing interim values to a file (either a tempfile I concatenate later or append=TRUE) would be appropriate but I have to safely parallelize. 
+- Writing a small file to disk for every element of `.x` and then combining them all later tends to be costly in disk I/O, and I'll admit that I never knew how large a headache could be created by writing 10M+ files to the same folder on a Mac...
+
+A happy medium might look like this: if a worker always has its own stable PID, for N workers I generate N files and append all results for individual `.x` elements handled by that worker to that file. Then `outfile_{PID}.csv` has no chance of corruption from multiple writes, but we still get dramatically fewer intermediate files to concatenate.
+
+Here's an example of what I mean:
+```r|
+library(tidyverse)
+library(furrr)
+
+plan(multisession(workers = 4))
+
+set.seed(1234)
+test_x <- rpois(10000, 100)
+
+test_func <- function(x){
+  pid <- Sys.getpid()
+  some_data <- jsonlite::toJSON(list(norm = rnorm(10, mean = x, sd = x + 10)))
+  write_lines(x = some_data,
+              path = paste0("outfile_", pid, ".json"),
+              append = TRUE)
+  invisible(x)
+}
+
+furrr::future_map(test_x, test_func)
+```
+
+That snippet works fine, but it depends on workers having stable independent PIDs and I'm not sure if that's a globally true assumption about future workers. (The magic of future/furrr has been that I need not think too much about the nature of those workers.) Do you know if this is likely to be a safe-enough pattern for cases like this? 
+`.progress = T` does not seem to display correctly when using `future_map` functions inside  `mutate` functions for nested list columns.  They just pop up at 100% after the mutate is complete.
+Hi,
+I'm working a lot with furrr inside Rstudio.
+
+```
+plan(multiprocess)
+```
+
+However this is now kicked by rstudio (because of stability reasons?
+
+the error I now get is:
+
+```
+[ONE-TIME WARNING] Forked processing ('multicore') is disabled in future (>= 1.13.0) when running R from RStudio, because it is considered unstable. Because of this, plan("multicore") will fall back to plan("sequential"), and plan("multiprocess") will fall back to plan("multisession") - not plan("multicore") as in the past. For more details, how to control forked processing or not, and how to silence this warning in future R sessions, see ?future::supportsMulticore
+```
+
+when switching to 
+```
+plan(multisession)
+```
+a whole lot of things no longer work.
+
+Any clue how to fix this?

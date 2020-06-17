@@ -1,0 +1,208 @@
+Our application use custom credentials for SQS queue on AWS.
+Currently this is not supported in the SqsConnectionFactory and we can't modify the config for the inner sqs client configured in it.
+
+What about adding a protected method for building the sqs client configuration that can be then overriden in a subclass?
+If I use multiple connections when I register extension in service, this extension applies only one instance. 
+enqueue version: 0.10
+packages/enqueue.yaml
+```
+enqueue:
+    default:
+        transport: 'amqp+lib://%enqueue.amqp.user%:%enqueue.amqp.pass%@%enqueue.amqp.host%:%enqueue.amqp.port%/%enqueue.amqp.vhost%?heartbeat_on_tick=1'
+        client:
+            prefix: '%enqueue.client.prefix%'
+            app_name: '%enqueue.client.app%'
+        job: true
+        async_commands: true
+
+    task:
+        transport: 'amqp+lib://%enqueue.amqp.user%:%enqueue.amqp.pass%@%enqueue.amqp.host%:%enqueue.amqp.port%/%enqueue.amqp.vhost%?heartbeat_on_tick=1'
+        client:
+            prefix: '%enqueue.client.prefix%'
+            app_name: '%enqueue.task.client.app%'
+        async_commands: true
+
+    taskevent:
+        transport: 'amqp+lib://%enqueue.amqp.user%:%enqueue.amqp.pass%@%enqueue.amqp.host%:%enqueue.amqp.port%/%enqueue.amqp.vhost%?heartbeat_on_tick=1'
+        client:
+            prefix: '%enqueue.client.prefix%'
+            app_name: '%enqueue.taskevent.client.app%'
+        async_commands: true
+```
+
+services/services.yaml
+
+```
+    AdgoalCommon\FaultTolerance\RabbitEnqueue\QueueFaultTolerantExtension:
+        autowire: true
+        tags:
+            - { name: 'enqueue.consumption.extension', priority: 10 }
+```
+
+
+I've looked through the docs, the code, issues and pull requests, but cannot find how to set the (default) visibliity timeout when using enqueue/enqueue-bundle (Symfony).
+
+I have found that the SqsDestination.php has several attributes, one of which is the visibilityTimeout. It seems to me that this sets the Default Visibility Timeout (since this default is indeed normally 30 seconds in SQS).
+
+But how do I set this attribute?
+
+Looking into the SqsDriver, it seems that with the standard enqueue:setup-broker, it's impossible to add attributes
+
+```
+            /** @var SqsDestination $queue */
+            $queue = $this->createRouteQueue($route);
+            if (array_key_exists($queue->getQueueName(), $declaredQueues)) {
+                continue;
+            }
+
+            $log('Declare processor queue: %s', $queue->getQueueName());
+            $this->getContext()->declareQueue($queue);
+```
+
+I would need to add `$queue->setVisibilityTimeout(60*15)` here., before the `declareQueue` is called..
+
+Am I correct that the only way to modify this is to extend the SqsDriver?
+
+Seems to me that there is probably an easier way here... Seems like many Destination classes have attributes.. isn't there a more generic way to configure these attributes for my application?
+## Why?
+
+We are using MessagePack as a serializer (instead of standard JSON) and Gzip for compressing to reduce the message size, so basically we do the following:
+
+* `body` value of the Interop message is processed like `gzencode(msgpack_pack($bodyValue));`
+* `headers` values - in the same way
+
+When the message is sent from `RdKafkaProducer`, headers are sent as "native" headers using `producev()` method (while still duplicated inside the Interop Message).
+
+https://github.com/php-enqueue/enqueue-dev/blob/8f86cf9feedb5437999f6fa6d990665696a38f2a/pkg/rdkafka/RdKafkaProducer.php#L58
+
+And the whole message looks like:
+
+<img width="1439" alt="headers_sent" src="https://user-images.githubusercontent.com/3725595/71763816-6e417100-2ef1-11ea-9839-3d909a6adb0b.png">
+
+But when the message is read from topic, Gzipped and MessagePacke'd headers are corrupted:
+
+<img width="678" alt="headers_corrupted" src="https://user-images.githubusercontent.com/3725595/71763861-0e979580-2ef2-11ea-84fb-fd0d9528877d.png">
+
+_(note the difference in the headers values in producer and consumer, `b"\x1F‹\x08"` - corrupted messages)_
+
+The issue is those corrupted headers are merged and used as a priority here:
+
+https://github.com/php-enqueue/enqueue-dev/blob/8f86cf9feedb5437999f6fa6d990665696a38f2a/pkg/rdkafka/RdKafkaConsumer.php#L173-L175
+
+## Proposed solution
+
+So, in order to workaround it, we need to not send it (actually, we don't use those native headers so it would be useful to not send extra data), s we need a setting.
+
+## Alternative solution
+
+Alternative solution would be to not serialize native headers at all. But that would be a BC break. So we probably can introduce a setting to leave the headers as is (disabled by default).
+
+---
+
+This is definitely a bug with `php-rdkafka` or `librdkafka` that headers are being corrupted, I will report it separately to corresponded repositories.
+Considering:
+
+```
+# config/packages/enqueue.yaml
+enqueue:
+    default:
+        transport:
+            dsn: "rdkafka://"
+            global:
+                bootstrap.servers: '%env(KAFKA_BOOTSTRAP_SERVERS)%'
+                security.protocol: ssl
+                group.id: '%env(KAFKA_GROUP_ID)%'
+                ssl.ca.location: '%env(KAFKA_ROOT_CA)%'
+                ssl.certificate.location: '%env(KAFKA_CERT)%'
+                ssl.key.location: '%env(KAFKA_KEY)%'
+                enable.ssl.certificate.verification: 'false'
+                ssl.endpoint.identification.algorithm: 'none'
+                enable.auto.commit: 'true'
+            topic:
+                auto.offset.reset: latest
+        client: ~
+```
+
+and
+
+```
+# config/packages/dev/enqueue.yaml
+enqueue:
+    default:
+        transport:
+            global:
+                debug: all
+```
+
+I would like `debug: all` to be merged to `global` configuration from main configuration.
+
+Unfortunately it does not work this way (`enqueue-bundle` 0.9.13), the final config for `global` is taken from last occurence.
+
+It works when I add:
+
+```
+->arrayNode('global')
+    ->ignoreExtraKeys(false)
+->end()
+```
+
+to the `Enqueue\Symfony\DependencyInjection\TransportFactory::getConfiguration()`. Symfony's DI container has to know that there is `global` node with array type, which can take any options.
+
+:information_source: Would be great if it could be fixed in `0.9` branch because we're using `sroze/messenger-enqueue-transport` which currently does not allow using Enqueue `0.10`.
+Hi.
+
+I'm using this package within Symfony 4.4.
+I have configured processor with custom queue, because I don't want to read and write messages to **enqueue.app.default** queue.
+
+So my processor service configuration is:
+
+ ```
+cache_processor:
+    class: My\CacheProcessor
+    arguments:
+      - '@My\CacheUpdater'
+    tags:
+      - { name: enqueue.processor, processor: 'my_cache', queue: 'my_cache', topic: !php/const My\CachePublisher::SUBSCRIBED_TOPIC }
+
+```
+
+As you can see here, the queue is **my_cache** and after calling 
+
+```
+php bin/console enqueue:setup-broker
+```
+I can see it in my rabbitMQ web interface.
+
+My **CachePublisher** sends message through producer:
+
+`$this->producer->sendEvent($this->getSubscribedTopic(), $this->message)`
+
+where `getSubscribedTopic()` returns **topic** parameter value from processor's tag specified earlier.
+
+The problem is that it sends all messages to **enqueue.app.default** queue, while I expect it to push them to the **my_cache** queue.
+
+Maybe I don't understand something. Any help appreciated.
+Hi, how to send message by stomp to ActiveMQ through SSL
+
+This is example by using rethab/stomp-php
+```
+$opts = [
+            'ssl' => [
+                'cafile' => storage_path('crt/') . 'rootCA.crt',
+                'verify_peer' => true,
+            ]
+        ];
+ 
+        $producer = new Stomp('ssl://core-secure-esbdmz.apps.okd.gazprom-neft.local:443', $opts);
+```
+
+Fixes #986
+If there is any error from rdkafka extension like this one 
+```
+1573035921.906|FAIL|rdkafka#consumer-1| [thrd:kafka:9092/bootstrap]:kafka:9092/bootstrap: Failed to resolve 'kafka:9092':Name does not resolve
+```
+it can't be handled or reached.
+
+https://github.com/php-enqueue/enqueue-dev/blob/master/pkg/rdkafka/RdKafkaConsumer.php#L165
+
+Maybe some exception can be thrown here.

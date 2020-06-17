@@ -1,0 +1,280 @@
+Hello,
+
+
+I am currently using your repository for my PhD. I would like to know: how to send a `Chan` from a server to a Client such that they both connect to this new `session_channel()`? I have a recursive error which requests either a `send` when I have a `recv` or a `recv` when I have a `send`.
+
+Thank you in advance.
+Are there plans to allow the user to configure the actual transport underneath a Chan? I want to use session types with async/await and in distributed systems. Thanks!
+
+
+
+Hello. I am currently experimenting with BSTs in Rust and hopefully soon MPSTs. I'll be publishing the code soon. The following thread covers different design decisions relating to the internal implementation without changing the interface for consumers. When I move on to MPST, I'll experiment with a DSL using macros.
+
+1. Use a union over all message variants and rely on the state machine to select the desired type to send/recv. Vs. Transmuting a Box-pointer on the crossbeam-channel.
+
+**Note**: For safety, the union will can trivially be replaced with an enum. Currently rust's enum representations aren't quite as nice as they could be, but this should improve in the future - further reducing the cost of tagging each variant. **Importantly we do not need unsafe to implement session types**. The space inefficient enum tag won't be much more than the optimized choice-based tag, and it is already significantly cheaper than boxing all messages.
+
+2. Backend agnostic. I.e. A `#[no_std]` context can use a `core::cell::Cell<Option<UnionOfMessages>>` as the underlying channel without worrying about allocations.
+
+3. Choices can send a single message, and if followed with a send; the two messages may be bundled. Vs. Sending each boolean choice over the channel.
+
+4. Although Rust doesn't have linear types, it does have private constructors - which I conject in combination with affine types is sufficient to force the protocol to progress through at least one valid path. Replacing the unit in the `E` type parameter of a `Chan` with a public contextual type, with a private constructor instantiating it, the relevant function can be forced to return the closed channel to its caller.
+
+Do we need anything stronger than requiring the program progress through at least one valid path?
+
+**Proof of concept:**
+
+```rust
+mod private {
+    pub struct Start(());
+    pub struct End(());
+    
+    impl Start {
+        pub fn finish(self) -> End {
+            End(())
+        }
+    }
+    
+    pub fn require_completion(f: impl Fn(Start) -> End) {
+        f(Start(()));
+    }
+    
+    pub fn require_completion_mut(mut f: impl FnMut(Start) -> End) {
+        f(Start(()));
+    }
+}
+use self::private::{require_completion, require_completion_mut};
+
+fn main() {
+    // The closure is given a Start, but it cannot create another.
+    // It is required to return an End, but it can only acquire one by consuming
+    // the Start with a call to Start::finish.
+    require_completion(|s| s.finish());
+    
+    // Good! These fail as expected.
+    //require_completion(|_| private::Start(()).finish());
+    //require_completion(|_| private::End(()));
+    
+    // Caveat: This misuse of channels is prevented by Fn, but not FnMut.
+    // However, an actor defined without the visibility of its caller removes
+    // this particular risk too.
+    require_completion(|mut s| {
+        require_completion_mut(|s2|
+            core::mem::replace(&mut s, s2).finish()
+        );
+        s.finish()
+    });
+}
+```
+Suggestion is to add a macro for writing the session types down.
+
+Something like:
+
+```rust
+proto!{Atm, Client,
+    ?<Id>,
+    +[
+        act: &[
+            ?<u64>, !<u64>, act;
+            ?<u64>, +[act; act];
+            !<u64>;
+            eps
+        ];
+        eps
+    ]
+}
+```
+where
+
+- `?<T>, P` denotes `Recv<T, P>`
+- `!<T>, P` denotes `Send<T, P>`
+- `+[A; B; C]` is `Choose<A, Choose<B, C>>`
+- `&[A; B; C]` is `Offer<A, Offer<B, C>>`
+- `t: P` should be `Rec<P>`. Any occurrences of `t` in `P` should be replaced with an appropriate `Var<N>` construct
+- `eps` is just `Eps`
+
+The output of `proto!()` is then two type aliases:
+
+```rust
+type Atm = ...;
+type Client = <Atm as HasDual>::Dual;
+```
+
+This should replace the current constructs like this:
+
+```rust
+type Atm = Recv<Id, Choose<Rec<AtmInner>, Eps>>;
+
+type AtmInner = Offer<AtmDeposit, Offer<AtmWithdraw, Offer<AtmBalance, Eps>>>;
+
+type AtmDeposit = Recv<u64, Send<u64, Var<Z>>>;
+type AtmWithdraw = Recv<u64, Choose<Var<Z>, Var<Z>>>;
+type AtmBalance = Send<u64, Var<Z>>;
+
+type Client = <Atm as HasDual>::Dual;
+```
+
+
+Some relevant documentation: https://github.com/rust-lang-nursery/rustfmt#checking-style-on-a-ci-server and http://johannh.me/blog/rustfmt-ci.html
+Associated types are powerful enough to avoid needing an environment stack or recursive session types.
+
+``` rust
+pub trait HasDual {
+    type Dual: SessionType;
+}
+
+pub trait Alias {
+    type Id: HasDual;
+}
+
+pub struct Goto<A: Alias>(PhantomData<A>);
+pub struct GotoDual<A: Alias>(PhantomData<A>);
+
+impl<A: Alias> HasDual for Goto<A> {
+    type Dual = GotoDual<A>;
+}
+
+impl<A: Alias> HasDual for GotoDual<A> {
+    type Dual = Goto<A>;
+}
+```
+
+Cool, but it requires ugly struct definitions and impls at every depth. I think this downside is mentioned throughout session type literature. It's not practical, they said. Just use recursive session types, they said.
+
+But wait, there's macros!
+
+``` rust
+proto!(Atm = {
+    Recv String,
+    AtmMenu = Accept {
+        AtmDeposit = {
+            Recv u64,
+            Send u64,
+            Goto AtmMenu
+        },
+        AtmWithdraw = {
+            Recv u64,
+            Send bool,
+            Goto AtmMenu
+        },
+        AtmGetBalance = {
+            Send u64,
+            Goto AtmMenu
+        },
+        End
+    }
+});
+```
+
+Unfortunately the macro necessary to expand such a construct is ridiculously complex (and this is after omitting recursion, choose/offer, etc.):
+
+``` rust
+#[macro_export]
+macro_rules! proto(
+    (@form_ty End) => (End);
+    (@form_ty Goto $t:ty) => (Goto<$t>);
+    (@form_ty Recv $t:ty, $($rest:tt)*) => (Recv<$t, proto!(@form_ty $($rest)*)>);
+    (@form_ty Send $t:ty, $($rest:tt)*) => (Send<$t, proto!(@form_ty $($rest)*)>);
+    (@form_ty {$($stuff:tt)*}) => (proto!(@form_ty $($stuff)*));
+    (@form_ty $i:ty = {$($stuff:tt)*}) => (<$i as Alias>::Id);
+    (@form_ty $i:ty = $t:ident {$($stuff:tt)*}) => (<$i as Alias>::Id);
+    (@new_aliases () $($others:tt)*) => (
+        proto!(@construct_alias $($others)*);
+    );
+    (@new_aliases ({$($some:tt)*}$($rest:tt)*) $($others:tt)*) => (
+        proto!(@new_aliases ($($some)* $($rest)*) $($others)*);
+    );
+    (@new_aliases (, $($rest:tt)*) $($others:tt)*) => (
+        proto!(@new_aliases ($($rest)*) $($others)*);
+    );
+    (@new_aliases ($alias:ident = {$($astuff:tt)*} $($lol:tt)*) $($others:tt)*) => (
+        proto!(@new_aliases ($($lol)*) ($alias = {$($astuff)*}) $($others)*);
+    );
+    (@new_aliases ($alias:ident = $t:ident {$($astuff:tt)*} $($lol:tt)*) $($others:tt)*) => (
+        proto!(@new_aliases ($($lol)*) ($alias = {$t {$($astuff)*}}) $($others)*);
+    );
+    (@new_aliases ($x:ident $($rest:tt)*) $($others:tt)*) => (
+        proto!(@new_aliases ($($rest)*) $($others)*);
+    );
+    (@construct_final ($alias:ident, $($arest:tt)*)) => (
+        #[allow(dead_code)]
+        struct $alias;
+
+        impl Alias for $alias {
+            type Id = proto!(@form_ty $($arest)*);
+        }
+    );
+    (@construct_final ($alias:ident, $($arest:tt)*) $($rest:tt)*) => (
+        proto!(@construct_final ($alias, $($arest)*));
+        proto!(@construct_final $($rest)*);
+    );
+    (@construct_alias @eps $($rest:tt)*) => (
+        proto!(@construct_final $($rest)*);
+    );
+    (@construct_alias ($alias:ident = {$($rest:tt)*}) $($others:tt)*) => (
+        proto!(@new_aliases ($($rest)*) $($others)* ($alias, $($rest)*));
+    );
+    ($start:ident = {$($rest:tt)*}) => (
+        proto!(@construct_alias ($start = {$($rest)*}) @eps);
+    );
+);
+```
+
+Right now the path down a `Choose` style decision tree is formed by signaling with booleans over the channel, which is not (space) efficient. Further, you must use macros to avoid having to do a bunch of annoying compositions to select the branches you want.
+
+Here's an alternative API which unfortunately requires Rust nightly, but (somehow) works:
+
+``` rust
+#![feature(optin_builtin_traits)]
+
+use std::marker::PhantomData;
+
+trait ChooseFrom { }
+impl<Q> ChooseFrom for Finally<Q> {}
+impl<P, Q: ChooseFrom> ChooseFrom for Choose<P, Q> {}
+
+struct Finally<Q>(PhantomData<Q>);
+struct Choose<P, Q: ChooseFrom>(PhantomData<(P, Q)>);
+
+struct Compound<A, B>(PhantomData<(A, B)>);
+trait NotSame { }
+impl NotSame for .. { }
+impl<A> !NotSame for Compound<A, A> { }
+
+trait Chooser<T> {
+    fn num() -> usize;
+}
+
+impl<P, Q: ChooseFrom> Chooser<P> for Choose<P, Q> {
+    fn num() -> usize { 0 }
+}
+
+impl<P> Chooser<P> for Finally<P> {
+    fn num() -> usize { 0 }
+}
+
+impl<P, S, Q: ChooseFrom + Chooser<S>> Chooser<S> for Choose<P, Q>
+    where Compound<S, P>: NotSame {
+
+    fn num() -> usize { 1 + Q::num() }
+}
+
+
+impl<P, Q: ChooseFrom> Choose<P, Q> {
+    fn choose<S>(&self) -> usize where Self: Chooser<S> {
+        Self::num()
+    }
+}
+
+fn main() {
+    let a: Choose<usize, Choose<isize, Choose<String, Finally<()>>>> = Choose(PhantomData);
+
+    println!("{:?}", a.choose::<String>());
+}
+```
+
+Basically, in theory you can just call `chan.choose::<Protocol>()` and it will signal over the channel that you're switching to that protocol using a single number. Perhaps if there's a monomorphization recursion limit anyway, we could use u8 or u16 instead of usize to make the discriminant as small as possible. (Safety note: if the number wraps around it will cause memory safety violations. Perhaps we can use peano numbers to encode a maximum limit here.)
+
+Also, I believe with inlining LLVM will completely optimize this away.
+
+Are the transmutes necessary for performance reasons? `Chan` could be reconstructing itself as it takes itself by value, and should not need to transmute. I'm reasonably confident LLVM will optimize this away.

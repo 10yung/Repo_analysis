@@ -1,0 +1,174 @@
+In today's MIR, an indirect assignment like `*p = *q;` is similar to, but not exactly the same as:
+```rust
+tmp = *q;
+*p = tmp;
+```
+The differences are:
+* performance: they only produce the same codegen for primitives
+  * this is assuming `tmp` isn't used elsewhere, allowing codegen to treat it like an SSA value, resulting in `store(p, load(q))`, which is also what `*p = *q` codegens to
+  * for non-primitives, the amount of data being copied doubles, as `tmp` must be in memory
+* correctness: only `*p = *q;` is UB (AFAIK) if `p..p+size` overlaps `q..q+size`
+  * this also likely only affects non-primitives, which have to copy data in memory, but we could decide to ignore the type and always make it UB when they overlap
+
+<hr/>
+
+For the purposes of this discussion, a primitive is:
+* scalar (`bool`, `char`, integer, float, or pointer/reference)
+* vector (SIMD-enabled array of scalars)
+
+Scalar pairs likely also need to be included, due to how easy they are to support in any code that already handles scalars, and also due to their use in wide pointers/references.
+
+<hr/>
+
+What's interesting about primitives, though, is that some kinds of `Rvalue`s (the RHS of the assignment) *always* produce primitive values, because they're primitive operations.
+
+The `Rvalue` variants which are always primitive, today, are:
+* `Ref` (`&T` / `&mut T` - may become dependent on custom DSTs in the future)
+* `AddressOf` (`*const T` / `*mut T` - may become dependent on custom DSTs in the future)
+* `Len` (`usize`)
+* `Cast`, other than unsizing (scalar)
+* `BinaryOp`, `UnaryOp` (scalar, or maybe also vector)
+* `CheckedBinaryOp` (pair of integer and `bool` - only if we consider scalar pairs to be primitive)
+* `NullaryOp(SizeOf)` (`usize`)
+* `NullaryOp(Box)` (`Box<T>`)
+* `Discriminant` (integer)
+
+Which leaves these variants as potentially relying on memory operations to write the result:
+* `Use` (any type, one copy)
+* `Repeat` (`[T; N]`, `N` copies)
+* `Cast`, specifically unsizing (any type implementing `CoerceUnsized`, per-field copies)
+* `Aggregate` (any ADT, per-field copies)
+
+If we want to remain conservative, we could ignore types for the latter, and just assume that the destination of the assignment cannot overlap any memory read in the `Operand`s of the `Rvalue`.
+
+We could even cement the distinction by moving the always-primitive operations into a new `PrimOp` enum, and/or move the other `Rvalue`s to their own statements (e.g. introduce `Copy(*p, *q)`), but that's more aesthetic than anything for the time being.
+
+At the very least, we should probably document these differences, and make sure that `miri` only allows overlaps in the cases we don't consider UB (either abstractly, or due to our choice of codegen).
+
+<hr/>
+
+Another interesting aspect of the always-primitive ops is that they're "pure functions" of their operands (other than `NullaryOp(Box)`, I suppose, but that could be replaced with a call to a lang item returning a `Box<MaybeUninit<T>>`, instead).
+
+This means that if we wanted to, we could replace some of the intermediary locals with an `PrimOp` DAG, a bit like SSA but without φ (`phi`) nodes or a strict instruction stream.
+All of the necessary ordering would still happen at the statement level (so this is nowhere near as complex as VSDG), but we might see some benefits in scalar-heavy code.
+
+<hr/>
+
+Asides aside, cc @RalfJung @rust-lang/compiler (is there no `mir-opt` team?)
+Successful merges:
+
+ - #67682 ([const-prop] Remove useless typedef)
+ - #68247 (Clean up err codes)
+ - #68348 (Make iter::Empty<T> Send and Sync for any T)
+
+Failed merges:
+
+
+r? @ghost
+Closes #64552 
+r? @ghost 
+cc @Aaron1011  
+Add -Wl,-znotext to default linker flags to link with lld 9 on FreeBSD 13.0-CURRENT i386 where rust-nightly has been failing to link since 2019-12-10 with variations of
+```
+ = note: ld: error: relocation R_386_PC32 cannot be used against symbol __rust_probestack; recompile with -fPIC
+          >>> defined in /wrkdirs/usr/ports/lang/rust-nightly/work/rustc-nightly-src/build/i686-unknown-freebsd/stage1/lib/rustlib/i686-unknown-freebsd/lib/libcompiler_builtins-6570a75fe85f0e1a.rlib(compiler_builtins-6570a75fe85f0e1a.compiler_builtins.2i519eqi-cgu.15.rcgu.o)
+          >>> referenced by std.4xivr03c-cgu.14
+          >>>               std-9bd70afd58e204b7.std.4xivr03c-cgu.14.rcgu.o:(_$LT$alloc..boxed..Box$LT$F$GT$$u20$as$u20$core..ops..function..FnOnce$LT$A$GT$$GT$::call_once::h1c78ed6e734a2bfc (.llvm.10122419023709863394)) in archive /wrkdirs/usr/ports/lang/rust-nightly/work/rustc-nightly-src/build/i686-unknown-freebsd/stage1/lib/rustlib/i686-unknown-freebsd/lib/libstd-9bd70afd58e204b7.rlib
+
+          ld: error: relocation R_386_PC32 cannot be used against symbol __rust_probestack; recompile with -fPIC
+          >>> defined in /wrkdirs/usr/ports/lang/rust-nightly/work/rustc-nightly-src/build/i686-unknown-freebsd/stage1/lib/rustlib/i686-unknown-freebsd/lib/libcompiler_builtins-6570a75fe85f0e1a.rlib(compiler_builtins-6570a75fe85f0e1a.compiler_builtins.2i519eqi-cgu.15.rcgu.o)
+          >>> referenced by std.4xivr03c-cgu.14
+          >>>               std-9bd70afd58e204b7.std.4xivr03c-cgu.14.rcgu.o:(std::io::util::copy::h9115f048f2203467) in archive /wrkdirs/usr/ports/lang/rust-nightly/work/rustc-nightly-src/build/i686-unknown-freebsd/stage1/lib/rustlib/i686-unknown-freebsd/lib/libstd-9bd70afd58e204b7.rlib
+          clang-cpp: error: linker command failed with exit code 1 (use -v to see invocation)
+
+error: aborting due to previous error
+
+error: could not compile `rustc_macros`.
+```
+Full log: http://beefy17.nyi.freebsd.org/data/head-i386-default/p523508_s356869/logs/rust-nightly-1.42.0.20200118.log
+
+AFAICT it stopped building after bumping compiler_builtins to 0.1.22 in https://github.com/rust-lang/rust/pull/67110.
+Successful merges:
+
+ - #67682 ([const-prop] Remove useless typedef)
+ - #68133 (Slimmer syntax)
+ - #68154 (Add more BTreeMap/BTreeSet benchmarks regarding iteration)
+ - #68247 (Clean up err codes)
+ - #68348 (Make iter::Empty<T> Send and Sync for any T)
+
+Failed merges:
+
+ - #68353 (Remove `rustc_error_codes` deps except in `rustc_driver`)
+
+r? @ghost
+I've been working on restricting specialization in the standard library to prevent issues like #67194. This is the fallout of those changes.
+
+* The `PartialEq` and `Hash` implementations for  `RangeInclusive` are changed to avoid specialization.
+* The `PartialOrd` specialization for slices now specializes on a limited set of concrete types.
+* Some impls of `TrustedRandomAccess` (a trait used to improve `iter::Zip` performance) have been removed.
+* Added some tests for the soundness problems.
+
+ * Call `abort_if_errors` so all errors actually stop rustdoc.
+* Don't panic with "compiler aborted in rustdoc!", instead just exit to avoid the ugly panic message.
+* Use rlib as the crate type when searching for doctests matching what is used for doc generation so `#[no_std]` crates don't create "no global memory allocator" errors.
+
+Fixes #52243
+Fixes #54010
+
+r? @GuillaumeGomez
+This improves the diagonistics/fixes ICEs when generic parameters appear within some constants. For example of the new errors:
+```rust
+use std::mem::size_of;
+
+fn foo<T>() {
+    let _ = [0; size_of::<T>()]; // now errors with: type parameters can't appear within an array length expression
+}
+
+#[repr(usize)]
+enum Enum<T> {
+    V1 = size_of::<T>(), // now errors with: type parameters can't appear within an enum discriminant
+}
+``` 
+
+Previously emitted confusing errors like:
+```
+error[E0277]: the size for values of type `T` cannot be known at compilation time
+   --> src/main.rs:45:27
+    |
+35  | fn foo<T>() {
+    |        - help: consider restricting this bound: `T: std::marker::Sized`
+...
+45  |     let _ = [0; size_of::<T>()];
+    |                           ^ doesn't have a size known at compile-time
+    |
+    = help: the trait `std::marker::Sized` is not implemented for `T`
+```
+Note doesn't disallow referring to `Self` in either enum discriminants or array length expressions as there are cases where it can currently be sucessfully used, i.e.:
+```rust
+struct Foo;
+
+impl Foo {
+    const A: usize = 37;
+
+    fn bar() -> [u8; Self::A]{
+        [0; Self::A]
+    }
+}
+```
+I don't think that this disallows any more code that didn't either produce a compiler error before or caused an ICE.
+
+cc #43408 
+cc #67945 (doesn't actually fully fix it see: https://github.com/rust-lang/rust/issues/67945#issuecomment-575946966)
+PLACEHOLDER
+
+cc #45600
+Remove dependencies on `rustc_error_codes` in all crates except for `rustc_driver`.
+
+This has some benefits:
+
+1. Adding a new error code when hacking on the compiler only requires rebuilding at most `rustc_error_codes`, `rustc_driver`, and the reflexive & transitive closure of the crate where the new error code is being added and its reverse dependencies. This improves time-to-UI-tests (TTUT).
+
+2. Adding an error description to an error code only requires rebuilding `rustc_error_codes` and `rustc_driver`. This should substantially improve TTUT.
+
+r? @petrochenkov 
+cc @rust-lang/wg-diagnostics 

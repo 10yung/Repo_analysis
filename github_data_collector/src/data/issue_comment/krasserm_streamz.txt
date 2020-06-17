@@ -1,0 +1,112 @@
+Now that we're on the latest cats, etc, I'd like to make sure we minimize binary compatibility breakages going forward.
+
+Example of adding them to an existing project: https://github.com/sirthias/borer/pull/66
+The 0.10 doc links go to master branch, and I need to add the 0.11 section
+https://travis-ci.org/krasserm/streamz/jobs/602367687#L1093
+
+I'll still release a milestone build on cats-effect+fs2 2.x, but with a warning that there's possibly an issue in this module
+I'm reasonably happy with this approach.
+
+This version has
+- 2 clear versions that do support the behavior we want to have
+- A drop-in replacement for the old version (minus type annotations) that effectively re-implements the previous unsafe behavior, but removing the default `_ => ()`.
+
+Still todo:
+- Probably should have some tests
+- It would be nice to add a scalafix migration to eliminate the mechanical work someone needs to do on upgrade. The work isn't hard, but potentially there might be compile errors that are confusing for people who are newer to scala
+
+If we want to keep the single method name instead of split method names, we'll have to implement some dependent type + typeclass trickery; gitter chat about it: [October 5, 2018 9:13 AM](https://gitter.im/typelevel/general?at=5bb7637bc7bf7c3662bd8169)
+The problem:
+Akka streams have materialized values, but the default `.toStream()` or `.toSink()` discard them. I've created race conditions by converting sinks with a materialized Future result and not waiting on that future.
+
+Ad-hoc solution:
+I created this:
+```scala
+implicit class RichAkkaSink[A, B](val sink: AkkaSink[A, Future[B]])
+        extends AnyVal {
+
+      /** Converts an akka sink with a success-status-indicating Future[B]
+        * materialized result into an fs2 stream which will fail if the Future fails.
+        * The stream returned by this will emit the Future's value one time at the end,
+        * then terminate.
+        */
+      def toSinkWithStatusMat(
+          implicit ec: ExecutionContext,
+          m: Materializer
+      ): Pipe[IO, A, B] =
+        Fs2AkkaCompat.toSinkWithStatusMat(sink)
+
+      /** The same as toSinkWithStatusMat, but ignoring the materialized value */
+      def toSinkWithStatusMat_(
+          implicit ec: ExecutionContext,
+          m: Materializer
+      ): Sink[IO, A] =
+        in => in.through(Fs2AkkaCompat.toSinkWithStatusMat(sink)).void
+    }
+
+  /** Converts an akka sink with a success-status-indicating Future[B]
+    * materialized result into an fs2 stream which will fail if the Future fails.
+    * The stream returned by this will emit the Future's value one time at the end,
+    * then terminate.
+    */
+  def toSinkWithStatusMat[A, B](
+      akkaSink: AkkaSink[A, Future[B]]
+  )(
+      implicit ec: ExecutionContext,
+      m: Materializer
+  ): Pipe[IO, A, B] = {
+    val mkPromise = Promise.empty[IO, Either[Throwable, B]]
+    // `Sink` is just a function of Stream[F, A] => Stream[F, Unit], so we take a stream as input.
+    in =>
+      Stream.eval(mkPromise).flatMap { p =>
+        // Akka streams produce a materialized value as a side effect of being run.
+        // streamz-converters allows us to have a `Future[Done] => Unit` callback when that materialized value is created.
+        // This callback tells the akka materialized future to store its result status into the Promise
+        val captureMaterializedResult: Future[B] => Unit = _.onComplete {
+          case Failure(ex)    => p.complete(Left(ex)).unsafeRunSync
+          case Success(value) => p.complete(Right(value)).unsafeRunSync
+        }
+        // toSink is from streamz-converters; convert an akka sink to fs2 sink with a callback for the materialized values
+        val fs2Sink: Sink[IO, A] = akkaSink.toSink(captureMaterializedResult)
+
+        val fs2Stream: Stream[IO, Unit] = fs2Sink.apply(in)
+        val materializedResultStream: Stream[IO, B] = Stream.eval {
+          p.get // Async wait on the promise to be completed; => IO[Either[Throwable, B]]
+          .rethrow // IO[Either[Throwable, B]] => IO[B]
+        }
+        // Run the akka sink for its effects and then run stream containing the effect of getting the Promise results
+        fs2Stream.drain ++ materializedResultStream
+      }
+  }
+```
+
+The problem with my approach is that the user is still required to realize they need the alternate converter method.
+
+A more comprehensive solution:
+I'd like to make a breaking API change before we make the 1.x release.
+```scala
+// currently
+def toSink(onMaterialization: M => Unit = _ => ())
+```
+
+Proposed:
+```scala
+package streamz.converter {
+  // For convenience on wildcard imports
+  val Discard: M => Unit = _ => ()
+}
+
+def toSink(onMaterialization: M => Unit)
+def toSink()(implicit ev: M =:= Akka.NotUsed)
+```
+
+This guarantees that a caller must either provide an explicit `onMaterialization`, for which `Discard` will be wildcard imported for convenience, or if they don't want to pass one, that `M` must be `NotUsed`.
+
+I haven't tested this yet, but I believe the general approach should work.
+
+If you're willing to take this, I'll send a PR implementing it
+In addition to [replying](https://github.com/krasserm/streamz/blob/v-0.8.1/streamz-camel-akka/README.md#receiving-in-out-message-exchanges-from-an-endpoint) to consumed in-out message exchanges also support delayed *ack* of consumed in-only message exchanges e.g. by extending the DSL with an `.ack` element. Implementation of this features should also cover #32.
+
+Stream errors (see also [difference between errors and failures](http://doc.akka.io/docs/akka/current/scala/general/stream/stream-design.html#the-difference-between-error-and-failure)) should be translatable to negative acknowledgements (exceptions or faults) on individual message exchanges while stream failures should fail all message exchanges that are currently being processed.
+
+

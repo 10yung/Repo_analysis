@@ -1,0 +1,581 @@
+Two changes:
+
+- Remove water and replace with sys call for tun setup
+- Support named interfaces
+
+**This needs testing**
+
+I submitted the PR to get some more help reviewing and testing. I've tested on Catalina.
+
+If anyone has pointers on sending route messages to an AF_ROUTE socket so we can replace the execs I'd love to see an example.
+I successfully set up a LH+2-node Nebula mesh where the 2 nodes are running Windows (with OpenVPN preinstalled, and that's how they had a TAP adapter). In the process, I noticed that Nebula sets up static IPs on the TAP adapters (at least on the Windows machines), which caused me a couple of headaches trying to figure out why my connections to OpenVPN servers were not working anymore after I stopped Nebula. Removing the static IP and setting DNS servers to be obtained automatically, solved the issue.
+
+Is it possible (or are there plans for it) to only apply the static IP to the TAP adapter while Nebula is running, and revert any changes when we stop it? Or what's the recommended usage if our TAP adapter is also used for other purposes?
+
+I initially thought that Nebula would create a new network adapter for its purposes; that would also work if it's doable.
+I am trying to create a selinux policy for Nebula to ignore events to make sure I can keep selinux active on my servers while running Nebula. It mostly works, but the Nebula service fails on a reboot.
+When I first run Nebula manually, or I set selinux to permissive I can start the service. If I then enable selinux I can restart as expected.
+
+in journalctl -xe I see the following message:
+level=fatal msg="no such device"
+
+Looks like selinux is still preventing the creation of the network interface for Nebula, and a manual start of Nebula or a start of the service with selinux permissive resolves it.
+
+Environment: Centos 8
+
+## Steps taken
+
+Created a service for Nebula, like in the example git repo.
+
+```
+cat /usr/lib/systemd/system/nebula.service
+[Unit]
+Description=nebula
+Wants=basic.target
+After=basic.target network.target
+
+[Service]
+SyslogIdentifier=nebula
+StandardOutput=syslog
+StandardError=syslog
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStart=/usr/local/bin/nebula -config /etc/nebula/config.yml
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+
+Created a policy with audit2allow and loaded it.
+
+```
+grep nebula /var/log/audit/audit.log | audit2allow -M nebulalocal 
+semodule -i nebulalocal.pp
+semodule -l
+```
+
+Now all invalid selinux AVC's are allowed in current policy, no errors left:
+
+```
+*** Invalid AVC allowed in current policy ***
+
+type=AVC msg=audit(1578750253.305:191): avc:  denied  { execute } for  pid=16679 comm="(nebula)" name="nebula" dev="dm-0" ino=51248653 scontext=system_u:system_r:init_t:s0 tcontext=unconfined_u:object_r:user_home_t:s0 tclass=file permissive=0
+ 
+**** Invalid AVC allowed in current policy ***
+
+100% done
+found 0 alerts in /var/log/audit/audit.log
+```
+
+But when I try to start the service it fails
+
+``` 
+systemctl status nebula
+● nebula.service - nebula
+   Loaded: loaded (/usr/lib/systemd/system/nebula.service; enabled; vendor preset: disabled)
+   Active: failed (Result: exit-code) since Sat 2020-01-11 16:07:50 CET; 22s ago
+  Process: 832 ExecStart=/usr/local/bin/nebula -config /etc/nebula/config.yml (code=exited, status=1/FAILURE)
+ Main PID: 832 (code=exited, status=1/FAILURE)
+```
+
+If I then set selinux to permissive I can start the service, and even when I turn it back to enforcing, Nebula will keep working and can be restarted
+
+```
+setenforce 0
+systemctl start nebula
+setenforce 1
+systemctl restat nebula <-- no problem
+```
+
+I can also manually start Nebula on start up, and after that I can start the service using enforcing selinux.
+
+
+Issue:
+Nebula crashes with OOM error, during handshake with the Lighthouse.  
+
+Nebula version: Master branch commit 5c126cd42b3f5be20037650ff78cf3b4052fc4be 
+Operating system: Ubuntu 16.04
+
+Nebula node configuration:
+```
+pki:
+  ca: ca.crt
+  cert: host.crt
+  key: host.key
+
+static_host_map:
+  "10.2.2.1": ["192.168.1.1:4242"]
+
+lighthouse:
+  am_lighthouse: false
+  interval: 60
+  hosts:
+  - "10.2.2.1"
+
+listen:
+  host: 0.0.0.0
+  port: 4242
+
+tun:
+  dev: nebula2
+  mtu: 1300
+logging:
+  # panic, fatal, error, warning, info, or debug. Default is info
+  level: info
+  # json or text formats currently available. Default is text
+  format: text
+
+
+# Nebula security group configuration
+firewall:
+  conntrack:
+    tcp_timeout: 120h
+    udp_timeout: 3m
+    default_timeout: 10m
+    max_connections: 100000
+
+  outbound:
+    # Allow all outbound traffic from this node
+    - port: any
+      proto: any
+      host: any
+
+  inbound:
+    # Allow icmp between any nebula hosts
+    - port: any
+      proto: icmp
+      host: any
+```
+
+
+Error log:
+
+```
+INFO[0000] Nebula interface is active                    build=dev+20200109161940 interface=nebula2 network=10.2.1.1/24
+fatal error: runtime: out of memory
+
+runtime stack:
+runtime.throw(0xb5d08a, 0x16)
+	runtime/panic.go:774 +0x72
+runtime.sysMap(0xc0c4000000, 0x4000000, 0x10c5058)
+	runtime/mem_linux.go:169 +0xc5
+runtime.(*mheap).sysAlloc(0x10ab340, 0xe000, 0x7f5db6d4ec01, 0x7f5db6d4f740)
+	runtime/malloc.go:701 +0x1cd
+runtime.(*mheap).grow(0x10ab340, 0x7, 0xffffffff)
+	runtime/mheap.go:1255 +0xa3
+runtime.(*mheap).allocSpanLocked(0x10ab340, 0x7, 0x10c5068, 0x7f5db4041098)
+	runtime/mheap.go:1170 +0x266
+runtime.(*mheap).alloc_m(0x10ab340, 0x7, 0x450067, 0x7f5db4041098)
+	runtime/mheap.go:1022 +0xc2
+runtime.(*mheap).alloc.func1()
+	runtime/mheap.go:1093 +0x4c
+runtime.systemstack(0x0)
+	runtime/asm_amd64.s:370 +0x66
+runtime.mstart()
+	runtime/proc.go:1146
+
+goroutine 10 [running]:
+runtime.systemstack_switch()
+	runtime/asm_amd64.s:330 fp=0xc077a562b0 sp=0xc077a562a8 pc=0x45cb10
+runtime.(*mheap).alloc(0x10ab340, 0x7, 0x10067, 0x2)
+	runtime/mheap.go:1092 +0x8a fp=0xc077a56300 sp=0xc077a562b0 pc=0x4279fa
+runtime.(*mcentral).grow(0x10ad0b8, 0x0)
+	runtime/mcentral.go:255 +0x7b fp=0xc077a56340 sp=0xc077a56300 pc=0x41994b
+runtime.(*mcentral).cacheSpan(0x10ad0b8, 0x0)
+	runtime/mcentral.go:106 +0x2fe fp=0xc077a563a0 sp=0xc077a56340 pc=0x41946e
+runtime.(*mcache).refill(0x7f5dc8c236d0, 0x67)
+	runtime/mcache.go:138 +0x85 fp=0xc077a563c0 sp=0xc077a563a0 pc=0x418f15
+runtime.(*mcache).nextFree(0x7f5dc8c236d0, 0x67, 0x4, 0x0, 0x0)
+	runtime/malloc.go:854 +0x87 fp=0xc077a563f8 sp=0xc077a563c0 pc=0x40d867
+runtime.mallocgc(0x2500, 0xa5a520, 0xc06b77f101, 0xc06b499a34)
+	runtime/malloc.go:1022 +0x793 fp=0xc077a56498 sp=0xc077a563f8 pc=0x40e1a3
+runtime.makeslice(0xa5a520, 0x2329, 0x2329, 0xc06b499a34)
+	runtime/slice.go:49 +0x6c fp=0xc077a564c8 sp=0xc077a56498 pc=0x4473ec
+github.com/slackhq/nebula.(*LightHouse).QueryServer(0xc00006b140, 0xc000000000, 0xc57c60, 0xc000162480)
+	github.com/slackhq/nebula@/lighthouse.go:89 +0x13b fp=0xc077a56718 sp=0xc077a564c8 pc=0x9d977b
+github.com/slackhq/nebula.(*LightHouse).Query(0xc00006b140, 0x0, 0xc57c60, 0xc000162480, 0x0, 0x0, 0x0, 0x0, 0x0)
+	github.com/slackhq/nebula@/lighthouse.go:67 +0x22f fp=0xc077a56788 sp=0xc077a56718 pc=0x9d962f
+github.com/slackhq/nebula.ixHandshakeStage0(0xc000162480, 0xc000000000, 0xc0000f0180)
+	github.com/slackhq/nebula@/handshake_ix.go:20 +0x75 fp=0xc077a57060 sp=0xc077a56788 pc=0x9c3905
+github.com/slackhq/nebula.(*Interface).getOrHandshake(0xc000162480, 0x40000000a020201, 0xffffffffffffffff)
+	github.com/slackhq/nebula@/inside.go:86 +0x132 fp=0xc077a57110 sp=0xc077a57060 pc=0x9d5c02
+github.com/slackhq/nebula.(*Interface).SendMessageToVpnIp(0xc000162480, 0xa02020100020003, 0xc06b499a20, 0x4, 0x4, 0xc06b499a24, 0xc, 0xc, 0xc0c3ff5900, 0x2329, ...)
+	github.com/slackhq/nebula@/inside.go:116 +0x3d fp=0xc077a57198 sp=0xc077a57110 pc=0x9d615d
+github.com/slackhq/nebula.(*LightHouse).QueryServer(0xc00006b140, 0xc000000000, 0xc57c60, 0xc000162480)
+	github.com/slackhq/nebula@/lighthouse.go:91 +0x220 fp=0xc077a573e8 sp=0xc077a57198 pc=0x9d9860
+github.com/slackhq/nebula.(*LightHouse).Query(0xc00006b140, 0x0, 0xc57c60, 0xc000162480, 0x0, 0x0, 0x0, 0x0, 0x0)
+	github.com/slackhq/nebula@/lighthouse.go:67 +0x22f fp=0xc077a57458 sp=0xc077a573e8 pc=0x9d962f
+github.com/slackhq/nebula.ixHandshakeStage0(0xc000162480, 0xc000000000, 0xc0000f0180)
+	github.com/slackhq/nebula@/handshake_ix.go:20 +0x75 fp=0xc077a57d30 sp=0xc077a57458 pc=0x9c3905
+github.com/slackhq/nebula.(*Interface).getOrHandshake(0xc000162480, 0x60000000a020201, 0xffffffffffffffff)
+	github.com/slackhq/nebula@/inside.go:86 +0x132 fp=0xc077a57de0 sp=0xc077a57d30 pc=0x9d5c02
+github.com/slackhq/nebula.(*Interface).SendMessageToVpnIp(0xc000162480, 0xa02020100020003, 0xc06b499a10, 0x4, 0x4, 0xc06b499a14, 0xc, 0xc, 0xc0c3ff3400, 0x2329, ...)
+	github.com/slackhq/nebula@/inside.go:116 +0x3d fp=0xc077a57e68 sp=0xc077a57de0 pc=0x9d615d
+github.com/slackhq/nebula.(*LightHouse).QueryServer(0xc00006b140, 0xc000000000, 0xc57c60, 0xc000162480)
+	github.com/slackhq/nebula@/lighthouse.go:91 +0x220 fp=0xc077a580b8 sp=0xc077a57e68 pc=0x9d9860
+github.com/slackhq/nebula.(*LightHouse).Query(0xc00006b140, 0x0, 0xc57c60, 0xc000162480, 0x0, 0x0, 0x0, 0x0, 0x0)
+	github.com/slackhq/nebula@/lighthouse.go:67 +0x22f fp=0xc077a58128 sp=0xc077a580b8 pc=0x9d962f
+github.com/slackhq/nebula.ixHandshakeStage0(0xc000162480, 0xc000000000, 0xc0000f0180)
+	github.com/slackhq/nebula@/handshake_ix.go:20 +0x75 fp=0xc077a58a00 sp=0xc077a58128 pc=0x9c3905
+github.com/slackhq/nebula.(*Interface).getOrHandshake(0xc000162480, 0x30000000a020201, 0xffffffffffffffff)
+	github.com/slackhq/nebula@/inside.go:86 +0x132 fp=0xc077a58ab0 sp=0xc077a58a00 pc=0x9d5c02
+github.com/slackhq/nebula.(*Interface).SendMessageToVpnIp(0xc000162480, 0xa02020100020003, 0xc06b499a00, 0x4, 0x4, 0xc06b499a04, 0xc, 0xc, 0xc0c3ff0f00, 0x2329, ...)
+	github.com/slackhq/nebula@/inside.go:116 +0x3d fp=0xc077a58b38 sp=0xc077a58ab0 pc=0x9d615d
+github.com/slackhq/nebula.(*LightHouse).QueryServer(0xc00006b140, 0xc000000000, 0xc57c60, 0xc000162480)
+	github.com/slackhq/nebula@/lighthouse.go:91 +0x220 fp=0xc077a58d88 sp=0xc077a58b38 pc=0x9d9860
+github.com/slackhq/nebula.(*LightHouse).Query(0xc00006b140, 0x0, 0xc57c60, 0xc000162480, 0x0, 0x0, 0x0, 0x0, 0x0)
+	github.com/slackhq/nebula@/lighthouse.go:67 +0x22f fp=0xc077a58df8 sp=0xc077a58d88 pc=0x9d962f
+github.com/slackhq/nebula.ixHandshakeStage0(0xc000162480, 0xc000000000, 0xc0000f0180)
+	github.com/slackhq/nebula@/handshake_ix.go:20 +0x75 fp=0xc077a596d0 sp=0xc077a58df8 pc=0x9c3905
+github.com/slackhq/nebula.(*Interface).getOrHandshake(0xc000162480, 0x70000000a020201, 0xffffffffffffffff)
+	github.com/slackhq/nebula@/inside.go:86 +0x132 fp=0xc077a59780 sp=0xc077a596d0 pc=0x9d5c02
+github.com/slackhq/nebula.(*Interface).SendMessageToVpnIp(0xc000162480, 0xa02020100020003, 0xc06b4999f0, 0x4, 0x4, 0xc06b4999f4, 0xc, 0xc, 0xc0c3feea00, 0x2329, ...)
+	github.com/slackhq/nebula@/inside.go:116 +0x3d fp=0xc077a59808 sp=0xc077a59780 pc=0x9d615d
+github.com/slackhq/nebula.(*LightHouse).QueryServer(0xc00006b140, 0xc000000000, 0xc57c60, 0xc000162480)
+	github.com/slackhq/nebula@/lighthouse.go:91 +0x220 fp=0xc077a59a58 sp=0xc077a59808 pc=0x9d9860
+github.com/slackhq/nebula.(*LightHouse).Query(0xc00006b140, 0x0, 0xc57c60, 0xc000162480, 0x0, 0x0, 0x0, 0x0, 0x0)
+	github.com/slackhq/nebula@/lighthouse.go:67 +0x22f fp=0xc077a59ac8 sp=0xc077a59a58 pc=0x9d962f
+github.com/slackhq/nebula.ixHandshakeStage0(0xc000162480, 0xc000000000, 0xc0000f0180)
+	github.com/slackhq/nebula@/handshake_ix.go:20 +0x75 fp=0xc077a5a3a0 sp=0xc077a59ac8 pc=0x9c3905
+github.com/slackhq/nebula.(*Interface).getOrHandshake(0xc000162480, 0x40000000a020201, 0xffffffffffffffff)
+	github.com/slackhq/nebula@/inside.go:86 +0x132 fp=0xc077a5a450 sp=0xc077a5a3a0 pc=0x9d5c02
+github.com/slackhq/nebula.(*Interface).SendMessageToVpnIp(0xc000162480, 0xa02020100020003, 0xc06b4999e0, 0x4, 0x4, 0xc06b4999e4, 0xc, 0xc, 0xc0c3fec500, 0x2329, ...)
+	github.com/slackhq/nebula@/inside.go:116 +0x3d fp=0xc077a5a4d8 sp=0xc077a5a450 pc=0x9d615d
+github.com/slackhq/nebula.(*LightHouse).QueryServer(0xc00006b140, 0xc000000000, 0xc57c60, 0xc000162480)
+	github.com/slackhq/nebula@/lighthouse.go:91 +0x220 fp=0xc077a5a728 sp=0xc077a5a4d8 pc=0x9d9860
+github.com/slackhq/nebula.(*LightHouse).Query(0xc00006b140, 0x0, 0xc57c60, 0xc000162480, 0x0, 0x0, 0x0, 0x0, 0x0)
+	github.com/slackhq/nebula@/lighthouse.go:67 +0x22f fp=0xc077a5a798 sp=0xc077a5a728 pc=0x9d962f
+github.com/slackhq/nebula.ixHandshakeStage0(0xc000162480, 0xc000000000, 0xc0000f0180)
+	github.com/slackhq/nebula@/handshake_ix.go:20 +0x75 fp=0xc077a5b070 sp=0xc077a5a798 pc=0x9c3905
+github.com/slackhq/nebula.(*Interface).getOrHandshake(0xc000162480, 0x50000000a020201, 0xffffffffffffffff)
+	github.com/slackhq/nebula@/inside.go:86 +0x132 fp=0xc077a5b120 sp=0xc077a5b070 pc=0x9d5c02
+github.com/slackhq/nebula.(*Interface).SendMessageToVpnIp(0xc000162480, 0xa02020100020003, 0xc06b4999d0, 0x4, 0x4, 0xc06b4999d4, 0xc, 0xc, 0xc0c3fea000, 0x2329, ...)
+	github.com/slackhq/nebula@/inside.go:116 +0x3d fp=0xc077a5b1a8 sp=0xc077a5b120 pc=0x9d615d
+github.com/slackhq/nebula.(*LightHouse).QueryServer(0xc00006b140, 0xc000000000, 0xc57c60, 0xc000162480)
+	github.com/slackhq/nebula@/lighthouse.go:91 +0x220 fp=0xc077a5b3f8 sp=0xc077a5b1a8 pc=0x9d9860
+github.com/slackhq/nebula.(*LightHouse).Query(0xc00006b140, 0x0, 0xc57c60, 0xc000162480, 0x0, 0x0, 0x0, 0x0, 0x0)
+	github.com/slackhq/nebula@/lighthouse.go:67 +0x22f fp=0xc077a5b468 sp=0xc077a5b3f8 pc=0x9d962f
+github.com/slackhq/nebula.ixHandshakeStage0(0xc000162480, 0xc000000000, 0xc0000f0180)
+	github.com/slackhq/nebula@/handshake_ix.go:20 +0x75 fp=0xc077a5bd40 sp=0xc077a5b468 pc=0x9c3905
+github.com/slackhq/nebula.(*Interface).getOrHandshake(0xc000162480, 0xa020201, 0xffffffffffffffff)
+	github.com/slackhq/nebula@/inside.go:86 +0x132 fp=0xc077a5bdf0 sp=0xc077a5bd40 pc=0x9d5c02
+github.com/slackhq/nebula.(*Interface).SendMessageToVpnIp(0xc000162480, 0xa02020100020003, 0xc06b4999c0, 0x4, 0x4, 0xc06b4999c4, 0xc, 0xc, 0xc0c3fe7900, 0x2329, ...)
+	github.com/slackhq/nebula@/inside.go:116 +0x3d fp=0xc077a5be78 sp=0xc077a5bdf0 pc=0x9d615d
+github.com/slackhq/nebula.(*LightHouse).QueryServer(0xc00006b140, 0xc000000000, 0xc57c60, 0xc000162480)
+	github.com/slackhq/nebula@/lighthouse.go:91 +0x220 fp=0xc077a5c0c8 sp=0xc077a5be78 pc=0x9d9860
+github.com/slackhq/nebula.(*LightHouse).Query(0xc00006b140, 0x0, 0xc57c60, 0xc000162480, 0x0, 0x0, 0x0, 0x0, 0x0)
+	github.com/slackhq/nebula@/lighthouse.go:67 +0x22f fp=0xc077a5c138 sp=0xc077a5c0c8 pc=0x9d962f
+github.com/slackhq/nebula.ixHandshakeStage0(0xc000162480, 0xc000000000, 0xc0000f0180)
+	github.com/slackhq/nebula@/handshake_ix.go:20 +0x75 fp=0xc077a5ca10 sp=0xc077a5c138 pc=0x9c3905
+github.com/slackhq/nebula.(*Interface).getOrHandshake(0xc000162480, 0x10000000a020201, 0xffffffffffffffff)
+	github.com/slackhq/nebula@/inside.go:86 +0x132 fp=0xc077a5cac0 sp=0xc077a5ca10 pc=0x9d5c02
+github.com/slackhq/nebula.(*Interface).SendMessageToVpnIp(0xc000162480, 0xa02020100020003, 0xc06b4999b0, 0x4, 0x4, 0xc06b4999b4, 0xc, 0xc, 0xc0c3fe5400, 0x2329, ...)
+	github.com/slackhq/nebula@/inside.go:116 +0x3d fp=0xc077a5cb48 sp=0xc077a5cac0 pc=0x9d615d
+github.com/slackhq/nebula.(*LightHouse).QueryServer(0xc00006b140, 0xc000000000, 0xc57c60, 0xc000162480)
+	github.com/slackhq/nebula@/lighthouse.go:91 +0x220 fp=0xc077a5cd98 sp=0xc077a5cb48 pc=0x9d9860
+github.com/slackhq/nebula.(*LightHouse).Query(0xc00006b140, 0x0, 0xc57c60, 0xc000162480, 0x0, 0x0, 0x0, 0x0, 0x0)
+	github.com/slackhq/nebula@/lighthouse.go:67 +0x22f fp=0xc077a5ce08 sp=0xc077a5cd98 pc=0x9d962f
+github.com/slackhq/nebula.ixHandshakeStage0(0xc000162480, 0xc000000000, 0xc0000f0180)
+	github.com/slackhq/nebula@/handshake_ix.go:20 +0x75 fp=0xc077a5d6e0 sp=0xc077a5ce08 pc=0x9c3905
+github.com/slackhq/nebula.(*Interface).getOrHandshake(0xc000162480, 0x10000000a020201, 0xffffffffffffffff)
+	github.com/slackhq/nebula@/inside.go:86 +0x132 fp=0xc077a5d790 sp=0xc077a5d6e0 pc=0x9d5c02
+github.com/slackhq/nebula.(*Interface).SendMessageToVpnIp(0xc000162480, 0xa02020100020003, 0xc06b4999a0, 0x4, 0x4, 0xc06b4999a4, 0xc, 0xc, 0xc0c3fe2f00, 0x2329, ...)
+	github.com/slackhq/nebula@/inside.go:116 +0x3d fp=0xc077a5d818 sp=0xc077a5d790 pc=0x9d615d
+github.com/slackhq/nebula.(*LightHouse).QueryServer(0xc00006b140, 0xc000000000, 0xc57c60, 0xc000162480)
+	github.com/slackhq/nebula@/lighthouse.go:91 +0x220 fp=0xc077a5da68 sp=0xc077a5d818 pc=0x9d9860
+github.com/slackhq/nebula.(*LightHouse).Query(0xc00006b140, 0x0, 0xc57c60, 0xc000162480, 0x0, 0x0, 0x0, 0x0, 0x0)
+	github.com/slackhq/nebula@/lighthouse.go:67 +0x22f fp=0xc077a5dad8 sp=0xc077a5da68 pc=0x9d962f
+github.com/slackhq/nebula.ixHandshakeStage0(0xc000162480, 0xc000000000, 0xc0000f0180)
+	github.com/slackhq/nebula@/handshake_ix.go:20 +0x75 fp=0xc077a5e3b0 sp=0xc077a5dad8 pc=0x9c3905
+github.com/slackhq/nebula.(*Interface).getOrHandshake(0xc000162480, 0x40000000a020201, 0xffffffffffffffff)
+	github.com/slackhq/nebula@/inside.go:86 +0x132 fp=0xc077a5e460 sp=0xc077a5e3b0 pc=0x9d5c02
+github.com/slackhq/nebula.(*Interface).SendMessageToVpnIp(0xc000162480, 0xa02020100020003, 0xc06b499990, 0x4, 0x4, 0xc06b499994, 0xc, 0xc, 0xc0c3fe0a00, 0x2329, ...)
+	github.com/slackhq/nebula@/inside.go:116 +0x3d fp=0xc077a5e4e8 sp=0xc077a5e460 pc=0x9d615d
+github.com/slackhq/nebula.(*LightHouse).QueryServer(0xc00006b140, 0xc000000000, 0xc57c60, 0xc000162480)
+	github.com/slackhq/nebula@/lighthouse.go:91 +0x220 fp=0xc077a5e738 sp=0xc077a5e4e8 pc=0x9d9860
+github.com/slackhq/nebula.(*LightHouse).Query(0xc00006b140, 0x0, 0xc57c60, 0xc000162480, 0x0, 0x0, 0x0, 0x0, 0x0)
+	github.com/slackhq/nebula@/lighthouse.go:67 +0x22f fp=0xc077a5e7a8 sp=0xc077a5e738 pc=0x9d962f
+github.com/slackhq/nebula.ixHandshakeStage0(0xc000162480, 0xc000000000, 0xc0000f0180)
+	github.com/slackhq/nebula@/handshake_ix.go:20 +0x75 fp=0xc077a5f080 sp=0xc077a5e7a8 pc=0x9c3905
+github.com/slackhq/nebula.(*Interface).getOrHandshake(0xc000162480, 0x70000000a020201, 0xffffffffffffffff)
+	github.com/slackhq/nebula@/inside.go:86 +0x132 fp=0xc077a5f130 sp=0xc077a5f080 pc=0x9d5c02
+github.com/slackhq/nebula.(*Interface).SendMessageToVpnIp(0xc000162480, 0xa02020100020003, 0xc06b499980, 0x4, 0x4, 0xc06b499984, 0xc, 0xc, 0xc0c3fde500, 0x2329, ...)
+	github.com/slackhq/nebula@/inside.go:116 +0x3d fp=0xc077a5f1b8 sp=0xc077a5f130 pc=0x9d615d
+github.com/slackhq/nebula.(*LightHouse).QueryServer(0xc00006b140, 0xc000000000, 0xc57c60, 0xc000162480)
+	github.com/slackhq/nebula@/lighthouse.go:91 +0x220 fp=0xc077a5f408 sp=0xc077a5f1b8 pc=0x9d9860
+github.com/slackhq/nebula.(*LightHouse).Query(0xc00006b140, 0x0, 0xc57c60, 0xc000162480, 0x0, 0x0, 0x0, 0x0, 0x0)
+	github.com/slackhq/nebula@/lighthouse.go:67 +0x22f fp=0xc077a5f478 sp=0xc077a5f408 pc=0x9d962f
+github.com/slackhq/nebula.ixHandshakeStage0(0xc000162480, 0xc000000000, 0xc0000f0180)
+	github.com/slackhq/nebula@/handshake_ix.go:20 +0x75 fp=0xc077a5fd50 sp=0xc077a5f478 pc=0x9c3905
+github.com/slackhq/nebula.(*Interface).getOrHandshake(0xc000162480, 0x70000000a020201, 0xffffffffffffffff)
+	github.com/slackhq/nebula@/inside.go:86 +0x132 fp=0xc077a5fe00 sp=0xc077a5fd50 pc=0x9d5c02
+github.com/slackhq/nebula.(*Interface).SendMessageToVpnIp(0xc000162480, 0xa02020100020003, 0xc06b499970, 0x4, 0x4, 0xc06b499974, 0xc, 0xc, 0xc0c3fdc000, 0x2329, ...)
+	github.com/slackhq/nebula@/inside.go:116 +0x3d fp=0xc077a5fe88 sp=0xc077a5fe00 pc=0x9d615d
+github.com/slackhq/nebula.(*LightHouse).QueryServer(0xc00006b140, 0xc000000000, 0xc57c60, 0xc000162480)
+	github.com/slackhq/nebula@/lighthouse.go:91 +0x220 fp=0xc077a600d8 sp=0xc077a5fe88 pc=0x9d9860
+github.com/slackhq/nebula.(*LightHouse).Query(0xc00006b140, 0x0, 0xc57c60, 0xc000162480, 0x0, 0x0, 0x0, 0x0, 0x0)
+	github.com/slackhq/nebula@/lighthouse.go:67 +0x22f fp=0xc077a60148 sp=0xc077a600d8 pc=0x9d962f
+github.com/slackhq/nebula.ixHandshakeStage0(0xc000162480, 0xc000000000, 0xc0000f0180)
+	github.com/slackhq/nebula@/handshake_ix.go:20 +0x75 fp=0xc077a60a20 sp=0xc077a60148 pc=0x9c3905
+github.com/slackhq/nebula.(*Interface).getOrHandshake(0xc000162480, 0x60000000a020201, 0xffffffffffffffff)
+	github.com/slackhq/nebula@/inside.go:86 +0x132 fp=0xc077a60ad0 sp=0xc077a60a20 pc=0x9d5c02
+github.com/slackhq/nebula.(*Interface).SendMessageToVpnIp(0xc000162480, 0xa02020100020003, 0xc06b499960, 0x4, 0x4, 0xc06b499964, 0xc, 0xc, 0xc0c3fd9900, 0x2329, ...)
+	github.com/slackhq/nebula@/inside.go:116 +0x3d fp=0xc077a60b58 sp=0xc077a60ad0 pc=0x9d615d
+github.com/slackhq/nebula.(*LightHouse).QueryServer(0xc00006b140, 0xc000000000, 0xc57c60, 0xc000162480)
+	github.com/slackhq/nebula@/lighthouse.go:91 +0x220 fp=0xc077a60da8 sp=0xc077a60b58 pc=0x9d9860
+github.com/slackhq/nebula.(*LightHouse).Query(0xc00006b140, 0x0, 0xc57c60, 0xc000162480, 0x0, 0x0, 0x0, 0x0, 0x0)
+	github.com/slackhq/nebula@/lighthouse.go:67 +0x22f fp=0xc077a60e18 sp=0xc077a60da8 pc=0x9d962f
+github.com/slackhq/nebula.ixHandshakeStage0(0xc000162480, 0xc000000000, 0xc0000f0180)
+	github.com/slackhq/nebula@/handshake_ix.go:20 +0x75 fp=0xc077a616f0 sp=0xc077a60e18 pc=0x9c3905
+github.com/slackhq/nebula.(*Interface).getOrHandshake(0xc000162480, 0x40000000a020201, 0xffffffffffffffff)
+	github.com/slackhq/nebula@/inside.go:86 +0x132 fp=0xc077a617a0 sp=0xc077a616f0 pc=0x9d5c02
+github.com/slackhq/nebula.(*Interface).SendMessageToVpnIp(0xc000162480, 0xa02020100020003, 0xc06b499950, 0x4, 0x4, 0xc06b499954, 0xc, 0xc, 0xc0c3fd7400, 0x2329, ...)
+	github.com/slackhq/nebula@/inside.go:116 +0x3d fp=0xc077a61828 sp=0xc077a617a0 pc=0x9d615d
+github.com/slackhq/nebula.(*LightHouse).QueryServer(0xc00006b140, 0xc000000000, 0xc57c60, 0xc000162480)
+	github.com/slackhq/nebula@/lighthouse.go:91 +0x220 fp=0xc077a61a78 sp=0xc077a61828 pc=0x9d9860
+github.com/slackhq/nebula.(*LightHouse).Query(0xc00006b140, 0x0, 0xc57c60, 0xc000162480, 0x0, 0x0, 0x0, 0x0, 0x0)
+	github.com/slackhq/nebula@/lighthouse.go:67 +0x22f fp=0xc077a61ae8 sp=0xc077a61a78 pc=0x9d962f
+github.com/slackhq/nebula.ixHandshakeStage0(0xc000162480, 0xc000000000, 0xc0000f0180)
+	github.com/slackhq/nebula@/handshake_ix.go:20 +0x75 fp=0xc077a623c0 sp=0xc077a61ae8 pc=0x9c3905
+github.com/slackhq/nebula.(*Interface).getOrHandshake(0xc000162480, 0x70000000a020201, 0xffffffffffffffff)
+	github.com/slackhq/nebula@/inside.go:86 +0x132 fp=0xc077a62470 sp=0xc077a623c0 pc=0x9d5c02
+github.com/slackhq/nebula.(*Interface).SendMessageToVpnIp(0xc000162480, 0xa02020100020003, 0xc06b499940, 0x4, 0x4, 0xc06b499944, 0xc, 0xc, 0xc0c3fd4f00, 0x2329, ...)
+	github.com/slackhq/nebula@/inside.go:116 +0x3d fp=0xc077a624f8 sp=0xc077a62470 pc=0x9d615d
+github.com/slackhq/nebula.(*LightHouse).QueryServer(0xc00006b140, 0xc000000000, 0xc57c60, 0xc000162480)
+	github.com/slackhq/nebula@/lighthouse.go:91 +0x220 fp=0xc077a62748 sp=0xc077a624f8 pc=0x9d9860
+github.com/slackhq/nebula.(*LightHouse).Query(0xc00006b140, 0x0, 0xc57c60, 0xc000162480, 0x0, 0x0, 0x0, 0x0, 0x0)
+	github.com/slackhq/nebula@/lighthouse.go:67 +0x22f fp=0xc077a627b8 sp=0xc077a62748 pc=0x9d962f
+github.com/slackhq/nebula.ixHandshakeStage0(0xc000162480, 0xc000000000, 0xc0000f0180)
+	github.com/slackhq/nebula@/handshake_ix.go:20 +0x75 fp=0xc077a63090 sp=0xc077a627b8 pc=0x9c3905
+github.com/slackhq/nebula.(*Interface).getOrHandshake(0xc000162480, 0x40000000a020201, 0xffffffffffffffff)
+	github.com/slackhq/nebula@/inside.go:86 +0x132 fp=0xc077a63140 sp=0xc077a63090 pc=0x9d5c02
+github.com/slackhq/nebula.(*Interface).SendMessageToVpnIp(0xc000162480, 0xa02020100020003, 0xc06b499930, 0x4, 0x4, 0xc06b499934, 0xc, 0xc, 0xc0c3fd2a00, 0x2329, ...)
+	github.com/slackhq/nebula@/inside.go:116 +0x3d fp=0xc077a631c8 sp=0xc077a63140 pc=0x9d615d
+github.com/slackhq/nebula.(*LightHouse).QueryServer(0xc00006b140, 0xc000000000, 0xc57c60, 0xc000162480)
+	github.com/slackhq/nebula@/lighthouse.go:91 +0x220 fp=0xc077a63418 sp=0xc077a631c8 pc=0x9d9860
+github.com/slackhq/nebula.(*LightHouse).Query(0xc00006b140, 0x0, 0xc57c60, 0xc000162480, 0x0, 0x0, 0x0, 0x0, 0x0)
+	github.com/slackhq/nebula@/lighthouse.go:67 +0x22f fp=0xc077a63488 sp=0xc077a63418 pc=0x9d962f
+github.com/slackhq/nebula.ixHandshakeStage0(0xc000162480, 0xc000000000, 0xc0000f0180)
+	github.com/slackhq/nebula@/handshake_ix.go:20 +0x75 fp=0xc077a63d60 sp=0xc077a63488 pc=0x9c3905
+github.com/slackhq/nebula.(*Interface).getOrHandshake(0xc000162480, 0x50000000a020201, 0xffffffffffffffff)
+	github.com/slackhq/nebula@/inside.go:86 +0x132 fp=0xc077a63e10 sp=0xc077a63d60 pc=0x9d5c02
+github.com/slackhq/nebula.(*Interface).SendMessageToVpnIp(0xc000162480, 0xa02020100020003, 0xc06b499920, 0x4, 0x4, 0xc06b499924, 0xc, 0xc, 0xc0c3fd0500, 0x2329, ...)
+	github.com/slackhq/nebula@/inside.go:116 +0x3d fp=0xc077a63e98 sp=0xc077a63e10 pc=0x9d615d
+github.com/slackhq/nebula.(*LightHouse).QueryServer(0xc00006b140, 0xc000000000, 0xc57c60, 0xc000162480)
+	github.com/slackhq/nebula@/lighthouse.go:91 +0x220 fp=0xc077a640e8 sp=0xc077a63e98 pc=0x9d9860
+github.com/slackhq/nebula.(*LightHouse).Query(0xc00006b140, 0x0, 0xc57c60, 0xc000162480, 0x0, 0x0, 0x0, 0x0, 0x0)
+	github.com/slackhq/nebula@/lighthouse.go:67 +0x22f fp=0xc077a64158 sp=0xc077a640e8 pc=0x9d962f
+github.com/slackhq/nebula.ixHandshakeStage0(0xc000162480, 0xc000000000, 0xc0000f0180)
+	github.com/slackhq/nebula@/handshake_ix.go:20 +0x75 fp=0xc077a64a30 sp=0xc077a64158 pc=0x9c3905
+github.com/slackhq/nebula.(*Interface).getOrHandshake(0xc000162480, 0x10000000a020201, 0xffffffffffffffff)
+	github.com/slackhq/nebula@/inside.go:86 +0x132 fp=0xc077a64ae0 sp=0xc077a64a30 pc=0x9d5c02
+github.com/slackhq/nebula.(*Interface).SendMessageToVpnIp(0xc000162480, 0xa02020100020003, 0xc06b499910, 0x4, 0x4, 0xc06b499914, 0xc, 0xc, 0xc0c3fce000, 0x2329, ...)
+	github.com/slackhq/nebula@/inside.go:116 +0x3d fp=0xc077a64b68 sp=0xc077a64ae0 pc=0x9d615d
+github.com/slackhq/nebula.(*LightHouse).QueryServer(0xc00006b140, 0xc000000000, 0xc57c60, 0xc000162480)
+	github.com/slackhq/nebula@/lighthouse.go:91 +0x220 fp=0xc077a64db8 sp=0xc077a64b68 pc=0x9d9860
+github.com/slackhq/nebula.(*LightHouse).Query(0xc00006b140, 0x0, 0xc57c60, 0xc000162480, 0x0, 0x0, 0x0, 0x0, 0x0)
+	github.com/slackhq/nebula@/lighthouse.go:67 +0x22f fp=0xc077a64e28 sp=0xc077a64db8 pc=0x9d962f
+...additional frames elided...
+created by github.com/slackhq/nebula.Main
+	github.com/slackhq/nebula@/main.go:305 +0x1d27
+```
+
+OS version: Windows 10 Pro 1909
+
+I tried to install the service, and this is what I'm keeping getting:
+
+```
+nebula -service install -config D:\Apps\Nebula\config.yml
+2020/01/09 23:58:30 Valid actions: ["start" "stop" "restart" "install" "uninstall"]
+2020/01/09 23:58:30 Failed to install Nebula Network Service: service Nebula already exists
+```
+
+While there is no Nebula service installed before.
+
+I also tried to uninstall, this is what I got.
+
+First try:
+
+```
+nebula -service uninstall
+2020/01/09 23:57:16 Valid actions: ["start" "stop" "restart" "install" "uninstall"]
+2020/01/09 23:57:16 Failed to uninstall Nebula Network Service: RemoveEventLogSource() failed: The system cannot find the file specified.
+```
+
+Second try:
+
+```
+nebula -service uninstall
+2020/01/10 00:01:34 Valid actions: ["start" "stop" "restart" "install" "uninstall"]
+2020/01/10 00:01:34 Failed to uninstall Nebula Network Service: The specified service has been marked for deletion.
+```
+wip, allow for a list of IPs within a nebula certificate and update nebula-cert's signing to allow for it. 
+Dear all,
+
+we built nebula and use it in our test environment for a while, it works very well. 
+recently, we try build a new k3s cluster and cause some problem.
+
+most of case can work right.
+e.g:
+1. I can join some node use nebula network.
+2. I can execute "kubectl log/exec" for some pod work on remote machine
+
+but pod-to-pod community not work. something like:
+
+1. ingress to remote pod can't work.
+1. I tried to login some pod, use traceroute, it doesn't reply.
+
+I don't have any idea to finger it out. Does anyone have successful experience ?
+the log doesn't show anything about this.
+
+I guess maybe the problem caused by Flannel layer? I am not sure.
+
+environment info:
+os: Debian 9
+k3s: version v1.0.1 (e94a3c60)
+flannel mode: vxlan
+
+
+
+
+
+
+
+
+This change moves the logic for creating the `LightHouse` structure out of main.go and into `NewLightHouseFromConfig`. It then makes the following config values reload on SIGHUP by registering a reload callback:
+
+- `static_host_map`
+- `lighthouse.hosts`
+- `lighthouse.interval`
+- `punch_back`
+
+This makes it possible to update the static hosts or lighthouses and do a reload, without having to restart the Nebula process.
+I can't find evidence this is in wide use, but worth supporting these, as it may help folks behind NAT.
+```
+fatal error: concurrent map writes
+fatal error: concurrent map writes
+
+goroutine 30 [running]:
+runtime.throw(0x613713, 0x15)
+	F:/go/src/runtime/panic.go:774 +0x5c fp=0x1ec5244 sp=0x1ec5230 pc=0x404e0
+runtime.mapassign(0x580468, 0x2a9fcc0, 0x6f62b9, 0xf0)
+	F:/go/src/runtime/map.go:680 +0x538 fp=0x1ec5284 sp=0x1ec5244 pc=0x1d7e8
+github.com/slackhq/nebula.ixHandshakeStage0(0x1c6b200, 0xc0a86464, 0x20364d0)
+	G:/sourcecode/nebula/handshake_ix.go:67 +0xaf8 fp=0x1ec575c sp=0x1ec5284 pc=0x4f6c30
+github.com/slackhq/nebula.(*Interface).getOrHandshake(0x1c6b200, 0xc0a86464, 0x200d640)
+	G:/sourcecode/nebula/inside.go:83 +0x98 fp=0x1ec57ac sp=0x1ec575c pc=0x504e20
+github.com/slackhq/nebula.(*Interface).SendMessageToVpnIp(0x1c6b200, 0x1c00003, 0xc0a86464, 0x1c70ec0, 0xa, 0xa, 0x1c70ed0, 0xc, 0xc, 0x1e31400, ...)
+	G:/sourcecode/nebula/inside.go:113 +0x24 fp=0x1ec57ec sp=0x1ec57ac pc=0x505234
+github.com/slackhq/nebula.(*LightHouse).QueryServer(0x1d7c000, 0xc0a86450, 0x701cb0, 0x1c6b200)
+	G:/sourcecode/nebula/lighthouse.go:82 +0x18c fp=0x1ec591c sp=0x1ec57ec pc=0x508348
+github.com/slackhq/nebula.(*LightHouse).Query(0x1d7c000, 0xc0a86450, 0x701cb0, 0x1c6b200, 0x1, 0x490fc, 0x0, 0x0, 0x0)
+	G:/sourcecode/nebula/lighthouse.go:58 +0x174 fp=0x1ec5950 sp=0x1ec591c pc=0x508198
+github.com/slackhq/nebula.ixHandshakeStage0(0x1c6b200, 0xc0a86450, 0x20360e0)
+	G:/sourcecode/nebula/handshake_ix.go:20 +0x4c fp=0x1ec5e28 sp=0x1ec5950 pc=0x4f6184
+github.com/slackhq/nebula.(*Interface).getOrHandshake(0x1c6b200, 0xc0a86450, 0x2329)
+	G:/sourcecode/nebula/inside.go:83 +0x98 fp=0x1ec5e78 sp=0x1ec5e28 pc=0x504e20
+github.com/slackhq/nebula.(*Interface).consumeInsidePacket(0x1c6b200, 0x1e2a500, 0x3c, 0x2329, 0x1c1f3b0, 0x1c1f3c0, 0xc, 0xc, 0x1e2ca00, 0x2329, ...)
+	G:/sourcecode/nebula/inside.go:27 +0xa4 fp=0x1ec5f98 sp=0x1ec5e78 pc=0x5048c8
+github.com/slackhq/nebula.(*Interface).listenIn(0x1c6b200, 0x0)
+	G:/sourcecode/nebula/interface.go:191 +0xd4 fp=0x1ec5fe4 sp=0x1ec5f98 pc=0x506e4c
+runtime.goexit()
+	F:/go/src/runtime/asm_arm.s:868 +0x4 fp=0x1ec5fe4 sp=0x1ec5fe4 pc=0x6d87c
+created by github.com/slackhq/nebula.(*Interface).Run
+	G:/sourcecode/nebula/interface.go:152 +0x310
+
+goroutine 1 [chan receive, 9613 minutes]:
+github.com/slackhq/nebula.shutdownBlock(0x1c6b200)
+	G:/sourcecode/nebula/main.go:304 +0xd0
+github.com/slackhq/nebula.Main(0xbed3c8f5, 0x1b, 0x0, 0x6fe1a0, 0x12)
+	G:/sourcecode/nebula/main.go:296 +0x19e0
+main.main()
+	G:/sourcecode/nebula/cmd/nebula/main.go:42 +0x1e4
+
+goroutine 5 [syscall, 9613 minutes]:
+os/signal.signal_recv(0x0)
+	F:/go/src/runtime/sigqueue.go:147 +0x130
+os/signal.loop()
+	F:/go/src/os/signal/signal_unix.go:23 +0x14
+created by os/signal.init.0
+	F:/go/src/os/signal/signal_unix.go:29 +0x30
+
+goroutine 7 [chan receive, 9613 minutes]:
+github.com/slackhq/nebula.(*Config).CatchHUP.func1(0x1d36440, 0x1c5a0c0)
+	G:/sourcecode/nebula/config.go:109 +0x98
+created by github.com/slackhq/nebula.(*Config).CatchHUP
+	G:/sourcecode/nebula/config.go:108 +0x8c
+
+goroutine 8 [sleep]:
+runtime.goparkunlock(...)
+	F:/go/src/runtime/proc.go:310
+time.Sleep(0xfc23ac00, 0x6)
+	F:/go/src/runtime/time.go:105 +0x158
+github.com/slackhq/nebula.(*HostMap).Punchy(0x1c73e80, 0x1c1ebd0)
+	G:/sourcecode/nebula/hostmap.go:386 +0x78
+created by github.com/slackhq/nebula.Main
+	G:/sourcecode/nebula/main.go:176 +0x1cd8
+
+goroutine 25 [chan receive]:
+github.com/slackhq/nebula.(*connectionManager).Run(0x1d367c0)
+	G:/sourcecode/nebula/connection_manager.go:144 +0xa0
+created by github.com/slackhq/nebula.(*connectionManager).Start
+	G:/sourcecode/nebula/connection_manager.go:138 +0x2c
+
+goroutine 26 [running]:
+	goroutine running on other thread; stack unavailable
+created by github.com/slackhq/nebula.Main
+	G:/sourcecode/nebula/main.go:281 +0x1870
+
+goroutine 27 [sleep, 2 minutes]:
+runtime.goparkunlock(...)
+	F:/go/src/runtime/proc.go:310
+time.Sleep(0xf8475800, 0xd)
+	F:/go/src/runtime/time.go:105 +0x158
+github.com/slackhq/nebula.(*LightHouse).LhUpdateWorker(0x1d7c000, 0x701cb0, 0x1c6b200)
+	G:/sourcecode/nebula/lighthouse.go:221 +0x280
+created by github.com/slackhq/nebula.Main
+	G:/sourcecode/nebula/main.go:282 +0x189c
+
+goroutine 28 [chan receive]:
+github.com/slackhq/nebula.(*Interface).emitStats(0x1c6b200, 0x540be400, 0x2)
+	G:/sourcecode/nebula/interface.go:259 +0x84
+created by github.com/slackhq/nebula.Main
+	G:/sourcecode/nebula/main.go:290 +0x1954
+
+goroutine 29 [syscall]:
+syscall.Syscall6(0x16d, 0x5, 0x1c66800, 0x40, 0x10000, 0x0, 0x0, 0x1, 0x1c66800, 0x0)
+	F:/go/src/syscall/asm_linux_arm.s:45 +0x8
+github.com/slackhq/nebula.(*udpConn).ReadMulti(0x1c1ebd0, 0x1c66800, 0x40, 0x40, 0x2329, 0x1dfa500, 0x60)
+	G:/sourcecode/nebula/udp_linux.go:198 +0x5c
+github.com/slackhq/nebula.(*udpConn).ListenOut(0x1c1ebd0, 0x1c6b200)
+	G:/sourcecode/nebula/udp_linux.go:149 +0x268
+github.com/slackhq/nebula.(*Interface).listenOut(0x1c6b200, 0x0)
+	G:/sourcecode/nebula/interface.go:174 +0x58
+created by github.com/slackhq/nebula.(*Interface).Run
+	G:/sourcecode/nebula/interface.go:147 +0x2d0
+
+goroutine 26 [running]:
+runtime.throw(0x613713, 0x15)
+	F:/go/src/runtime/panic.go:774 +0x5c fp=0x1ec9200 sp=0x1ec91ec pc=0x404e0
+runtime.mapassign(0x580468, 0x2a9fcc0, 0x6f62b9, 0xf0)
+	F:/go/src/runtime/map.go:680 +0x538 fp=0x1ec9240 sp=0x1ec9200 pc=0x1d7e8
+github.com/slackhq/nebula.ixHandshakeStage0(0x1c6b200, 0xc0a86464, 0x20364d0)
+	G:/sourcecode/nebula/handshake_ix.go:67 +0xaf8 fp=0x1ec9718 sp=0x1ec9240 pc=0x4f6c30
+github.com/slackhq/nebula.(*Interface).getOrHandshake(0x1c6b200, 0xc0a86464, 0xffffffff)
+	G:/sourcecode/nebula/inside.go:83 +0x98 fp=0x1ec9768 sp=0x1ec9718 pc=0x504e20
+github.com/slackhq/nebula.(*Interface).SendMessageToVpnIp(0x1c6b200, 0x1c00003, 0xc0a86464, 0x21cea64, 0xa, 0xa, 0x21cea70, 0xc, 0xc, 0x24faa00, ...)
+	G:/sourcecode/nebula/inside.go:113 +0x24 fp=0x1ec97a8 sp=0x1ec9768 pc=0x505234
+github.com/slackhq/nebula.(*LightHouse).QueryServer(0x1d7c000, 0xc0a86450, 0x701cb0, 0x1c6b200)
+	G:/sourcecode/nebula/lighthouse.go:82 +0x18c fp=0x1ec98d8 sp=0x1ec97a8 pc=0x508348
+github.com/slackhq/nebula.(*LightHouse).Query(0x1d7c000, 0xc0a86450, 0x701cb0, 0x1c6b200, 0x0, 0x0, 0x1, 0x0, 0x0)
+	G:/sourcecode/nebula/lighthouse.go:58 +0x174 fp=0x1ec990c sp=0x1ec98d8 pc=0x508198
+github.com/slackhq/nebula.(*HandshakeManager).NextOutboundHandshakeTimerTick(0x1c5f980, 0x4b01fffe, 0xbf7b2d7f, 0x490d9f7d, 0x20cf5, 0xaa5698, 0x701cb0, 0x1c6b200)
+	G:/sourcecode/nebula/handshake_manager.go:78 +0xb6c fp=0x1ec9f8c sp=0x1ec990c pc=0x4fe9d0
+github.com/slackhq/nebula.(*HandshakeManager).Run(0x1c5f980, 0x701cb0, 0x1c6b200)
+	G:/sourcecode/nebula/handshake_manager.go:47 +0x84 fp=0x1ec9fdc sp=0x1ec9f8c pc=0x4fde14
+runtime.goexit()
+	F:/go/src/runtime/asm_arm.s:868 +0x4 fp=0x1ec9fdc sp=0x1ec9fdc pc=0x6d87c
+created by github.com/slackhq/nebula.Main
+	G:/sourcecode/nebula/main.go:281 +0x1870
+```

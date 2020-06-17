@@ -1,0 +1,336 @@
+Container.set type enhancement
+
+When trying to get services inside a scoped container that reference each other,
+we get `Maximum call stack size exceeded error`.
+
+Code required to reproduce:
+```ts
+import "reflect-metadata";
+import Container, { Service, Inject } from "typedi";
+
+@Service()
+class A {
+  @Inject(() => B)
+  b: any;
+}
+
+@Service()
+class B {
+  @Inject(() => A)
+  a: any;
+}
+
+// Works
+console.log({
+  a: Container.get(A),
+  b: Container.get(B),
+});
+
+const instance = Container.of("some-instance");
+// Throws Maximum call stack size exceeded error
+console.log({
+  a: instance.get(A),
+  b: instance.get(B),
+});
+```
+
+Output when running with `ts-node`:
+```
+PS D:\typedi-test> ts-node --project .\tsconfig.json index.ts
+{ a: A { b: B { a: [Circular] } }, b: B { a: A { b: [Circular] } } }
+
+D:\typedi-test\src\ContainerInstance.ts:245
+        return this.services.find(service => {
+                             ^
+RangeError: Maximum call stack size exceeded
+    at D:\typedi-test\src\ContainerInstance.ts:245:35
+    at Array.find (<anonymous>)
+    at ContainerInstance.findService (D:\typedi-test\src\ContainerInstance.ts:245:30)
+    at ContainerInstance.get (D:\typedi-test\src\ContainerInstance.ts:102:39)
+    at Object.value (D:\typedi-test\src\decorators\Inject.ts:48:42)
+    at D:\typedi-test\src\ContainerInstance.ts:381:54
+    at Array.forEach (<anonymous>)
+    at ContainerInstance.applyPropertyHandlers (D:\typedi-test\src\ContainerInstance.ts:376:28)
+    at ContainerInstance.getServiceValue (D:\typedi-test\src\ContainerInstance.ts:343:18)
+    at ContainerInstance.get (D:\typedi-test\src\ContainerInstance.ts:114:32)
+```
+No idea why source paths are wrong there ...
+
+Error when running compiled code:
+```
+PS D:\typedi-test> node .\dist\index.js
+{ a: A { b: B { a: [Circular] } }, b: B { a: A { b: [Circular] } } }
+D:\typedi-test\node_modules\reflect-metadata\Reflect.js:562
+        function GetOrCreateMetadataMap(O, P, Create) {
+                                       ^
+
+RangeError: Maximum call stack size exceeded
+    at GetOrCreateMetadataMap (D:\typedi-test\node_modules\reflect-metadata\Reflect.js:562:40)
+    at OrdinaryHasOwnMetadata (D:\typedi-test\node_modules\reflect-metadata\Reflect.js:593:31)
+    at OrdinaryGetMetadata (D:\typedi-test\node_modules\reflect-metadata\Reflect.js:601:26)
+    at OrdinaryGetMetadata (D:\typedi-test\node_modules\reflect-metadata\Reflect.js:606:24)
+    at OrdinaryGetMetadata (D:\typedi-test\node_modules\reflect-metadata\Reflect.js:606:24)
+    at Object.getMetadata (D:\typedi-test\node_modules\reflect-metadata\Reflect.js:357:20)
+    at ContainerInstance.getServiceValue (D:\typedi-test\node_modules\typedi\ContainerInstance.js:181:75)
+    at ContainerInstance.get (D:\typedi-test\node_modules\typedi\ContainerInstance.js:47:30)
+    at Object.value (D:\typedi-test\node_modules\typedi\decorators\Inject.js:30:42)
+    at D:\typedi-test\node_modules\typedi\ContainerInstance.js:246:54
+```
+
+
+Hello, I have strange issue when injecting into constructor together custom decorated class.
+Please read test case:
+```
+describe("Constructor inject not working when double decorated", function() {
+
+    beforeEach(() => Container.reset());
+
+    it("should inject service via constructor", function() {
+        function logClass() {
+            return function _<T extends {new(...args: any[]): {}}>(constructor: T) {
+                return class extends constructor {
+                    constructor(...args: any[]) {
+                        console.log(`Creating: ${constructor.name}`);
+                        console.log(args);
+                        super(...args);
+                        console.log(`Did something after the original constructor!`);
+                    }
+                };
+            };
+        }
+        @Service()
+        class TestService {
+        }
+        @Service()
+        class SecondTestService {
+        }
+        @Service("mega.service")
+        class NamedService {
+        }
+        @Service()
+        @logClass()
+        class TestServiceWithParameters {
+            constructor(
+                public testClass: TestService,
+                @Inject(type => SecondTestService) public secondTest: any,
+                @Inject("mega.service") public megaService: any
+            ) {
+            }
+        }
+        Container.get(TestServiceWithParameters).testClass.should.be.instanceOf(TestService);
+        Container.get(TestServiceWithParameters).secondTest.should.be.instanceOf(SecondTestService);
+        Container.get(TestServiceWithParameters).megaService.should.be.instanceOf(NamedService);
+    });
+
+});
+```
+Result is:
+```
+  Constructor inject not working when double decorated
+Creating: TestServiceWithParameters
+[ TestService {},
+  undefined,
+  undefined,
+  ContainerInstance {
+    services: [ [Object], [Object], [Object], [Object] ],
+    id: undefined } ]
+Did something after the original constructor!
+    1) should inject service via constructor
+```
+
+But with, commented `@logClass()` decorator everything works fine. Could you help?
+I have services that has 2 level injections as follow.
+```ts
+interface IFoo {
+ foo: string;
+}
+const foo = new Token<IFoo>();
+
+interface IBar {
+  bar: string;
+}
+const bar = new Token<IBar>();
+
+@Service()
+class FooService implements IFoo {
+  foo: string
+}
+
+@Service()
+class BarService implements IBar {
+ @Inject(foo)
+  fooService: IFoo;
+}
+
+@Service()
+class FooBarService {
+  @Inject(bar)
+  barService: IBar;
+}
+
+Container.set(foo, new FooService());
+Container.set(bar, new BarService());
+Container.get(FooBarService);
+```
+I'm trying to get `FooBarService`, depends on `IBar` that has implementation depends on `IFoo`. I get `FooBarService` instance with `barService` injected with instance, but `barService.fooService` is undefined.
+
+I can do class injection in multiple level, including circular injection using `Inject((type) => Classname)` easily. But no hope for token. Anyone has a suggestion to encounter this problem?
+Hello all,
+
+I  have some issues in unit testing container.get(service), checkout the below code.
+```
+import * as _ from 'lodash';
+import {Service, Inject, Container} from 'typedi';
+import OTPService from '../otp/index';
+
+@Service()
+export default class DevicechangeService {
+  constructor(@Inject('devicechangeModel')private devicechangeModel, @Inject('otpModel')private otpModel, @Inject('logger')private logger,) {}
+
+  /**
+   *
+   * Service to change the device
+   *
+   * @method deviceChange
+   * @param {number} accountId
+   * @param {string} deviceId
+   * @param {number} mobile
+   * @return {object} resolves after sending otp
+   */
+
+  public async deviceChange(accountId : number, deviceId : string, newdeviceId : string, created : number, mobile : number,) : Promise < any > {
+    try {
+      await this
+        .devicechangeModel
+        .addDeviceChangeDetails(accountId);
+
+       let OTPServiceInstance = Container.get(OTPService);
+
+
+      await this
+        .otpModel
+        .updateOTPtoInactiveForModule('DEVICE_CHANGE', accountId);
+      //get the new otp
+
+        //get the user details
+        //send the otp
+        let result = await OTPServiceInstance.sendOTP(serviceprovider, mobile, otpMessage, isd);
+        if (result instanceof Object) {
+          return result;
+        }
+        return true;
+      } else {
+        return {
+          field: 421,
+          message: errorCode('account').getMessage(421)
+        };
+      }
+    } catch (e) {
+      throw e;
+    }
+  }
+}
+```
+Here i am not able to set mock class for OTPService, so not able to alter container.get(OTPService) from the above code.
+
+I have tried below but still it does'nt come inside mocked service.
+```
+@Service()
+class OTPService {
+  public generateOTP : any = jest
+    .fn()
+    .mockImplementation(async(accountId : number, deviceId : string, status : string) => new Promise((resolve : any) => {
+      console.log('calls here')
+      resolve({})
+    }),);
+  public sendOTP : any = jest
+    .fn()
+    .mockImplementation(async(serviceprovider : string, mobile : number, otpMessage : string, isd : number) => new Promise((resolve : any) => resolve({})),);
+}
+
+describe('Account', () => {
+  beforeEach(done => {
+    Container.set(OTPService, new OTPService());
+    done();
+  });
+  describe('#deviceChange', () => {
+    it('check everyting cool', async done => {
+      let logger = {};
+      let otpModel = {
+        updateOTPtoInactiveForModule: jest
+          .fn()
+          .mockImplementation(async(deviceChange : string, accountId : number) => new Promise((resolve : any) => resolve(true))),
+        getUserPhoneService: jest
+          .fn()
+          .mockResolvedValue(true)
+      };
+      let devicechangeModel = {
+        addDeviceChangeDetails: jest
+          .fn()
+          .mockResolvedValue(true),
+        updateDeviceChangeToInactive: jest
+          .fn()
+          .mockResolvedValue(true)
+      };
+      // Container.set('OTPService', new OTPService());
+      let DeviceChangeServiceInstance = new DeviceChangeService(devicechangeModel, otpModel, logger);
+      let deviceChangeStatus = DeviceChangeServiceInstance.deviceChange(accountId, deviceId, newdeviceId, created, mobile);
+    });
+  });
+});
+
+```
+
+
+Guys any input how to solve this...
+The remove is too simple, its just dropping references:
+https://github.com/typestack/typedi/blob/master/src/ContainerInstance.ts#L218
+
+But to properly manange the life-cycle of an allocated object there needs to be a complementary `dispose()` or close or stop or whatever function on created objects.
+
+The problem arises for me because one of my services uses `setTimeout` which ends up creating a global reference to the instance. There is a `.stop()` function on my service which when called will clear the timeout and allow the object to be free'd but there is nobody calling it.
+
+In production it doesn't matter because I am only allocating all the instances in my container once but in tests I am regularly resetting the Container in the same process between tests. We finally crossed over the bubble where we are running out of memory because of too many un-freed instances.
+
+Instead remove and reset should iterate over all services and call an optional `.dispose()` method if it exists, before dropping references to the service.
+
+Psuedo-code:
+```ts
+async void reset() {
+  await Promise.all(this.services.map(s => s && s.dispose && s.dispose())
+  this.services = []
+  return this
+}
+```
+
+Related to #80 
+Is it possible to create instances of a class like in Spring? Something like:
+
+```typescript
+@Service()
+export class DynamodbConfig {
+
+  @Bean(DocumentClientToken)
+  public createDocumentClient(@Inject(AwsRegionTableToken) region: string): DocumentClient {
+    return new DocumentClient({ region: region });
+  }
+}
+```
+According to the names used in the docs, the library claims it's implementing the _Dependency Injection_ pattern. However, going through code examples, most of them _pull_ certain dependencies from an object that knows where they all are. The dependencies are actually not injected, but pulled. Moreover, from the constructor signature you cannot tell what the dependencies are. This pattern is called a [_service locator_](https://en.wikipedia.org/wiki/Service_locator_pattern) and it's targeting the same concern - decoupling, but is a completely different pattern.
+
+In current shape the docs are confusing, since claiming implementing a different pattern that it actually implements.
+Perhaps there is a way to do this but I couldn't figure it out, something like this:
+
+```ts
+@Service()
+export class Example {
+  constructor(private worker: () => Worker) {
+  }
+
+  public check() {
+    return this.worker().id;
+  }
+}
+```
+
+I am having issues with circular dependencies and its really tempting to do `private worker: Worker` but of course that doesn't work. I have to do an extra layer of indirection and am not sure the best way to do it.

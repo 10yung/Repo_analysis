@@ -1,0 +1,480 @@
+In Scala.js, for cross-publishng to `0.6.x` and `1.0.0-RC`, it is common practice to use system env virable to switch Scala.js plugin version.
+[One example can be found on circe](https://github.com/circe/circe/blob/104602fee8371f92494b05e7e4865358897e3813/project/plugins.sbt#L1-L2). 
+
+For Scala.js cross-publishing, one will performe the steps like below:
+
+1. Set system env to `0.6.31`
+1. Start sbt
+1. Release to `0.6.31`
+1. Shutdown sbt
+1. Start sbt
+1. Set system env to `1.0.0-RC1`
+1. Release to `1.0.0-RC1`
+1. Shutdown sbt
+
+Any idea to automate such process in single `releaseProcess` settings?
+
+
+
+As explained in #256 , many projects running with a CI have tweeked the parameter `releaseCommitMessage` to add `[ci skip]` : 
+
+```sbt
+releaseCommitMessage := s"[ci skip] Setting version to ${(version in ThisBuild).value}"
+```
+
+Otherwise the CI triggers an infinite loop after a merge on `master` : 
+
+- the CI hooks trigger `sbt-release`
+- `sbt-release` add a commit message
+- the commit message triggers the CI
+
+But after upgrading to 1.0.12, which should have no breaking change according to semantic versionning, this infinite loop will re-appear. It is mandatory to also configure the new parameter `releaseNextCommitMessage` added by https://github.com/sbt/sbt-release/commit/e1abd0a62072ca803636829b7fa0812ef67e59a1#diff-f3ca64c8ba9a5c72fa812cb7fbbc27a4R238 to add `[ci-skip]` .
+
+I fear many projects will face this breaking change. In our case, we upgraded many sbt plugin and maven dependencies at once, we didn't know about this `[ci-skip]` tricks (added by previous developers in our project), so we didn't figure out right away that the `sbt-release` upgrade was in cause.
+
+I suggest that the default value of `releaseNextCommitMessage` should be the value configured for `releaseCommitMessage`. This way, it keeps the behaviour of version `1.0.11` and fix the breaking change.
+I had the following issue: https://github.com/sbt/sbt-release/issues/259 , which this PR solves. 
+I have the following release process for my project that cross-compiles in 2.12.10 and 2.13.1
+```
+releaseProcess := Seq[ReleaseStep](
+        checkSnapshotDependencies,
+        inquireVersions,
+        runClean,
+        releaseStepCommandAndRemaining("+test"),
+        setReleaseVersion,
+        commitReleaseVersion,
+        tagRelease,
+        releaseStepCommandAndRemaining("+publish"),
+        setNextVersion,
+        commitNextVersion,
+        pushChanges
+      )
+```
+I would like to be able to run `sbt release skip-tests`, but the tests are still running. 
+Many times I published a version, only to find out there is something wrong with it (typically cross-publishing not doing what I was expected).
+
+When that happen I have to keep publishing until it does what I want, and I end up burning version numbers with bad versions.
+
+Maybe sbt-release could provide a way to do a "dry run" so we see what artifacts would be published, but without any impact on the source repository or the artifact repository?
+* sbt-release: 1.0.11
+* sbt: 1.2.8
+* Scala: 2.12.9
+* JDK: 11
+
+My sbt project have many sub projects to be published, so I want to define shared publishing settings by `in ThisBuild`, like this:
+
+```sbt
+lazy val project1 = ...
+lazy val project2 = ...
+...
+lazy val project100 = ...
+
+licenses in ThisBuild := Seq(...)
+scmInfo in ThisBuild := Some(...)
+publishConfiguration in ThisBuild := publishConfiguration.value.withOverwrite(true)
+publishLocalConfiguration in ThisBuild := publishLocalConfiguration.value.withOverwrite(true)
+...
+```
+
+Then when I try to overwrite the accidentally-published artifacts, it failed with the below error message: 
+
+<details>
+<summary>Stack Trace</summary>
+
+```
+[error] java.io.IOException: PUT operation failed because the destination file exists and overwriting is disabled:
+[error]     source     : /home/vagrant/IdeaProjects/foo-bar/target/scala-2.12/ARTIFACT_2.12-0.1.0.pom
+[error]     destination: https://oss.sonatype.org/service/local/staging/deploy/maven2/default/ARTIFACT_2.12/0.24.0-v2-473-0/ARTIFACT_2.12-0.1.0.pom
+[error] If you have a staging repository that has failed, drop it and start over.
+[error] Otherwise fix the double publishing, or relax the setting as follows:
+[error]     publishConfiguration := publishConfiguration.value.withOverwrite(true)
+[error]     publishLocalConfiguration := publishLocalConfiguration.value.withOverwrite(true)
+[error]         at sbt.internal.librarymanagement.ConvertResolver$LocalIfFileRepo.put(ConvertResolver.scala:403)
+[error]         at org.apache.ivy.plugins.repository.AbstractRepository.put(AbstractRepository.java:130)
+[error]         at sbt.internal.librarymanagement.ConvertResolver$ChecksumFriendlyURLResolver.put(ConvertResolver.scala:118)
+[error]         at sbt.internal.librarymanagement.ConvertResolver$ChecksumFriendlyURLResolver.put$(ConvertResolver.scala:105)
+[error]         at sbt.internal.librarymanagement.ConvertResolver$$anonfun$defaultConvert$lzycompute$1$PluginCapableResolver$1.put(ConvertResolver.scala:165)
+[error]         at org.apache.ivy.plugins.resolver.RepositoryResolver.publish(RepositoryResolver.java:216)
+[error]         at sbt.internal.librarymanagement.IvyActions$.$anonfun$publish$5(IvyActions.scala:497)
+[error]         at sbt.internal.librarymanagement.IvyActions$.$anonfun$publish$5$adapted(IvyActions.scala:496)
+[error]         at scala.collection.TraversableLike$WithFilter.$anonfun$foreach$1(TraversableLike.scala:788)
+[error]         at scala.collection.Iterator.foreach(Iterator.scala:937)
+[error]         at scala.collection.Iterator.foreach$(Iterator.scala:937)
+[error]         at scala.collection.AbstractIterator.foreach(Iterator.scala:1425)
+[error]         at scala.collection.IterableLike.foreach(IterableLike.scala:70)
+[error]         at scala.collection.IterableLike.foreach$(IterableLike.scala:69)
+[error]         at scala.collection.AbstractIterable.foreach(Iterable.scala:54)
+[error]         at scala.collection.TraversableLike$WithFilter.foreach(TraversableLike.scala:787)
+[error]         at sbt.internal.librarymanagement.IvyActions$.publish(IvyActions.scala:496)
+[error]         at sbt.internal.librarymanagement.IvyActions$.$anonfun$publish$3(IvyActions.scala:144)
+[error]         at scala.runtime.java8.JFunction0$mcV$sp.apply(JFunction0$mcV$sp.java:12)
+[error]         at sbt.internal.librarymanagement.IvyActions$.withChecksums(IvyActions.scala:157)
+[error]         at sbt.internal.librarymanagement.IvyActions$.withChecksums(IvyActions.scala:151)
+[error]         at sbt.internal.librarymanagement.IvyActions$.$anonfun$publish$1(IvyActions.scala:144)
+[error]         at sbt.internal.librarymanagement.IvyActions$.$anonfun$publish$1$adapted(IvyActions.scala:134)
+[error]         at sbt.internal.librarymanagement.IvySbt$Module.$anonfun$withModule$1(Ivy.scala:239)
+[error]         at sbt.internal.librarymanagement.IvySbt.$anonfun$withIvy$1(Ivy.scala:204)
+[error]         at sbt.internal.librarymanagement.IvySbt.sbt$internal$librarymanagement$IvySbt$$action$1(Ivy.scala:70)
+[error]         at sbt.internal.librarymanagement.IvySbt$$anon$3.call(Ivy.scala:77)
+[error]         at xsbt.boot.Locks$GlobalLock.withChannel$1(Locks.scala:95)
+[error]         at xsbt.boot.Locks$GlobalLock.xsbt$boot$Locks$GlobalLock$$withChannelRetries$1(Locks.scala:80)
+[error]         at xsbt.boot.Locks$GlobalLock$$anonfun$withFileLock$1.apply(Locks.scala:99)
+[error]         at xsbt.boot.Using$.withResource(Using.scala:10)
+[error]         at xsbt.boot.Using$.apply(Using.scala:9)
+[error]         at xsbt.boot.Locks$GlobalLock.ignoringDeadlockAvoided(Locks.scala:60)
+[error]         at xsbt.boot.Locks$GlobalLock.withLock(Locks.scala:50)
+[error]         at xsbt.boot.Locks$.apply0(Locks.scala:31)
+[error]         at xsbt.boot.Locks$.apply(Locks.scala:28)
+[error]         at sbt.internal.librarymanagement.IvySbt.withDefaultLogger(Ivy.scala:77)
+[error]         at sbt.internal.librarymanagement.IvySbt.withIvy(Ivy.scala:199)
+[error]         at sbt.internal.librarymanagement.IvySbt.withIvy(Ivy.scala:196)
+[error]         at sbt.internal.librarymanagement.IvySbt$Module.withModule(Ivy.scala:238)
+[error]         at sbt.internal.librarymanagement.IvyActions$.publish(IvyActions.scala:134)
+[error]         at sbt.Classpaths$.$anonfun$publishTask$4(Defaults.scala:2416)
+[error]         at sbt.Classpaths$.$anonfun$publishTask$4$adapted(Defaults.scala:2416)
+[error]         at scala.Function1.$anonfun$compose$1(Function1.scala:44)
+[error]         at sbt.internal.util.$tilde$greater.$anonfun$$u2219$1(TypeFunctions.scala:40)
+[error]         at sbt.std.Transform$$anon$4.work(System.scala:67)
+[error]         at sbt.Execute.$anonfun$submit$2(Execute.scala:269)
+[error]         at sbt.internal.util.ErrorHandling$.wideConvert(ErrorHandling.scala:16)
+[error]         at sbt.Execute.work(Execute.scala:278)
+[error]         at sbt.Execute.$anonfun$submit$1(Execute.scala:269)
+[error]         at sbt.ConcurrentRestrictions$$anon$4.$anonfun$submitValid$1(ConcurrentRestrictions.scala:178)
+[error]         at sbt.CompletionService$$anon$2.call(CompletionService.scala:37)
+[error]         at java.base/java.util.concurrent.FutureTask.run(FutureTask.java:264)
+[error]         at java.base/java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:515)
+[error]         at java.base/java.util.concurrent.FutureTask.run(FutureTask.java:264)
+[error]         at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1128)
+[error]         at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:628)
+[error]         at java.base/java.lang.Thread.run(Thread.java:834)
+[error] Caused by: java.io.IOException: destination file exists and overwrite == false
+[error]         at org.apache.ivy.plugins.repository.url.URLRepository.put(URLRepository.java:75)
+[error]         at sbt.internal.librarymanagement.ConvertResolver$LocalIfFileRepo.put(ConvertResolver.scala:366)
+[error]         at org.apache.ivy.plugins.repository.AbstractRepository.put(AbstractRepository.java:130)
+[error]         at sbt.internal.librarymanagement.ConvertResolver$ChecksumFriendlyURLResolver.put(ConvertResolver.scala:118)
+[error]         at sbt.internal.librarymanagement.ConvertResolver$ChecksumFriendlyURLResolver.put$(ConvertResolver.scala:105)
+[error]         at sbt.internal.librarymanagement.ConvertResolver$$anonfun$defaultConvert$lzycompute$1$PluginCapableResolver$1.put(ConvertResolver.scala:165)
+[error]         at org.apache.ivy.plugins.resolver.RepositoryResolver.publish(RepositoryResolver.java:216)
+[error]         at sbt.internal.librarymanagement.IvyActions$.$anonfun$publish$5(IvyActions.scala:497)
+[error]         at sbt.internal.librarymanagement.IvyActions$.$anonfun$publish$5$adapted(IvyActions.scala:496)
+[error]         at scala.collection.TraversableLike$WithFilter.$anonfun$foreach$1(TraversableLike.scala:788)
+[error]         at scala.collection.Iterator.foreach(Iterator.scala:937)
+[error]         at scala.collection.Iterator.foreach$(Iterator.scala:937)
+[error]         at scala.collection.AbstractIterator.foreach(Iterator.scala:1425)
+[error]         at scala.collection.IterableLike.foreach(IterableLike.scala:70)
+[error]         at scala.collection.IterableLike.foreach$(IterableLike.scala:69)
+[error]         at scala.collection.AbstractIterable.foreach(Iterable.scala:54)
+[error]         at scala.collection.TraversableLike$WithFilter.foreach(TraversableLike.scala:787)
+[error]         at sbt.internal.librarymanagement.IvyActions$.publish(IvyActions.scala:496)
+[error]         at sbt.internal.librarymanagement.IvyActions$.$anonfun$publish$3(IvyActions.scala:144)
+[error]         at scala.runtime.java8.JFunction0$mcV$sp.apply(JFunction0$mcV$sp.java:12)
+[error]         at sbt.internal.librarymanagement.IvyActions$.withChecksums(IvyActions.scala:157)
+[error]         at sbt.internal.librarymanagement.IvyActions$.withChecksums(IvyActions.scala:151)
+[error]         at sbt.internal.librarymanagement.IvyActions$.$anonfun$publish$1(IvyActions.scala:144)
+[error]         at sbt.internal.librarymanagement.IvyActions$.$anonfun$publish$1$adapted(IvyActions.scala:134)
+[error]         at sbt.internal.librarymanagement.IvySbt$Module.$anonfun$withModule$1(Ivy.scala:239)
+[error]         at sbt.internal.librarymanagement.IvySbt.$anonfun$withIvy$1(Ivy.scala:204)
+[error]         at sbt.internal.librarymanagement.IvySbt.sbt$internal$librarymanagement$IvySbt$$action$1(Ivy.scala:70)
+[error]         at sbt.internal.librarymanagement.IvySbt$$anon$3.call(Ivy.scala:77)
+[error]         at xsbt.boot.Locks$GlobalLock.withChannel$1(Locks.scala:95)
+[error]         at xsbt.boot.Locks$GlobalLock.xsbt$boot$Locks$GlobalLock$$withChannelRetries$1(Locks.scala:80)
+[error]         at xsbt.boot.Locks$GlobalLock$$anonfun$withFileLock$1.apply(Locks.scala:99)
+[error]         at xsbt.boot.Using$.withResource(Using.scala:10)
+[error]         at xsbt.boot.Using$.apply(Using.scala:9)
+[error]         at xsbt.boot.Locks$GlobalLock.ignoringDeadlockAvoided(Locks.scala:60)
+[error]         at xsbt.boot.Locks$GlobalLock.withLock(Locks.scala:50)
+[error]         at xsbt.boot.Locks$.apply0(Locks.scala:31)
+[error]         at xsbt.boot.Locks$.apply(Locks.scala:28)
+[error]         at sbt.internal.librarymanagement.IvySbt.withDefaultLogger(Ivy.scala:77)
+[error]         at sbt.internal.librarymanagement.IvySbt.withIvy(Ivy.scala:199)
+[error]         at sbt.internal.librarymanagement.IvySbt.withIvy(Ivy.scala:196)
+[error]         at sbt.internal.librarymanagement.IvySbt$Module.withModule(Ivy.scala:238)
+[error]         at sbt.internal.librarymanagement.IvyActions$.publish(IvyActions.scala:134)
+[error]         at sbt.Classpaths$.$anonfun$publishTask$4(Defaults.scala:2416)
+[error]         at sbt.Classpaths$.$anonfun$publishTask$4$adapted(Defaults.scala:2416)
+[error]         at scala.Function1.$anonfun$compose$1(Function1.scala:44)
+[error]         at sbt.internal.util.$tilde$greater.$anonfun$$u2219$1(TypeFunctions.scala:40)
+[error]         at sbt.std.Transform$$anon$4.work(System.scala:67)
+[error]         at sbt.Execute.$anonfun$submit$2(Execute.scala:269)
+[error]         at sbt.internal.util.ErrorHandling$.wideConvert(ErrorHandling.scala:16)
+[error]         at sbt.Execute.work(Execute.scala:278)
+[error]         at sbt.Execute.$anonfun$submit$1(Execute.scala:269)
+[error]         at sbt.ConcurrentRestrictions$$anon$4.$anonfun$submitValid$1(ConcurrentRestrictions.scala:178)
+[error]         at sbt.CompletionService$$anon$2.call(CompletionService.scala:37)
+[error]         at java.base/java.util.concurrent.FutureTask.run(FutureTask.java:264)
+[error]         at java.base/java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:515)
+[error]         at java.base/java.util.concurrent.FutureTask.run(FutureTask.java:264)
+[error]         at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1128)
+[error]         at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:628)
+[error]         at java.base/java.lang.Thread.run(Thread.java:834)
+[error] (publish) java.io.IOException: PUT operation failed because the destination file exists and overwriting is disabled:
+[error]     source     : /home/vagrant/IdeaProjects/ARTIFACT/target/scala-2.12/ARTIFACT_2.12-0.1.0.pom
+[error]     destination: https://oss.sonatype.org/service/local/staging/deploy/maven2/default/ARTIFACT_2.12/0.24.0-v2-473-0/ARTIFACT_2.12-0.1.0.pom
+[error] If you have a staging repository that has failed, drop it and start over.
+[error] Otherwise fix the double publishing, or relax the setting as follows:
+[error]     publishConfiguration := publishConfiguration.value.withOverwrite(true)
+[error]     publishLocalConfiguration := publishLocalConfiguration.value.withOverwrite(true)
+```
+</details>
+
+but I allow overwrite explicitly in `build.sbt`:
+
+```sbt
+publishConfiguration in ThisBuild := publishConfiguration.value.withOverwrite(true)
+publishLocalConfiguration in ThisBuild := publishLocalConfiguration.value.withOverwrite(true)
+```
+
+It seems that `publishConfiguration in ThisBuild` and `publishLocalConfiguration in ThisBuild` is not recognized...?
+I have put my version information in a file named `./Version.sbt` (note capital first letter). SBT reads this file in, and sets the version correctly.
+
+I have defined the property `releaseVersionFile` as follows:
+
+    releaseVersionFile := file("Version.sbt")
+
+However, after performing a release, I find that I have both a `./Version.sbt` file (with its contents unmodified) _and_ a `./version.sbt` file (with an updated version number).
+
+Any ideas?
+
+I'm running on Linux Mint (19.2), using Java Zulu OpenJDK 8.
+Hi,
+
+With Play2.7  and sbt-version 1.2.8, had included sbt-release plugin. On refreshing the project, we get an error, missing parameter **type: ver => Version(ver)** 
+
+build.sbt has the following 
+
+```scala
+lazy val root = (project in file(".")).enablePlugins(PlayScala, BuildInfoPlugin, GitVersioning, GitBranchPrompt)
+
+//build info
+buildInfoKeys := Seq[BuildInfoKey](name, version, scalaVersion, sbtVersion)
+buildInfoPackage := "eu.byjean"
+
+//git
+showCurrentGitBranch
+git.useGitDescribe := true
+git.baseVersion := "0.0.0"
+val VersionRegex = "v([0-9]+.[0-9]+.[0-9]+)-?(.*)?".r
+git.gitTagToVersionNumber := {
+  case VersionRegex(v,"SNAPSHOT") => Some(s"$v-SNAPSHOT")
+  case VersionRegex(v,"") => Some(v)
+  case VersionRegex(v,s) => Some(s"$v-$s-SNAPSHOT")
+  case v => None
+}
+
+// sbt native packager
+publishTo := Some("temp" at "file:///tmp/repository")
+makeDeploymentSettings(Universal, packageBin in Universal, "zip")
+
+// sbt release
+def setVersionOnly(selectVersion: Versions => String): ReleaseStep =  { st: State =>
+  val vs = st.get(ReleaseKeys.versions).getOrElse(sys.error("No versions are set! Was this release part executed before inquireVersions?"))
+  val selected = selectVersion(vs)
+
+  st.log.info("Setting version to '%s'." format selected)
+  val useGlobal =Project.extract(st).get(releaseUseGlobalVersion)
+  val versionStr = (if (useGlobal) globalVersionString else versionString) format selected
+
+  reapply(Seq(
+    if (useGlobal) version in ThisBuild := selected
+    else version := selected
+  ), st)
+}
+
+lazy val setReleaseVersion: ReleaseStep = setVersionOnly(_._1)
+
+// strip the qualifier off the input version, eg. 1.2.1-SNAPSHOT -> 1.2.1
+//releaseVersion     := { ver => Version(ver).map(_.withoutQualifier.string).getOrElse(versionFormatError(_)) }
+
+
+releaseVersion <<= (releaseVersionBump)( bumper=>{
+      ver =>  Version(ver)
+    .map(_.withoutQualifier)
+    .map(_.bump(bumper.value).string).getOrElse(versionFormatError(_))
+})
+
+val showNextVersion = settingKey[String]("the future version once releaseNextVersion has been applied to it")
+val showReleaseVersion = settingKey[String]("the future version once releaseNextVersion has been applied to it")
+showReleaseVersion := (version, releaseVersion)((v,f)=>f(v))
+showNextVersion := (version, releaseNextVersion)((v,f)=>f(v))
+
+releaseProcess := Seq(
+  checkSnapshotDependencies,
+  inquireVersions,
+  setReleaseVersion,
+  runTest,
+  tagRelease,
+  // publishArtifacts,
+  ReleaseStep(releaseStepTask(publish in Universal))  
+)
+```
+Help appreciated.
+mdsabz
+internal SBT modules as dependencies are not checked for SNAPSHOT versions currently.  
+[build.sbt](https://github.com/pathikrit/better-files/blob/800d63d31582b4119074e0593d257992c1b3cbee/build.sbt)
+
+```
+> sbt +release
+[info] Loading settings for project global-plugins from idea.sbt,metals.sbt ...
+[info] Loading global plugins from /Users/pbhowmick/.sbt/1.0/plugins
+[info] Loading settings for project better-files-build from plugins.sbt ...
+[info] Loading project definition from /Users/pbhowmick/workspace/better-files/project
+[info] Loading settings for project root from version.sbt,build.sbt ...
+[info] Set current project to better-files-root (in build file:/Users/pbhowmick/workspace/better-files/)
+[info] Forcing Scala version to 2.11.12 on all projects.
+[info] Reapplying settings...
+[info] Set current project to better-files-root (in build file:/Users/pbhowmick/workspace/better-files/)
+[info] Updating ...
+[info] Done updating.
+Release version [3.7.1] :
+Next version [3.7.2-SNAPSHOT] :
+[info] Setting version to '3.7.1'.
+[info] Reapplying settings...
+[info] Set current project to better-files-root (in build file:/Users/pbhowmick/workspace/better-files/)
+Tag [v3.7.1] exists! Overwrite, keep or abort or enter a new tag (o/k/a)? [a] o
+[warn] Overwriting a tag can cause problems if others have already seen the tag (see `git help tag`)!
+[info] Reapplying settings...
+[info] Set current project to better-files-root (in build file:/Users/pbhowmick/workspace/better-files/)
+[info] Wrote /Users/pbhowmick/workspace/better-files/core/target/scala-2.11/better-files_2.11-3.7.1.pom
+[error] gpg: using "0x66aa02ec8aa60db9" as default secret key for signing
+[error] gpg: using "0x66aa02ec8aa60db9" as default secret key for signing
+[error] gpg: using "0x66aa02ec8aa60db9" as default secret key for signing
+[error] gpg: using "0x66aa02ec8aa60db9" as default secret key for signing
+[info]  published better-files_2.11 to https://oss.sonatype.org/service/local/staging/deploy/maven2/com/github/pathikrit/better-files_2.11/3.7.1/better-files_2.11-3.7.1.jar.asc
+[info]  published better-files_2.11 to https://oss.sonatype.org/service/local/staging/deploy/maven2/com/github/pathikrit/better-files_2.11/3.7.1/better-files_2.11-3.7.1.pom.asc
+[info]  published better-files_2.11 to https://oss.sonatype.org/service/local/staging/deploy/maven2/com/github/pathikrit/better-files_2.11/3.7.1/better-files_2.11-3.7.1-javadoc.jar
+[info]  published better-files_2.11 to https://oss.sonatype.org/service/local/staging/deploy/maven2/com/github/pathikrit/better-files_2.11/3.7.1/better-files_2.11-3.7.1-sources.jar.asc
+[info]  published better-files_2.11 to https://oss.sonatype.org/service/local/staging/deploy/maven2/com/github/pathikrit/better-files_2.11/3.7.1/better-files_2.11-3.7.1-javadoc.jar.asc
+[info]  published better-files_2.11 to https://oss.sonatype.org/service/local/staging/deploy/maven2/com/github/pathikrit/better-files_2.11/3.7.1/better-files_2.11-3.7.1-sources.jar
+[info]  published better-files_2.11 to https://oss.sonatype.org/service/local/staging/deploy/maven2/com/github/pathikrit/better-files_2.11/3.7.1/better-files_2.11-3.7.1.jar
+[info]  published better-files_2.11 to https://oss.sonatype.org/service/local/staging/deploy/maven2/com/github/pathikrit/better-files_2.11/3.7.1/better-files_2.11-3.7.1.pom
+[success] Total time: 6 s, completed Mar 1, 2019 9:41:19 AM
+[info] Setting version to '3.7.2-SNAPSHOT'.
+[info] Reapplying settings...
+[info] Set current project to better-files-root (in build file:/Users/pbhowmick/workspace/better-files/)
+[info] Nexus repository URL: https://oss.sonatype.org/service/local
+[info] sonatypeProfileName = com.github.pathikrit
+[info] Reading staging repository profiles...
+[info] Repository comgithubpathikrit-1057 is already closed
+[info] Activity open started:2019-02-25T15:58:47.620Z, stopped:2019-02-25T16:00:03.384Z
+[info] repositoryCreated: id:comgithubpathikrit-1057, user:pathikrit, ip:158.106.220.50
+[info] Activity close started:2019-02-25T16:07:34.805Z, stopped:2019-02-25T16:16:15.069Z
+[info]   Evaluate: id:5e9e8e6f8d20a3, rule:sources-staging
+[info]   Evaluate: javadoc-staging
+[info]     Passed: javadoc-staging
+[info]   Evaluate: no-traversal-paths-in-archive-file
+[info]     Passed: no-traversal-paths-in-archive-file
+[info]   Evaluate: checksum-staging
+[info]     Passed: checksum-staging
+[info]   Evaluate: pom-staging
+[info]     Passed: pom-staging
+[info]   Evaluate: signature-staging
+[info]     Passed: signature-staging
+[info]   Evaluate: profile-target-matching-staging
+[info]     Passed: profile-target-matching-staging
+[info]   Evaluate: sources-staging
+[info]     Passed: sources-staging
+[info]     Passed: id:5e9e8e6f8d20a3
+[info]      email: to:pathikritbhowmick@msn.com
+[info] repositoryClosed: id:comgithubpathikrit-1057
+[info] Closed successfully
+[info] Reading staging profiles...
+[info] Promoting staging repository [comgithubpathikrit-1057] status:closed, profile:com.github.pathikrit(3ce6558c41fb47) description: Implicitly created (auto staging).
+[info] Activity release started:2019-03-01T14:41:26.318Z, stopped:
+[info]   Evaluate: id:nx-internal-ruleset, rule:RepositoryWritePolicy
+[info]   Evaluate: RepositoryWritePolicy
+[info]     Passed: RepositoryWritePolicy
+[info]     Passed: id:nx-internal-ruleset
+[info]  copyItems: source:comgithubpathikrit-1057, target:releases
+[info]      email: to:pathikritbhowmick@msn.com
+[info] repositoryReleased: id:comgithubpathikrit-1057, target:releases
+[info] Promoted successfully
+[info] Dropping staging repository [comgithubpathikrit-1057] status:released, profile:com.github.pathikrit(3ce6558c41fb47) description: Implicitly created (auto staging).
+[info] Dropped successfully: comgithubpathikrit-1057
+[info] Closing staging repository [comgithubpathikrit-1058] status:open, profile:com.github.pathikrit(3ce6558c41fb47) description: Implicitly created (auto staging).
+[info] Activity open started:2019-03-01T14:36:10.166Z, stopped:2019-03-01T14:36:16.304Z
+[info] repositoryCreated: id:comgithubpathikrit-1058, user:pathikrit, ip:158.106.220.50
+[info] Activity close started:2019-03-01T14:41:40.287Z, stopped:
+[info]   Evaluate: id:5e9e8e6f8d20a3, rule:sources-staging
+[info]   Evaluate: signature-staging
+[info]     Passed: signature-staging
+[info]   Evaluate: profile-target-matching-staging
+[info]     Passed: profile-target-matching-staging
+[info]   Evaluate: checksum-staging
+[info]     Passed: checksum-staging
+[info]   Evaluate: javadoc-staging
+[info]     Passed: javadoc-staging
+[info]   Evaluate: pom-staging
+[info]     Passed: pom-staging
+[info]   Evaluate: sources-staging
+[info]     Passed: sources-staging
+[info]   Evaluate: no-traversal-paths-in-archive-file
+[info]     Passed: no-traversal-paths-in-archive-file
+[info]     Passed: id:5e9e8e6f8d20a3
+[info]      email: to:pathikritbhowmick@msn.com
+[info] repositoryClosed: id:comgithubpathikrit-1058
+[info] Closed successfully
+[info] Promoting staging repository [comgithubpathikrit-1058] status:closed, profile:com.github.pathikrit(3ce6558c41fb47) description: Implicitly created (auto staging).
+[info] Activity release started:2019-03-01T14:42:23.165Z, stopped:2019-03-01T14:42:28.168Z
+[info]   Evaluate: id:nx-internal-ruleset, rule:RepositoryWritePolicy
+[info]   Evaluate: RepositoryWritePolicy
+[info]     Failed: RepositoryWritePolicy, failureMessage:Artifact updating: Repository ='releases:Releases' does not allow updating artifact='/com/github/pathikrit/better-files_2.11/3.7.1/better-files_2.11-3.7.1-javadoc.jar'
+[info]     Failed: id:nx-internal-ruleset, failureCount:1
+[info] repositoryReleaseFailed: id:comgithubpathikrit-1058, cause:com.sonatype.nexus.staging.StagingRulesFailedException: One or more rules have failed
+[error] Failed to promote the repository
+[error] Activity release started:2019-03-01T14:42:23.165Z, stopped:2019-03-01T14:42:28.168Z
+[error]     Failed: RepositoryWritePolicy, failureMessage:Artifact updating: Repository ='releases:Releases' does not allow updating artifact='/com/github/pathikrit/better-files_2.11/3.7.1/better-files_2.11-3.7.1-javadoc.jar'
+[error] java.lang.Exception: Failed to promote the repository
+[error]         at xerial.sbt.Sonatype$NexusRESTService.promoteStage(Sonatype.scala:827)
+[error]         at xerial.sbt.Sonatype$NexusRESTService.closeAndPromote(Sonatype.scala:855)
+[error]         at xerial.sbt.Sonatype$SonatypeCommand$.$anonfun$sonatypeReleaseAll$2(Sonatype.scala:279)
+[error]         at scala.collection.TraversableLike.$anonfun$map$1(TraversableLike.scala:233)
+[error]         at scala.collection.immutable.List.foreach(List.scala:388)
+[error]         at scala.collection.TraversableLike.map(TraversableLike.scala:233)
+[error]         at scala.collection.TraversableLike.map$(TraversableLike.scala:226)
+[error]         at scala.collection.immutable.List.map(List.scala:294)
+[error]         at xerial.sbt.Sonatype$SonatypeCommand$.$anonfun$sonatypeReleaseAll$1(Sonatype.scala:278)
+[error]         at sbt.Command$.$anonfun$applyEffect$4(Command.scala:142)
+[error]         at sbt.Command$.$anonfun$applyEffect$2(Command.scala:137)
+[error]         at sbtrelease.ReleasePlugin$autoImport$.$anonfun$releaseStepCommand$2(ReleasePlugin.scala:94)
+[error]         at sbtrelease.ReleasePlugin$autoImport$ReleaseKeys$.filterFailure$1(ReleasePlugin.scala:177)
+[error]         at sbtrelease.ReleasePlugin$autoImport$ReleaseKeys$.$anonfun$releaseCommand$9(ReleasePlugin.scala:195)
+[error]         at scala.Function$.$anonfun$chain$2(Function.scala:24)
+[error]         at scala.collection.LinearSeqOptimized.foldLeft(LinearSeqOptimized.scala:122)
+[error]         at scala.collection.LinearSeqOptimized.foldLeft$(LinearSeqOptimized.scala:118)
+[error]         at scala.collection.immutable.List.foldLeft(List.scala:85)
+[error]         at scala.collection.TraversableOnce.$div$colon(TraversableOnce.scala:150)
+[error]         at scala.collection.TraversableOnce.$div$colon$(TraversableOnce.scala:150)
+[error]         at scala.collection.AbstractTraversable.$div$colon(Traversable.scala:104)
+[error]         at scala.Function$.$anonfun$chain$1(Function.scala:24)
+[error]         at sbtrelease.ReleasePlugin$autoImport$ReleaseKeys$.$anonfun$releaseCommand$2(ReleasePlugin.scala:201)
+[error]         at sbt.Command$.$anonfun$applyEffect$4(Command.scala:142)
+[error]         at sbt.Command$.$anonfun$applyEffect$2(Command.scala:137)
+[error]         at sbt.Command$.process(Command.scala:181)
+[error]         at sbt.MainLoop$.processCommand(MainLoop.scala:151)
+[error]         at sbt.MainLoop$.$anonfun$next$2(MainLoop.scala:139)
+[error]         at sbt.State$$anon$1.runCmd$1(State.scala:246)
+[error]         at sbt.State$$anon$1.process(State.scala:250)
+[error]         at sbt.MainLoop$.$anonfun$next$1(MainLoop.scala:139)
+[error]         at sbt.internal.util.ErrorHandling$.wideConvert(ErrorHandling.scala:16)
+[error]         at sbt.MainLoop$.next(MainLoop.scala:139)
+[error]         at sbt.MainLoop$.run(MainLoop.scala:132)
+[error]         at sbt.MainLoop$.$anonfun$runWithNewLog$1(MainLoop.scala:110)
+[error]         at sbt.io.Using.apply(Using.scala:22)
+[error]         at sbt.MainLoop$.runWithNewLog(MainLoop.scala:104)
+[error]         at sbt.MainLoop$.runAndClearLast(MainLoop.scala:59)
+[error]         at sbt.MainLoop$.runLoggedLoop(MainLoop.scala:44)
+[error]         at sbt.MainLoop$.runLogged(MainLoop.scala:35)
+[error]         at sbt.StandardMain$.runManaged(Main.scala:138)
+[error]         at sbt.xMain.run(Main.scala:89)
+[error]         at xsbt.boot.Launch$$anonfun$run$1.apply(Launch.scala:109)
+[error]         at xsbt.boot.Launch$.withContextLoader(Launch.scala:128)
+[error]         at xsbt.boot.Launch$.run(Launch.scala:109)
+[error]         at xsbt.boot.Launch$$anonfun$apply$1.apply(Launch.scala:35)
+[error]         at xsbt.boot.Launch$.launch(Launch.scala:117)
+[error]         at xsbt.boot.Launch$.apply(Launch.scala:18)
+[error]         at xsbt.boot.Boot$.runImpl(Boot.scala:56)
+[error]         at xsbt.boot.Boot$.main(Boot.scala:18)
+[error]         at xsbt.boot.Boot.main(Boot.scala)
+[error] java.lang.Exception: Failed to promote the repository
+[error] Use 'last' for the full log.
+```

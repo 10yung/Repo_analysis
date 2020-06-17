@@ -1,0 +1,157 @@
+Specifically, autumnai.com redirects to some random ad or other dubious sites.
+Not at all necessary, but it'd help me (and hopefully other people) avoid feeling like an idiot. :)
+ 
+I am getting the following error when I try to build collenchyma on Windows 10:
+
+```
+C:\Users\Maplicant\.cargo\registry\src\github.com-1ecc6299db9ec823\collenchyma-0.0.8\src\tensor.rs:326:21: 348:22 error: non-exhaustive patterns: type &device::DeviceType is non-empty [E0002]
+C:\Users\Maplicant\.cargo\registry\src\github.com-1ecc6299db9ec823\collenchyma-0.0.8\src\tensor.rs:326                     match destination {
+                                                                                                                     ^
+C:\Users\Maplicant\.cargo\registry\src\github.com-1ecc6299db9ec823\collenchyma-0.0.8\src\tensor.rs:326:21: 348:22 help: run `rustc --explain E0002` to see a detailed explanation
+C:\Users\Maplicant\.cargo\registry\src\github.com-1ecc6299db9ec823\collenchyma-0.0.8\src\tensor.rs:326:21: 348:22 help: Please ensure that all possible cases are being handled; possibly adding wildcards or more match arms.
+C:\Users\Maplicant\.cargo\registry\src\github.com-1ecc6299db9ec823\collenchyma-0.0.8\src\tensor.rs:326                     match destination {
+                                                                                                                     ^
+error: aborting due to previous error
+```
+
+I'm guessing this has to do with the match statement at tensor.rs:342 not having a default case, but I'm not sure.
+
+I've implemented feature related to decoupling from #37. Main commit can be viewed [here](https://github.com/alexandermorozov/collenchyma/commit/50a0ab1f01785fe7bc0676d72ecba727219efdd1). Below is commit message for convenience:
+
+Change `SharedTensor::read()` signature from
+`fn read(&self, device: &DeviceType) -> Result<&MemoryType, ...>`
+into
+`fn read<D: IDevice(&self, device: &D) -> Result<&D::M, ...>`
+New signature provides type-level guarantee that if a Cuda device is passed
+into read(), then it'll return Cuda memory (and not Native or OpenCL).
+Previously required additional unwraps (.as_native().unwrap()) are no
+longer required, code is more clear and concise.
+
+Internally `SharedTensor` uses `Any` type to store objects of different types
+uniformely. Synchronization between memories is also done through type-erased
+interface. This makes it possible to define a new Framework in an external
+crate, or extract Cuda and OpenCL frameworks into their own crates. Though
+error types would require some additional work.
+
+Use of "dynamic typing" has drawbacks -- mainly slightly larger runtime
+overhead. Before this patch benchmarks showed that `SharedTensor::read()` takes
+19-22ns, now it takes 23-26ns. For comparison, minimal synchronized CUDA
+operation will take about 10-40us. Small NN layers on CPU are much faster,
+e.g. 10-input softmax layer takes about 500ns. Still, in typical NNs overhead
+looks negligible, and I think it's fair tradeoff for code clarity and better
+decoupling.
+
+Here are actual benches, before:
+
+```
+test bench_shared_tensor_access_time_first                            ... bench:          19 ns/iter (+/- 2)
+test bench_shared_tensor_access_time_second                           ... bench:          21 ns/iter (+/- 0)
+```
+
+after:
+
+```
+test bench_shared_tensor_access_time_first                        ... bench:          23 ns/iter (+/- 0)
+test bench_shared_tensor_access_time_second                       ... bench:          26 ns/iter (+/- 3)
+```
+
+What's your opinion on it?
+
+I've implemented memory access API and syncronization based on bitmasks. Tesnsor/TensorView and decoupling aren't implemented.
+
+Native and CUDA pass all tests. OpenCL compiles but segfaults on my machine, both with this PR and without it.
+
+PR isn't ready to be merged yet -- I'd like to fix plugins and Leaf first to see that there are no unexpected problems.
+
+With Cuda 7.0/7.5 i get this error
+ollenchyma>cargo test
+Running target\debug\backend_specs-5e76dbe75e34191a.exe
+`
+running 5 tests
+test backend_spec::native::it_can_use_ibackend_trait_object ... ok
+test backend_spec::native::it_can_create_default_backend ... ok
+`
+after that backend_specs-randumnumber.exe stopped working
+GDB OUTPUT:
+`running 5 tests
+[New Thread 16076.0x1804]
+[New Thread 16076.0x3c24]
+[New Thread 16076.0x315c]
+[New Thread 16076.0x34c0]
+[New Thread 16076.0x32d4]
+[New Thread 16076.0x42ec]
+[New Thread 16076.0x34e4]
+[New Thread 16076.0x2a64]
+[New Thread 16076.0xe3c]
+
+Program received signal SIGSEGV, Segmentation fault.
+[Switching to Thread 16076.0x34e4]
+0x000000000051b670 in cuInit ()`
+
+stackframe:
+`
+#0  0x000000000051b670 in cuInit ()
+#1  0x00000000004874ec in collenchyma::frameworks::cuda::api::driver::utils::API::ffi_init ()
+
+```
+at src\frameworks\cuda\api\driver/utils.rs:15
+```
+#2  0x0000000000472fcb in collenchyma::frameworks::cuda::api::driver::utils::API::init ()
+
+```
+at src\frameworks\cuda\api\driver/utils.rs:11
+```
+#3  0x0000000000472bfd in collenchyma::frameworks::cuda::Cuda.IFramework::new ()
+
+```
+at src\frameworks\cuda/mod.rs:46
+```
+#4  0x0000000000406dfe in backend_specs::backend::IBackend::defaultco::backend::Backend<co::frameworks::cuda::Cuda> () at src/backend.rs:106
+#5  0x0000000000406cf0 in backend_specs::backend_spec::cuda::it_can_create_default_backend ()
+
+```
+at tests/backend_specs.rs:37
+```
+#6  0x0000000000429e29 in boxed::F.FnBox$LT$A$GT$::call_box::h809104141212590368 ()
+#7  0x000000000042c844 in sys_common::unwind::try::try_fn::h15534802711051563033 ()
+#8  0x00000000004c471b in sys_common::unwind::try::inner_try::h3ae51230bca914caH9s ()
+#9  0x000000000042cbfb in boxed::F.FnBox$LT$A$GT$::call_box::h11947310459896948609 ()
+#10 0x00000000004d522e in sys::thread::Thread::new::thread_start::h24036cb9e2bd1c0fLey ()
+#11 0x00007ffcfe848102 in KERNEL32!BaseThreadInitThunk ()
+
+   from C:\WINDOWS\system32\kernel32.dll
+#12 0x00007ffd00b0c5b4 in ntdll!RtlUserThreadStart () from C:\WINDOWS\SYSTEM32\ntdll.dll
+#13 0x0000000000000000 in ?? ()
+
+Backtrace stopped: previous frame inner to this frame (corrupt stack?)
+`
+
+Ideally we could fill this table:
+
+|  | osx | linux |
+| --- | --- | --- |
+| native | x | x |
+| cuda |  |  |
+| opencl |  |  |
+
+It would be nice to have an API to fill `SharedTensor` with a constant value. Currently closest thing is `leaf::weight::FillerType::Constant { value: 0.0 }.fill(&mut tensor)`. There are two problems: usability and performance.
+
+On usability side this interface is available only from `leaf` crate, from first glance looks like it's have to do something with weights and is quite verbose.
+
+On performance side it's implemented by adding native device, filling CPU mem and syncronizing with original device. If original belongs to `Cuda` framework, I think this operation can be done without allocating host memory, filling it using CPU and doing a PCI transfer. At least for `SharedTensor<f32>` there is `cuMemsetD32()`.
+
+I don't completely understand whole arhitecture, but it seems that because the operation depends on backend, it should be implemented as collenchyma plugin. It looks like it'd be too much to create separate repo for this, so maybe it should be done inside collenchyma somewhere in `src/plugins/`?
+
+Well, that said, it's not clear if it's worth to do now... In my opinion this mostly depends on how it affects performance. And I haven't seen any perf issues yet except one probably fixed in autumnai/leaf#90.
+
+It'd be good if `collenchyma` would link to CUDA libraries out of the box when using it as a feature.
+
+To run the `leaf-examples` on my machine, I needed to provide my own `build.rs` to get the cuda `lib` dir added for link searching.
+
+See this [thread](https://users.rust-lang.org/t/linking-to-cuda-library-in-leaf/4957) on rust users.
+
+A CUDA cuMemAlloc returns an error when trying to allocate 0 bytes.
+
+We should wrap the CUDA driver call so that trying to allocate 0 bytes returns a null pointer. Before implementing that it should be checked if providing cuMemFree with a null pointer is valid.
+
+The recommended workaround for now is allocating 1 byte instead 0 bytes.

@@ -1,0 +1,196 @@
+This fixes incorrect flash size in dfu iface string
+While writing a firmware for the ATSAMD11D14A-SS, I failed to implement a workaround for a silicon bug that Atmel describes as "Errata 9905." Various sources online summarize this errata as "the DFLL clock must be requested before being configured otherwise a write access to a DFLL register can freeze the device." If bugged firmware attempts to program the DFLL in an incorrect way too soon after reset, the BMP will fail to scan it and give "Timeout during scan. Is target stuck in WFI?" This will make it impossible to erase the firmware and try to flash a working one.
+
+As far as I can tell, what is happening is that the `samd_probe` function releases the ARM core from Atmel's "extended reset" state (https://github.com/blacksphere/blackmagic/blob/master/src/target/samd.c#L545). However, the BMP does not halt the core at this point, and the core can start running the bugged firmware. By the time GDB tries to attach to the target, the firmware has triggered the errata and frozen the core. The BMP then gets very confused.
+
+As a workaround, I wrote the following patch that was able to work around the problem for me by moving the logic that releases the extended reset state to the attach function. I'm not entirely sure why it works since it seems like the code should still have a race window with the firmware, but it worked when I tried it. I don't expect this patch to get merged, but I'm not sure how this should be properly fixed. I am filing this issue for now in order to open a discussion for a proper solution to the problem.
+
+```patch
+diff --git a/src/target/samd.c b/src/target/samd.c
+index 3507d02..7116ce6 100644
+--- a/src/target/samd.c
++++ b/src/target/samd.c
+@@ -37,6 +37,7 @@
+ #include "target.h"
+ #include "target_internal.h"
+ #include "cortexm.h"
++#include "gdb_packet.h"
+ 
+ static int samd_flash_erase(struct target_flash *t, target_addr addr, size_t len);
+ static int samd_flash_write(struct target_flash *f,
+@@ -363,6 +364,21 @@ bool samd_protected_attach(target *t)
+ 	return true;
+ }
+ 
++bool samd_hax_attach(target *t) {
++	t->attach = cortexm_attach;
++
++	if (target_mem_read32(t, SAMD_DSU_CTRLSTAT) &
++	    SAMD_STATUSA_CRSTEXT) {
++		gdb_outf("in hooked attach\n");
++
++		/* Write bit to clear from extended reset */
++		target_mem_write32(t, SAMD_DSU_CTRLSTAT,
++		                   SAMD_STATUSA_CRSTEXT);
++	}
++
++	return cortexm_attach(t);
++}
++
+ /**
+  * Use the DSU Device Indentification Register to populate a struct
+  * describing the SAM D device.
+@@ -474,6 +490,8 @@ static void samd_add_flash(target *t, uint32_t addr, size_t length)
+ char variant_string[60];
+ bool samd_probe(target *t)
+ {
++	gdb_outf("in samd_probe\n");
++
+ 	uint32_t cid = samd_read_cid(t);
+ 	uint32_t pid = samd_read_pid(t);
+ 
+@@ -540,18 +558,28 @@ bool samd_probe(target *t)
+ 	samd_add_flash(t, 0x00000000, 0x40000);
+ 	target_add_commands(t, samd_cmd_list, "SAMD");
+ 
++	gdb_outf("about to poke reset bullshit\n");
++
++	t->attach = samd_hax_attach;
++
++#if 0
+ 	/* If we're not in reset here */
+ 	if (!platform_srst_get_val()) {
++		gdb_outf("in first if statement\n");
+ 		/* We'll have to release the target from
+ 		 * extended reset to make attach possible */
+ 		if (target_mem_read32(t, SAMD_DSU_CTRLSTAT) &
+ 		    SAMD_STATUSA_CRSTEXT) {
++			gdb_outf("in second if statement\n");
+ 
+ 			/* Write bit to clear from extended reset */
+ 			target_mem_write32(t, SAMD_DSU_CTRLSTAT,
+ 			                   SAMD_STATUSA_CRSTEXT);
+ 		}
+ 	}
++#endif
++
++	gdb_outf("leaving samd_probe\n");
+ 
+ 	return true;
+ }
+```
+
+New pull request replacing #574. Fix for #573. 
+
+On the Arduino Nano 33 BLE, the reset signal takes a long time to return to the high state. During that time the MCU is stopped and all memory operations in `cortexm_reset()` fail.
+
+This pull request is the result of discussions with @UweBonnes:
+
+- New functions (platform agnostic):
+    - `platform_srst_assert`: assert SRST for 1ms
+    - `platform_srst_release`: release SRST and wait until the target is likely responsive again
+    - `platform_srst_reset`: perform reset (assert & release)
+- Replace the low-level functions with the new ones where appropriate
+- Improve timing functions (timeouts, time measurement, delay) to a minimum precision of 1ms (relevant for STM32-based hosts and Launchpad ICDI)
+- Removed timing and read-back code from `platform_srst_get_val()` as it has been moved to the new platform agnostic functions 
+
+Aside from the cleanup, the main addition is `platform_srst_reset`. After releasing SRST, it waits until reading back the GPIO value shows the desired effect and measures the duration. It then waits the same duration again as the target might have different thresholds to distinguish low/high and as the target might need a short time to become responsive again.
+
+This should solve the problem observed on the Arduino Nano BLE 33, which is not immediately responsive after the reset signal is released since it takes about 1ms to return to the high level.
+I'm using the BMP with PlatformIO and an Arduino Nano 33 BLE (nRF52840). Debugging works but firmware upload reliably fails every other time. In particular, it fails after resetting the Arduino (by power cycling or pressing the button on the board).
+
+The executed command is:
+```
+arm-none-eabi-gdb -nx --batch -ex "target extended-remote /dev/cu.usbmodemC1CA9EF71" -ex "monitor swdp_scan" -ex "attach 1" -ex load -ex compare-sections -ex kill firmware.elf
+```
+
+And the output is:
+```
+Target voltage: 3.3V
+Available Targets:
+No. Att Driver
+ 1      Nordic nRF52 M3/M4
+ 2      Nordic nRF52 Access Port 
+hal_sleep () at ./mbed-os/targets/TARGET_NORDIC/TARGET_NRF5x/TARGET_NRF52/sleep.c:87
+87    ./mbed-os/targets/TARGET_NORDIC/TARGET_NRF5x/TARGET_NRF52/sleep.c: No such file or directory.
+Error erasing flash with vFlashErase packet
+```
+
+The error message on the last line is from the `load` command.
+
+With a debug version of BMP I have narrowed down the problem to this line:
+
+https://github.com/blacksphere/blackmagic/blob/master/src/target/nrf51.c#L165
+
+Further investigations showed that the error will always occur on the first `target_mem_...` call. In fact, it looks like it's already pending before the function is called. It goes away with a call to `target_check_error()` before line 160.
+
+I'll will further investigate it and come up with a PR. So stay tuned.
+im reading [samd21 datasheet](http://ww1.microchip.com/downloads/en/DeviceDoc/SAMD21-Family-DataSheet-DS40001882D.pdf) 
+
+on this [**section 13.13.9**](http://ww1.microchip.com/downloads/en/DeviceDoc/SAMD21-Family-DataSheet-DS40001882D.pdf#_OPENTOPIC_TOC_PROCESSING_d115e38553)
+
+i think
+#define SAMD_DID_SERIES_MASK		0x1F
+https://github.com/blacksphere/blackmagic/blob/master/src/target/samd.c
+
+should be 0x3F 
+
+I've created initial implementation for Blackmagic firmware and implemented a basic OpenOCD HLA interface driver for blackmagic probe.
+On the probe itself, I've extended the remote.c interface with a new class REMOTE_HL_PACKET. 
+It's currently in experimental stage, but seems to pass functional tests: eg. single stepping, flashing, RTOS threads support, openocd built in memory transfer tests. 
+Speed and performance feel similar to that of st-link. Transfer rate is about 30 KB/s. Half of that of direct gdb connection, but for RTOS support of OpenOCD I think it's a reasonable tradeoff.
+
+It enables this workflow:
+
+```
+[Target SWD]
+  ↑↓
+[Blackmagic on st-link ] 
+  ↑↓
+[REMOTE_HL commands over /dev/ttyACM0]
+  ↑↓
+[OpenOCD GDB server] ← OpenOCD features (RTOS threads, OpenOCD commands, etc.)
+  ↑ ↓
+GDB extended-remote
+```
+
+TODO: 
+- srst reset assertion
+- JTAG
+- Trace SWO functionality using libusb
+- Ability to set serial port / use TCP connection
+
+You can find the code on my github:
+https://github.com/walmis/openocd-blackmagic/blob/master/src/jtag/drivers/blackmagic.c
+https://github.com/walmis/openocd-blackmagic
+https://github.com/walmis/blackmagic
+ cortexm_reset() first pulse SRST before the target is released, as long as CORTEXM_TOPT_INHIBIT_SRST is not set. Later CORTEXM_AIRCR_VECTKEY | CORTEXM_AIRCR_SYSRESETREQ triggers another reset.
+
+I propose to either remove the reset via srst at all or invert CORTEXM_TOPT_INHIBIT_SRST to CORTEXM_TOPT_ENABLE_SRST so that some device may request this extra reset.
+
+Any opinions?
+Hi, I have the problem when I uses BMP with MCU ATSAMR34. 
+Target connected with helping SWD interface, but so that to see its need send in gdb:
+mon jtag_scan
+And after:
+mon swdp_scan
+And then we see the target. If we skip the step jtag_scan, we don't see the target. 
+As per the Discord discussion today I have changed OWN_HL to LOWLEVEL_UNAVAILABLE and also added a comment before the usage of LOWLEVEL_UNAVAILABLE in gdb_packet.c.
+
+I am not able to test building pc-stlinkv2 on my Windows machine, however I do not think this minor change will cause any issue.
+I understand that the relevant code for **unlocking** NRF52 chips got copied from https://devzone.nordicsemi.com/f/nordic-q-a/12484/approtect-and-dap/47301 by @markrages.
+When I took a look at it, I wondered why the addresses `MDM_POWER_EN` and `MDM_SELECT_AP` are not multiples of four. I am sure that part of the code currently writes stuff to invalid addresses and therefore does nothing.
+
+This line:
+https://github.com/blacksphere/blackmagic/blob/8a07f444351298f93b271ad6240ea9b3f8da4fe0/src/target/nrf51.c#L415
+should be:
+```cpp
+adiv5_dp_write(ap->dp, ADIV5_DP_CTRLSTAT, (ADIV5_DP_CTRLSTAT_CDBGPWRUPACK | ADIV5_DP_CTRLSTAT_CDBGPWRUPREQ));
+```
+
+And that line:
+https://github.com/blacksphere/blackmagic/blob/8a07f444351298f93b271ad6240ea9b3f8da4fe0/src/target/nrf51.c#L417
+should be:
+```cpp
+adiv5_dp_write(dp, ADIV5_DP_SELECT, 0x01000000);
+```

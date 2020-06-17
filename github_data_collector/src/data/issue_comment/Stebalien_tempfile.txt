@@ -1,0 +1,50 @@
+Reading the docs for the windows temp dir selection, it goes through several fallbacks before it selects a dir:
+
+https://docs.microsoft.com/en-gb/windows/win32/api/fileapi/nf-fileapi-gettemppatha
+
+Would it be possible for this crate to check that the dir selected is writable by the current user before selecting it? ( See https://github.com/rust-lang/cargo/issues/4350 )
+Fixes #30.
+As the title says, currently the code doesn't make any validations if the `prefix` or `suffix` are valid path component values (i.e. they don't contain a slash or `\0`).
+
+(If needed I can provide the patch.)
+
+So, unix really is lovely...
+
+```sh
+> mkdir -p /foo/bar
+> cd /foo/bar
+> chmod a-x /foo
+> touch first
+> touch /foo/bar/second
+touch: cannot touch '/foo/bar/second': Permission denied
+```
+
+As written, *this* library has the same problem as the second case. We use the absolute path when creating temporary files instead of the relative path. I believe this can actually be an issue in practice with some jails.
+
+Fixing this on *linux* is doable with `openat` and `unlinkat`. Fixing this on osx is possible using per-thread CWDs (at the cost of two extra syscalls to set/unset the thread-local CWD).
+Linux supports linking a securely created temporary file (`O_TMPFILE`) back into the filesystem, so long as it wasn't created with `O_EXCL`. I believe this will improve the performance (and security) of one of my applications.
+
+This branch extends `NamedTemporaryFile` to create these unnamed temporary files, such that the existing interface is maintained: you can persist these unnamed `NamedTemporaryFile`s into the filesystem:
+
+```rust
+let tmp = NamedTempFile::new_deleted(&temp_dir).unwrap();
+...
+tmp.persist_noclobber(&some_directory).unwrap();
+```
+
+The code hasn't turned out that great:
+
+ * I don't like the name `new_deleted`, nor `attempt_without_name`, nor ramming this support for unnamed temporary files into an interface named `NamedTemporaryFile`. I decided to add it to `NamedTemporaryFile` as it is where the `persist` functionality currently exists, and because we can gracefully fall-back to a real named file without breaking anyone, hopefully.
+ * The `path()` function continues to exist, and returns an implementation detail: the path to the `/proc/self/fd..`. While not inherently harmful, this is at least confusing.
+ * I cannot see how to `renameat2` directly into the filesystem, so for the `persist`-clobbering case, the code has to create yet another named temporary file, and link into that, then rename. This is horrible.
+ * I haven't tested it on non-Linux, and suspect I've made some mistakes there.
+
+Note that `NamedTemporaryFile`s can't end up marked as `deleted` on non-modern-linux platforms, so the error handling/fallback around those cases is less interesting (e.g. the bailing in the windows `persist` implementation).
+
+So:
+
+ * Should this functionality belong in this create?
+ * Can anyone else think of a better interface or name?
+ * Is there anything horribly wrong with what's here?
+
+Like #2 and #3, it would be nice to get a normal file after calling `persist` on a `NamedTemporaryFile`. `NamedTemporaryFile` is opened with `0o600`, I'd expect to get a `0o644` file after that.

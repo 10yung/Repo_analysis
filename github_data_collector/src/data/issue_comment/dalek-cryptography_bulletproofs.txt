@@ -1,0 +1,103 @@
+In a recent paper (https://eprint.iacr.org/2019/944) Hoffmann, Kloß and Rupp show how to reduce the required blinding scalars to only a logarithmic number. This could be a nice prover speedup. 
+The main idea is that for each value send in the inner product argument only a single blinding scalar is needed. The blinding vector s therefore only needs 2 log(n) random entries at specific positions. It's explained in section 3.4.3 of the paper.
+
+They also have an implementation here: https://github.com/emsec/QESA_ZK
+
+CC: @devhoffmann
+
+
+Our implementation of the R1CS system differs from the one described in the paper.
+
+We extended the system to allow randomized constraints, obtained as Fiat-Shamir challenges bound to the entire previous proof transcript data.  This makes the system more powerful: for example, we can do a proof-of-shuffle asymptotically faster (`O(n)`) than described in the paper (`O(n log n)`).  
+
+Our initial iteration of this idea had the limitation that the randomness could only be bound to the values of the externally committed wires (the individual `V` commitments), but for Cloak we needed to be able to bind the randomness to the values of internal wires (committed to by the `a_L, a_R, a_O` vector commitments).
+
+To solve this problem, @oleganza came up with a two-phase construction where the vector commitments are "split" and randomized, e.g. `a_L = a_L' + e*a_L''`, where `a_L'` is a vector with nonzero "phase 1" entries, `a_L''` is a vector with nonzero "phase 2" entries, and `e` is a FS challenge. (More details on the construction are available in our internal documentation).
+
+Before we can release this API, we need to a) formalize the model for these randomized constraint systems and b) have a security proof in that model.
+
+We described this problem to @bbuenz last fall and at the Stanford Blockchain Conference in January.  As of ZCon1 I think he said that he had suggested the problem to an MSc student but I don't remember the details.  I think this work would be done best in the open; this GH issue is a good place to keep track of it, because it blocks release of the R1CS API.
+See https://github.com/dalek-cryptography/bulletproofs/pull/277#issuecomment-498873608
+
+We should probably create a `TranscriptError` type that can be converted into either error type.
+I'm trying to update the R1CS benchmark code for #277 and I'm a bit confused by the Randomized / Randomizable distinction introduced in #268, #270.
+
+The documentation for `RandomizableConstraintSystem` says
+
+> Gadgets that do not use randomization should use trait bound `CS: ConstraintSystem`, while gadgets that need randomization should use trait bound `CS: RandomizedConstraintSystem`. Gadgets generally _should not_ use this trait as a bound on the CS argument: it should be used by the higher-order protocol that composes gadgets together.
+
+But the `RandomizableConstraintSystem` trait is the one with the `specify_randomized_constraints`, so aren't gadgets that need randomization forced to use the "able" trait, not the "ized" trait?
+This is a [zkInterface](https://github.com/QED-it/zkinterface) adapter to use bulletproofs as a proving system.
+
+See [live demo](https://qed-it.github.io/zkinterface-wasm/).
+
+See [example usage](https://github.com/QED-it/zkinterface-wasm/blob/master/zkif-wasm-bundles/zkif-wasm-bulletproofs/src/backend_bulletproofs.rs).
+I found these lines in `prover.rs`:
+
+```rust
+fn constrain(&mut self, lc: LinearCombination) {
+// TODO: check that the linear combinations are valid
+// (e.g. that variables are valid, that the linear combination evals to 0 for prover, etc).
+//[..]
+}
+```
+
+I tried implementing this, since I have some issues debugging a proof system I built. I've written:
+
+```rust
+    fn constrain(&mut self, lc: LinearCombination) {
+        let sum: Scalar = lc.terms.iter().map(|(v, s)| {
+            let l = match v {
+                Variable::One() => Scalar::one(),
+                Variable::Committed(i) => self.v[*i],
+                Variable::MultiplierLeft(i) => self.a_L[*i],
+                Variable::MultiplierRight(i) => self.a_R[*i],
+                Variable::MultiplierOutput(i) => self.a_O[*i],
+            };
+            l * s
+        }).sum();
+        debug_assert_eq!(sum, Scalar::zero());
+        // TODO: check that the linear combinations are valid
+        // (e.g. that variables are valid, that the linear combination evals to 0 for prover, etc).
+        self.constraints.push(lc);
+    }
+}
+```
+
+Which *works* but it changes the behaviour of the method. Certain tests (e.g. `example_gadget_test()`) started failing, because now the prove system does not return `Err` on validation, but panics earlier.
+
+---
+
+Another option would be to return `Result<(), R1CSError>` in `fn constrain`, but that alters the signature for `ConstraintSystem` (and thus for verifier, who will always return `Ok(())` anyhow). It would also not allow to disable this behaviour on `--release` builds.
+
+---
+
+What kind of implementation for this `TODO` would you consider best? Maybe even something different from my proposals?
+It allows for the challenge phase to accept closures that take some more
+context, e.g. moving non-Clone values in the challenge closure.
+
+This works in stable since Rust 1.35; cfr.
+https://github.com/rust-lang/rust/issues/28796.
+
+This closes issue #244.
+
+---
+
+In other news: I'm not yet happy with the `'static` bound on the closures. Since I'm not yet worried about that kind of performance (just hacking around currently), I'm not going to fight the borrow checker there, yet.
+Hi! It was briefly discussed in the dalek-cryptography slack that this crate currently cannot be used in `no_std` environments due to its internal usage of `rand::thread_rng()`, which obviously requires thread-local storage and thus the `std` library. @oleganza proposed exposing an API such as `verify_with_rng()`, which then the current `verify()` would be a backwards-compatible wrapper for by passing in a `rand::thread_rng()`. `verify_with_rng()` should have a trait bound for `Rng + CryptoRng` (and possibly also `SeedableRng`? since the `FromEntropy` trait also requires `std`).
+
+Questions:
+
+1. Would you like me to feature-gate the publicity of this? I.e.:
+  ```
+  #[cfg(not(feature = "std"))]
+  pub fn verify_with_rng() { ... }
+
+  #[cfg(feature = "std")]
+  fn verify_with_rng() { ... }
+  ```
+  So that explicitly only `no_std` users are trusted with passing in their own correctly-seeded PRNG?
+Fixes #265 
+Add a `FnMut` closure to `Prover::prove(...)` to allow the prover to adjust the generator capacity based on the circuit size for the given constraint system.
+
+See: https://github.com/dalek-cryptography/bulletproofs/pull/257#issuecomment-476429341

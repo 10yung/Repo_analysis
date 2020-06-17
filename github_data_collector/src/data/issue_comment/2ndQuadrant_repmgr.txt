@@ -1,0 +1,293 @@
+Hello,
+Does repmgrd takes in account witness host for consensus or just regular standbys ?
+Thank you
+When registered configure file have been deleted or moved , 
+but local repmgr command can find repmgr.conf in other location.
+In this situation, the configure file we read from registered location should be checked , 
+othrewise this will make confusing in data_directory checks.
+Having a master and standby node. Result of repmgr cluster show:
+` ID | Name           | Role    | Status    | Upstream | Location | Priority | Timeline | Connection string                                          
+----+----------------+---------+-----------+----------+----------+----------+----------+-------------------------------------------------------------
+ 1  | primary        | primary | * running |          | default  | 100      | 1       | host=w.x.y.z user=repmgr dbname=repmgr connect_timeout=2
+ 2  | standby_node_1 | standby |   running | primary  | default  | 100      | 1       | host=w.x.y.z user=repmgr dbname=repmgr connect_timeout=2
+`
+
+Current configuration file of primary is:
+node_id=1
+node_name=primary
+conninfo='host=w.x.y.z user=repmgr dbname=repmgr connect_timeout=2'
+replication_user='repmgr_repl'
+pg_bindir='/usr/xxxx/postgres/12/bin/'
+data_directory='/var/xxxx/postgres/12/data'
+config_directory='/etc/xxxx/postgres/12/data'
+log_level='INFO'
+log_facility='STDERR'
+log_file='/var/log/xxxx/repmgr/repmgr.log'
+shutdown_check_timeout=50
+monitoring_history='yes'
+
+Starting repmgrd on primary node with: repmgrd -d -v
+
+Log file content:
+[2019-12-10 16:15:13] [NOTICE] repmgrd (repmgrd 5.0.0) starting up
+[2019-12-10 16:15:13] [INFO] connecting to database "host=w.x.y.z user=repmgr dbname=repmgr connect_timeout=2"
+INFO:  set_repmgrd_pid(): provided pidfile is /tmp/repmgrd.pid
+[2019-12-10 16:15:13] [NOTICE] starting monitoring of node "primary" (ID: 1)
+[2019-12-10 16:15:13] [INFO] "connection_check_type" set to "ping"
+[2019-12-10 16:15:13] [NOTICE] monitoring cluster primary "primary" (ID: 1)
+[2019-12-10 16:15:13] [INFO] child node "standby_node_1" (ID: 2) is attached
+
+Made no changes in the configuration file, just wanted to check reloading repmgrd with: kill -HUP `cat /tmp/repmgrd.pid`
+
+Following is recorded in the logfile:
+[2019-12-10 16:23:25] [INFO] reloading configuration file
+[2019-12-10 16:23:25] [WARNING] unable to parse new configuration, retaining current configuration
+[2019-12-10 16:23:25] [DETAIL] following errors were detected:
+  "promote_command": required parameter was not found
+  "follow_command": required parameter was not found
+
+Thats's weird.... These parameters were not required at the initial start of repmgrd, but after doing a reload these are required?!?!?!
+Repmgr version 5.0.0
+PostgreSQL version 12.1
+
+According to the documentation:
+For the sake of simplicity, the repmgr user is created as a superuser. If desired, it's possible to create the repmgr user as a normal user. However for certain operations superuser permissions are requiredl; in this case the command line option --superuser can be provided to specify a superuser. 
+
+User repmgr is created as normal user. 
+
+Trying to run 'repmgr node check'
+> repmgr node check
+INFO: connection is not a superuser connection, falling back to simple check
+HINT: add the "repmgr" user to group "pg_read_all_settings" or "pg_monitor"
+Node "standby_node_1":
+	Server role: OK (node is standby)
+	Replication lag: OK (0 seconds)
+	WAL archiving: OK (0 pending archive ready files)
+	Downstream servers: OK (this node has no downstream nodes)
+	Replication slots: OK (node has no physical replication slots)
+	Missing physical replication slots: OK (node has no missing physical replication slots)
+	Configured data directory: OK
+
+Obviously the command requires a superuser to retrieve all information and not doing only the simple check. So run it with option '--superuser' to provide a superuser
+
+> repmgr --superuser=<user> -v --log-level DEBUG node check
+INFO: checking for package configuration file "/etc/xxxx/repmgr/conf/repmgr.conf"
+INFO: configuration file found at: "/etc/xxxx/repmgr/conf/repmgr.conf"
+DEBUG: connecting to: "user=repmgr connect_timeout=2 dbname=repmgr host=w.x.y.z fallback_application_name=repmgr"
+DEBUG: set_config():
+  SET synchronous_commit TO 'local'
+DEBUG: get_node_record():
+  SELECT n.node_id, n.type, n.upstream_node_id, n.node_name,  n.conninfo, n.repluser, n.slot_name, n.location, n.priority, n.active, n.config_file, '' AS upstream_node_name, NULL AS attached   FROM repmgr.nodes n  WHERE n.node_id = 2
+DEBUG: get_node_replication_stats():
+ SELECT pg_catalog.current_setting('max_wal_senders')::INT AS max_wal_senders,         (SELECT pg_catalog.count(*) FROM pg_catalog.pg_stat_replication) AS attached_wal_receivers,         current_setting('max_replication_slots')::INT AS max_replication_slots,         (SELECT pg_catalog.count(*) FROM pg_catalog.pg_replication_slots WHERE slot_type='physical') AS total_replication_slots,         (SELECT pg_catalog.count(*) FROM pg_catalog.pg_replication_slots WHERE active IS TRUE AND slot_type='physical')  AS active_replication_slots,         (SELECT pg_catalog.count(*) FROM pg_catalog.pg_replication_slots WHERE active IS FALSE AND slot_type='physical') AS inactive_replication_slots,         pg_catalog.pg_is_in_recovery() AS in_recovery
+DEBUG: get_recovery_type(): SELECT pg_catalog.pg_is_in_recovery()
+DEBUG: get_replication_lag_seconds():
+ SELECT CASE WHEN (pg_catalog.pg_last_wal_receive_lsn() = pg_catalog.pg_last_wal_replay_lsn())           THEN 0         ELSE EXTRACT(epoch FROM (pg_catalog.clock_timestamp() - pg_catalog.pg_last_xact_replay_timestamp()))::INT           END         AS lag_seconds
+DEBUG: lag seconds: 0
+DEBUG: get_downstream_node_records():
+  SELECT n.node_id, n.type, n.upstream_node_id, n.node_name,  n.conninfo, n.repluser, n.slot_name, n.location, n.priority, n.active, n.config_file, '' AS upstream_node_name, NULL AS attached     FROM repmgr.nodes n    WHERE n.upstream_node_id = 2 ORDER BY n.node_id 
+DEBUG: clear_node_info_list() - closing open connections
+DEBUG: clear_node_info_list() - unlinking
+DEBUG: clear_node_info_list() - closing open connections
+DEBUG: clear_node_info_list() - unlinking
+DEBUG: get_all_node_records_with_missing_slot():
+   SELECT n.node_id, n.type, n.upstream_node_id, n.node_name,  n.conninfo, n.repluser, n.slot_name, n.location, n.priority, n.active, n.config_file, '' AS upstream_node_name, NULL AS attached      FROM repmgr.nodes n LEFT JOIN pg_catalog.pg_replication_slots rs        ON rs.slot_name = n.slot_name     WHERE n.slot_name IS NOT NULL      AND rs.slot_name IS NULL       AND n.upstream_node_id = 2       AND n.type = 'standby'
+DEBUG: clear_node_info_list() - closing open connections
+DEBUG: clear_node_info_list() - unlinking
+DEBUG: clear_node_info_list() - closing open connections
+DEBUG: clear_node_info_list() - unlinking
+INFO: connection is not a superuser connection, falling back to simple check
+HINT: add the "repmgr" user to group "pg_read_all_settings" or "pg_monitor"
+Node "standby_node_1":
+	Server role: OK (node is standby)
+	Replication lag: OK (0 seconds)
+	WAL archiving: OK (0 pending archive ready files)
+	Downstream servers: OK (this node has no downstream nodes)
+	Replication slots: OK (node has no physical replication slots)
+	Missing physical replication slots: OK (node has no missing physical replication slots)
+	Configured data directory: OK
+
+Not what I expected..... It looks like the command doesn't use the --superuser option at all. Ofcourse it is possible to add the repmgr (normal) user to one of the groups, but that would, to my opinion, undermine the usage of the --superuser option
+I have a replicated cluster composed of three nodes:
+
+| ID | Name         | Role       | Status    | Upstream | Location | Priority |                                    
+|----|----------------|------------|------------|--------------|-------------|----------|
+| 1  | node-one    | primary | * running |                 | default    | 100      |
+| 2  | node-two | standby |   running | node-one | default    | 60          | 
+| 3  | node-three    | standby |   running | node-one | default    | 20       |  
+
+Repmgrd runs on all the nodes.
+
+I am using the following versions of software:
+Repmgr 5.0
+PostgreSQL 10.10
+Fedora 29
+
+When the primary node (**node-one**) crashes, the failover is triggered and **node-two** becomes the new primary as expected. The other standby - **node-three** is attached to the new primary (**node-two**) and the PostgreSQL server is stopped:
+```
+[2019-11-30 09:35:19] [DETAIL] PQping() returned "PQPING_NO_RESPONSE"
+[2019-11-30 09:35:19] [INFO] sleeping 10 seconds until next reconnection attempt
+[2019-11-30 09:35:29] [INFO] checking state of node 1, 6 of 6 attempts
+[2019-11-30 09:35:29] [WARNING] unable to ping "user=repmgr connect_timeout=2 dbname=repmgr host=node-one fallback_application_name=repmgr"
+[2019-11-30 09:35:29] [DETAIL] PQping() returned "PQPING_NO_RESPONSE"
+[2019-11-30 09:35:29] [WARNING] unable to reconnect to node 1 after 6 attempts
+[2019-11-30 09:35:29] [NOTICE] setting "wal_retrieve_retry_interval" to 86405000 milliseconds
+[2019-11-30 09:35:29] [WARNING] wal receiver not running
+[2019-11-30 09:35:29] [NOTICE] WAL receiver disconnected on all sibling nodes
+[2019-11-30 09:35:29] [INFO] WAL receiver disconnected on all 1 sibling nodes
+[2019-11-30 09:35:29] [NOTICE] this node's priority is 0 so will not be considered as an automatic promotion candidate
+[2019-11-30 09:35:29] [NOTICE] setting "wal_retrieve_retry_interval" to 5000 ms
+[2019-11-30 09:35:29] [INFO] follower node awaiting notification from a candidate node
+[2019-11-30 09:35:30] [NOTICE] attempting to follow new primary "node-two" (node ID: 2)
+WARNING: following problems with command line parameters detected:
+  --no-wait will be ignored when executing STANDBY FOLLOW
+INFO: local node 3 can attach to follow target node 2
+DETAIL: local node's recovery point: 0/4000DC8; follow target node's fork point: 0/4000DC8
+NOTICE: setting node 3's upstream to node 2
+NOTICE: stopping server using "pg_ctl  -D '/var/lib/pgsql/data/userdata' -w -m fast stop"
+```
+After the restart, it is registered as standby, replication from **node-two** works correctly, but repmgrd attempts to connect to the old primary node (**node-one**), which is unavailable:
+```
+[2019-11-30 09:35:49] [NOTICE] repmgrd (repmgrd 5.0.0) starting up
+[2019-11-30 09:35:49] [INFO] connecting to database "host=node-three user=repmgr dbname=repmgr connect_timeout=2"
+INFO:  set_repmgrd_pid(): provided pidfile is /tmp/repmgrd.pid
+[2019-11-30 09:35:49] [NOTICE] starting monitoring of node "node-three" (ID: 2)
+[2019-11-30 09:35:49] [INFO] "connection_check_type" set to "ping"
+[2019-11-30 09:35:49] [ERROR] connection to database failed
+[2019-11-30 09:35:49] [DETAIL] 
+could not translate host name "node-one" to address: Name or service not known
+[2019-11-30 09:35:49] [DETAIL] attempted to connect using:
+  user=repmgr connect_timeout=2 dbname=repmgr host=node-one fallback_application_name=repmgr
+[2019-11-30 09:35:49] [ERROR] unable connect to upstream node (ID: 1), terminating
+[2019-11-30 09:35:49] [HINT] upstream node must be running before repmgrd can start
+[2019-11-30 09:35:49] [INFO] repmgrd terminating...
+```
+
+This looks like the same problem, reported on StackExchange some time ago: https://dba.stackexchange.com/questions/246542/repmgr-service-crashes-during-automatic-failover-slaves-upstream-node-points-t?newreg=4be13df65c8f404db988158b604695c8
+Repmgr version 5.0.0
+PostgreSQL version 12.1
+
+Standby configuration file:
+node_id='2'
+node_name='standby_node_1'
+conninfo='host=w.x.y.z user=repmgr dbname=repmgr connect_timeout=2'
+replication_user='repmgr_repl'
+pg_bindir='/usr/xxxx/postgres/12/bin/'
+data_directory='/var/xxxx/postgres/12/data'
+config_directory='/etc/xxxx/postgres/12/data'
+log_level=INFO
+log_facility=STDERR
+log_file='/var/log/xxxx/repmgr/repmgr.log'
+
+For streaming replication a dedicated user is used 'repmgr_repl', which is also in the configuration file of the standby.
+
+Cloned the standby with following command:
+repmgr -h w.x.y.z -U repmgr -d repmgr --copy-external-config-file=samepath standby clone --superuser xxxx --replication-user repmgr_repl -c
+
+The standby is cloned successfully:
+NOTICE: destination directory "/var/xxxx/postgres/12/data" provided
+INFO: connecting to source node
+DETAIL: connection string is: host=w.x.y.z user=repmgr dbname=repmgr
+DETAIL: current installation size is 45 MB
+NOTICE: checking for available walsenders on the source node (2 required)
+NOTICE: checking replication connections can be made to the source server (2 required)
+NOTICE: copying external configuration files from upstream node "w.x.y.z"
+INFO: rsync command line:
+  rsync --archive --checksum --compress --progress --rsh=ssh w.x.y.z:/etc/xxxx/postgres/12/data/postgresql.conf /etc/xxxx/postgres/12/data/postgresql.conf
+receiving incremental file list
+INFO: rsync command line:
+  rsync --archive --checksum --compress --progress --rsh=ssh w.x.y.z:/etc/xxxx/postgres/12/data/pg_hba.conf /etc/xxxx/postgres/12/data/pg_hba.conf
+receiving incremental file list
+INFO: rsync command line:
+  rsync --archive --checksum --compress --progress --rsh=ssh w.x.y.z:/etc/xxxx/postgres/12/data/pg_ident.conf /etc/xxxx/postgres/12/data/pg_ident.conf
+receiving incremental file list
+INFO: checking and correcting permissions on existing directory "/var/xxxx/postgres/12/data"
+NOTICE: starting backup (using pg_basebackup)...
+INFO: executing:
+  /usr/xxxx/postgres/12/bin/pg_basebackup -l "repmgr base backup"  -D /var/xxxx/postgres/12/data -h w.x.y.z -p 5432 -U repmgr_repl -c fast -X stream 
+NOTICE: standby clone (using pg_basebackup) complete
+NOTICE: you can now start your PostgreSQL server
+
+As stated in the standby repmgr.conf parameter 'replication_user' is added. However on the command line I have to explicit add option --replication-user to the command otherwise it uses user repmgr. This is not what I expected when reading the example conf file:
+#replication_user='repmgr'	 # User to make replication connections with, if not set
+				                 #  defaults to the user defined in "conninfo".
+
+Secondly the replication user isn't added to postgresql.auto.conf:
+primary_conninfo = 'host=w.x.y.z user=repmgr application_name=standby_node_1 connect_timeout=2'
+
+Again not what I expected by providing the 'replication_user' parameter in the configuration file and providing the option --replication-user on the command line
+
+On this page:
+
+https://repmgr.org/
+
+The link to "Release Notes" points to:
+
+https://repmgr.org/docs/current/release-5.0.0.html
+
+This doesn't exist, but is instead hosted here:
+
+https://repmgr.org/docs/current/release-5.0.html
+
+I'm not sure if the homepage should be changed to 5.0, or the release notes moved to 5.0.0... but one of them needs to be done to prevent HTTP 404 errors.
+Hi!
+
+As i read in the release docs since pg12 you are using pg_promote to promote a slave.
+My question: can't i override this by using the promote_command or the service_promote_command?
+
+In my configuration both config settings are totally ignored!
+
+Best Regards,
+David
+
+
+I'm trying to install postgres 9.6 on an ec2 instance following instructions here: https://installvirtual.com/install-postgresql-9-6-on-amazon-ec2-amazon-linux/ 
+When I try to yum install postgres96 or update yum, I get the following error with the URL 
+
+```
+[root@ ]# yum install postgresql96
+Loaded plugins: priorities, update-motd, upgrade-helper
+https://dl.2ndquadrant.com/default/release/rpm/packages/amzn/latest/x86_64/9.6/repodata/repomd.xml: [Errno 14] HTTPS Error 404 - Not Found
+Trying other mirror.
+To address this issue please refer to the below knowledge base article 
+
+https://access.redhat.com/articles/1320623
+
+If above article doesn't help to resolve this issue please open a ticket with Red Hat Support.
+
+https://dl.2ndquadrant.com/default/release/rpm/dbg_packages/amzn/latest/x86_64/9.6/repodata/repomd.xml: [Errno 14] HTTPS Error 404 - Not Found
+Trying other mirror.
+
+
+ One of the configured repositories failed (2ndQuadrant packages (PG9.6) for latest - x86_64 - Debug),
+ and yum doesn't have enough cached data to continue. At this point the only
+ safe thing yum can do is fail. There are a few ways to work "fix" this:
+
+     1. Contact the upstream for the repository and get them to fix the problem.
+
+     2. Reconfigure the baseurl/etc. for the repository, to point to a working
+        upstream. This is most often useful if you are using a newer
+        distribution release than is supported by the repository (and the
+        packages for the previous distribution release still work).
+
+     3. Disable the repository, so yum won't use it by default. Yum will then
+        just ignore the repository until you permanently enable it again or use
+        --enablerepo for temporary usage:
+
+            yum-config-manager --disable 2ndquadrant-dl-default-release-pg9.6-debug
+
+     4. Configure the failing repository to be skipped, if it is unavailable.
+        Note that yum will try to contact the repo. when it runs most commands,
+        so will have to try and fail each time (and thus. yum will be be much
+        slower). If it is a very temporary problem though, this is often a nice
+        compromise:
+
+            yum-config-manager --save --setopt=2ndquadrant-dl-default-release-pg9.6-debug.skip_if_unavailable=true
+
+failure: repodata/repomd.xml from 2ndquadrant-dl-default-release-pg9.6-debug: [Errno 256] No more mirrors to try.
+https://dl.2ndquadrant.com/default/release/rpm/dbg_packages/amzn/latest/x86_64/9.6/repodata/repomd.xml: [Errno 14] HTTPS Error 404 - Not Found
+```
+
+The output for cat /etc/os-release is: Amazon Linux AMI 2018.03
+Greetings, data consistency is important to me, that's why I use first 4 (n1, n2, n3, n4).
+The documentation parsed moments with promote_command and follow_command. If the wizard crashes, a new one will be assigned and the leader will be reassigned to all standby. When integrating with barman, there is restore_command, will it be performed automatically as the first two to restore and restore the ex master as standby? And what kind of automation is there when the standby crashes?

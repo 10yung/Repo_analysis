@@ -1,0 +1,293 @@
+Added support json_object_getn, setn, deln for non null-terminated strgins.
+
+Please, review it. Thanks
+It would be worth to add a [Swig](http://www.swig.org/tutorial.html) template to generate interfaces in other languages.
+Enable pedantic, strict prototypes, and treat warnings as errors
+
+Resolve several cases of: function declaration isn’t a prototype
+[-Werror=strict-prototypes]
+
+Resolve: format ‘%p’ expects argument of type ‘void *’, but argument 4
+has type ‘const json_t * {aka const struct json_t *}’ [-Werror=format=]
+Use it when loading a JSON number and json_strtoint returns ERANGE and the number is positive.
+Only falling back on the new type as a last resort only before issuing a parsing error
+ensure minimal breakage in backward compatibility.
+Add the oss-fuzz badge in README to see bugs/errors found by the OSS-Fuzz integration at a glance
+I build my current project(s) with both gcc and clang and have a pile of docker images running (so far) 7 builds in a test setup. The clang memory-sanitize build is very unhappy with jansson.
+
+The compile flags that I'm using are:
+```
+CC = clang
+CFLAGS = -g -Og -fsanitize=memory -fPIE -fno-omit-frame-pointer -fsanitize-memory-track-origins
+CPP = clang++ -E
+CPPFLAGS = -fsanitize=memory -fPIE -fno-omit-frame-pointer -fsanitize-memory-track-origins
+```
+(I also use "-Wall -Wformat=2 -Wno-variadic-macros -Wcast-align -Wno-vla -Wextra" but those are more or less optional).
+
+I believe that just running "make check" with the clang mem-san build will show the errors. I made a minimal test application that uses the jansson library and just loads the JSON
+`{"Server Name": "ChrisDev",}` from a string and that shows the problem.
+
+I've been playing with the config files for building jansson to try to get a mem-san build, but I fear I'm missing something obvious (this is way outside my experience). Specifically this log output caused by not passing -o flag to clang in conftest.c and it fails with "main() not found" (which is a accurate but not desired):
+```
+checking how to run the C preprocessor... clang
+configure: error: in `/home/chrismz/jansson-2.12':
+configure: error: C preprocessor "clang" fails sanity check
+```
+I posted some basic code fixes to the google groups that allow me to use the jansson source directly in my project and get it to compile. Sadly the couple of fixes I made don't allow mem-san to actually run, down in the lexer there's an error that I don't really want to have to fix. I'm hoping someone who actually understands the code already can do that.
+Running it inside my code I get the following problem:
+```
+Uninitialized bytes in __interceptor_memchr at offset 0 inside [0x701000000050, 11)
+==17893==WARNING: MemorySanitizer: use-of-uninitialized-value
+    #0 0x10e8a9d in parse_object /builds/chris/listener/Listener/../jansson/src/load.c:717:13 /// if (memchr(key, '\0', len)) {
+    #1 0x10e76bc in parse_value /builds/chris/listener/Listener/../jansson/src/load.c:860:20
+    #2 0x10e696e in parse_json /builds/chris/listener/Listener/../jansson/src/load.c:897:14
+    #3 0x10e6cb0 in json_loadf /builds/chris/listener/Listener/../jansson/src/load.c:1029:14
+    #4 0xf3a54d in digiflex::ConfigurationFile::LoadConfig(digiflex::Configuration&, bool*) /builds/chris/listener/Listener/../common/ConfigurationFile.cpp:70:29
+    #5 0x12eb216 in UpdateRedisConfig(char*) /builds/chris/listener/Listener/main.cpp:362:14
+    #6 0x12eb96c in main /builds/chris/listener/Listener/main.cpp:413:5
+    #7 0x7fbca932f812 in __libc_start_main (/lib64/libc.so.6+0x23812)
+    #8 0xdaa26d in _start (/code/listener/listener-new+0xdaa26d)
+
+  Uninitialized value was created by a heap allocation
+    #0 0xdb2e83 in malloc /llvm-project/compiler-rt/lib/msan/msan_interceptors.cpp:925:3
+    #1 0x10e8e51 in jsonp_malloc /builds/chris/listener/Listener/../jansson/src/memory.c:28:12
+    #2 0x10e7b20 in lex_scan_string /builds/chris/listener/Listener/../jansson/src/load.c:389:9
+    #3 0x10e72d4 in lex_scan /builds/chris/listener/Listener/../jansson/src/load.c:620:9
+    #4 0x10e8a11 in parse_object /builds/chris/listener/Listener/../jansson/src/load.c:700:5
+    #5 0x10e76bc in parse_value /builds/chris/listener/Listener/../jansson/src/load.c:860:20
+    #6 0x10e696e in parse_json /builds/chris/listener/Listener/../jansson/src/load.c:897:14
+    #7 0x10e6cb0 in json_loadf /builds/chris/listener/Listener/../jansson/src/load.c:1029:14
+    #8 0xf3a54d in digiflex::ConfigurationFile::LoadConfig(digiflex::Configuration&, bool*) /builds/chris/listener/Listener/../common/ConfigurationFile.cpp:70:29
+    #9 0x12eb216 in UpdateRedisConfig(char*) /builds/chris/listener/Listener/main.cpp:362:14
+    #10 0x12eb96c in main /builds/chris/listener/Listener/main.cpp:413:5
+    #11 0x7fbca932f812 in __libc_start_main (/lib64/libc.so.6+0x23812)
+
+SUMMARY: MemorySanitizer: use-of-uninitialized-value /builds/chris/listener/Listener/../jansson/src/load.c:717:13 in parse_object
+```
+
+The code changes required to build in clang (from email)
+
+Modern C++ demands that printing pointers be done only after casting to void:
+
+```
+static int loop_check(hashtable_t *parents, const json_t *json, char *key, size_t key_size)
+ {
+-    snprintf(key, key_size, "%p", json);
++    snprintf(key, key_size, "%p", (void *) json);
+```
+
+
+This is only used in the conditionally defined code that follows so should be moved in with it:
+
+```
+static uint32_t buf_to_uint32(char *data) 
+
+#if !defined(_WIN32) && defined(USE_URANDOM)
+```
+
+
+You print one buffer into a same-size buffer with extra context and while it might be valid the compiler complains because it doesn't know that. I went with added context, others might prefer ...TEXT_WITH_CONTEXT = 200 or whatever:
+
+```
+#define JSON_ERROR_TEXT_LENGTH    160
++#define JSON_ERROR_CONTEXT_LENGTH  80
+ #define JSON_ERROR_SOURCE_LENGTH   80
+
+```
+Then used in the code:
+
+```
+@@ -114,9 +114,9 @@ static void error_set(json_error_t *error, const lex_t *lex,
+         if(saved_text && saved_text[0])
+         {
+             if(lex->saved_text.length <= 20) {
+-                snprintf(msg_with_context, JSON_ERROR_TEXT_LENGTH,
++                snprintf(msg_with_context, JSON_ERROR_TEXT_LENGTH + JSON_ERROR_CONTEXT_LENGTH,
+                          "%s near '%s'", msg_text, saved_text);
+-                msg_with_context[JSON_ERROR_TEXT_LENGTH - 1] = '\0';
++                msg_with_context[JSON_ERROR_TEXT_LENGTH + JSON_ERROR_CONTEXT_LENGTH - 1] = '\0';
+                 result = msg_with_context;
+             }
+         }
+@@ -131,9 +131,9 @@ static void error_set(json_error_t *error, const lex_t *lex,
+                 result = msg_text;
+             }
+             else {
+-                snprintf(msg_with_context, JSON_ERROR_TEXT_LENGTH,
++                snprintf(msg_with_context, JSON_ERROR_TEXT_LENGTH + JSON_ERROR_CONTEXT_LENGTH,
+                          "%s near end of file", msg_text);
+-                msg_with_context[JSON_ERROR_TEXT_LENGTH - 1] = '\0';
++                msg_with_context[JSON_ERROR_TEXT_LENGTH + JSON_ERROR_CONTEXT_LENGTH - 1] = '\0';
+                 result = msg_with_context;
+             }
+         }
+
+```
+
+(I thought I could re-open a bug, but apparently not. This is from #420)
+
+I've run into this now compiling jansson 2.12.0 under the xtensa-esp32-elf 8.2.0 compiler. It's because `-Wformat-truncation` is passed in from the upper level Makefile. I also threw in a warning about an unused function :)
+
+[https://developers.redhat.com/blog/2018/05/24/detecting-string-truncation-with-gcc-8/] is a decent article about handling the issue. Although personally I'd be inclined to use
+```
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+...
+#pragma GCC diagnostic pop
+```
+
+Error message:
+```
+[redacted]/components/jansson/hashtable_seed.c:48:17: warning: 'buf_to_uint32' defined but not used [-Wunused-function]
+ static uint32_t buf_to_uint32(char *data) {
+                 ^~~~~~~~~~~~~
+CC build/jansson/load.o
+CC build/freemodbus/port/portserial.o
+[redacted]/components/jansson/load.c: In function 'error_set':
+[redacted]/components/jansson/load.c:118:29: error: ' near '' directive output may be truncated writing 7 bytes into a region of size between 1 and 160 [-Werror=format-truncation=]
+                          "%s near '%s'", msg_text, saved_text);
+                             ^~~~~~~
+[redacted]/components/jansson/load.c:117:17: note: 'snprintf' output 9 or more bytes (assuming 168) into a destination of size 160
+                 snprintf(msg_with_context, JSON_ERROR_TEXT_LENGTH,
+                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                          "%s near '%s'", msg_text, saved_text);
+                          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[redacted]/components/jansson/load.c:135:29: error: ' near end of file' directive output may be truncated writing 17 bytes into a region of size between 1 and 160 [-Werror=format-truncation=]
+                          "%s near end of file", msg_text);
+                             ^~~~~~~~~~~~~~~~~
+[redacted]/components/jansson/load.c:134:17: note: 'snprintf' output between 18 and 177 bytes into a destination of size 160
+                 snprintf(msg_with_context, JSON_ERROR_TEXT_LENGTH,
+                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                          "%s near end of file", msg_text);
+                          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+cc1: some warnings being treated as errors
+make[1]: *** [load.o] Error 1
+make: *** [component-jansson-build] Error 2
+make: *** Waiting for unfinished jobs....
+```
+## I use the Jansson pack(v2.7.0) in keil5( v5.23.0.0 ). The hardware I use is stm32F103ZET6.
+
+### When I create a project without ucos-II(Embedded operating system), jansson works well. But jansson in ucos-II task, there is some problem of json_dumps() when integer is in Json.
+
+```c
+ int main(void)
+{	
+    //hardware init
+    NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
+    delay_init();
+    LED_Init();
+    uart_init(115200);
+    /*************************************************************************************************
+    *
+    *                           before enter ucos2
+    *
+    **************************************************************************************************
+    */
+    {
+        char a[] = "{\"id\":31,\"dataCode\":0,\"data\":{\"ap_sta_mode\": 1,\"physical_equipment_id\": 1,\"ssid\":\"wifi_name\",\"passwd\":\"wifi_password\",\"ip\":\"192.168.16.123\"}}";
+        json_t *json_data;
+        json_error_t json_error;
+        json_data = json_loads((char*)a, JSON_DECODE_ANY, &json_error);
+        
+        char *out;
+        out = json_dumps(json_data, JSON_ENCODE_ANY);
+        printf("\r\n before enter ucos2 \r\n out:\r\n%s\r\n\r\n", out);
+        free(out);
+        json_decref(json_data);
+    }
+    
+    //enter ucos-II
+    OSInit();   
+    OSTaskCreate(start_task,(void *)0,(OS_STK *)&START_TASK_STK[START_STK_SIZE-1],START_TASK_PRIO );//creat start task
+    OSStart();	  	 
+}
+
+//start task
+//create other tasks
+void start_task(void *pdata)
+{
+    OS_CPU_SR cpu_sr=0;
+	pdata = pdata; 
+  	OS_ENTER_CRITICAL();			//ENTER_CRITICAL   
+ 	OSTaskCreate(led0_task,(void *)0,(OS_STK*)&LED0_TASK_STK[LED0_STK_SIZE-1],LED0_TASK_PRIO);						   
+ 	OSTaskCreate(led1_task,(void *)0,(OS_STK*)&LED1_TASK_STK[LED1_STK_SIZE-1],LED1_TASK_PRIO);	 				   
+	OSTaskSuspend(START_TASK_PRIO);	//suspend start_task
+	OS_EXIT_CRITICAL();				//EXIT_CRITICAL
+}
+
+//LED0 task
+void led0_task(void *pdata)
+{	 	
+    /*************************************************************************************************
+    *
+    *                           after enter ucos2
+    *
+    **************************************************************************************************
+    */
+    {
+        char a[] = "{\"id\":31,\"dataCode\":0,\"data\":{\"ap_sta_mode\": 1,\"physical_equipment_id\": 1,\"ssid\":\"wifi_name\",\"passwd\":\"wifi_password\",\"ip\":\"192.168.16.123\"}}";
+        json_t *json_data;
+        json_error_t json_error;
+        json_data = json_loads((char*)a, JSON_DECODE_ANY, &json_error);
+        
+        char *out;
+        out = json_dumps(json_data, JSON_ENCODE_ANY);
+        printf("\r\n after enter ucos2 \r\n out:\r\n%s\r\n\r\n", out);
+        free(out);
+        json_decref(json_data);
+    }
+	while(1)
+	{
+		LED0=0;
+		delay_ms(80);
+		LED0=1;
+		delay_ms(920);
+	};
+}
+```
+
+##
+### The output is like that
+```json
+ before enter ucos2 
+ out:
+{"id": 31, "dataCode": 0, "data": {"ip": "192.168.16.123", "ssid": "wifi_name", "ap_sta_mode": 1, "physical_equipment_id": 1, "passwd": "wifi_password"}}
+
+
+ after enter ucos2 
+ out:
+{"id": 133278215761, "dataCode": 134229585, "data": {"ip": "192.168.16.123", "ssid": "wifi_name", "ap_sta_mode": 4429196881, "physical_equipment_id": 4429196881, "passwd": "wifi_password"}}
+
+```
+Issue #478
+Without this pragma, building with clang and -Wall I get the following:
+
+```
+In file included from imap/mboxevent.c:53:
+/usr/local/cyruslibs/include/jansson.h:140:6: error: unused function 'json_decrefp' [-Werror,-Wunused-function]
+void json_decrefp(json_t **json)
+     ^
+/usr/local/cyruslibs/include/jansson.h:186:41: error: unused function 'json_error_code' [-Werror,-Wunused-function]
+static JSON_INLINE enum json_error_code json_error_code(const json_error_t *e) {
+                                        ^
+/usr/local/cyruslibs/include/jansson.h:228:5: error: unused function 'json_object_set' [-Werror,-Wunused-function]
+int json_object_set(json_t *object, const char *key, json_t *value)
+    ^
+/usr/local/cyruslibs/include/jansson.h:234:5: error: unused function 'json_object_set_nocheck' [-Werror,-Wunused-function]
+int json_object_set_nocheck(json_t *object, const char *key, json_t *value)
+    ^
+/usr/local/cyruslibs/include/jansson.h:240:5: error: unused function 'json_object_iter_set' [-Werror,-Wunused-function]
+int json_object_iter_set(json_t *object, void *iter, json_t *value)
+    ^
+/usr/local/cyruslibs/include/jansson.h:255:5: error: unused function 'json_array_set' [-Werror,-Wunused-function]
+int json_array_set(json_t *array, size_t ind, json_t *value)
+    ^
+/usr/local/cyruslibs/include/jansson.h:261:5: error: unused function 'json_array_append' [-Werror,-Wunused-function]
+int json_array_append(json_t *array, json_t *value)
+    ^
+/usr/local/cyruslibs/include/jansson.h:267:5: error: unused function 'json_array_insert' [-Werror,-Wunused-function]
+int json_array_insert(json_t *array, size_t ind, json_t *value)
+    ^
+```
+
+And ditto everywhere else jansson.h is included.  This patch has no effect on the code built, but allows callers to turn on full warnings safely with clang.

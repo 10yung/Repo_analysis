@@ -1,0 +1,116 @@
+
+Instead of augmenting existing custom rotor actions with new information, SwipeCellKit appears to completely override them with the swipe actions that have been configured. Here's an example of what that looks like, this one from `SwipeTableViewCell+Accessibility.swift`:
+
+```Swift
+open override var accessibilityCustomActions: [UIAccessibilityCustomAction]? {
+        get {
+            guard let tableView = tableView, let indexPath = tableView.indexPath(for: self) else {
+                return super.accessibilityCustomActions
+            }
+            
+            let leftActions = delegate?.tableView(tableView, editActionsForRowAt: indexPath, for: .left) ?? []
+            let rightActions = delegate?.tableView(tableView, editActionsForRowAt: indexPath, for: .right) ?? []
+            
+            let actions = [rightActions.first, leftActions.first].compactMap({ $0 }) + rightActions.dropFirst() + leftActions.dropFirst()
+            
+            if actions.count > 0 {
+                return actions.compactMap({ SwipeAccessibilityCustomAction(action: $0,
+                                                                    indexPath: indexPath,
+                                                                    target: self,
+                                                                    selector: #selector(performAccessibilityCustomAction(accessibilityCustomAction:))) })
+            } else {
+                return super.accessibilityCustomActions
+            }
+        }
+        
+        set {
+            super.accessibilityCustomActions = newValue
+        }
+    }
+```
+
+For apps using custom cell designs that are unique enough they need more rotor actions, this, to put it mildly, really stinks, especially since its implementation in an extension makes it very difficult to override.
+
+To compound things, I suspect this accessibility use case is not unusual, since unique cell designs are exactly the kind of edge case that make using Apple's default swipe implementation problematic. 
+
+What I would propose is changing this code to either allow an injected additional set of custom rotor actions or reconfigure this code to add the swipe actions _on top of_ existing actions set by the subclassing cell. 
+
+Thoughts?
+It's my `SwipeAction`:
+
+```
+var options = SwipeOptions()
+options.expansionStyle = .destructive(automaticallyDelete: false)
+/---------------------
+let delete = SwipeAction(style: .destructive, title: deleteTitle) { action, indexPath in
+    for index in 0..<self.inboxHistories.count {
+        if let i = self.inboxHistories[index].index(of: history) {
+            if inboxHistories[index].count == 1 {
+                inboxHistories.remove(at: index)
+            } else {
+                self.inboxHistories[index].remove(at: i)
+            }
+            break
+        }
+    }
+    action.fulfill(with: .delete)
+}
+```
+
+`inboxHistories` is an 2D array that provides the sections and the data in sections.
+But when I try to delete one section (also try to delete the section that contains one element) from the array it crashes!
+When I use showSwipe with animation it works, yet with "animation: false" it doesn't.
+- Added property customView in SwipeAction
+
+Since all rules were following minimumButtonWidth the SwipeActionsView was readapted to auto-layout using the .frame variable in each action view.
+
+The SwipeActionButton now is inside some UIView that has the same behavior of contentRect calculated by SwipeActionButtonWrapperView. This allows setting constraints to enable SwipeActionsView to calculate the animations and perform the scroll effect
+I am using `SwipeCellKit` in a `UITableViewController` together with a side menu that is activated by a swipe from left to right. My `SwipeTableViewCell` only defines right items so I would expect swiping from right to left to show the `SwipeCellKit` actions and swipe from left to right to open the side menu.
+
+The problem is that `SwipeCellKit` takes precedents over the side menu and handles the swipe gesture for both left to right and right to left without checking if swipe actions are defined for that direction.
+
+I found this in `SwipeController` (https://github.com/SwipeCellKit/SwipeCellKit/blob/develop/Source/SwipeController.swift#L365):
+
+```swift
+if gestureRecognizer == panGestureRecognizer,
+    let view = gestureRecognizer.view,
+    let gestureRecognizer = gestureRecognizer as? UIPanGestureRecognizer {
+    let translation = gestureRecognizer.translation(in: view)
+    return abs(translation.y) <= abs(translation.x)
+}
+```
+
+I think the `return abs(translation.y) <= abs(translation.x)` should also check if there are actions defined for the currently handled direction. 
+
+Maybe something like this
+
+```swift
+if gestureRecognizer == panGestureRecognizer,
+    let view = gestureRecognizer.view,
+    let gestureRecognizer = gestureRecognizer as? UIPanGestureRecognizer {
+    let translation = gestureRecognizer.translation(in: view)
+
+    let canSwipeLeft = (delegate?.swipeController(self, editActionsForSwipeableFor: .right)?.count ?? 0) > 0
+    let canSwipeRight = (delegate?.swipeController(self, editActionsForSwipeableFor: .left)?.count ?? 0) > 0
+
+    switch (canSwipeLeft, canSwipeRight) {
+    case (true, true):
+        return abs(translation.y) <= abs(translation.x)
+    case (false, false):
+        return false
+    case (true, false):
+        // only if swipe is horizontal and either to the left or to the right but menu is already open (so it gets dismissed)
+        return abs(translation.y) <= abs(translation.x) && (translation.x < 0 || swipeable?.state == .right)
+    case (false, true):
+        // only if swipe is horizontal and either to the right or to the left but menu is already open (so it gets dismissed)
+        return abs(translation.y) <= abs(translation.x) && (translation.x > 0 || swipeable?.state == .left)
+    }
+}
+```
+In your MailExample app many actions are called when I select them at the same time. I have not found the previous issue, but if such a bug has already been, please tell me.
+![ezgif com-video-to-gif](https://user-images.githubusercontent.com/23062460/56197281-274cdc00-6041-11e9-9d55-b47f7f3c04cd.gif)
+
+
+Per #206. Border transmission in landscape on an iPhone X starts at safe inset instead of edge of screen.
+Hey, thank you for this awesome library. I'm trying to find a way so when the user swipes the cell the action occurs immediately so without giving the user a chance for the cell to stick and show the available options
+Fix button label vertical alignment per @snod comment on issue #66.

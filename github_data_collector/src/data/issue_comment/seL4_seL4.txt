@@ -1,0 +1,106 @@
+At https://github.com/seL4/seL4/blob/master/src/arch/x86/kernel/apic.c#L67, printf's first 2 placeholder strings have gotten reversed.
+Mainly at Arch_initFpu()'s CONFIG_XSAVE_XSAVES block (https://github.com/seL4/seL4/blob/master/src/arch/x86/machine/fpu.c#L86).
+
+1. Line#96: x86_wrmsr(IA32_XSS_MSR, desired_features). IA32_XSS_MSR is defined with typo value of 0xD0A, it should be 0xDA0. (https://github.com/seL4/seL4/blob/master/include/arch/x86/arch/machine.h#L36)
+
+2. The above variable desired_features does not have desired value. Because IA32_XSS MSR can only be set a few bits, other values will cause general-protection fault. (https://software.intel.com/sites/default/files/managed/a4/60/253665-sdm-vol-1.pdf#P320)
+
+3. Line#93 set nullFpuState->header.xcomp_bv. But its type xsave_state_t has mismatched size with XSAVE area. Based on Intel manual, its size should be 576 bytes - 512B legacy region plus 64B XSAVE header. But now it is only 532B as its legacy region(i387_state_t) has only 468 bytes.(https://github.com/seL4/seL4/blob/master/include/arch/x86/arch/machine/fpu.h#L25)
+
+And in these codes, some relevant names/comments look also none consistent with Intel manual. Maybe it is better to take a careful look at them thoroughly.
+According to the newest ACPI specification(version 6.3 https://uefi.org/sites/default/files/resources/ACPI_6_3_final_Jan30.pdf), RSDP structure can be found in either of the two places(section 5.2.5.1). One is at 0E0000h~0FFFFFh, the other is at the first 1KB of the Extended BIOS Data Area.
+
+https://github.com/seL4/seL4/blob/master/src/plat/pc99/machine/acpi.c#L177 function acpi_get_rsdp() implemented only the first one. To increase seL4 compatibility, we can add a little code just before line 181:
+```
+    unsigned long ebda = *(uint16_t *)0x40e;  // EBDA base address >> 4
+    ebda <<= 4;
+    if (ebda > 0x400)               // Linux use this value to validate the base address
+        for (addr = (char *)ebda; addr < (char *)ebda + 1024; addr += 16) {
+            if (strncmp(addr, acpi_str_rsd, 8) == 0) {
+                if (acpi_calc_checksum(addr, ACPI_V1_SIZE) == 0) {
+                    return (acpi_rsdp_t *)addr;
+                }
+            }
+        }
+```
+Hi,
+
+In boot stage, when memory map entries exceed limitation, https://github.com/seL4/seL4/blob/master/src/arch/x86/kernel/boot_sys.c#L572 will give a warning. The warning used a false format "%zd", it could be "%d".
+
+And the preceding alternation to multiboot_mmap_length is too early, for the printf wants its original value. Thus line 571 should follow the printf statement.
+
+Regards.
+Happy New Year again :-)
+
+Some low level console io functions like printf have bugs in file https://github.com/seL4/seL4/blob/master/src/machine/io.c.
+
+1.  print_unsigned_long_long() will print leading 0s of lower(right) 4 bytes after printing upper(left) 4 bytes. When all lower parts are 0s, it will break out in line 136 after testing shifts == 8. That means all lower parts have been done. But line 142 print_unsigned_long(lower, ui_base) will still be executed-printing another 0. Wrong. Line 136 should be:
+```
+    if (shifts == 7) {    // at least left 1 number to allow the next statement to deal
+```
+
+2. Like "%4d" format, vprintf() will print padding spaces after printing the argument value in line 268:
+```
+    n += print_spaces(nspaces - n);
+```
+But as nspaces counting padding request and n counting total printed, (nspaces - n) has no means. And most likely nspaces will be less than n. To patch this, it should append a temporary varible to record original n just after getting nspaces, then after printing the arg value:
+```
+    n += print_spaces(nspaces - (n - orig_n));
+```
+Here, print_spaces() should also be fixed.
+
+3. In line 32 of print_spaces(), it should return i instead of n(declare i outside for loop). Thus, whenever n>=0 or n<0, the return value will all be the correct result.
+
+4. In x86_64, sizeof(long)==8. When printf("%lu",l), the biggest value will be 20 decimals long. Now in line 72 of print_unsigned_long(), it just gives the buffer size sizeof(unsigned long) * 2 + 3 == 19.  So buffer maybe overflow.
+
+Wish these helpful.
+
+Regards.
+Happy New Year!
+
+In https://github.com/seL4/seL4/blob/master/src/arch/x86/kernel/cmdline.c#L136, cmdline_parse() wants to print information about arguments cmd_line and console_port. Because printf() eventually use x86KSdebugPort but not x86KSconsolePort to work, and x86KSdebugPort hasn't got meaningful value yet, so it failed.
+
+The most straightforward way to fix it is to give x86KSdebugPort the same value as x86KSconsolePort before #L136. But, as nobody in kernel tree use x86KSconsolePort, maybe it's better to remove it. 
+
+Regards.
+Merry Christmas!
+
+https://github.com/seL4/seL4/blob/master/src/arch/x86/64/head.S#L135 used wrong mask 0x800000 to test x86_64 PCID feature.
+
+According to Intel® 64 and IA-32 ArchitecturesSoftware Developer’s Manual Table 3-10(https://software.intel.com/sites/default/files/managed/ad/01/253666-sdm-vol-2a.pdf), bit 17 is PCID flag, its mask is 0x20000. So the above statement should be:
+```
+    andl $0x20000, %ecx
+```
+
+Regards.
+This adds the RISC-V PLIC driver for Ariane and updates the device tree.
+The following changes are made to ensure that invariants hold for IPC situations and to ensure that the receiver of an IPC does not need to trust a sender not to cause it to receive an IPC without an SC.
+
+Senders of IPCs to passive servers are not given any control as to
+whether SCs are donated so as to avoid the situation where a passive
+server expects an SC but ends up inactive with no SC due to misplaced
+trust in the sender.
+
+The new semantics for scheduling context donation are simply that if the
+sender has not timeout faulted, the receiver has no SC, and the sender
+has an SC then the sender's SC will be donated to the receiver.
+
+If the sender has an SC it is guaranteed to be ready on its core unless
+it is a time-out fault (in which case the SC won't be donated to the
+receiver).
+
+This ensures a receiver will never time-out fault but that it may become
+unschedulable if it ends up without an SC. To prevent this, trusted
+software should not remove scheduling contexts from TCBs blocked on send
+to endpoints serviced by passive servers.
+
+Additionally, scheduling contexts must be configured and ready to execute on the core for which they are configured in order to be bound to a TCB or notification. This ensures that notification objects and threads blocked on endpoints are configured such that a receive operation will lead to the receiver having no SC or a ready SC but never a unready / timed-out SC.
+
+The necessary updates to sel4test can be found in the sel4/sel4test#20 PR.
+
+So as to ensure that all TCBs in queues are either faulted, passive, or
+have schedulable SCs we cannot allow arbitrary SCs to be bound to TCBs
+that are already in queues.
+
+If a TCB is in a queue it should first be removed before having an SC
+bound to it.

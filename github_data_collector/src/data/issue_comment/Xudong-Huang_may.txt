@@ -1,0 +1,108 @@
+That is when I was running benchmark on my MacBook Pro (15-inch, 2018, i7, 16GB DDR4)
+![image](https://user-images.githubusercontent.com/350283/66992017-0e160c80-f104-11e9-9042-7487cfed0b4a.png)
+
+The result is 2.8x slower than 4190944 even it is running in release mode.
+What are the possible tunings I missed?
+Tokio is switching to a new scheduler implementation. Read ["Making the Tokio Scheduler 10x faster"](https://tokio.rs/blog/2019-10-scheduler/) for the details.
+
+As such, it would be nice if a new comparison/benchmark of between May and Tokio could take place, as it means that the 'Performance' section of the current README will become outdated.
+
+Using gdb or something else. It's quite important for debugging.
+Is there a performance comparison with go language?
+Just read https://www.usenix.org/system/files/fast19-kourtis.pdf and it makes a really compelling case for the combination of stackful coroutines + proper linux AIO (and eventually SPDK support). This is a combination I could actually imagine myself using in [sled](https://github.com/spacejam/sled), where I'm now trying to scale toward a many-core architecture, but don't want to pay the various ergonomic costs associated with the popular async stuff in the rust ecosystem right now.
+
+https://github.com/hmwill/tokio-linux-aio may be a nice reference for building linux AIO support for May.
+
+Would you be interested in having AIO support in May directly, or do you see this as something better implemented in a separate library? Very curious about this :)
+we can use this API to wrap the code that would run for a long time or would block a thread.
+
+when the API is invoked, the worker thread would become a normal thread, and it will kick another thread to continue scheduling on the worker queue.
+
+when the API is invoked in the IO thread, it would first re-scheduling to a worker thread.
+It would be great if there was a Postgres client library for may. Thanks for considering!
+could use a ReadV/WriteV extension trait for the new interface
+The current scheduler has the following problems:
+1) it needs configuration (workers, io_workers, run_on_io): it would be nicer if user does not need to configure anything and yet get maximum performance all the time
+2) it has a global ready list: scaling to anything other than a few cores and this will become a bottleneck
+3) timer thread is also global: another point of contention
+4) event loop is on a separate thread
+Both 3) and 4) cause unnecessary OS context switches whenever there is a timer expiry or I/O poll
+
+I propose the following design for a new scheduler which I plan to implement. This is a request for comments. My understanding of may is not that deep so it is possible that some things won't work :-)
+
+- may has N schedulers (S) where N is the number of CPUs of the machine
+- each S runs on its own kernel thread
+- each S has a single threaded eventloop (coros waiting for io) and a timerlist (coros waiting on timer)
+- each S has its own readylist which contains coroutines ready to run (crossbeam-deque: work-stealing)
+- each S has its own yieldlist (coros that yielded and can resume immediately)
+- may has a single list of parked threads (parked)
+- may has a counter of stealing threads (num_stealing)
+
+The scheduling loop will look like this:
+
+```rust
+loop {
+  // when yieldlist is not empty, this means we have coroutines the yielded but are ready to run.
+  // as such we do need to check the eventloop and return as fast as possible
+  let timeout = if !sched.yieldlist.empty() { 0 } else { sched.next_deadline() - now() };
+  while let Some(co) = yieldlist.pop_back() {
+    sched.readylist.push(co);
+  }
+  // select moves ready coroutines to the local readylist. each ready coroutine is pushed to the front
+  sched.eventloop.select(timeout);
+  // if we have more than 1 coroutine ready to run, and there are no threads stealing,
+  // and we have parked threads, unpark one to increase parallelism
+  if sched.readylist.len() > 1 && num_stealing.load(Ordering::Acquire) == 0 && !parked.empty() {
+    if let Some(t) = parked.pop() {
+      t.unpark();
+    }
+  }
+  // run all coros until readylist is empty
+  while let Some(co) = sched.readylist.pop() {
+    run_coroutine(co);
+  }
+  // we have cpu bound coroutines that yielded, restart the loop to make more coroutines ready/expire timers, etc.
+  if !select.yieldlist.empty() {
+    continue;
+  }
+  // we have no ready coroutines to run. time to steal!
+  assert!(sched.readlist.empty());
+  num_stealing.fetch_add(1, Ordering::Release);
+  // see implementation below
+  if sched.steal() {
+    continue;
+  }
+  // we didn't manage to steal anything, which means there is nothing to do.
+  num_stealing.fetch_sub(1, Ordering::Release);
+  parked.push(thread::current());
+  thread::park()
+}
+```
+
+To make stealing fast and avoid spurious park()/unpark() we spin for a while trying to steal and then give up.
+
+```rust
+fn steal(&mut self) {
+  let deadline = now() + 100ms;  // needs tuning
+  loop {
+    let id = rand() % N;  // random victim
+    if id == self.id {  // stealing from ourselves is silly :-p
+      continue;
+    } else {
+      let stolen = loop {
+        match schedules[id].readylist.steal() {
+          Steal::Empty => break None,
+          Steal::Data(co) => break Some(co),
+          Steal::Retry => {},
+      };
+      if let Some(co)  = stolen {
+        self.readylist.push(co);
+        return true;
+      }
+    }
+    if now() > deadline {
+      return false;
+    }
+  }
+}
+```

@@ -1,0 +1,497 @@
+fluid-lite子图修复了dnn中的bug，详见https://github.com/PaddlePaddle/Paddle-Lite/pull/2786  此处更新了lite的commit id.
+**本提交合并后，CI 将对新增代码 no_grad_set 字段的修改强制人工批准。该字段默认为空。**
+_（参见 @chenjiaoAngel https://github.com/PaddlePaddle/Paddle/pull/22351 ）_
+
+【消息示例】
+```
+0. You must have one RD (chenjiaoAngel (Recommend), luotao1 or phlrain) approval for the python/paddle/fluid/tests/unittests/white_list/no_grad_set_white_list.py, which manages the white list of no_grad_set without value in operators.
+
+Traceback (most recent call last):
+[11:21:34]	  File "test_fused_emb_seq_pool_op.py", line 58, in test_check_grad
+[11:21:34]	    ['W'], 'Out', no_grad_set=('Ids'), check_dygraph=False)
+[11:21:34]	  File "op_test.py", line 1258, in check_grad
+[11:21:34]	    user_defined_grads, check_dygraph)
+[11:21:34]	  File "op_test.py", line 1299, in check_grad_with_place
+[11:21:34]	    self.op_type + " Op.")
+[11:21:34]	AssertionError: no_grad_set must be None, op_type is fused_embedding_seq_pool Op.
+```
+
+【拦截示例】[(链接)](http://ci.paddlepaddle.org/viewLog.html?buildId=272699&tab=buildLog&buildTypeId=Paddle_PrCiCoverage&logTab=tree&filter=allhttp://ci.paddlepaddle.org/viewLog.html?buildId=272699&tab=buildLog&buildTypeId=Paddle_PrCiCoverage&logTab=tree&filter=all)
+<img width="734" alt="image" src="https://user-images.githubusercontent.com/38650344/72658366-f7c16a80-39ea-11ea-81de-7275093f88c9.png">
+- 环境信息
+    1）PaddlePaddle版本：paddle 1.5
+- 训练信息
+    1）单机，单卡
+    2）显存信息
+- 复现信息：模型部分代码大致如下：
+```
+# -*- coding: utf-8 -*-  
+import paddle.fluid as fluid
+import numpy as np
+
+
+class ConvBnLayer(fluid.dygraph.Layer):
+    def __init__(self, name_scope, num_filters, filter_size,
+                 stride=1, groups=1, act=None):
+        super(ConvBnLayer, self).__init__(name_scope)
+
+        self.conv2d = fluid.dygraph.Conv2D('conv2d', num_filters=num_filters, filter_size=filter_size,
+                                           stride=stride, padding=(filter_size - 1) // 2,
+                                           groups=groups, bias_attr=False,
+                                           param_attr=fluid.ParamAttr(name="weights"))
+        self.batch_norm = fluid.dygraph.BatchNorm(self.full_name(), num_filters, act=act)
+
+    def forward(self, inputs):
+        out = self.conv2d(inputs)
+        out = self.batch_norm(out)
+
+        return out
+
+
+class ShortCut(fluid.dygraph.Layer):
+    def __init__(self, name_scope, ch_out, stride):
+        super(ShortCut, self).__init__(name_scope)
+
+        self.ch_out = ch_out
+        self.stride = stride
+        self.conv = ConvBnLayer(self.full_name(), ch_out, 1, stride)
+
+    def forward(self, inputs):
+        ch_in = inputs.shape[1]
+        if ch_in != self.ch_out or self.stride != 1:
+            return self.conv(inputs)
+        else:
+            return inputs
+
+
+class BottleneckBlock(fluid.dygraph.Layer):
+    def __init__(self, name_scope, num_filters, stride):
+        super(BottleneckBlock, self).__init__(name_scope)
+
+        self.conv0 = ConvBnLayer(self.full_name(), num_filters,
+                                 filter_size=1,
+                                 act='relu')
+        self.conv1 = ConvBnLayer(self.full_name(), num_filters, filter_size=3,
+                                 stride=stride, act='relu')
+        self.conv2 = ConvBnLayer(self.full_name(), num_filters * 4, filter_size=1,
+                                 act=None)
+        self.short = ShortCut(self.full_name(), num_filters * 4, stride)
+
+    def forward(self, inputs):
+        out = self.conv0(inputs)
+        out = self.conv1(out)
+        out = self.conv2(out)
+
+        short = self.short(inputs)
+
+        return fluid.layers.elementwise_add(short, out, act='relu')
+
+
+class DecoderBlock(fluid.dygraph.Layer):
+    def __init__(self, name_scope, num_filters):
+        super(DecoderBlock, self).__init__(name_scope)
+
+        self.dimension_reduction = ConvBnLayer(self.full_name(), num_filters // 2,
+                                               filter_size=1, act='relu')
+
+        self.conv1 = ConvBnLayer(self.full_name(), num_filters // 2,
+                                 filter_size=3, stride=1, act='relu')
+
+        self.conv2 = ConvBnLayer(self.full_name(), num_filters // 2,
+                                 filter_size=3, stride=1, act='relu')
+
+    def forward(self, inputs, feature_map):
+        out = self.dimension_reduction(inputs)
+        b, c, w, h = out.shape
+
+        # 对out上采样
+        out = fluid.layers.resize_bilinear(out, out_shape=[w * 2, h * 2])
+        # 和feature_map拼接
+        out = fluid.layers.concat([out, feature_map], axis=1)
+
+        out = self.conv1(out)
+        out = self.conv2(out)
+        return out
+
+
+class Decoder(fluid.dygraph.Layer):
+    def __init__(self, name_scope):
+        super(Decoder, self).__init__(name_scope)
+
+        self.decode_1 = DecoderBlock(self.full_name(), 2048)
+        self.decode_2 = DecoderBlock(self.full_name(), 1024)
+        self.decode_3 = DecoderBlock(self.full_name(), 512)
+        self.decode_4 = ConvBnLayer(self.full_name(), 3, 1)
+
+    def forward(self, inputs, feature_map):
+        out = self.decode_1(inputs, feature_map[2])
+        out = self.decode_2(out, feature_map[1])
+        out = self.decode_3(out, feature_map[0])
+        out = self.decode_4(out)
+        return out
+
+
+class DisResNet(fluid.dygraph.Layer):
+    def __init__(self, name_scope, layers):
+        super(DisResNet, self).__init__(name_scope)
+
+        self.layers = layers
+        support_layers = [50, 101, 152]
+        assert layers in support_layers, \
+            "supported layers are {} but input layer is {}".format(support_layers, layers)
+
+        if layers == 50:
+            depth = [3, 4, 6, 3]
+        elif layers == 101:
+            depth = [1, 4, 23, 3]
+        else:
+            depth = [3, 8, 36, 3]
+        num_filters = [64, 128, 256, 512]
+
+        self.bottleneck_deep_list = []
+        for block in range(len(depth)):
+            bottleneck_block_list = []
+            for i in range(depth[block]):
+                bottleneck_block = BottleneckBlock(self.full_name(),
+                                                   num_filters=num_filters[block],
+                                                   stride=2 if i == 0 and block != 0 else 1)
+                bottleneck_block_list.append(bottleneck_block)
+            self.bottleneck_deep_list.append(bottleneck_block_list)
+
+        self.decoder = Decoder(self.full_name())
+        self.feature_map = []
+
+    def forward(self, inputs):
+        out = inputs
+
+        for bottleneck_block_list in self.bottleneck_deep_list:
+            for bottleneck_block in bottleneck_block_list:
+                out = bottleneck_block(out)
+            self.feature_map.append(out)
+
+        out = self.decoder(out, self.feature_map)
+
+        return out
+
+
+if __name__ == '__main__':
+    with fluid.dygraph.guard():
+        seresnext = DisResNet('seresnext', 50)
+        img = np.zeros([2, 3, 224, 224]).astype('float32')
+        label = np.zeros([2, 3, 224, 224]).astype('float32')
+        gt_box = [[30, 30], [60, 60]]
+        local_label = label[:, :, gt_box[0][0]:gt_box[1][0], gt_box[0][1]:gt_box[1][1]]
+        img = fluid.dygraph.to_variable(img)
+        label = fluid.dygraph.to_variable(label)
+        local_label = fluid.dygraph.to_variable(local_label)
+        outs = seresnext(img)
+
+        local_out = outs[:, :, gt_box[0][0]:gt_box[1][0], gt_box[0][1]:gt_box[1][1]]
+        loss = fluid.layers.square_error_cost(outs, label)
+        local_loss = fluid.layers.square_error_cost(local_out, local_label)
+        mean_loss = fluid.layers.mean(loss)
+        mean_local_loss = fluid.layers.mean(local_loss)
+
+        total_loss = 0.7 * mean_local_loss + 0.3 * mean_loss
+        total_loss.backward()
+        print(total_loss)
+```
+
+- 问题描述：训练中，每个step后显存都会增加，最后由于显存不够，程序终止
+![image](https://user-images.githubusercontent.com/20850734/72677532-51ec2980-3ad8-11ea-8eb6-e5550b229f17.png)
+
+
+
+update docker image of CI_py35 and CI_inference, because it has updated cmake version from 3.5.1 to 3.16.0 before.
+Hi, 
+
+Not sure why this happens. 
+
+I defined a class as following with fluid.dygraph.Layer. 
+
+```python
+class DeConv2D(fluid.dygraph.Layer):
+    def __init__(self,
+            name_scope,
+            num_filters=64,
+            filter_size=7,
+            stride=1,
+            stddev=0.02,
+            padding=[0,0],
+            outpadding=[0,0,0,0],
+            relu=True,
+            norm=True,
+            relufactor=0.0,
+            use_bias=False
+            ):
+        super(DeConv2D,self).__init__(name_scope)
+
+        if use_bias == False:
+            de_bias_attr = False
+        else:
+            de_bias_attr = fluid.ParamAttr(name="de_bias",initializer=fluid.initializer.Constant(0.0))
+
+        self._deconv = Conv2DTranspose(self.full_name(),
+                                        num_filters,
+                                        filter_size=filter_size,
+                                        stride=stride,
+                                        padding=padding,
+                                        param_attr=fluid.ParamAttr(
+                                            name="this_is_deconv_weights",
+                                            initializer=fluid.initializer.NormalInitializer(loc=0.0, scale=stddev)),
+                                        bias_attr=de_bias_attr)
+
+
+
+        if norm:
+            self.bn = BatchNorm(self.full_name(),
+                num_channels=num_filters,
+                param_attr=fluid.ParamAttr(
+                    name="de_wights",
+                    initializer=fluid.initializer.NormalInitializer(1.0, 0.02)),
+                bias_attr=fluid.ParamAttr(name="de_bn_bias",initializer=fluid.initializer.Constant(0.0)),
+                trainable_statistics=True)        
+        self.outpadding = outpadding
+        self.relufactor = relufactor
+        self.use_bias = use_bias
+        self.norm = norm
+        self.relu = relu
+
+    def forward(self,inputs):
+        #todo: add use_bias
+        #if self.use_bias==False:
+        with fluid.dygraph.guard():
+            conv = self._deconv(inputs)
+                  #else:
+            #    conv = self._deconv(inputs)
+            conv = fluid.layers.pad2d(conv, paddings=self.outpadding, mode='constant', pad_value=0.0)
+            conv = to_variable(conv)
+            if self.norm:
+                    conv = self.bn(conv)
+            if self.relu:
+                conv = fluid.layers.leaky_relu(conv,alpha=self.relufactor)
+        return conv
+```
+
+But I got the following error when I called this class with a generator defined as following:
+
+```python
+class generator(fluid.dygraph.Layer):
+    # Network Architecture is exactly same as in infoGAN (https://arxiv.org/abs/1606.03657)
+    # Architecture : FC1024_BR-FC7x7x128_BR-(64)4dc2s_BR-(1)4dc2s_S
+    # from the main, we can see that input_dim=62, input_size=32 and output_dim=1
+    def __init__(self, name_scope, input_dim=62, output_dim=1, input_size=32, norm=True):
+        super(generator, self).__init__(name_scope)
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.input_size = input_size
+
+        self.fc = Linear(name_scope=name_scope + '_fc', input_size=self.input_dim,
+                         output_size=128 * (self.input_size // 8) * (self.input_size // 8))
+        ##128 * (self.input_size // 8) * (self.input_size // 8)
+        if norm:
+            with fluid.dygraph.guard():
+                self.bn = BatchNorm(self.full_name(),
+                    num_channels=128 * (self.input_size // 8) * (self.input_size // 8),
+                    param_attr=fluid.ParamAttr(
+                        name="scale",
+                        initializer=fluid.initializer.NormalInitializer(1.0,0.02)),
+                    bias_attr=fluid.ParamAttr(
+                        name="bias",
+                        initializer=fluid.initializer.Constant(0.0)),
+                    trainable_statistics=True
+                    )
+
+        self.deconv = DeConv2D(self.full_name(),
+                               num_filters=128,
+                               filter_size=4,
+                               stride=2,
+                               stddev=0.02,
+                               padding=[1, 1],
+                               outpadding=[0, 1, 0, 1]
+                               )
+
+    def forward(self, input):
+        x = self.fc(input)
+        x = self.bn(x)
+        x = fluid.layers.relu(x)
+        x = fluid.layers.reshape(x, [-1, 128, (self.input_size // 8), (self.input_size // 8)])
+        x = self.deconv(to_variable(x))
+        #print('size of x in forward discriminator:{}'.format(x.shape))
+        return x
+```
+The error information is as follows. 
+
+PaddleCheckError: unsupported type <NULL>, must be Variable, list[Variable] or tuple[Variable] at [/paddle/paddle/fluid/pybind/imperative.cc:143]
+
+The error line is conv = self.bn(conv). 
+
+Thanks,
+This PR improves the `elementwise_add` MKL-DNN kernel's test code coverage.
+
+test=develop
+- 环境
+   1）PaddlePaddle版本：1.6.2
+   2）CPU：Intel(R) Xeon(R) CPU E5-2620 v2
+   3）GPU：no
+   4）系统环境：CentOS 6.3 ，Python版本 3.6.5
+
+- 问题描述
+看报错信息，问题出在了 `true_values = layers.elementwise_mul(value_enc, condition, axis=0)`
+打印出来 value_enc, condition 的shape 和 dtype 如下：
+```
+(-1, 1000, 10) VarType.FP32
+(-1, 1) VarType.FP32
+```
+看样子应该没有问题才对啊。具体出错日志如下：
+
+```
+/home/xx/paddle_env/lib/python3.6/site-packages/paddle/fluid/executor.py:779: UserWarning: The following exception is not an EOF exception.
+  "The following exception is not an EOF exception.")
+Traceback (most recent call last):
+  File ".../models/grammar/infer_decoder.py", line 592, in <module>
+    result = exe.run(feed=_data, fetch_list=outputs + (inputs, ))
+  File "/home/xx/paddle_env/.../.../utils/debug/executor.py", line 47, in run
+    return self.exe.run(fluid.default_main_program(), *args, **kwargs)
+  File "/home/xx/paddle_env/lib/python3.6/site-packages/paddle/fluid/executor.py", line 780, in run
+    six.reraise(*sys.exc_info())
+  File "/home/xx/paddle_env/lib/python3.6/site-packages/six.py", line 693, in reraise
+    raise value
+  File "/home/xx/paddle_env/lib/python3.6/site-packages/paddle/fluid/executor.py", line 775, in run
+    use_program_cache=use_program_cache)
+  File "/home/xx/paddle_env/lib/python3.6/site-packages/paddle/fluid/executor.py", line 822, in _run_impl
+    use_program_cache=use_program_cache)
+  File "/home/xx/paddle_env/lib/python3.6/site-packages/paddle/fluid/executor.py", line 899, in _run_program
+    fetch_var_name)
+paddle.fluid.core_avx.EnforceNotMet:
+
+--------------------------------------------
+C++ Call Stacks (More useful to developers):
+--------------------------------------------
+0   std::string paddle::platform::GetTraceBackString<std::string const&>(std::string const&, char const*, int)
+1   paddle::memory::detail::MetadataCache::load(paddle::memory::detail::MemoryBlock const*) const
+2   paddle::memory::detail::MemoryBlock::total_size(paddle::memory::detail::MetadataCache const&) const
+3   paddle::memory::detail::MemoryBlock::split(paddle::memory::detail::MetadataCache*, unsigned long)
+4   paddle::memory::detail::BuddyAllocator::SplitToAlloc(std::_Rb_tree_const_iterator<std::tuple<unsigned long, unsigned long, void*> >, unsigned long)
+5   paddle::memory::detail::BuddyAllocator::Alloc(unsigned long)
+6   void* paddle::memory::legacy::Alloc<paddle::platform::CPUPlace>(paddle::platform::CPUPlace const&, unsigned long)
+7   paddle::memory::allocation::NaiveBestFitAllocator::AllocateImpl(unsigned long)
+8   paddle::memory::allocation::AllocatorFacade::Alloc(paddle::platform::Place const&, unsigned long)
+9   paddle::memory::allocation::AllocatorFacade::AllocShared(paddle::platform::Place const&, unsigned long)
+10  paddle::memory::AllocShared(paddle::platform::Place const&, unsigned long)
+11  paddle::framework::Tensor::mutable_data(paddle::platform::Place, paddle::framework::proto::VarType_Type, unsigned long)
+12  paddle::operators::ElementwiseMulKernel<paddle::platform::CPUDeviceContext, float>::Compute(paddle::framework::ExecutionContext const&) const
+13  std::_Function_handler<void (paddle::framework::ExecutionContext const&), paddle::framework::OpKernelRegistrarFunctor<paddle::platform::CPUPlace, false, 0ul, paddle::operators::ElementwiseMulKernel<paddle::platform::CPUDeviceContext,
+float>, paddle::operators::ElementwiseMulKernel<paddle::platform::CPUDeviceContext, double>, paddle::operators::ElementwiseMulKernel<paddle::platform::CPUDeviceContext, int>, paddle::operators::ElementwiseMulKernel<paddle::platform::CPUDe
+viceContext, long> >::operator()(char const*, char const*, int) const::{lambda(paddle::framework::ExecutionContext const&)#1}>::_M_invoke(std::_Any_data const&, paddle::framework::ExecutionContext const&)
+14  paddle::framework::OperatorWithKernel::RunImpl(paddle::framework::Scope const&, paddle::platform::Place const&, paddle::framework::RuntimeContext*) const
+15  paddle::framework::OperatorWithKernel::RunImpl(paddle::framework::Scope const&, paddle::platform::Place const&) const
+16  paddle::framework::OperatorBase::Run(paddle::framework::Scope const&, paddle::platform::Place const&)
+17  paddle::framework::Executor::RunPreparedContext(paddle::framework::ExecutorPrepareContext*, paddle::framework::Scope*, bool, bool, bool)
+18  paddle::framework::Executor::Run(paddle::framework::ProgramDesc const&, paddle::framework::Scope*, int, bool, bool, std::vector<std::string, std::allocator<std::string> > const&, bool)
+
+------------------------------------------
+Python Call Stacks (More useful to users):
+------------------------------------------
+  File "/home/xx/paddle_env/lib/python3.6/site-packages/paddle/fluid/framework.py", line 2488, in append_op
+    attrs=kwargs.get("attrs", None))
+  File "/home/xx/paddle_env/lib/python3.6/site-packages/paddle/fluid/layer_helper.py", line 43, in append_op
+    return self.main_program.current_block().append_op(*args, **kwargs)
+  File "/home/xx/paddle_env/lib/python3.6/site-packages/paddle/fluid/layers/nn.py", line 14055, in _elementwise_op
+    'use_mkldnn': use_mkldnn})
+  File "/home/xx/paddle_env/lib/python3.6/site-packages/paddle/fluid/layers/nn.py", line 14452, in elementwise_mul
+    return _elementwise_op(LayerHelper('elementwise_mul', **locals()))
+  File "/home/xx/paddle_env/.../.../models/grammar/nets.py", line 158, in _select_value
+    true_values = layers.elementwise_mul(value_enc, condition, axis=0)
+  File "/home/xx/paddle_env/.../.../models/grammar/nets.py", line 245, in grammar_output
+    select_v_output = _select_value(cond_select_v, inputs, value_enc, value_len, zero_output, ptr_net, grammar)
+  File ".../models/grammar/infer_decoder.py", line 444, in _output_layer
+    return self._fn_output(inputs, actions, gmr_mask, self._decode_vocab, self._grammar)
+  File ".../models/grammar/infer_decoder.py", line 379, in _grammar_step
+    logits = self._output_layer(logits, actions, gmr_mask)
+  File ".../models/grammar/infer_decoder.py", line 179, in step
+    decode_outputs, decode_states = self._grammar_step(cell_outputs, next_cell_states, states, actions, gmr_mask)
+  File ".../models/grammar/infer_decoder.py", line 576, in <module>
+    outputs, states, next_input = decoder.step(time=None, inputs=inputs, states=states, actions=actions, gmr_mask=gmr_mask)
+
+----------------------
+Error Message Summary:
+----------------------
+Error: Paddle internal Check failed. (Please help us create a new issue, here we need to find the developer to add a user friendly error message)
+  [Hint: Expected desc->check_guards() == true, but received desc->check_guards():0 != true:1.] at (/paddle/paddle/fluid/memory/detail/meta_cache.cc:33)
+  [operator < elementwise_mul > error]
+terminate called after throwing an instance of 'paddle::platform::EnforceNotMet'
+  what():
+
+--------------------------------------------
+C++ Call Stacks (More useful to developers):
+--------------------------------------------
+0   std::string paddle::platform::GetTraceBackString<std::string const&>(std::string const&, char const*, int)
+1   paddle::memory::detail::MetadataCache::load(paddle::memory::detail::MemoryBlock const*) const
+2   paddle::memory::detail::MemoryBlock::type(paddle::memory::detail::MetadataCache const&) const
+3   paddle::memory::detail::BuddyAllocator::Free(void*)
+4   void paddle::memory::legacy::Free<paddle::platform::CPUPlace>(paddle::platform::CPUPlace const&, void*, unsigned long)
+5   paddle::memory::allocation::NaiveBestFitAllocator::FreeImpl(paddle::memory::allocation::Allocation*)
+6   std::_Sp_counted_base<(__gnu_cxx::_Lock_policy)2>::_M_release()
+7   paddle::framework::Variable::PlaceholderImpl<paddle::framework::LoDTensor>::~PlaceholderImpl()
+8   paddle::framework::Scope::~Scope()
+9   paddle::framework::Scope::DropKids()
+10  paddle::framework::Scope::~Scope()
+11  paddle::framework::ScopePool::DeleteScope(paddle::framework::Scope*)
+12  paddle::framework::ScopePool::Clear()
+
+
+----------------------
+Error Message Summary:
+----------------------
+Error: Paddle internal Check failed. (Please help us create a new issue, here we need to find the developer to add a user friendly error message)
+  [Hint: Expected desc->check_guards() == true, but received desc->check_guards():0 != true:1.] at (/paddle/paddle/fluid/memory/detail/meta_cache.cc:33)
+
+W0117 21:11:13.445998 32227 init.cc:206] *** Aborted at 1579266673 (unix time) try "date -d @1579266673" if you are using GNU date ***
+W0117 21:11:13.447896 32227 init.cc:206] PC: @                0x0 (unknown)
+W0117 21:11:13.447973 32227 init.cc:206] *** SIGABRT (@0x1f400007de3) received by PID 32227 (TID 0x7fa3cf61a700) from PID 32227; stack trace: ***
+W0117 21:11:13.449512 32227 init.cc:206]     @     0x7fa3cf1f1160 (unknown)
+W0117 21:11:13.451095 32227 init.cc:206]     @     0x7fa3ce75f3f7 __GI_raise
+W0117 21:11:13.452637 32227 init.cc:206]     @     0x7fa3ce7607d8 __GI_abort
+W0117 21:11:13.453466 32227 init.cc:206]     @     0x7fa3862f5c65 __gnu_cxx::__verbose_terminate_handler()
+W0117 21:11:13.454200 32227 init.cc:206]     @     0x7fa3862f3e06 __cxxabiv1::__terminate()
+W0117 21:11:13.454921 32227 init.cc:206]     @     0x7fa3862f2ec9 __cxa_call_terminate
+W0117 21:11:13.455674 32227 init.cc:206]     @     0x7fa3862f3a7a __gxx_personality_v0
+W0117 21:11:13.456523 32227 init.cc:206]     @     0x7fa3a15d1853 _Unwind_RaiseException_Phase2
+W0117 21:11:13.457386 32227 init.cc:206]     @     0x7fa3a15d1d87 _Unwind_Resume
+W0117 21:11:13.458170 32227 init.cc:206]     @     0x7fa376bf100d paddle::memory::detail::BuddyAllocator::Free()
+W0117 21:11:13.460266 32227 init.cc:206]     @     0x7fa376be3cb5 paddle::memory::legacy::Free<>()
+W0117 21:11:13.461257 32227 init.cc:206]     @     0x7fa376be43d5 paddle::memory::allocation::NaiveBestFitAllocator::FreeImpl()
+W0117 21:11:13.461984 32227 init.cc:206]     @     0x7fa3753a4bc9 std::_Sp_counted_base<>::_M_release()
+W0117 21:11:13.462761 32227 init.cc:206]     @     0x7fa3753a5658 paddle::framework::Variable::PlaceholderImpl<>::~PlaceholderImpl()
+W0117 21:11:13.463474 32227 init.cc:206]     @     0x7fa376bbdadd paddle::framework::Scope::~Scope()
+W0117 21:11:13.464776 32227 init.cc:206]     @     0x7fa376bbd9f1 paddle::framework::Scope::DropKids()
+W0117 21:11:13.465487 32227 init.cc:206]     @     0x7fa376bbda5d paddle::framework::Scope::~Scope()
+W0117 21:11:13.466053 32227 init.cc:206]     @     0x7fa3755c67f6 paddle::framework::ScopePool::DeleteScope()
+W0117 21:11:13.466992 32227 init.cc:206]     @     0x7fa3755c6851 paddle::framework::ScopePool::Clear()
+W0117 21:11:13.467104 32227 init.cc:206]     @           0x4b123f capsule_dealloc
+W0117 21:11:13.467195 32227 init.cc:206]     @           0x49870f free_keys_object
+W0117 21:11:13.467284 32227 init.cc:206]     @           0x499aa9 dict_tp_clear
+W0117 21:11:13.467351 32227 init.cc:206]     @           0x43d432 collect
+W0117 21:11:13.467555 32227 init.cc:206]     @           0x43e0e1 _PyGC_CollectNoFail
+W0117 21:11:13.467746 32227 init.cc:206]     @           0x567b54 PyImport_Cleanup
+W0117 21:11:13.467803 32227 init.cc:206]     @           0x4228f8 Py_FinalizeEx.part.3
+W0117 21:11:13.467970 32227 init.cc:206]     @           0x43c0c5 Py_Main
+W0117 21:11:13.468165 32227 init.cc:206]     @           0x41e672 main
+W0117 21:11:13.469758 32227 init.cc:206]     @     0x7fa3ce74bbd5 __libc_start_main
+W0117 21:11:13.470021 32227 init.cc:206]     @           0x41e731 (unknown)
+W0117 21:11:13.471513 32227 init.cc:206]     @                0x0 (unknown)
+
+Command terminated
+
+```
+- 修复python2的打印为python3的形式
+- 另外修复了多余的空格
+
+用coco数据集、shufflenetv2-ssd，也就是轻量级竞赛里的内容，epoch_num =8 或10，训练出的模型，使用score.py评分时报内存异常，提交到百度后台大概半小时左右可以出成绩（之前正常模型十几分钟），异常截图如下。同样代码和数据epoch_num=1训练出的模型评分正常。
+aistudio（paddle 1.5.0）和本地（1.6.1）都出。
+
+![QQ图片20200117152008](https://user-images.githubusercontent.com/53244607/72595768-87acd900-3945-11ea-871f-5a1d5be39f5f.jpg)
+![image](https://user-images.githubusercontent.com/53244607/72595856-b925a480-3945-11ea-981c-5c4c560aa5cb.png)
+
+

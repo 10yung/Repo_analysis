@@ -1,0 +1,504 @@
+
+[DynamicConcurrencyLimit.zip](https://github.com/MassTransit/MassTransit/files/4077426/DynamicConcurrencyLimit.zip)
+### Is this a bug report?
+
+Yes
+
+### Can you also reproduce the problem with the latest version?
+
+Yes
+
+
+### Environment
+
+1. Operating system: Windows
+2. Visual Studio version: 2019 16.3.10
+3. Dotnet version: dotnet core 3.1
+
+### Steps to Reproduce
+
+1. Configure a consumer with a `ConcurrentMessageLimit` of 3. Configure the management endpoint and add a `RequestClient` in order to dyanmically alter the `ConcurrentMessageLimit` using the `SetConcurrencyLimit` event.
+
+```
+        public void ConfigureServices(IServiceCollection services)
+        {
+            // ...
+                        
+            services.AddMassTransit(ConfigureMassTransit);
+            
+            // ...
+        }
+
+        private IBusControl CreateBus(IServiceProvider serviceProvider)
+        {
+            return Bus.Factory.CreateUsingAzureServiceBus(cfg =>
+            {
+                IServiceBusHost host = cfg.Host(Configuration.GetConnectionString("AzureServiceBus"), hostConfig => { });
+
+                var managementEndpoint = cfg.ManagementEndpoint();
+
+                cfg.ReceiveEndpoint("example-message-endpoint",
+                    ec =>
+                    {
+                        ec.Consumer<ExampleMessageConsumer>(cc =>
+                        {
+                            cc.UseConcurrentMessageLimit(3, managementEndpoint, "example-message-endpoint");
+                        });
+                    });
+            });
+        }
+
+        private void ConfigureMassTransit(IServiceCollectionConfigurator serviceCollection)
+        {
+            serviceCollection.AddBus(CreateBus);
+            serviceCollection.AddConsumer<ExampleMessageConsumer>();
+            serviceCollection.AddRequestClient<SetConcurrencyLimit>();
+        }
+```
+
+2. Make a request using the `RequestClient` to change the concurrency limit to 1:
+```
+await _requestClient.GetResponse<ConcurrencyLimitUpdated>(new
+               {
+                   Id = "example-message-endpoint",
+                   ConcurrencyLimit = 1,
+                   Timestamp = DateTime.UtcNow
+               });
+```
+
+3. Make another request using the `RequestClient` to change the concurrency limit to 1 again.
+
+
+### Expected Behavior
+
+The concurrency limit is unchanged as is being changed from 1 to 1.
+
+### Actual Behavior
+
+`MassTransit.RequestTimeoutException: 'Timeout waiting for response, RequestId: xxx`
+
+I think the issue might be in the `ConcurrencyLimiter` code. The `_concurrencyLimit` field is never updated from its initialised value. This means that any time a request is made to update the concurreny limit, the `previousLimit` is always set to the initialised value.
+
+In the above example, the `previousLimit` is set to 3 (though it should be 1). The `_limit.CurrentCount` is 1.
+
+The first `WaitAsync()` on the `_limit` reduces the `_limit.CurrentCount` to 0. The second causes the timeout.
+
+```
+try
+                    {
+                        var concurrencyLimit = context.Message.ConcurrencyLimit;
+                        if (concurrencyLimit < 1)
+                            throw new ArgumentOutOfRangeException(nameof(concurrencyLimit), "The concurrency limit must be >= 1");
+
+                        var previousLimit = _concurrencyLimit;
+                        if (concurrencyLimit > previousLimit)
+                            _limit.Release(concurrencyLimit - previousLimit);
+                        else
+                            for (; previousLimit > concurrencyLimit; previousLimit--)
+                                await _limit.WaitAsync().ConfigureAwait(false);
+
+                        _lastUpdated = context.Message.Timestamp;
+
+                        await context.RespondAsync<ConcurrencyLimitUpdated>(new
+                        {
+                            Timestamp = DateTime.UtcNow,
+                            context.Message.Id,
+                            context.Message.ConcurrencyLimit
+                        }).ConfigureAwait(false);
+
+                        LogContext.Debug?.Log("Set Consumer Limit: {ConcurrencyLimit} ({CommandId})", context.Message.ConcurrencyLimit, context.Message.Id);
+                    }
+``````
+
+### Proposed solution
+
+Set the _concurrencyLimit after it has been updated, e.g.
+
+```
+try
+                    {
+                        var concurrencyLimit = context.Message.ConcurrencyLimit;
+                        if (concurrencyLimit < 1)
+                            throw new ArgumentOutOfRangeException(nameof(concurrencyLimit), "The concurrency limit must be >= 1");
+
+                        var previousLimit = _concurrencyLimit;
+                        if (concurrencyLimit > previousLimit)
+                            _limit.Release(concurrencyLimit - previousLimit);
+                        else
+                            for (; previousLimit > concurrencyLimit; previousLimit--)
+                                await _limit.WaitAsync().ConfigureAwait(false);
+
+                        _lastUpdated = context.Message.Timestamp;
+                        _concurrencyLimit = concurrencyLimit; // Set the concurrency limit here
+
+                        await context.RespondAsync<ConcurrencyLimitUpdated>(new
+                        {
+                            Timestamp = DateTime.UtcNow,
+                            context.Message.Id,
+                            context.Message.ConcurrencyLimit
+                        }).ConfigureAwait(false);
+
+                        LogContext.Debug?.Log("Set Consumer Limit: {ConcurrencyLimit} ({CommandId})", context.Message.ConcurrencyLimit, context.Message.Id);
+                    }
+```
+
+### Reproducible Demo
+
+1. Run the app. Concurrency is initialised to 3.
+2. Make a POST request to `https://localhost:5001/concurrency/1` to update the concurrency to 1 (should get a 200).
+3. Make the same request again. This request will timeout.
+
+Thanks,
+<!--
+  PLEASE READ THE FIRST SECTION :-)
+-->
+
+### Is this a bug report?
+
+Yes
+
+<!--
+  If you answered "Yes":
+  
+    Please note that your issue will be fixed much faster if you spend about
+    half an hour preparing it, including the exact reproduction steps and a demo.
+    
+    If you're in a hurry or don't feel confident, it's fine to report bugs with
+    less details, but this makes it less likely they'll get fixed soon.
+
+    In either case, please fill as many fields below as you can.
+
+  If you answered "No":
+
+    If this is a question or a discussion, please use [StackOverflow](https://stackoverflow.com/questions/tagged/masstransit) or [MT mailing list for questions](https://groups.google.com/forum/#!forum/masstransit-discuss)
+-->
+
+
+### Can you also reproduce the problem with the latest version?
+
+yes
+
+### Environment
+
+<!--
+  Please fill in all the relevant fields.
+-->
+
+1. Operating system: Docker linux (centos 7)
+2. Visual Studio version: 2017
+3. Dotnet version: Core 2.2
+
+### Steps to Reproduce
+
+<!--
+  How would you describe your issue to someone who doesn’t know you or your project?
+  Try to write a sequence of steps that anybody can repeat to see the issue.
+-->
+
+1.  Create an Interface Data Contract AEvent  
+    public interface AEvent  {}
+2.  Create an Interface Data Contract BEvent inheriting AEvent  
+    public interface BEvent : AEvent  {}
+3.  Configure Publish for AEvent  and BEvent so that exchange type are "topic" 
+    IRabbitMqBusFactoryConfigurator..Publish<AEvent  >(x => x.ExchangeType = topic);
+    IRabbitMqBusFactoryConfigurator..Publish<BEvent >(x => x.ExchangeType = topic);
+4. Add Consumers for AEvent   and BEvent with a routing key
+5. Publish a BEvent message with the same routing key
+
+=> BEvent Consumer receives the message but not AEvent  Consumer
+
+### Actual Behavior
+
+<!--
+  Did something go wrong?
+  Is something broken, or not behaving as you expected?
+  Please attach screenshots if possible! They are extremely helpful for diagnosing issues.
+-->
+
+AEvent Exchange  is bound to BEvent Exchange  without any routing key
+
+### Expected Behavior
+
+AEvent Exchange should be bound to BEvent Exchange with "#" routing key in case of topic exchange.
+
+(but such things won't help with "direct" echanges ...)
+
+However a warning about this in [https://masstransit-project.com/advanced/topology/rabbitmq.html#hierarchical-exchange-layout](https://masstransit-project.com/advanced/topology/rabbitmq.html#hierarchical-exchange-layout) should be nice
+
+(Thanks for you time !)
+
+We use `services.AddMassTransit` to configure MassTransit. To test the behavior if RabbitMQ service is down at startup, I stopped the service and ran the .net core 3 web api. The following is the result.
+It complains about unreachable Broker, nothing works during this time service and healthcheck endpoints of the api are unreachable. When I start the service, Kestrel initializes and service starts to work as desired. 
+
+Question 1 : How to initialize and run the api like normal under this situation. This means controllers and healthchecks would be running.
+
+Question 2 : Is there a .net core 3 sample that demonstrates, health check implementation on MassTransit.
+```
+RabbitMQ Connect Failed: Broker unreachable: admin@localhost:5672/myapp
+RabbitMQ Connect Failed: Broker unreachable: admin@localhost:5672/myapp
+RabbitMQ Connect Failed: Broker unreachable: admin@localhost:5672/myapp
+RabbitMQ Connect Failed: Broker unreachable: admin@localhost:5672/myapp
+RabbitMQ Connect Failed: Broker unreachable: admin@localhost:5672/myapp
+------- Start RabbitMQ service-----
+RabbitMQ Connect Failed: Broker unreachable: admin@localhost:5672/myapp
+warn: Microsoft.AspNetCore.Server.Kestrel[0]
+      Overriding address(es) 'http://localhost:8110'. Binding to endpoints defined in UseKestrel() instead.
+```
+### Is this a bug report?
+
+YES.
+
+### Can you also reproduce the problem with the latest version?
+
+YES.
+
+### Steps to Reproduce
+
+1.  Create a typical message customer throwing exception.
+2.  Add `.UseScheduledRedelivery()` filter.
+3.  Send a message. It should fail several times and then be moved on the error queue.
+
+### Expected Behavior
+
+MT adds a tone of useful headers to the message, all starting with the prefix `MT-*`. They should all appear in message's payload `Headers` property as well as in SQS's "message attributes" unless this newly added `AllowTransportHeader` filter states otherwise.
+
+### Actual Behavior
+
+Actual message on the queue has some headers only in message body and some only in message attributes:
+
+```
+Payload:
+
+{
+  "messageId": "eb800000-857f-0205-2274-08d7822ceb48",
+  "conversationId": "eb800000-857f-0205-3ea1-08d7822ce6fd",
+  "sourceAddress": "amazonsqs://eu-central-1/my-tmp?durable=false&autodelete=true",
+  "destinationAddress": "amazonsqs://eu-central-1/dev-krzlab-plgrd-rec",
+  "messageType": [
+    "urn:message:WebApp:MyMsg"
+  ],
+  "message": {
+    "payload": "throw"
+  },
+  "sentTime": "2019-12-16T13:36:13.3759604Z",
+  "headers": {
+    "MT-Scheduling-DeliveredAddress": "amazonsqs://eu-central-1/dev-krzlab-plgrd-rec",
+    "MT-Redelivery-Count": 3
+  },
+  "host": {
+    ...
+  }
+}
+
+Message Attributes:
+
+Content-Type: application/vnd.masstransit+json
+MT-Fault-Message: EXCEPTION MESSAGE
+MT-Reason: fault
+```
+
+### Reproducible Demo
+
+``` lang-cs
+c.AddBus(provider => Bus.Factory.CreateUsingAmazonSqs(bfc =>
+{
+    bfc.UseAmazonSqsMessageScheduler();
+    
+    bfc.Host("eu-central-1", hc =>
+    {
+        hc.AccessKey("...");
+        hc.SecretKey("...");
+    });
+
+    bfc.ReceiveEndpoint("dev-krzlab-plgrd-rec", rec =>
+    {
+        rec.UseScheduledRedelivery(r => r.Interval(3, TimeSpan.FromSeconds(2)));
+        rec.UseInMemoryOutbox();
+        rec.Consumer<MyMsgConsumer>(provider);
+    });
+}));
+
+public class MyMsgConsumer : IConsumer<MyMsg>
+{
+    public async Task Consume(ConsumeContext<MyMsg> context)
+    {
+        throw new Exception("EXCEPTION MESSAGE");
+    }
+}
+```
+<!--
+Thank you for sending the PR!
+
+If you changed any code, please provide us with clear instructions on how you verified your changes work. Bonus points for screenshots!
+
+Happy contributing!
+-->
+
+Mostly fairly simple. I'm not that happy with the code for custom queries, but I didn't work too hard as it might be a good idea to pull it, since the other providers don't support it and there are other ways of loading related data.
+
+Tests are green.
+
+Relates to  #1628
+Currently the `EntityFrameworkSagaRepository` is based on Entity Framework Core 2.2 and there are a few breaking changes. It's not possible to use this in a project based on Entity Framework Core 3.x. However, it shouldn't be difficult to take this code and update it to 3.x, probably 3.1 since it's compatible again with .NET Standard 2.0. I'd suggest adding a new project and keeping the 2.2 project around as I'm sure many people are not yet ready to move to 3.1.
+
+I'd like to create this issue for any discussion related to this if that's okay.
+
+Related: #1596
+Create extension methods for the registration configurator (invoked via the `.AddMassTransit` container extension method) for the supported saga repositories so that they can easily be configured for the configured sagas (including state machine sagas).
+
+This would configure the persistence components in the container so that they are properly resolved as the endpoints are configured. Should support an easy way to say "for all my sagas, use this" and let the registration sort it out (generics, vs explicit registrations, etc.).
+
+## Storage Engines
+
+- [ ] In Memory
+- [ ] NHiberate
+- [ ] Entity Framework
+- [ ] MongoDB
+- [ ] Redis
+- [ ] Marten
+- [ ] DocumentDb
+- [ ] Dapper
+- [ ] Azure Session State
+
+## Repository Changes
+
+Migrate the existing implementations to a new set of saga repository interfaces.
+
+`ISagaRepositoryContextFactory<TContext>`
+
+Used to created a _SagaRepositoryContext<TContext>_ for each received message.
+
+`ISagaConsumeContextFactory<TContext, TSaga, TMessage>`
+
+Used to create a _SagaConsumeContext<TSaga, TMessage>_ for a saga instance that has been loaded from storage or created by an initiating message.
+
+`ISagaQueryContextFactory<TContext, TSaga, TMessage>`
+
+Used to create a _SagaQueryContext<TSaga, TMessage>_ for a message to query the repository.
+
+`ISagaRepository<TSaga>`
+
+Should remain mostly unchanged, but would have a standard implementation that uses the above interfaces to manage the repository interaction and focus purely on the saga behavior details (and dry up the saga repositories).        
+
+## Bonus Features
+
+- [ ] Use a bus observer to connect/disconnect database connections for saga repositories when the bus is started/stopped, so that a failing connection _might_ stop the bus from starting.
+
+Possible syntax may include (all within the configuration block):
+
+```cs
+namespace NewRegistration
+{
+    public static class Program
+    {
+        public static void Main()
+        {
+            builder.AddMassTransit(cfg =>
+            {
+                // see below
+            });
+        }
+    }    
+}
+```
+
+Configure the saga for an in-memory repository:
+
+```cs
+cfg.AddSaga<SimpleSaga>()
+    .InMemoryRepository();
+```
+
+Configure using entity framework:
+
+```cs
+cfg.AddStateMachineSaga<MyMachine, MyInstance>()
+    .EntityFrameworkRepository(ef =>
+    {
+        ef.Connection("localhost", "test-database");
+
+        ef.SomethingElse();
+    });
+```
+
+Updated: Changed to shorter syntax
+
+Thoughts?
+### Is this a bug report?
+
+Yes
+
+### Can you also reproduce the problem with the latest version?
+
+Yes
+
+### Environment
+
+1. Operating system: Windows 2016 Core
+2. Visual Studio version: 2019
+3. Dotnet version: .NET Core 2.2
+
+### Steps to Reproduce
+
+(Write your steps here:)
+
+1. Create Turnout endpoint with TurnoutEndpoint<> extension
+2. Set PartitionCount on ServiceConfigurator to 1
+3. Create multiple messages
+
+### Expected Behavior
+
+The total amount of concurrent messages being handled = 1
+
+### Actual Behavior
+
+The actual amount of concurrent messages being handled = 10
+First I thought this would be my processor count, but that's actually 12.
+
+### Reproducible Demo
+
+A demo would require an active Service Bus instance from Azure. The code is pretty simple:
+Just add one or more calls to TurnoutEndpoint and add messages to the queue
+
+Support simple URN-style addresses for resolving send endpoints (which use the current host, rather than requiring it to be specified explicitly).
+
+Examples include: `queue:input-queue` or `topic:OrderStatusUpdates`.
+
+Can also include query parameters, such as `?durable=false&autodelete=true`.
+
+Add extension methods which can be used to build the URI to resolve a send endpoint for the transport.
+
+- [ ] RabbitMQ
+  - [x] Support `exchange:name?` endpoint name
+  - [x] Support `queue:name?` endpoint name
+
+```
+public static Task<ISendEndpoint> GetSendEndpoint(this ISendEndpointProvider provider, string exchangeName, 
+	ExchangeType exchangeType = default,
+	bool durable = true,
+	bool autoDelete = false,
+	bool bindQueue = false,
+	string queueName = default)
+{
+}
+```
+
+- [ ] Azure Service Bus
+  - [x] Support `queue:name`
+  - [ ] Support `topic:name`
+
+```
+public static Task<ISendEndpoint> GetSendEndpoint(this ISendEndpointProvider provider, 
+	string queueName = default,
+	string topicName = default)
+{
+}
+```
+
+- [x] ActiveMQ
+  - [x] Support `queue:name`
+  - [x] Support `topic:name`
+
+- [x] Amazon SQS
+  - [x] Support `queue:name`
+  - [ ] Support `topic:name`

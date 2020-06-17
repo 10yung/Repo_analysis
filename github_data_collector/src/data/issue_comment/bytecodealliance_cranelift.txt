@@ -1,0 +1,141 @@
+This code works fine on Ubuntu 18.04. Note that the segfault comes before main.
+
+I am using cranelift, cranelift-object, cranelift-module 0.54.
+
+```
+function u0:0() -> i32 system_v {
+    gv0 = symbol colocated u1:0
+    sig0 = (i64) -> i32 system_v
+    fn0 = u0:0 sig0
+
+ebb0:
+    v0 = global_value.i64 gv0
+    v1 = load.i64 v0
+    v2 = call fn0(v1)
+    v3 = iconst.i32 0
+    return v3
+}
+```
+
+```
+$ target/debug/rcc
+int puts(const char *s);
+static const char *index_page = "index.html";
+int main() {
+    puts(index_page);
+}
+$ ./a.out
+Segmentation fault
+$ gdb
+(gdb) break main
+Breakpoint 1 at 0x119a
+(gdb) run
+Starting program: /home/joshua/src/rcc/a.out 
+
+Program received signal SIGSEGV, Segmentation fault.
+0x00007ffff7fc408c in ?? () from /lib/ld-musl-x86_64.so.1
+(gdb) where
+#0  0x00007ffff7fc408c in ?? () from /lib/ld-musl-x86_64.so.1
+#1  0x0000000000000000 in ?? ()
+```
+
+```
+$ target/debug/rcc -c -o a.o  # this means compile to object file but don't link
+int puts(const char *s);
+static const char *index_page = "index.html";
+int main() {
+    puts(index_page);
+}
+$ objdump -rd a.o
+
+a.o:     file format elf64-x86-64
+
+
+Disassembly of section .text:
+
+0000000000000000 <main>:
+   0:	40 55                	rex push %rbp
+   2:	48 89 e5             	mov    %rsp,%rbp
+   5:	48 8d 05 00 00 00 00 	lea    0x0(%rip),%rax        # c <main+0xc>
+			8: R_X86_64_PC32	index_page-0x4
+   c:	48 8b 00             	mov    (%rax),%rax
+   f:	48 89 c7             	mov    %rax,%rdi
+  12:	e8 00 00 00 00       	callq  17 <main+0x17>
+			13: R_X86_64_PLT32	puts-0x4
+  17:	40 b8 00 00 00 00    	rex mov $0x0,%eax
+  1d:	40 5d                	rex pop %rbp
+  1f:	c3                   	retq
+```
+
+cc @philipc 
+Now that `finalize_definitions` is called by default when finalizing a module (since #1290), calling it in an application using Cranelift is likely either an unintentional second call to `finalize_definitions`, or an outright error. If the lifecycle of finalization is entirely internal to `Module` (as it seems it ought to be), we ought to make this non-public and avoid some misuse.
+
+I happened to trip across this when revisiting some code written before this change was made, where this might have more clearly signalled what changed in the mean time.
+- [x] This has been discussed in meetings and chat messages.
+- [x] A short description of what this does, why it is needed: this implements a rudimentary interpreter for Cranelift IR; only a subset of instructions are currently implemented and implementation gaps are marked with `TODO` or `FIXME`. This PR is a RFC on the interpreter design; any feedback is welcome.
+- [x] This PR contains test cases, if meaningful.
+- [x] A reviewer from the core maintainer team has been assigned for this PR.
+#### What is the feature or code improvement you would like to do in Cranelift?
+
+I would like to implement the [SIMD  `load_extend` instructions](https://github.com/WebAssembly/simd/blob/master/proposals/simd/SIMD.md#load-and-extend). 
+
+#### What is the value of adding this in Cranelift?
+
+This is necessary for Wasm SIMD spec compliance.
+
+#### Do you have an implementation plan, and/or ideas for data structures or algorithms to use?
+
+I see that currently `shared/instructions.rs` includes instructions such as `uload32` and `sload32`; one option is to add the additional instructions `[u/s]load8x8`, `[u/s]load16x4`, and `[u/s]load32x4`. Alternately, @bnjbvr and I had discussed using the IR->IR infrastructure of legalization to implement peephole optimizations; if this was in place and at the right level, I could translate the Wasm `load8x8_s`, e.g., to Cranelift's `load.i8x8` and `uextend` and then write a peephole optimization to generate the appropriate x86 `PMOVSXBW` to encode both of these instructions (perhaps with a new Cranelift `x86_pmovsxb` instruction). Which approach is better.
+
+#### What is the feature or code improvement you would like to do in Cranelift?
+
+In #1347 I added a temporary lowering for Wasm's `load_splat` to two Cranelift instructions, `load + splat`. This generates extra instructions that could be removed by a specialized Cranelift `load_splat` instruction or by smarter codegen (e.g. complex addressing on splat).
+
+#### What is the value of adding this in Cranelift?
+
+Fewer instructions produced.
+
+#### Do you have an implementation plan, and/or ideas for data structures or algorithms to use?
+
+Seeking feedback on which way to proceed: specialized `load_splat` or smarter codegen.
+
+#### Have you considered alternative implementations? If so, how are they better or worse than your proposal?
+
+See above.
+
+If/when Cranelift gains a `load_splat` instruction, the `load + splat` could be replaced with a single Cranelift `load_splat`. This change allows the `simd_load_splat.wast` spec test to pass.
+
+- [x] This has been discussed in issue #...
+- [x] A short description of what this does, why it is needed: see above.
+- [x] This PR contains test cases, if meaningful: see SIMD spec tests run in `wasmtime`.
+- [x] A reviewer from the core maintainer team has been assigned for this PR.
+- [x] This has not been discussed in an issue.
+- [x] A short description of what this does, why it is needed: I did not implement the `i8x16` shifts previously because there was discussion about whether they should be included in the spec (https://github.com/WebAssembly/simd/issues/117). I still feel they should not be included due to the large overhead they impose on x86 but I am (rather unwillingly) implementing them here so we can get additional performance measurements.
+- [ ] This PR contains test cases, if meaningful.
+- [x] A reviewer from the core maintainer team has been assigned for this PR.
+This issue will track progress on our new instruction selector / machine-code emission work, which has been ongoing (in design and initial implementation).
+
+The scope of the work is:
+- Build a new instruction selector, to replace the recipes and meta-DSL system that adds encodings to existing Cranelift IR instructions.
+- Develop a low-level encoding of machine instructions, with virtual registers prior to register allocation (an "IR" of sorts)
+- Interface the above to a new register allocator infrastructure, [`minira`](https://github.com/bnjbvr/minira)
+- Develop the binary-encoding pass that emits into a `CodeSink` from the above representation
+
+As discussed among @sunfishcode, @julian-seward1, @bnjbvr, and others, we want to do this work in order to clean up the story for a new machine backend, as recipes had become difficult to write and maintain.
+
+The system will be co-developed with an initial backend for ARM64 using the new interfaces.
+- [ ] This has been discussed in issue #..., or if not, please tell us why
+  here.
+This is a really small change.
+- [ ] A short description of what this does, why it is needed; if the
+  description becomes long, the matter should probably be discussed in an issue
+  first.
+This fixes small bug caused by inaccurate use of parentheses in `narrow_icmp_imm`.
+- [ ] This PR contains test cases, if meaningful.
+No tests.
+- [ ] A reviewer from the core maintainer team has been assigned for this PR.
+  If you don't know who could review this, please indicate so and/or ping
+  `bnjbvr`. The list of suggested reviewers on the right can help you.
+@bnjbvr 
+<!-- Please ensure all communication adheres to the [code of
+conduct](https://github.com/CraneStation/cranelift/blob/master/CODE_OF_CONDUCT.md). -->

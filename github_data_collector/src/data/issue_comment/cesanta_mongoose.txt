@@ -1,0 +1,163 @@
+I see some webservers reply to the proxy requests with strange data and MG_EV_HTTP_REPLY never gets called. At the MG_EV_CLOSE event, I see that the reply is stuck in the mbuf. In the cases I see, it looks like the reply status is good ("200 OK"), the reply headers are good, but the reply data is empty (the last \n\r are not there). (The apache httpd proxy is okey with this, also adds a "Content-Length: 0" header). (I do not care why those webservers do this, I just want the mongoose proxy to work "the same" as the apache httpd proxy).
+
+My solution is to send out the stuck data in the MG_EV_CLOSE event handler:
+<pre>
+static void mg_reverse_proxy_handler(...)
+...
+  case MG_EV_CLOSE: {
+     struct mbuf *io = &nc->recv_mbuf;
+     //printf("proxy close: mbuf %p, bytes %d\n", io, (int)io->len); //, io->buf);
+     if (io->len > 0) {
+        mg_send(pd->reverse_proxy_data.linked_conn, io->buf, io->len);
+     }
+     pd->reverse_proxy_data.linked_conn->flags |= MG_F_SEND_AND_CLOSE;
+     break;
+  }
+</pre>
+
+This works for me. I am not sure if mbufs are chained and I need to loop over the mbuf chain here. Would like to have advice from mongoose developers.
+
+With all these fixes, the mongoose proxy seems to work as well as the apache http proxy (minus the URL rewriting for doctoring the absolute URLs inside the proxied replies).
+
+K.O.
+
+The http proxy code fails with a funny problem: if the proxied web server returns a response with "chunked" encoding, mg_http_reverse_proxy() code decodes the chunking and replies with a complete non-chunked message, but leaves the "Transfer-Encoding: chunked" header. This confused the next guy: header says "chunked", but the data is non-chunked.
+
+My solution is to doctor the header, replace "T" with "X":
+<pre>
+static void mg_reverse_proxy_handler(...) ...
+...
+case MG_EV_HTTP_REPLY:
+       {
+          char* s = strstr((char*)hm->message.p, "Transfer-Encoding: chunked");
+          if (s) {
+             *s = 'X';
+          }
+       }
+...
+</pre>
+
+Not 100% good because we are missing the "Content-Length" header, but works because we close the connection after sending the reply.
+
+K.O.
+
+i create two thread ,a httpd,a mqtt broker
+two thread will call mg_mgr_init_opt 
+and will call SSL_library_init twice
+this will abort the program
+Define MG_ENABLE_HTTP_IGNORE_INVALID to ignore nonprintable TLV responses for Apple HomeKit Accessory Protocol
+Hi,
+
+Is there any way of modifying the [http] `Server` header to something other than `Mongoose/X.xx` ?
+
+Thanks
+I tested it has been reported that this error.
+
+{"success":false,"code":"90050","msg":"空指针异常","exception":"java.lang.NullPointerException"}
+In mongoose 6.16, mg_http_reverse_proxy() does not work without following fixes.
+a) after mg_connect_http_base(), mg_http_get_proto_data(be) returns NULL and there is an immediate crash
+b) purl is missing the query_string
+c) mg_http_handler() overwrites our proto_data, after that, our reverse_proxy_data.linked_conn becomes NULL, in mg_reverse_proxy_handler(), pd->...linked_conn is NULL and nothing works.
+
+With following changes against mongoose.c git tag 6.16, http proxy works:
+<pre>
+diff --git a/progs/mongoose616.cxx b/progs/mongoose616.cxx
+index cc33e4fe..781b3559 100644
+--- a/progs/mongoose616.cxx
++++ b/progs/mongoose616.cxx
+@@ -6651,7 +6651,9 @@ void mg_http_handler(struct mg_connection *nc, int ev,
+ 
+     if (req_len > 0) {
+       /* New request - new proto data */
+-      pd = mg_http_create_proto_data(nc);
++      if (!pd) {
++        pd = mg_http_create_proto_data(nc);
++      }
+       pd->rcvd = io->len;
+     }
+ 
+@@ -8107,8 +8109,8 @@ void mg_http_reverse_proxy(struct mg_connection *nc,
+   memset(&opts, 0, sizeof(opts));
+   opts.error_string = &error;
+ 
+-  mg_asprintf(&purl, sizeof(burl), "%.*s%.*s", (int) upstream.len, upstream.p,
+-              (int) (hm->uri.len - mount.len), hm->uri.p + mount.len);
++  mg_asprintf(&purl, sizeof(burl), "%.*s%.*s%s%.*s", (int) upstream.len, upstream.p,
++    (int) (hm->uri.len - mount.len), hm->uri.p + mount.len, (hm->query_string.len > 0 ? "?" : ""), (int) hm->query_string.len, hm->query_string.p);
+ 
+   be = mg_connect_http_base(nc->mgr, MG_CB(mg_reverse_proxy_handler, NULL),
+                             opts, "http", NULL, "https", NULL, purl, &path,
+@@ -8122,6 +8124,8 @@ void mg_http_reverse_proxy(struct mg_connection *nc,
+     goto cleanup;
+   }
+ 
++  mg_http_create_proto_data(be);
++
+   /* link connections to each other, they must live and die together */
+   mg_http_get_proto_data(be)->reverse_proxy_data.linked_conn = nc;
+   mg_http_get_proto_data(nc)->reverse_proxy_data.linked_conn = be;
+</pre>
+
+K.O.
+I'm trying to compile mongoose on IAR EWARM 8.31 but it misses sys/stat.h sys/types.h and fcntl.h so mongoose won't compile.
+Some googling showed up that Keil MDK ARM also misses these headers.
+
+How do I complie mongoose for my STM 32 board?
+I am updating the web server component of our data acquisition application from mongoose 6.4-ish to mongoose-6.16 (https://midas.triumf.ca).
+
+By necessity, our web server is multithreaded - we have many "web requests" that take a very long time to process (databases have to be queried, large data files have to be read, etc) - and it took me a few years to work up the courage to tackle the new multithreading model implemented in recent versions of mongoose.
+
+I generally like how the removal of old multithreading code simplified the mongoose code and api.
+
+But I have run into trouble working with the new code:
+(a) examples/multithreaded/multithreaded.c does not explain how to send arbitrary large amounts of data (more than fits in MG_CTL_MSG_MESSAGE_SIZE).
+(b) contrary to https://github.com/cesanta/mongoose/issues/1068, mg_broadcast() is obviously not thread-safe. True, it is safe against mg_mgr_poll() & co, but not safe against multiple threads calling mg_broadcast().
+
+Ultimately I got my web server working, with two changes to mongoose:
+1) mg_broadcast() has to be protected by a mutex (in user code)
+2) mg_mgr_handle_ctl_sock() should send the handshake reply after the loop over network connections (required change in mongoose.c).
+
+This is how I explain the problems to the next guy to work on our web server:
+
+   // NB: mg_broadcast() is advertised as thread-safe, but it is not.
+   //
+   // in mongoose 6.16, mg_brodacast() and mg_mgr_handle_ctl_sock() have several problems:
+   //
+   // a) "wrong thread" read from mgr->ctl[0], defeating the handshake
+   //
+   // b) "lost messages". if more than one message is written to mgr->ctl[0], the second message
+   //    will be "eaten" by mg_mgr_handle_ctl_sock() because of mistatch between number of bytes read and written
+   //    in the two functions. mg_mgr_handle_ctl_sock() always reads about 8000 bytes while mg_broadcast()
+   //    writes 8 bytes per message, (per examples/multithreaded/multithreaded.c. mhttpd messages are a bit longer).
+   //    So if multiple messages are present in the msg->ctl[0] pipe, the read call (of about 8000 bytes)
+   //    in mg_mgr_handle_ctl_sock() will return several messages (last message may be truncated)
+   //    but only the first message will be processed by the code. any additional messages are ignored.
+   //
+   // Problems (a) and (b) are easy to fix by using a mutex to serialize mg_broadcast().
+   //
+   // c) if the mg_broadcast() message contains pointers to the data buffer to be sent out,
+   //    the caller of mg_broadcast() should not free these data buffers until mg_send() is called
+   //    in "on_work_complete()". In theory, the caller of mg_broadcast() could wait until on_work_complete()
+   //    sets a "done" flag. In practice, if the corresponding network connection is closed before
+   //    mg_mgr_handle_ctl_sock() has looped over it, on_work_complete() will never run
+   //    and the "done" flag will never be set. (Of course, network connections are permitted to close
+   //    at any time without warning, but) the firefox browser closes the network connections "a lot"
+   //    especially when user pressed the "page reload" button at the moment when HTTP transations
+   //    are "in flight". (google-chrome tends to permit these "lame duck" transactions to complete and mongoose
+   //    does not see unexpected socket closures, at least not as many).
+   //
+   // To fix problem (c) I need to know when mg_mgr_handle_ctl_sock()'s loop over network connections
+   // has completed (two cases: (a) my on_work_complete() was hopefully called and finished,
+   // and (b) the "right" network connection was already closed (for whatever reason) and my on_work_complete()
+   // was never called).
+   //
+   // My solution is to change the handshake between mg_broadcast() and mg_mgr_handle_ctl_sock() by sending
+   // the handshake reply after looping over the network connections instead of after reading the message
+   // from msg->ctl[1].
+   //
+   // This requires a modification to the code in mongoose.c. If this change is lost/undone, nothing will work.
+   //
+
+K.O.
+
+If the browser is a client, is there an example of HTTP client downloading a large file from the server writed by mongoose? In the example, only the example of uploading a large file is found.

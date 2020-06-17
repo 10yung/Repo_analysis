@@ -1,0 +1,165 @@
+
+…on a way from InputInterface::getOption() to ::getFixtures()
+
+https://github.com/doctrine/DoctrineFixturesBundle/issues/301
+`
+[2019-12-26 12:12:03] console.ERROR: Error thrown while running command "doctrine:fixtures:load --em=platform --append --group=platform". Message: "Argument 1 passed to Doctrine\Bundle\FixturesBundle\Loader\SymfonyFixturesLoader::getFixtures() must be of the type array, string given, called in /opt/project/backend/vendor/doctrine/doctrine-fixtures-bundle/Command/LoadDataFixturesDoctrineCommand.php on line 116" {"exception":"[object] (TypeError(code: 0): Argument 1 passed to Doctrine\\Bundle\\FixturesBundle\\Loader\\SymfonyFixturesLoader::getFixtures() must be of the type array, string given, called in /opt/project/backend/vendor/doctrine/doctrine-fixtures-bundle/Command/LoadDataFixturesDoctrineCommand.php on line 116 at /opt/project/backend/vendor/doctrine/doctrine-fixtures-bundle/Loader/SymfonyFixturesLoader.php:93)","command":"doctrine:fixtures:load --em=platform --append --group=platform","message":"Argument 1 passed to Doctrine\\Bundle\\FixturesBundle\\Loader\\SymfonyFixturesLoader::getFixtures() must be of the type array, string given, called in /opt/project/backend/vendor/doctrine/doctrine-fixtures-bundle/Command/LoadDataFixturesDoctrineCommand.php on line 116"} []
+`
+
+The main inconsistency here is actually in lines:
+```
+$groups   = $input->getOption('group');
+$fixtures = $this->fixturesLoader->getFixtures($groups);
+```
+`$input->getOption` returns mixed
+However `::getFixtures` method allows to pass groups only as an array
+```
+public function getFixtures(array $groups = []) : array
+```
+It is a quite simple fix, i will prepare a pull request for that in a minute
+Not sure if I am going about this the proper way but, in any case, something seems to be amiss.
+On fixtures I am attempting to access a random category entity to add to an Ad entity. First I attempted to do that directly on fixtures, but as it did not work I put the method on a regular controller and injected the controller as service on fixtures just to check it.
+
+While the method works as expected on the controller, it returns NULL on fixtures.
+
+The Category entity is a GEDMO tree. 
+
+This is what I believe to be the relevant portions of:
+
+AppFixtures
+       
+      .....
+     use App\Controller\DefaultController;
+      .........
+ 
+     private $em;
+    private $defaultController;
+
+    public function __construct(
+        UserPasswordEncoderInterface $passwordEncoder,
+        TokenGenerator $tokenGenerator,
+        EntityManagerInterface $entityManager,
+        DefaultController $defaultController
+    ){
+        $this->passwordEncoder = $passwordEncoder;
+        $this->faker = \Faker\Factory::create();
+        $this->tokenGenerator = $tokenGenerator;
+        $this->em = $entityManager;
+        $this->defaultController = $defaultController;
+    }
+         /**
+     * Load data fixtures with the passed EntityManager
+     * @param ObjectManager $manager
+     */
+    public function load(ObjectManager $manager)
+    {
+        $this->loadUsers($manager);
+        $this->loadAds($manager);
+    }
+
+      .......
+       private const CATEGORIES = [
+        'house cleaning',
+        'garden cleaning',
+        'sports coach',
+        'tax return',
+        'english teacher',
+        'spanish teacher',
+        'french teacher',
+        'chinese teacher',
+        'car pooling'
+      ];
+      
+    ...........
+
+     public function loadAds(ObjectManager $manager)
+      {
+        for ($i = 0; $i < 100; $i++) {
+            $ad = new Ad();
+            $ad->setDescription($this->faker->realText(100));
+            $ad->setCreatedAt($this->faker->dateTimeThisYear);
+
+            $userReference = $this->getRandomUserReference($ad);
+            $ad->setUser($userReference);
+            
+            $title = self::CATEGORIES[array_rand(self::CATEGORIES)];
+    var_dump($title); // outputs a random category title
+            $category = $this->defaultController->getRandomCategory($title);
+    var_dump($category->getTitle()); // outputs error Call to a member function on null.
+            $ad->setCategory($category); // expects entity
+
+            $ad->setIsActive(true);
+
+            $this->setReference("ad_$i", $ad);
+
+            $manager->persist($ad);
+        }
+        $manager->flush();
+    }
+    ..........
+
+On App\DefaultController things works as expected an it outputs the JSON with the 
+correct info.
+
+    public function index()
+    {
+        $title = self::CATEGORIES[array_rand(self::CATEGORIES)];
+        $cat = $this->getRandomCategory($title);
+       // outputs something like 
+                   {
+                      "categoryId":25,
+                      "categoryTitle":"garden cleaning"
+                  }
+        return $this->json(array(
+            'categoryId' => $cat->getId(),
+            'categoryTitle' => $cat->getTitle()
+        ));  
+    }
+
+    public function getRandomCategory($title)
+    {
+        $this->repo = $this->em->getRepository(Category::class);
+        return $this->repo->findOneByTitle($title);
+    }
+
+I have a service like 
+```yaml
+ App\Doctrine\TableSchema:
+        arguments:
+            $prefix: '%env(string:DATABASE_PREFIX)%'
+        tags:
+            - { name: doctrine.event_subscriber, connection: default }
+```
+This service works well width the command 'doctrine:schema:create' 
+Should fix #291
+Hi,
+
+When starting to use the groups, I needed to load all fixtures BUT not the one I've put in a group (that are specific fixtures that are used for some tests). 
+
+For instance  when using the serialization groups in JMS Serializer, all objects that have no groups are put in a group `Default`. 
+See : https://jmsyst.com/libs/serializer/master/cookbook/exclusion_strategies#overriding-groups-of-deeper-branches-of-the-graph
+
+It would work like this:
+* `doctrine:fixtures:load --group=Default`: load all fixtures that have no group
+* `doctrine:fixtures:load --group=Default --group=User`: load all fixtures that have no group and the User group
+* `doctrine:fixtures:load --group=User`: load only the User group
+
+WDYT ?
+The ORMPurger has a `$excluded` option that allows you to ignore certain tables when purging. The DoctrineFixturesBundle however didn't implement this feature while it does seem very useful [(1)](https://stackoverflow.com/questions/41346893/symfony-doctrine-fixtures-do-not-purge-all-tables).
+
+So I added a `exclude-table` option that allows users to exclude certain tables from purging. I also added the option to the documentation.
+
+Feel free to give feedback if something seems off!
+I have mysql container that when i run 
+
+`php bin/console doctrine:fixtures:load`
+
+it timed outs.   
+
+I know that my connection is true because i have tested GET and POST through post man and although it takes a while the first time to connect, it finally connects and the next query is faster.   
+E.g. you want to use a fixture like a factory and define its loaded stuff by arguments given.
+You can't register the same class multiple times because get_class is used instead of service id.
+
+Could be fixed in Doctrine\Bundle\FixturesBundle\Loader\SymfonyFixturesLoader Line 36 by using service id as array key instead of get_class.
+
+Should I open a PR for this?

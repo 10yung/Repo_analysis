@@ -1,0 +1,232 @@
+Hello after setup a simple auth, with a verification token after login, Sinatra is taking on 
+average 4. something seconds to check the token.
+Is the jwt config?
+
+![verify](https://user-images.githubusercontent.com/1009077/72452005-95bef600-379b-11ea-8cef-e2af310b7cfa.png)
+![ttfb](https://user-images.githubusercontent.com/1009077/72452021-9ce60400-379b-11ea-831b-3fccafe3e290.png)
+
+
+
+
+
+middleware  
+JwtAuth
+
+```
+# frozen_string_literal: true
+
+class JwtAuth
+  def initialize(app)
+    @app = app
+  end
+ 
+  def call(env)
+    begin
+    auth_token = env.fetch('HTTP_AUTHORIZATION', '')
+  
+    payload = JsonWebToken.decode(auth_token)
+
+    unless User.exists?(email: payload['user']['email'])
+      raise JWT::InvalidPayload
+     end
+
+    #raise JWT::InvalidPayload unless User.exists?(email: payload['user']['email'])
+    env[:user] = User.find_by(email: payload['user']['email'])
+
+
+    # puts headers # show headers on this request
+
+    @app.call env
+  rescue JWT::DecodeError
+    [401, { 'Content-Type' => 'text/plain' }, ['A token must be passed.']]
+  rescue JWT::ExpiredSignature
+    [403, { 'Content-Type' => 'text/plain' }, ['The token has expired.']]
+  rescue JWT::InvalidIssuerError
+    [403, { 'Content-Type' => 'text/plain' }, ['The token does not have a valid issuer.']]
+  rescue JWT::InvalidIatError
+    [403, { 'Content-Type' => 'text/plain' }, ['The token does not have a valid "issued at" time.']]
+  rescue JWT::InvalidIatError
+    [403, { 'Content-Type' => 'text/plain' }, ['Invalid token']]
+  end
+  end
+end
+```
+
+```
+the JsonWebToken
+
+class JsonWebToken
+  class << self
+    def encode(email)
+     
+      JWT.encode payload(email), ENV['JWT_SECRET'], 'HS256' 
+    end
+  
+    def decode(auth_token)
+      options = { algorithm: 'HS256', iss: ENV['JWT_ISSUER'] }
+
+      JWT.decode(auth_token, ENV['JWT_SECRET'],  true, options)[0]
+    end
+
+    def payload(email)
+      {
+        exp: 24.hours.from_now.to_i,
+        iat: Time.now.to_i,
+        iss: ENV['JWT_ISSUER'],
+        user: {
+          email: email
+        }
+       # user_id: user.id
+      }
+    end
+  end
+end
+```
+
+ApiController
+
+
+```
+class ApiController < Sinatra::Base
+  use JwtAuth
+  before do
+    content_type :json, charset: 'utf-8'
+  end
+  
+
+ 
+
+  get '/verify' do
+    # add token to Authorization Header
+
+    auth_token = JsonWebToken.encode(@email)
+  
+    if auth_token
+      {  message: 'verified',tatus: 200 }.to_json
+    
+    else
+      halt 401, { message: 'Token failed verification' }.to_json
+
+    end
+  end
+
+  def current_user
+    @current_user ||= request.env[:user]
+  #  request.env[:user]
+  end
+end
+```
+
+
+```
+config.ru
+
+use Rack::Deflater
+use Rack::MethodOverride
+
+
+run Rack::URLMap.new(
+  '/' => PublicController,
+  '/api' => ApiController
+
+)
+```
+
+## Summary
+As of 2.2.1, `Decode#verify_signature` evaluates `&@keyfinder` before validating algorithm. This is quite inefficient and results in misleading failure messages (see reasoning below). I propose we move algorithm validation before finding the key so that we don't waste our time evaluating key finder when we know the algorithm is wrong.
+
+## Reasoning
+1. Key finder evaluation is usually used for supporting features like JWKS, where a network call needs to be made to get a public key. Making network calls can often be expensive for Ruby applications. Therefore it makes sense to do the cheaper checks such as `alg` validation first. The performance impact of this can be especially significant in applications where multiple types of token are accepted.
+2. A token with the wrong algorithm is most likely never gonna find the right key. In this case, the exception should clearly indicating the issue with the incorrect algorithm and raise `JWT::IncorrectAlgorithm` instead of `JWT::DecodeError, 'No verification key available`. 
+
+Please let me know if you are willing to accept a PR on this.
+I would like to invalidate the token when the user logs out even before the expired time
+docs for the following code
+
+- https://github.com/jwt/ruby-jwt/commit/922dac620bf1e707f36ee35eef1e5881d1e32cc5#diff-35b558119ace51c78f5563ad9f4d2ec3R8
+- https://github.com/jwt/ruby-jwt/commit/922dac620bf1e707f36ee35eef1e5881d1e32cc5#diff-35b558119ace51c78f5563ad9f4d2ec3R49
+Hello,  curious what is the "secret" per JWT spec when using RSA keypair
+Traceback (most recent call last):
+	2: from token.rb:1:in `<main>'
+	1: from /Users/***/.rvm/rubies/ruby-2.6.3/lib/ruby/site_ruby/2.6.0/rubygems/core_ext/kernel_require.rb:54:in `require'
+/Users/***/.rvm/rubies/ruby-2.6.3/lib/ruby/site_ruby/2.6.0/rubygems/core_ext/kernel_require.rb:54:in `require': cannot load such file -- jwt (LoadError)
+
+########################################################################
+require 'jwt'
+
+payload = { data: 'test' }
+
+
+token = JWT.encode payload, nil, 'none'
+
+puts token
+
+decoded_token = JWT.decode token, nil, false
+
+puts decoded_token
+This validates the certificate chain in accordance with RFC 5280, as described in [RFC 7515 section 4.1.6](https://tools.ietf.org/html/rfc7515#section-4.1.6).
+
+To use this in your app, here are a couple of notes:
+- you will want to cache the relevant CRL file(s) and make sure the cache is expired by the `OpenSSL::X509::CRL#next_update` timestamp
+- in case you need to dynamically extract the CRL distribution point URIs, it is possible to use this class in the `keyfinder` block argument passed to `JWT.decode`
+
+Closes https://github.com/jwt/ruby-jwt/issues/59
+Closes https://github.com/jwt/ruby-jwt/pull/308
+👋 Howdy -- should be self-explanatory, LMK if there are any questions!
+### Background
+when we upgrade from 2.1.0 to 2.2.1, we receive a lot of warnings about "already initialized constant JWT Error" when start rails or simply run `rails c`
+all errors inside this are shown
+https://github.com/jwt/ruby-jwt/blob/f4c7f15ccce3e74a475ddd9931eb7ccc5b594818/lib/jwt/error.rb#L3-L20
+
+I think it is related to `use first-class object short hand`
+https://github.com/jwt/ruby-jwt/commit/c0b4c59cdbe7fd0ca0646e5a80b3a8e8e128a4cd
+and
+https://github.com/jwt/ruby-jwt/blob/f4c7f15ccce3e74a475ddd9931eb7ccc5b594818/lib/jwt.rb#L8
+https://github.com/jwt/ruby-jwt/blob/faaa3a1556c98beb9e78bccdb78f9650df87a5b1/lib/jwt/claims_validator.rb#L1
+
+### Expect
+```
+git checkout v2.1.0
+
+irb
+2.4.0 :001 > require 'jwt/error'
+ => true
+2.4.0 :002 > require_relative './lib/jwt/error'
+ => true
+```
+
+### Actual
+```
+git checkout v2.2.1
+
+irb
+2.4.0 :001 > require 'jwt/error'
+ => true
+2.4.0 :002 > require_relative './lib/jwt/error'
+~/Documents/github/ruby-jwt/lib/jwt/error.rb:5: warning: already initialized constant JWT::DecodeError
+~/.rvm/gems/ruby-2.4.0/gems/jwt-1.5.6/lib/jwt/error.rb:3: warning: previous definition of DecodeError was here
+~/Documents/github/ruby-jwt/lib/jwt/error.rb:8: warning: already initialized constant JWT::VerificationError
+~/.rvm/gems/ruby-2.4.0/gems/jwt-1.5.6/lib/jwt/error.rb:4: warning: previous definition of VerificationError was here
+~/Documents/github/ruby-jwt/lib/jwt/error.rb:9: warning: already initialized constant JWT::ExpiredSignature
+~/.rvm/gems/ruby-2.4.0/gems/jwt-1.5.6/lib/jwt/error.rb:5: warning: previous definition of ExpiredSignature was here
+~/Documents/github/ruby-jwt/lib/jwt/error.rb:10: warning: already initialized constant JWT::IncorrectAlgorithm
+~/.rvm/gems/ruby-2.4.0/gems/jwt-1.5.6/lib/jwt/error.rb:6: warning: previous definition of IncorrectAlgorithm was here
+~/Documents/github/ruby-jwt/lib/jwt/error.rb:11: warning: already initialized constant JWT::ImmatureSignature
+~/.rvm/gems/ruby-2.4.0/gems/jwt-1.5.6/lib/jwt/error.rb:7: warning: previous definition of ImmatureSignature was here
+~/Documents/github/ruby-jwt/lib/jwt/error.rb:12: warning: already initialized constant JWT::InvalidIssuerError
+~/.rvm/gems/ruby-2.4.0/gems/jwt-1.5.6/lib/jwt/error.rb:8: warning: previous definition of InvalidIssuerError was here
+~/Documents/github/ruby-jwt/lib/jwt/error.rb:13: warning: already initialized constant JWT::InvalidIatError
+~/.rvm/gems/ruby-2.4.0/gems/jwt-1.5.6/lib/jwt/error.rb:9: warning: previous definition of InvalidIatError was here
+~/Documents/github/ruby-jwt/lib/jwt/error.rb:14: warning: already initialized constant JWT::InvalidAudError
+~/.rvm/gems/ruby-2.4.0/gems/jwt-1.5.6/lib/jwt/error.rb:10: warning: previous definition of InvalidAudError was here
+~/Documents/github/ruby-jwt/lib/jwt/error.rb:15: warning: already initialized constant JWT::InvalidSubError
+~/.rvm/gems/ruby-2.4.0/gems/jwt-1.5.6/lib/jwt/error.rb:11: warning: previous definition of InvalidSubError was here
+~/Documents/github/ruby-jwt/lib/jwt/error.rb:16: warning: already initialized constant JWT::InvalidJtiError
+~/.rvm/gems/ruby-2.4.0/gems/jwt-1.5.6/lib/jwt/error.rb:12: warning: previous definition of InvalidJtiError was here
+~/Documents/github/ruby-jwt/lib/jwt/error.rb:17: warning: already initialized constant JWT::InvalidPayload
+~/.rvm/gems/ruby-2.4.0/gems/jwt-1.5.6/lib/jwt/error.rb:13: warning: previous definition of InvalidPayload was here
+ => true
+```
+The example tokens in this library use `"alg": "ED25519`, but the spec `EdDSA`. `crv` is meant to be "ED25519" though.
+
+https://tools.ietf.org/html/rfc8037#appendix-A.4

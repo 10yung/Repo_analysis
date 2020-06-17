@@ -1,0 +1,138 @@
+Add support for `$position` modifier as described here http://docs.mongodb.org/manual/reference/operator/update/position/
+
+We probably just need to something like 
+
+```
+class ModifyPushEachPositionClause(fieldName: String, position: Int, values: Traversable[_])
+    extends ModifyClause(ModOps.Push) {
+  override def extend(q: BasicDBObjectBuilder): Unit = {
+    q.push(fieldName).add("$each", QueryHelpers.list(values)).add("$position", position).pop
+  }
+}
+
+class ModifyPushEachSliceClause(fieldName: String, slice: Int, position: Int, values: Traversable[_])
+    extends ModifyClause(ModOps.Push) {
+  override def extend(q: BasicDBObjectBuilder): Unit = {
+    q.push(fieldName).add("$each", QueryHelpers.list(values)).add("$slice", slice).add("$position", position).pop
+  }
+}
+```
+
+Note for other weary travelers: I've noticed IntelliJ's Scala plugin failing to understand Rogue sub-field queries:
+
+![](https://s3.amazonaws.com/f.cl.ly/items/1H3T0t1S2G2f0B0j3E1P/Screen%20Shot%202015-05-15%20at%2012.15.29%20PM.png)
+
+Full error:
+
+![](https://s3.amazonaws.com/f.cl.ly/items/093V180Q313d2I2m1w0P/Screen%20Shot%202015-05-15%20at%2012.17.54%20PM.png)
+
+Assuming that IntelliJ was correct, I almost gave up and assumed that Rogue subfield queries don't work (this is at the `v3.0.0-beta13.1` tag, which seems to have a pretty different syntax for subfield queries than what is documented?), but luckily I noticed that my running `sbt ~compile` was finishing successfully.
+
+I'll file this against IntelliJ or the Scala plugin.. "soon", but wanted to leave a note here about it too.
+
+As highlighted in thread: https://groups.google.com/forum/#!topic/rogue-users/VUQFeK4LSbE
+
+We're querying for the _id, but have no way to access it anyway, when using the `select(_.name) => (String)`syntax, so we could try not querying for it - which would require using the mongo`find()`differently, not via mongo's`select()`.
+
+Hi, I'm using the latest 2.2.0 version and it seems I found a bug. Here is how to reproduce it:
+
+```
+import net.liftweb.mongodb.record.BsonRecord
+import net.liftweb.record.field.EnumField
+import net.liftweb.mongodb.record.BsonMetaRecord
+import net.liftweb.mongodb.record.MongoRecord
+import net.liftweb.mongodb.record.field.ObjectIdPk
+import net.liftweb.mongodb.record.field.BsonRecordField
+import wws.db.connection.MongoConfig
+import net.liftweb.mongodb.record.MongoMetaRecord
+import com.foursquare.rogue.LiftRogue._
+
+// Enum that "causes throuble"
+object TestEnum extends Enumeration {
+  type TestEnum = Value
+  val ONE, TWO = Value
+}
+
+import TestEnum._
+
+// Model classes
+class NestedDoc extends BsonRecord[NestedDoc] {
+  def meta = NestedDoc
+  // the same field type as 'goodField' but Rogue converts it to String in queries
+  object thisFieldIsNotAString extends EnumField(this, TestEnum)
+}
+object NestedDoc extends NestedDoc with BsonMetaRecord[NestedDoc]
+
+class TestDbClass extends MongoRecord[TestDbClass] with ObjectIdPk[TestDbClass] {
+  override def meta = TestDbClass
+  object goodField extends EnumField(this, TestEnum) // this field works just fine
+  object badField extends BsonRecordField(this, NestedDoc)
+}
+object TestDbClass extends TestDbClass with MongoMetaRecord[TestDbClass] {
+  override def mongoIdentifier = MongoConfig.identifier.vend
+}
+
+// The app that tests this scenario
+object TestDbApp extends App {
+
+  def printDocWithFields(doc: TestDbClass): Unit = {
+    println(doc)
+    println(doc.goodField.get.getClass)
+    println(doc.badField.get.thisFieldIsNotAString.get.getClass)
+  }
+
+  MongoConfig.init()
+
+  val doc = TestDbClass.createRecord
+    .goodField(ONE)
+    .badField(NestedDoc.createRecord.thisFieldIsNotAString(ONE))
+  println("\n\nDoc before Save:")
+  printDocWithFields(doc)
+  val docDb = doc.saveTheRecord().get
+  val docId = docDb.id.get
+  println("\n\nDoc after Save:")
+  printDocWithFields(docDb)
+
+  val query = TestDbClass.where(_.goodField eqs ONE)
+    .and(_.badField.subfield(_.thisFieldIsNotAString) eqs TWO)
+  println("\n\nQuery:")
+  println(query)
+  println("Good field type: " + query.asDBObject.get("goodField").getClass)
+  println("Bad field type: " +     query.asDBObject.get("badField.thisFieldIsNotAString").getClass)
+
+  val docDbRefetch = TestDbClass.find(docId).head
+  println("\n\nDoc fetched with Java driver:")
+  printDocWithFields(docDbRefetch)
+
+  val docDbFetchWithRogue = TestDbClass.where(_.id eqs docId)
+    .and(_.goodField eqs ONE).fetch().head
+  println("\n\nDoc fetched with Rogue using good field:")
+  printDocWithFields(docDbFetchWithRogue)
+
+  val docDbFetchWithRogueBadField = TestDbClass.where(_.id eqs docId)
+    .and(_.badField.subfield(_.thisFieldIsNotAString) eqs ONE).fetch()
+  println("\n\nDoc fetched with Rogue using bad field:")
+  docDbFetchWithRogueBadField match {
+    case expected :: _ => printDocWithFields(expected) // Desired behavior
+    case List() => println("Didn't find the doc!!!") // Current behavior (bug?)
+  }
+}
+```
+
+I've noticed these comments in src/test/scala/com/foursquare/rogue/EndToEndTest.scala:
+
+```
+// This behavior is broken because we get a String back from mongo, and at
+// that point we only have a DummyField for the subfield, and that doesn't
+// know how to convert the String to an Enum.
+```
+
+However, this seems to be a different issue, could you confirm?
+
+Thanks
+
+p.s. I can write a test and submit a pull request if it helps.
+
+Changes since early 2.0.0 betas have not been merged into master -- is this on purpose?
+
+Latest Build (beta21) Rogue.scala lacks a conversion from Calendar to a QueryField. It still exists in master branch (beta14).

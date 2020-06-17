@@ -1,0 +1,219 @@
+We're seeing a small amount of unreproducible failures in production. If something goes wrong, the boolean return value doesn't tell you why. A throwing function contains more information that can be used for debugging.
+I have added package.swift file to support SPM.
+Note that I did not specify minimum platform version as it is iOS 8 by default.
+ - Use implicit returns
+ - Optional chaining
+Hi,
+
+I faced an issue while using Realm SDK that can be found here [Realm file decryption failed](https://github.com/realm/realm-cocoa/issues/5615).
+
+After some resource i understood that the problem was how i managed to store the Realm encryption key in keychain.
+
+This was how i check if there is some encryption key in keychain and if none, i create a new one like this:
+
+```
+static private func encryptionKey() throws -> Data {
+
+        if let storedEncryptionKey = KeychainWrapper.standard.data(forKey: .realmEncryptionKey) {
+            return storedEncryptionKey
+        }
+
+        Log.debug?.message("Generating random Realm encryption key.")
+
+        let newEncryptionKey = Data.withRandomBytes(count: 64)
+
+        guard KeychainWrapper.standard.set(newEncryptionKey, forKey: .realmEncryptionKey, withAccessibility: KeychainItemAccessibility.whenUnlockedThisDeviceOnly) else {
+            throw LocalStorageError.realmInstantationFailed
+        }
+
+        return newEncryptionKey
+}
+```
+
+So, when i tried to retrieve the encryption key from keychain using KeychainWrapper, this tries to get value from keychain an if no error retrieves the `Data` value, but with some error, this gives me `nil`. So i assume that on `nil` value means that i don't have the encryption key and i have to create a new one (With this i can't decrypt anymore my Realm DB since i can't know the right encryption key anymore).
+
+KeychainWrapper retrieve data value func:
+```
+open func data(forKey key: String, withAccessibility accessibility: KeychainItemAccessibility? = nil) -> Data? {
+        var keychainQueryDictionary = setupKeychainQueryDictionary(forKey: key, withAccessibility: accessibility)
+        
+        // Limit search results to one
+        keychainQueryDictionary[SecMatchLimit] = kSecMatchLimitOne
+        
+        // Specify we want Data/CFData returned
+        keychainQueryDictionary[SecReturnData] = kCFBooleanTrue
+        
+        // Search
+        var result: AnyObject?
+        let status = SecItemCopyMatching(keychainQueryDictionary as CFDictionary, &result)
+        
+        return status == noErr ? result as? Data : nil
+}
+```
+
+In my opinion, when retrieving values from Keychain using KeychainWrapper, you should give the chance to know if there is no value or other error as occurred.
+
+I had developed my own keychain access for this case:
+
+```
+static func getKeychainData(forKey key: SharedConstants.UniqueKey) throws -> Data {
+        
+        guard let encodedIdentifier = key.rawValue.data(using: String.Encoding.utf8) else {
+            throw LocalStorageError.couldntGetEncryptionKey
+        }
+        
+        let keychainQueryDictionary: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: Bundle.main.bundleIdentifier ?? "SwiftKeychainWrapper",
+            kSecAttrGeneric as String: encodedIdentifier,
+            kSecAttrAccount as String: encodedIdentifier,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecReturnData as String: kCFBooleanTrue
+        ]
+        
+        var result: AnyObject?
+        let status = SecItemCopyMatching(keychainQueryDictionary as CFDictionary, &result)
+        
+        switch status {
+        case errSecSuccess:
+            
+            guard let result = result as? Data else {
+                throw LocalStorageError.couldntGetEncryptionKey
+            }
+            
+            return result
+            
+        case errSecItemNotFound:
+            throw LocalStorageError.keychainItemNotFound
+            
+        default:
+            throw LocalStorageError.couldntGetEncryptionKey
+        }
+    
+}
+```
+
+This was my workaround to avoid replacing a value that i just want to store one time only, could be an idea for you too, since keychain gives us `errSecItemNotFound`.
+
+I found that your `set` function is automatically an insert or update, without giving us the option to choose that:
+
+```
+@discardableResult open func set(_ value: Data, forKey key: String, withAccessibility accessibility: KeychainItemAccessibility? = nil) -> Bool {
+        var keychainQueryDictionary: [String:Any] = setupKeychainQueryDictionary(forKey: key, withAccessibility: accessibility)
+        
+        keychainQueryDictionary[SecValueData] = value
+        
+        if let accessibility = accessibility {
+            keychainQueryDictionary[SecAttrAccessible] = accessibility.keychainAttrValue
+        } else {
+            // Assign default protection - Protect the keychain entry so it's only valid when the device is unlocked
+            keychainQueryDictionary[SecAttrAccessible] = KeychainItemAccessibility.whenUnlocked.keychainAttrValue
+        }
+        
+        let status: OSStatus = SecItemAdd(keychainQueryDictionary as CFDictionary, nil)
+        
+        if status == errSecSuccess {
+            return true
+        } else if status == errSecDuplicateItem {
+            return update(value, forKey: key, withAccessibility: accessibility)
+        } else {
+            return false
+        }
+}
+```
+
+So i had to develop my own `set` keychain in order to don't force update:
+
+```
+static func setKeychainData(with value: Data, forKey key: SharedConstants.UniqueKey) -> Bool {
+        
+        guard let encodedIdentifier = key.rawValue.data(using: String.Encoding.utf8) else {
+            return false
+        }
+        
+        let keychainQueryDictionary: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: Bundle.main.bundleIdentifier ?? "SwiftKeychainWrapper",
+            kSecAttrGeneric as String: encodedIdentifier,
+            kSecAttrAccount as String: encodedIdentifier,
+            kSecValueData as String: value,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        ]
+        
+        let status: OSStatus = SecItemAdd(keychainQueryDictionary as CFDictionary, nil)
+        
+        return status == errSecSuccess
+    
+}
+```
+
+Ideally this should have an option to force update, but in my case i just needed this.
+This is how i check if there is some encryption key in keychain and if not, how i create a new one:
+
+```
+static private func encryptionKey() throws -> Data {
+        
+        do {
+            
+            let storedEncryptionKey = try getKeychainData(forKey: .realmEncryptionKey)
+            return storedEncryptionKey
+            
+        } catch LocalStorageError.keychainItemNotFound {
+            
+            Log.debug?.message("Generating random Realm encryption key.")
+            
+            let newEncryptionKey = Data.withRandomBytes(count: 64)
+            
+            guard setKeychainData(with: newEncryptionKey, forKey: .realmEncryptionKey) else {
+                throw LocalStorageError.realmInstantationFailed
+            }
+            
+            return newEncryptionKey
+        }
+}
+```
+
+It's hard to reproduce the error that i had, but i found a way, since my keychain accessibility was `whenUnlockedThisDeviceOnly` for security reasons.
+
+- I add breakpoints when retrieving data from keychain and when setting.
+- Tried with an iPhone with passcode.
+- Before retrieving data from keychain, i lock my device and wait a while before proceed with this.
+- Retrieving  data from keychain will fail with `errSecInteractionNotAllowed` (if i remember well).
+- Then i unlock my iPhone before setting new data on keychain and let the code run.
+
+And now, i replaced my encryption key on keychain and the user will not be able to open my Realm DB anymore. And in production, i notice that some users had this problem.
+
+I think that giving us more flexibility to manage those kind of things will improve our experience.
+
+Thank you.
+
+Hi,
+
+I was wondering if you are going to support kSecAttrAccessControl in the wrapper in the short term?
+
+Thanks.
+
+Marta.
+Hello,
+Thank you so much for such a wonderful wrapper. It was really easy to implement.
+
+Issue : 
+I am storing a token in the keychain on Login. Post login, I redirect the user to the dashboard screen where the token is passed in an API call. 
+Ex : **Keychain: token = "XYZ"**
+
+If the token is revoked due to log in on another device, the user gets an error of authentication, here I am removing the token and redirecting user back to login.
+**Keychain: no token item** or I can set it to empty string instead of removing.
+
+Now, if I log in again, a new token is generated and saved in the keychain.
+**Keychain: token = "ABC"**
+
+Post this, when dashboard API is called, token "XYZ" is passed instead of "ABC"
+
+This happens only in the single lifecycle of the app. If I terminate/exit the app and open again, the token passed in the API is "ABC". 
+
+How can I update the existing key in the single lifecycle of the app?
+Is this the usual behavior or am I missing anything?
+I use this lib to store and fetch access token in every query. Can it slow down anything?
+Fixed a typo
+Related to https://github.com/jrendel/SwiftKeychainWrapper/issues/132
+If it doesn't make sense to make theme private schemes then I'm not sure what to do yet.

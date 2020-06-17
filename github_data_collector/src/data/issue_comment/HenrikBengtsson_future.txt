@@ -1,0 +1,238 @@
+Hmm, it looks like we fail to force single-threaded mode for OpenMP on some machines; the CRAN [rdevel-linux-x86_64-fedora-clang](https://www.r-project.org/nosvn/R.check/r-devel-linux-x86_64-fedora-clang/future-00check.html) server throws:
+```sh
+  'future.fork.multithreading.enable' = FALSE ...
+  ...
+  [10:33:23.561] - Evaluate future in single-threaded mode ...
+  [10:33:23.561] supports_omp_threads() = TRUE
+  [10:33:23.561] - Force single-threaded processing for OpenMP
+  [10:33:23.562] - Evaluate future in single-threaded mode ... DONE
+...
+[10:33:23.568] ...future.value <- base::withVisible(base::local(RhpcBLASctl::omp_get_max_threads()))
+...
+     [10:33:23.599] plan(): nbrOfWorkers() = 2
+     Number of OpenMP threads in 'MulticoreFuture' future: 24
+     Error: !enable && nthreads == 1L is not TRUE
+```
+
+
+(This issue should serve as a public place for the discussion @HenrikBengtsson and I had via mail recently)
+
+I wonder if it makes sense to support reproducible parallel streams via the default RNG kind "Mersenne-Twister" within a package to help users who are not aware that this RNG kind does not provide reproducible streams in parallel.
+
+(I am talking about the standard parallel backends in R and not specifically about the way one can do this via the {future} package.)
+
+# Multicore backend
+
+```r
+   old.seed = .Random.seed 
+   seed = sample(1:100000, 1) 
+   # we need to reset the seed first in case the user supplied a seed, 
+   # otherwise "L'Ecuyer-CMRG" won't be used 
+   rm(.Random.seed, envir = globalenv()) 
+   set.seed(seed, "L'Ecuyer-CMRG") 
+```
+
+If the user uses `set.seed(<number>)` and goes parallel via the `multicore` backend, the code above will ensure parallel RNG streams.
+
+If you want to see in action, https://github.com/mlr-org/parallelMap/pull/80 has some tests to ensure the correct functioning.
+
+# Socket backend
+
+Here, one can do
+
+```r
+clusterSetRNGStream(cl, iseed = sample(1:100000, 1)) 
+```
+
+to support the default RNG kind in parallel scenarios.
+
+# General
+
+Whenever doing this, I wonder if one should at least tell the user that this was done behind the scenes to make them aware of whats happening (including eventual decreases in speed).
+I create VMs using the following command in R:
+```
+vms <- gce_vm_cluster(vm_prefix=vm_base_name,
+                      cluster_size=cluster_size,
+                      docker_image = my_docker,
+                      ssh_args = list(username="test_user",
+                      key.pub="/home/test_user/.ssh/google_compute_engine.pub", 
+                      key.private="/home/test_user/.ssh/google_compute_engine"),
+                      predefined_type = "n1-highmem-2")
+```
+now when I SSH into the VMs, I do not find the .docker folder in the home directory
+
+```
+test_user@test_server_name:~$ gcloud beta compute --project "my_test_project" ssh --zone "us-central1-a" "r-vm3"
+test_user@r-vm3 ~ $ ls -a
+.  ..  .bash_history  .bash_logout  .bash_profile  .bashrc  .ssh
+```
+
+I need to run the `docker-credential-gcr configure-docker` command to get the folder/file `.docker/config.json`
+```
+test_user@r-vm3 ~ $ docker-credential-gcr configure-docker
+/home/test_user/.docker/config.json configured to use this credential helper for GCR registries
+test_user@r-vm3 ~ $ ls -a
+.  ..  .bash_history  .bash_logout  .bash_profile  .bashrc  .docker  .ssh
+```
+So I try to SSH into the created VMs to configure docker:
+```
+vm_names <- paste0(vm_base_name, seq(1,cluster_size))
+
+for(sesh in vm_names){
+session <- ssh_connect(sesh, keyfile="/home/test_user/.ssh/google_compute_engine")
+ssh_exec_wait(session,command="docker-credential-gcr configure-docker")
+ssh_disconnect(session)
+}
+```
+Then, I run the `plan` command:
+```
+plan(strategy="cluster", workers = as.cluster(vms, docker_image=my_docker))
+```
+I get an error: `Error in unserialize(node$con) : error reading from connection`
+
+I tried `makeCluster(vm_names)` and I get the error:
+```
+The authenticity of host 'AB-CD-01 (10.123.4.56)' can't be established.
+XY23456 key fingerprint is SHA256:98abc76543d2e10987f6ghi5j4321098k7654321l0987m65no432.
+Are you sure you want to continue connecting (yes/no)? yes
+Warning: Permanently added 'AB-CD-01 (10.123.4.56)' (XY23456) to the list of known hosts.
+test_user@AB-CD-01: Permission denied (publickey).
+```
+Any idea/suggestions on how to resolve this?
+Hi Henrik,
+
+would you accept a PR which adds a pkgdown site? This would make reading your excellent vignettes even more fun.
+
+If yes, I would also ask whether I should enclose all of this in using the ci-agnostic approach of the [tic](https://docs.ropensci.org/tic/dev/) package from Kirill and myself. This should come with no maintenance burden (optimally) and even with the option to easily update to YAML template updates in the future.
+
+I am having issues with nested `future` calls.
+
+Here I'm using `mlr3` and `furrr`, both using `future` package. When using them both together I'm having issues to have the parallelized calls to terminate. 
+
+```r
+library(magrittr)
+library(mlr3)
+library(mlr3learners)
+dtas_lst <-
+  list(
+    dta1 = iris %>% dplyr::select(-Species) %>% utils::head(75),
+    dta2 = iris %>% dplyr::select(-Species) %>% utils::tail(75)
+  )
+
+run_xgb <- function(dta, target_column = "Sepal.Length") {
+  ttsk <- mlr3::TaskRegr$new("ttsk", backend = dta, target = target_column)
+  learner <-
+    mlr3::lrn(
+      "regr.xgboost",
+      objective = "reg:linear",
+      eval_metric = "rmse",
+      nrounds = 100,
+      verbose = 0
+    )
+  learner$train(ttsk)
+  learner$predict(ttsk)$response
+}
+future::plan(list(future::sequential))
+furrr::future_map(dtas_lst, run_xgb, .progress = TRUE) # works!
+future::plan(list(future::multiprocess, future::sequential))
+furrr::future_map(dtas_lst, run_xgb, .progress = TRUE) # doesn't terminate
+```
+
+I've had cases where the parallel runs do work once during a session, but then not terminating on a rerun.
+
+Sometimes when closing down the session (after manually terminating the parallel run), I get the below message 
+
+```r
+# Error while shutting down parallel: unable to terminate some child processes
+```
+
+Upon googling this, I found that I could do the following check.
+
+```r
+parallel::mcparallel(scan(n = 1, quiet = TRUE))
+# $pid
+# [1] 32763
+
+# $fd
+# [1] 21 24
+
+# attr(,"class")
+# [1] "parallelJob"  "childProcess" "process"
+```
+
+Does anyone have any solutions to this? Is this perhaps a bug? Related to `future` or perhaps `parallel` or other package? I was having the same issue when I was running the `mlr` package.
+
+```r
+> Sys.info()
+                                     sysname
+                                     "Linux"
+                                     release
+                         "4.15.0-66-generic"
+                                     version
+"#75-Ubuntu SMP Tue Oct 1 05:24:09 UTC 2019"
+...
+                                     machine
+                                    "x86_64"
+...
+```
+This might be a dumb question, but is there a way my functions can detect whether they are running in the slave nodes? They they can behave differently according to the situations?
+Hello,
+I’m using future apply function with ssh connections, cluster plan. 
+However, future apply function makes retransmission of data frame or objects every mapping procedures even I use same datasets or objects when I’m just changing parameters of estimations to find optimal condition. 
+
+Pseudo code is here. 
+
+```R
+data <- mirt::Science
+nFactors <- 1:4
+future::plan('cluster', workers = paste0('s',1:2))
+future.apply::futute_lapply(X=nFactors, FUN = function(X, data){mirt::mirt(data = data, X)}, data = data)
+```
+
+After run this code, let’s watch traffic status. It seems do retransmission of data, even I don’t change any data for the parameter estimation. 
+
+How can I reduce data retransmission? That’s make me hard to operate HPC computing on some VPS provider, they makes QoS limit every my calculation. 
+
+Best,
+Seongho
+Make it possible to control future-related options per backend.  For example,
+```r
+plan(multisession, workers = 4L, wait.interval = 0.01)
+```
+would make all (multisession) futures to wait 0.01 seconds between pools, instead of the default 
+```r
+getOption("future.wait.interval", as.numeric(Sys.getenv("R_FUTURE_WAIT_INTERVAL", "0.2")))
+```
+
+This could be done by making `wait.interval` an argument to and a field of the `Future()`.
+
+
+# See also
+
+* https://github.com/HenrikBengtsson/future.apply/issues/41#issuecomment-535581882
+I specified `workers = 16` but all 24 cores are used when set `future::plan("multiprocess", workers = 16)`
+
+![image](https://user-images.githubusercontent.com/25057508/65854895-586f5d80-e390-11e9-9c11-4ef120ddbcaa.png)
+
+# Issue
+
+We have from `?future::future.options`:
+
+* `future.wait.timeout`: Maximum waiting time (in seconds) for a free worker before a timeout error is generated. (Default: `30 * 24 * 60 * 60` (= 30 days))
+* `future.wait.interval`: Initial interval (in seconds) between polls. (Default: `0.2` = 0.2 seconds)
+* `future.wait.alpha`: Positive scale factor used to increase the interval after each poll. (Default: `1.01`)
+
+Those defaults are not set per se, but through `getOption("future.wait.interval", 0.2)` in the different future packages.  However, in the [future.batchtools package, the default interval is 1.0 seconds](https://github.com/HenrikBengtsson/future.batchtools/blob/0.7.1/R/BatchtoolsFuture-class.R#L459-L460).
+
+PS. The [default is 0.2 seconds in BatchJobs](https://github.com/HenrikBengtsson/future.BatchJobs/blob/0.16.0/R/BatchJobsFuture-class.R#L535).
+
+# Suggestion
+
+* [ ] Document/clarify this difference.
+* [ ] ~~Introduce another option `getOption("future.wait.scale", 1.0)` so that we can use the same above defaults everywhere, but where future.batchtools uses `getOption("future.wait.scale", 5.0)`.~~  Hmm... that's just introducing yet another option without making it clearer to the user.
+* [ ] Introduce backend-specific options(?), e.g. `future.batchtools::future.wait.interval` (= 1.0), which, if available will override the futureverse-wide `future.wait.interval` option.  Need to think about this one.
+* [ ] ... and/or make it possible to set these backend-related options via `plan()`, e.g. `plan(batchtools_sge, future.wait.interval = 1.0)`.
+
+
+# See also
+This came up in https://github.com/mllg/batchtools/issues/201#issuecomment-409817626

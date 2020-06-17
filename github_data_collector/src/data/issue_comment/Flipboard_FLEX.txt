@@ -1,0 +1,125 @@
+```
+Fatal Exception: NSInvalidArgumentException
+
+0  CoreFoundation                 0x2147ce98c __exceptionPreprocess
+1  libobjc.A.dylib                0x2139a79f8 objc_exception_throw
+2  CoreFoundation                 0x2146d8bc0 -[NSCache init]
+3  Foundation                     0x215124ebc -[NSString rangeOfString:options:range:locale:]
+4  FLEX                           0x101e4e028 __61-[FLEXNetworkHistoryTableViewController updateSearchResults:]_block_invoke_2 + 356 (FLEXNetworkHistoryTableViewController.m:356)
+5  Foundation                     0x215137384 -[NSBlockPredicate evaluateWithObject:substitutionVariables:]
+6  Foundation                     0x2152a2290 _filterObjectsUsingPredicate
+7  Foundation                     0x21512d740 -[NSArray(NSPredicateSupport) filteredArrayUsingPredicate:]
+8  FLEX                           0x101e4df5c __61-[FLEXNetworkHistoryTableViewController updateSearchResults:]_block_invoke + 355 (FLEXNetworkHistoryTableViewController.m:355)
+9  FLEX                           0x101e7278c __61-[FLEXTableViewController onBackgroundQueue:thenOnMainQueue:]_block_invoke + 151 (FLEXTableViewController.m:151)
+10 libdispatch.dylib              0x21420ca38 _dispatch_call_block_and_release
+11 libdispatch.dylib              0x21420d7d4 _dispatch_client_callout
+12 libdispatch.dylib              0x2141b1c80 _dispatch_queue_override_invoke
+13 libdispatch.dylib              0x2141be030 _dispatch_root_queue_drain
+14 libdispatch.dylib              0x2141be8d4 _dispatch_worker_thread2
+15 libsystem_pthread.dylib        0x2143ee1b4 _pthread_wqthread
+16 libsystem_pthread.dylib        0x2143f0cd4 start_wqthread
+```
+There is currently almost no padding between the view backgroundColor preview circle and the info button. To fix this I've shifted the color preview over to the left by half the kContentPadding.
+`-[NSString stdString]` is a private method which returns `std::string`, aka
+
+```cpp
+basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >={
+    __compressed_pair<std::__1::basic_string<char, std::__1::char_traits<char>,
+    std::__1::allocator<char> >::__rep, std::__1::allocator<char> >={__rep}
+}
+```
+
+Not sure why, but FLEX crashes with `EXC_BAD_INSTRUCTION` when calling `[invocation getReturnValue:returnValue]`.
+<img width=30% height=30% src=https://user-images.githubusercontent.com/627231/70358108-73959800-182d-11ea-886d-bb3170f990e1.png>
+
+This is happening without the new card style and super broken.
+It would be great if FLEX would have ability to record non fatal errors. 
+The Network History doesn't register requests made using `NSURLSession`. The ones made using `NSURLConnection` do show up.
+This is an issue I've had for some time, using any version of FLEX (tried to rollback down to 2.1.0 and also tried the very last 3.1.0). So I suspect it's related iOS 13, but it could also have been happening before.
+
+I understand `FLEXNetworkObserver` is working this way:
+1. All delegate methods from `NSURLConnectionDataDelegate` and `NSURLSessionTaskDelegate` of all classes are swizzled
+2. The swizzling blocks of `NSURLConnectionDataDelegate`'s `connection:willSendRequest:redirectResponse:` and its equivalent (is it though?) `NSURLSessionTaskDelegate`'s `URLSession:task:willPerformHTTPRedirection:newRequest:completionHandler:` are calling blocks which store the request (wrapped into a `FLEXNetworkTransaction` object) into `FLEXNetworkRecorder`'s `networkTransactionsForRequestIdentifiers` array
+3. Once the request is finished (e.g. `URLSession:dataTask:didReceiveData:`), it is sent to `FLEXNetworkRecorder`
+4. If `FLEXNetworkRecorder` finds that request in `networkTransactionsForRequestIdentifiers`, it will record it.
+
+After investigation, I noticed that:
+- `NSURLConnectionDataDelegate`'s `connection:willSendRequest:redirectResponse:` is called
+- `NSURLSessionTaskDelegate`'s `URLSession:task:willPerformHTTPRedirection:newRequest:completionHandler:` **is never called**
+
+Reading its documentation, Apple says
+```
+This method is called only for tasks in default and ephemeral sessions. Tasks in background sessions automatically follow redirects.
+```
+But my session is indeed a default one.
+
+Now, I am not entirely sure those 2 methods are equivalent, and that I should expect it to be called when a request is sent.
+
+However, I know that `NSURLSession`'s `resume` should always be called. And I see that this method too is swizzled, and its swizzling block is also performing the above-mentioned step 2 of `FLEXNetworkObserver`.
+
+When checking how `resume` is swizzled, I see those comments:
+```
+// In iOS 7 resume lives in __NSCFLocalSessionTask
+// In iOS 8 resume lives in NSURLSessionTask
+// In iOS 9 resume lives in __NSCFURLSessionTask
+```
+Dat smelly smell.
+
+After drilling through the iOS 13 ObjC runtime, I didn't really find any more interesting classes implementing that `resume` method.
+
+<details>
+  <summary>Unsatisfactory results</summary>
+  
+  ```javascript
+  void DumpObjcMethods(Class clz) {
+      unsigned int methodCount = 0;
+      Method *methods = class_copyMethodList(clz, &methodCount);
+      
+      for (unsigned int i = 0; i < methodCount; i++) {
+          Method method = methods[i];
+          
+          if (strcmp(sel_getName(method_getName(method)), "resume") == 0) {
+              printf("\t'%s' has method named '%s' of encoding '%s'\n",
+                     class_getName(clz),
+                     sel_getName(method_getName(method)),
+                     method_getTypeEncoding(method));
+          }
+      }
+  
+      free(methods);
+  }
+  ```
+  
+  ```
+  [...]
+  '__NSCFURLSessionConnection' has method named 'resume' of encoding 'v16@0:8'
+  '__NSCFURLProxySessionConnection' has method named 'resume' of encoding 'v16@0:8'
+  '__NSCFURLLocalSessionConnection' has method named 'resume' of encoding 'v16@0:8'
+  '__NSCFURLLocalStreamTask' has method named 'resume' of encoding 'v16@0:8'
+  '__NSCFURLSessionTask' has method named 'resume' of encoding 'v16@0:8'
+  '__NSCFLocalSessionTask' has method named 'resume' of encoding 'v16@0:8'
+  [...]
+  ```
+</details>
+
+But after randomly playing with it and trying to force the use of `__NSCFLocalSessionTask` (which was the one for iOS 7), tadaa, the swizzling block is called, and network logs are back in Network History :tada:
+
+So, did Apple move the implementation back to `__NSCFLocalSessionTask`? Since when? iOS 13.x? Before? Why has no-one noticed it? Why is `URLSession:task:willPerformHTTPRedirection:newRequest:completionHandler:` not called? Why am I asking so many questions?
+
+I hope I was clear, thanks for any help 🙂
+I have two project. both use FLEX.but FLEX can't observe 'resume' method in one of the projects.
+and i found something here.
+![image](https://user-images.githubusercontent.com/17957287/68074245-f7460a00-fdd3-11e9-8973-515e8662a790.png)
+here when excute `injectIntoNSURLSessionTaskResume` i print the class is `__NSCFURLSessionTask `, but when i use afnetworking to excute such as a `GET` method, i found the class is __NSCFLocalDataTask,
+![image](https://user-images.githubusercontent.com/17957287/68074289-6b80ad80-fdd4-11e9-832e-89883ccb52b3.png)
+so i guess the FLEXNetworkObserver not observe resume because it didn't swizzle right method,and after i add code it worked.
+![image](https://user-images.githubusercontent.com/17957287/68074325-ba2e4780-fdd4-11e9-8eac-28463ba721f8.png)
+and the strange thing is the other project is normal without any change.
+need help
+Close #303.
+This was previously discussed here: https://github.com/NSExceptional/FLEXing/issues/7
+
+This solution seems to work 100% of the time, so I am assuming that locking and unlocking the zones is no longer needed on arm64e. It might be a good idea to confirm it however.
+
+(Only applies for apps that have an arm64e slice, arm64 apps running on an arm64e device are not affected)
+Fixed #269 

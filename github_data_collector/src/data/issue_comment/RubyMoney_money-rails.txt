@@ -1,0 +1,213 @@
+Rescue if remove_instance_variable raises NameError
+This solves the issue of being unable to edit the cents in a Money field.
+
+As an example, consider this config for a Money field in Rails Admin for use with database columns `price_cents` and `price_currency`:
+
+```ruby
+configure :price, :money
+exclude_fields :price_cents, :price_currency
+```
+
+Attempting to edit the field results in the following error because of the `Integer` field type.
+
+![image](https://user-images.githubusercontent.com/299357/70558043-57516e00-1b41-11ea-95ad-971e5075bb03.png)
+
+Changing the `Money` field type to extend `String` instead of `Integer` solves this issue.
+money_without_cents_and_with_symbol results in something, e.g. like "27.345 €" with a **normal** space between the number and the symbol. This allows the symbol to be split apart from the number, like this:
+![image](https://user-images.githubusercontent.com/1331850/69359924-dca3da00-0c89-11ea-9fd8-2b1dca3ee949.png)
+
+To avoid that the space needs to be replaced by the &nbsp; entity: "27.345&nbsp;€"
+
+That is the sole purpose of the `&nbsp;` entity as "non-breaking space".
+
+I don't think there's a use case for the normal space in html, of course it might for other  use-cases (api, log, etc) so perhaps this should be parametrized?
+
+Is there a workaround for this, besides reimplementing on the application side?
+I need a little bit of help, I'm looking to show the cost of a collection in multiple currencies, gbp, usd and eur.
+I've installed the gem, updated my database and I have GBP price as default and it's showing.
+
+I've added the rate configs
+
+```
+config.add_rate "GBP", "USD", 1.29137
+config.add_rate "GBP", "EUR", 1.16919
+```
+and registered the currencies in the model
+
+```
+register_currency :gbp
+register_currency :usd
+register_currency :eur
+monetize :price_cents, as: "price", with_currency: :gbp
+```
+
+How do I go about showing all three currency prices with the symbols, based on the exchange rate?
+https://github.com/RubyMoney/money-rails/pull/568
+
+The new default serialization introduced in 1.13.2 -> 1.13.3 breaks any apps that relied on the old default of serializing the complete object. This includes anyone using the common 0.10.x branch of Active Model Serializers, where including the name of the money field would include the whole object, including the currency.
+
+This is against expectation of anyone assuming the versioning follows SemVer.
+
+My use case is rendering objects with money fields as json from the backend API, and having a front end JS service that understands what was the serialized money object to format this on the front end using symbol from the embedded currency object. 
+Although I understand the desire to default to a simpler object, doing this in a minor point release seems incorrect.
+This issue is partially linked to the issue https://github.com/RubyMoney/money-rails/issues/578
+
+As a fix for https://github.com/RubyMoney/money-rails/issues/578 my idea was to make this change near https://github.com/RubyMoney/money-rails/blob/master/lib/money-rails/active_record/monetizable.rb#L193 :
+```diff
+        # Dont create a new Money instance if the values haven't been changed.
++        if memoized && memoized.cents == amount && memoized.currency == attr_currency
++          result = memoized
+-        if memoized && memoized.cents == amount
+-          if memoized.currency == attr_currency
+-            result = memoized
+-          else
+-            memoized_amount = memoized.amount.to_money(attr_currency)
+-            write_attribute subunit_name, memoized_amount.cents
+-            # Cache the value (it may be nil)
+-            result = instance_variable_set("@#{name}", memoized_amount)
+-          end
+        elsif amount.present?
+          # If amount is NOT nil (or empty string) load the amount in a Money
+          amount = Money.new(amount, attr_currency)
+
+          # Cache the value (it may be nil)
+          result = instance_variable_set("@#{name}", amount)
+        end
+```
+But after that these specs started failing:
+https://github.com/RubyMoney/money-rails/blob/master/spec/active_record/monetizable_spec.rb#L80
+```ruby
+      it "assigns the correct value from params" do
+        params_clp = { amount: '20000', tax: '1000', currency: 'CLP' }
+        product = Transaction.create(params_clp)
+        expect(product.valid?).to be_truthy
+        expect(product.amount.currency.subunit_to_unit).to eq(1)
+        expect(product.amount_cents).to eq(20000)
+      end
+```
+https://github.com/RubyMoney/money-rails/blob/master/spec/active_record/monetizable_spec.rb#L89
+```ruby
+      it "re-assigns cents amount when subunit/unit ratio changes preserving amount in units" do
+        transaction = Transaction.create(amount: '20000', tax: '1000', currency: 'USD')
+
+        expect(transaction.amount).to eq(Money.new(20000_00, 'USD'))
+
+        transaction.currency = 'CLP'
+
+        expect(transaction.amount).to eq(Money.new(20000, 'CLP'))
+        expect(transaction.amount_cents).to eq(20000)
+      end
+```
+```
+Failures:
+
+  1) MoneyRails::ActiveRecord::Monetizable.monetize assigns the correct value from params
+     Failure/Error: expect(product.amount_cents).to eq(20000)
+     
+       expected: 20000
+            got: 2000000
+     
+       (compared using ==)
+     # ./spec/active_record/monetizable_spec.rb:85:in `block (3 levels) in <top (required)>'
+
+  2) MoneyRails::ActiveRecord::Monetizable.monetize re-assigns cents amount when subunit/unit ratio changes preserving amount in units
+     Failure/Error: expect(transaction.amount).to eq(Money.new(20000, 'CLP'))
+     
+       expected: #<Money fractional:20000 currency:CLP>
+            got: #<Money fractional:2000000 currency:CLP>
+     
+       (compared using ==)
+     
+       Diff:
+       @@ -1,2 +1,2 @@
+       -#<Money fractional:20000 currency:CLP>
+       +#<Money fractional:2000000 currency:CLP>
+       
+     # ./spec/active_record/monetizable_spec.rb:96:in `block (3 levels) in <top (required)>'
+
+Finished in 1.06 seconds (files took 0.93408 seconds to load)
+254 examples, 2 failures
+```
+But if I change the params order so that in a params hash the currency would go prior to the amount then it passes
+```ruby
+      it "assigns the correct value from params" do
+        params_clp = { currency: 'CLP', amount: '20000', tax: '1000' }
+        product = Transaction.create(params_clp)
+        expect(product.valid?).to be_truthy
+        expect(product.amount.currency.subunit_to_unit).to eq(1)
+        expect(product.amount_cents).to eq(20000)
+      end
+```
+This way I get a green dot from rspec for this example. Also, if I pass `amount_cents` instead of `amount` then specs are also green.
+
+If I understand correctly, money-rails processes params hash key-value pairs one by one, and when it gets to the currency first it assigns it, and later when it gets to the amount it uses correct currency. But when the amount goes first then money-rails uses the default currency (EUR in specs) and since we pass not `amount_cents` but `amount` - it sets cents value according to the currency subunits config (100 subunits per unit in this case). Later when it gets to the currency it just sets it. As a result I get 2_000_000 CLP instead of 20_000 CLP.
+
+So, the primary issue is about the ordered nature of params processing. Also I believe that you should not apply the default currency when some currency is passed in params.
+
+Hello!
+
+I have a workflow where an user can setup for a record a currency and amount. Later he can update both currency and amount (for example he can switch from 100 EUR to 0.0001 BTC). Here is the issue. Compare this:
+```ruby
+[83] pry(main)> mm = MyModel.create(currency: 'EUR', amount_cents: 10000)
+=> #<MyModel:0x00007f344d88daf0 id: 1, currency: "EUR", amount_cents: 10000>
+[84] pry(main)> mm.amount
+=> #<Money fractional:10000 currency:EUR>
+[85] pry(main)> mm.update(currency: 'BTC', amount_cents: 10001)
+   (1.0ms)  BEGIN
+  MyModel Update (1.6ms)  UPDATE "my_models" SET "currency" = $1, "amount_cents" = $2 WHERE "my_models"."id" = $3  [["currency", "BTC"], ["amount_cents", 10001], ["id", 1]]
+   (5.3ms)  COMMIT
+=> true
+[86] pry(main)> mm.amount
+=> #<Money fractional:10001 currency:BTC>
+```
+to this:
+```ruby
+[57] pry(main)> mm = MyModel.create(currency: 'EUR', amount_cents: 10000)
+=> #<MyModel:0x0000564c4788c928 id: 2, currency: "EUR", amount_cents: 10000>
+[58] pry(main)> mm.amount
+=> #<Money fractional:10000 currency:EUR>
+[59] pry(main)> mm.update(currency: 'BTC', amount_cents: 10000)
+   (1.0ms)  BEGIN
+  MyModel Update (1.7ms)  UPDATE "my_models" SET "currency" = $1, "amount_cents" = $2 WHERE "my_models"."id" = $3 [["currency", "BTC"], ["amount_cents", 10000000000], ["id", 2]]
+   (5.1ms)  COMMIT
+=> true
+[60] pry(main)> mm.amount
+=> #<Money fractional:10000000000 currency:BTC>
+```
+Behavior in the latter example is pretty unexpected obviously. I investigated and found that the issue occurs due to the memoization logic implemented around this line (the one that calculates incorrect amount) https://github.com/RubyMoney/money-rails/blob/master/lib/money-rails/active_record/monetizable.rb#L197 . So it happens only in 1 specific case - when the cents amounts of both old and new values match and when the currencies differ at the same time. Personally I think that it is better not to decide for a developer about how many cents should be assigned and let him determine himself when a value should be converted to a different currency and when it shouldn't.
+
+ps. I'm using money-rails 1.13.2, rails 5.2.3 with activerecord (pg 1.1.4)
+Similarly to https://github.com/RubyMoney/money-rails/issues/445
+```
+  monetize :current_amount_cents,
+           with_model_currency: :currency
+  delegate :currency, to: :account
+```
+
+Fails to set the amount:
+`Price.create( "current_amount"=>500, "account_id"=>1315)`
+Sets the amount correctly:
+`Price.create( "account_id"=>1315, "current_amount"=>500)`
+
+A work around I've found is changing the order with strong parameters as my Price is created from an API controller.
+```
+def create_params
+  params.require(:price).permit(:account_id, :current_amount)
+end
+```
+Noticed this issue which might be a bit dated: https://github.com/RubyMoney/money-rails/issues/497
+
+Curious what's the best way to do things like `#group` with `#sum` or any active record calculations? Right now, I have it return the numbers in cents which I have to then convert to `Money` object.  
+Example 
+```
+class Transaction
+  include ActiveModel::Model
+  include MoneyRails::ActiveRecord::Monetizable
+
+  attr_accessor :amount_cents
+  monetize :amount_cents, with_model_currency: :currency
+
+end
+```
+
+It can not work because of after_save https://github.com/RubyMoney/money-rails/blob/07dec61e624dbbc6a0662cc5803cb93b8a64505a/lib/money-rails/active_record/monetizable.rb#L148

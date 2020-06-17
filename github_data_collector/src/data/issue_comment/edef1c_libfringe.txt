@@ -1,0 +1,81 @@
+
+The website and the crates.io package docs are out of sync. Please enable multiversion support (similar to docs.rs) for docs so that it is easy to use the project.
+There have been several changes over time since the last release. Please publish the new changes to crates.io if everything is green on the current master.
+Below is the output
+```sh
+$ cargo test --release
+   Compiling fringe v1.2.1 (file:///home/ubuntu/Project/rust/libfringe)
+    Finished release [optimized] target(s) in 5.91 secs
+     Running target/release/deps/fringe-cfa403e779d7269b
+
+running 5 tests
+test arch::tests::context ... ok
+test arch::tests::context_simd ... ok
+test arch::tests::swap ... ok
+error: process didn't exit successfully: `/home/ubuntu/Project/rust/libfringe/target/release/deps/fringe-cfa403e779d7269b` (signal: 4, SIGILL: illegal instruction)
+cargo test --release  7.44s user 3.98s system 179% cpu 6.352 total
+
+$ rustc --version
+rustc 1.25.0-nightly (a0dcecff9 2018-01-24)
+```
+
+seems that could not hanle panic properly.
+
+
+See previous discussion in #52.
+When running the example from the readme or anything else that uses libfringe like tokio-fibers i'm getting a segmenetation fault. Here's the stacktrace
+
+```
+#0  0x000055555555e5a1 in fringe::arch::imp::init::trampoline_2 ()
+    at /home/arturo/.cargo/registry/src/github.com-1ecc6299db9ec823/fringe-1.2.1/src/arch/x86_64.rs:115
+#1  0x00007fffffffd420 in ?? ()
+#2  0x000055555555e592 in fringe::arch::imp::init::trampoline_1 ()
+    at /home/arturo/.cargo/registry/src/github.com-1ecc6299db9ec823/fringe-1.2.1/src/arch/x86_64.rs:60
+#3  0x000055555555c420 in ?? () at /checkout/src/libcore/option.rs:157
+#4  0x0000000000000000 in ?? ()
+```
+Using a move closure inside a `struct::fn` which borrows a `struct` field results in corrupted memory when that closure is not `move`.
+
+Example:
+
+```
+extern crate fringe;
+use std::iter::Iterator;
+use fringe::generator::Yielder;
+use fringe::{OsStack, Generator};
+
+struct Gpx {
+    creator: String,
+}
+
+type Generator_<T> = fringe::Generator<(), T, fringe::OsStack>;
+
+impl Gpx {
+    pub fn events<'a>(&'a self) -> Generator_<&'a str> {
+        let stack = OsStack::new(1 << 24).unwrap();
+        Generator::new(stack, |ctx, ()| { // broken
+        // Generator::new(stack, move |ctx, ()| { // working
+            ctx.suspend(self.creator.as_str());
+        })
+    }
+}
+
+fn main() {
+    let data = Gpx{ creator: String::from("xyz") };
+    println!("{:?}", data.events().next());
+}
+```
+
+Unfortunately, I don't know if it's a problem with type checking or the unsafe portion. Given some pointers, I will try to debug it myself.
+I notice that there's no Drop implementation for Generator, and so it looks like it's owned stack won't get unwound, and so any resources owned by a Generator's stack will get leaked.
+
+So, it seems that that the only way currently to forcefully unwind a generator's stack is to pass in a value that asks it to panic, such as in [this example](https://github.com/cstorey/fringe-futures/blob/15b73c1194e7cd6773272d291372226c7632e1a8/src/lib.rs#L86). Is that right?
+
+I notice that context-rs has the ability to spawn a function [on top of a recovered stack](https://github.com/zonyitoo/context-rs/blob/9190d468be14e2f4b6660f6f7c48e1ab112a70bb/examples/how_to_ontop.rs), which might be an option for future implementation. But that seems quite risky.
+
+The `Stack` trait allows returning arbitrary raw pointers which can be used to write to arbitrary addresses using only safe code.
+
+I'd like to have some form of automated verification that we're not unintentionally modifying processor state that we're not declaring as clobbered.
+Preferably, we would automatically generate a list of processor state from a third-party source (such as [Capstone](http://www.capstone-engine.org/)) and use this to generate our clobber lists.
+
+Additionally, we could pattern-match the stack-swap code in real programs, and use this to statically check for state being carried across contexts.

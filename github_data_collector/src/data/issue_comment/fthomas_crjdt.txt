@@ -1,0 +1,159 @@
+Hi
+
+It looks like JSON CRDT described in the paper suffers from 2 kinds of unbounded growth problems
+
+- Tombstones in lists/sets
+- Applied operations
+
+Are there any ways to garbage-collect?  At some point I want to commit current state and clear operations. But then it is unclear how a newly added replica will converge with old replica - paper only describes transmission of messages.
+
+Same thing goes for tombstones. For an actively edited document the amount of tombstones may get out of hand. A possible solution that comes to mind - define some kind of `Commit` type of the operation that will signal to replica to perform tombstone GC. Commit Op is emitted arbitrarily by the programmer. 
+
+Please share your thoughts on the subject 
+Hi,
+
+Thanks for awesome library. It is quite difficult for a regular developer like me to figure out how to use the library. Could you please add some usage examples that would demonstrate convergence of two replicas with serialization/deserialization to/from JSON in between merges?
+
+Something like
+```
+p = initial state
+q = initial state
+
+p.someops
+q.someops
+
+p_ser:String = p.serialize
+q_ser:String = q.serialize
+<-- here it would be interesting for app developer to actually see JSON text, as if it is transmitted over network.
+
+
+p.merge(deserialize(q_ser))
+q.merge(deserialize(p_ser))
+
+```
+
+Thanks!
+I'm currently using the amazing [LSEQ CRDT](https://hal.archives-ouvertes.fr/hal-00921633/document) in a collaborative editor, and the new-ish JSON CRDT has me really excited. I'm trying to start on a port to JavaScript, but I'm afraid despite my CS background, the paper's notation is beyond me 😆
+
+I would love to include this in an upcoming talk I'm giving on [Collaborative Editing](https://speakerdeck.com/nybblr/does-the-network-seem-thin-up-here-collaborating-with-mountaintop-mesh-networks).
+
+Since I'm basically a n00b to Scala and Haskell, what resources would you recommend for wrapping my head around this? Or better yet, would you (or someone else really familiar with the datatype) be interested in collaborating on a JS port?
+The JSON CRDT [paper](https://arxiv.org/abs/1608.03960) was updated: "we have slightly refined the API, improved the clarity of explanations, and added some more examples".
+It would be great if the crjdt code will be updated to the paper :-)
+I want to discuss whether MapNode key i.e. `StrK(str: String)` should encode operation id i.e. `Id(c: BigInt, p: ReplicaId)`. Current implementation of `StrK` does not contain operation id `Id`.
+Semantically it means that any concurrent operations can be distinguished and preserved even if its string key is the same.
+
+For example, following operations
+```scala
+val p0 = Replica.empty("p")
+val q0 = Replica.empty("q")
+val p1 = p0.applyCmd(doc.downField("key") := `{}`)
+val q1 = q0.applyCmd(doc.downField("key") := `{}`)
+merge(p1, q1)
+```
+
+currently result in
+```
+MapNode(
+  Map(
+    MapT(DocK) -> MapNode(
+      Map(
+        MapT(StrK(key)) -> MapNode(Map(),Map())
+      ),
+    Map(StrK(key) -> Set(Id(1,p), Id(1,q))))
+  ),
+  Map(DocK -> Set(Id(1,p), Id(1,q)))
+)
+```
+
+If StrK encodes Id (let StrK to be `case class StrK(str: String, id: Id)`), above operations may result in
+```
+MapNode(
+  Map(
+    MapT(DocK) -> MapNode(
+      Map(
+        MapT(StrK(key, Id(1,p))) -> MapNode(Map(),Map()),
+        MapT(StrK(key, Id(1,q))) -> MapNode(Map(),Map())
+      ),
+      Map(
+        StrK(key, Id(1,p)) -> Set(Id(1,p)),
+        StrK(key, Id(1,q)) -> Set(Id(1,q))
+      )
+    )
+  ),
+  Map(DocK -> Set(Id(1,p), Id(1,q)))
+)
+```
+
+The first reason `StrK` should encode Id is lemma 7 in the paper refers to operation ID for ASSIGN operation with non-primitive values.
+> If o_a and o_c are assignments to the same cursor, we use the commutativity of updates to a partial function: child[id1 􏰀→ val1 ][id2 􏰀→ val2 ] = child[id2 􏰀→ val2 ][id1 􏰀→ val1 ] provided that id1 ̸= id2. Since operation IDs (Lamport timestamps) are unique, two concurrent assignments add two different keys to the mapping, and their order is immaterial.
+
+The second reason is that overriding causally dependent primitive value with non-primitive values creates an empty register viewed as present in document state, as reported in #15 . If StrK has operation ID, the two operation is distinguishable and empty register will not be present because `presSets` has different entries for each values.
+
+One negative reason `StrK` should not encode operation ID may be that the same value assigned by different operation will now be distinguished and may evolve with completely different histories. For example in Figure 3 of the paper, "grocery" key is initialized with an array independently by each replica. Following insertion is done against different ListNodes so I wonder two ListNode can be converged to the same array.
+
+Overriding causally dependent primitive value with empty list or map creates an empty register in document state.
+
+```scala
+val p0 = Replica
+    .empty("p")
+    .applyCmd(doc.downField("key") := "A")
+    .applyCmd(doc.downField("key") := `[]`)
+    .applyCmd(doc.downField("key").iter.insert("A"))
+```
+
+```
+MapNode(
+  Map(
+    MapT(DocK) -> MapNode(
+      Map(
+        RegT(StrK(key)) -> RegNode(Map()),
+        ListT(StrK(key)) -> ListNode(
+          Map(
+            RegT(IdK(Id(3,p))) -> RegNode(Map(Id(3,p) -> Str(A)))
+          ),
+          Map(IdK(Id(3,p)) -> Set(Id(3,p))),
+          Map(HeadR -> IdR(Id(3,p)), IdR(Id(3,p)) -> TailR)
+        )
+      ),
+      Map(StrK(key) -> Set(Id(2,p), Id(3,p)))
+    )
+  ),
+  Map(DocK -> Set(Id(1,p), Id(2,p), Id(3,p)))
+)
+```
+
+Converting documents that contain empty resister with last-writer-wins conflict resolver causes `Exception: java.lang.UnsupportedOperationException: empty.max`
+
+This is because the empty register is viewed present as `presSets` has key "key" so JSON converter tries to convert the empty register to JSON value, which is impossible.
+
+By the way `Node#values` query works correctly against empty register because it returns register's values that is empty. An implementation depends on Node states and does not use its query interface may hit this problem.
+Document state to JSON conversion introduced from #12 does not handle duplicate key as reported at [this comment](https://github.com/fthomas/crjdt/pull/12#issuecomment-270645358).
+
+Duplicate key can be made when MapNode is updated with different type values other than primitive.
+
+For example, concurrently updating to the same key "key" with object and string 
+```scala
+val p1 = p0
+    .applyCmd(doc.downField("key") := `{}`)
+    .applyCmd(doc.downField("key").downField("key2") := "D")
+val q1 = q0.applyCmd(doc.downField("key") := "C")
+merge(p1, q1)
+```
+
+results in duplicate keys, RegT(StrK(key)) and MapT(StrK(key)).
+
+```
+MapNode(
+  Map(
+    MapT(DocK) -> MapNode(
+      Map(
+        RegT(StrK(key)) -> RegNode(Map(Id(2,q) -> Str(C))),
+        MapT(StrK(key)) -> MapNode(Map(RegT(StrK(key2)) -> RegNode(Map(Id(3,p) -> Str(D)))),Map(StrK(key2) -> Set(Id(3,p))))
+      ),
+      Map(StrK(key) -> Set(Id(2,p), Id(3,p), Id(2,q)))
+    )
+  ),
+  Map(DocK -> Set(Id(1,p), Id(2,p), Id(3,p), Id(2,q)))
+)
+```

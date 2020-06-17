@@ -1,0 +1,152 @@
+第28行，……Unicode 转换格式（Uniform Transformation Format, UTF）……应该是……Unicode 转换格式（Unicode Transformation Format, UTF）……
+按照 MiloYip 大佬的观点，在解析数值必定会出错时返回 LEPT_PARSE_INVALID_VALUE，
+否则尽可能多匹配可以解析的字符，解析后返回LEPT_PARSE_ROOT_NOT_SINGULAR，
+但是解析篇中给出的实现不能达到上述目的，如 "01234"
+下面给出一种丑陋的但达到设计目的的实现
+```c
+static int lept_parse_number(lept_context *c, lept_value *val) {
+    int parse_type = -1;
+    const char *test = c->json;
+    errno = 0;
+    if (*test == '-')test++;
+    if (ISDIGIT(*test)) {
+        if (*test == '0') {
+            test++; 
+            if (*test == '.') {
+                test++;
+                if (!(ISDIGIT(*test)))return LEPT_PARSE_INVALID_VALUE;//0.
+                while (ISDIGIT(*test))test++;
+            }
+            else if (*test != 'e'&& *test != 'E' && *test != '\0') { parse_type = LEPT_PARSE_ROOT_NOT_SINGULAR; goto out; }//parse mostly valid text
+        }
+        else {
+            while (ISDIGIT(*test)) test++;
+            if (*test == '.') {
+                test++;
+                if (!(ISDIGIT(*test)))return LEPT_PARSE_INVALID_VALUE;//num+.
+                while (ISDIGIT(*test))test++;
+            }
+        }
+        if (*test == 'e' || *test == 'E') {
+            test++;
+            if (*test == '+' || *test == '-')test++;
+            if (!(ISDIGIT(*test))) { parse_type = LEPT_PARSE_ROOT_NOT_SINGULAR; goto out; }
+            while (ISDIGIT(*test))test++;
+        }
+    } else return LEPT_PARSE_INVALID_VALUE;
+out:
+    if (parse_type == LEPT_PARSE_ROOT_NOT_SINGULAR) {
+        int len = test - (c->json);
+        char *num = malloc(sizeof(char)*(len + 1));
+        memcpy(num, c->json, len);
+        num[len] = 0;
+        val->n = strtod(num, NULL);
+        free(num);
+        /*char *mod = test;
+        char ch = *mod;
+        printf("%s\n", c->json);
+        *mod = 0;
+        val->n = strtod(c->json, NULL);
+        *mod = ch;*/
+    }
+    else val->n = strtod(c->json, NULL);
+    if (errno == ERANGE && (val->n == HUGE_VAL || val->n == -HUGE_VAL)) { return LEPT_PARSE_NUMBER_TOO_BIG; }
+    c->json = test;
+    val->type = LEPT_NUMBER;
+    return parse_type > 0 ? parse_type : LEPT_PARSE_OK;
+}
+```
+static void lept_stringify_value(lept_context* c, const lept_value* v) {
+       case LEPT_NUMBER: c->top -= 32 - sprintf(lept_context_push(c, 32), "%.17g", v->u.n); break;
+
+这一句不能优化，因为c->top = 0;  c->top -= 32 - sprintf()在这个情况下等价于 c->top = 0 - (32 - sprintf())
+导致计算的c->top可能出现负值。程序就会出问题。
+本质原因是lept_context_push函数里，会让c->top发生变化。
+
+这个问题具体怎么回事，和编译器有很大关系。
+
+我总结的结果就是：在使用+= 或者 -=时，一定要确保右边的代码不能改动左边的变量，否则会出现意想不到的错误。
+
+In `test.c`, we compare the equality of two doubles simply with `==`:
+```c
+#define EXPECT_EQ_DOUBLE(expect, actual) EXPECT_EQ_BASE((expect) == (actual), expect, actual, "%.17g")
+```
+I don't know whether it works fine for others, but it just won't work on my computer. (Windows 10, 64, with (MinGW.org GCC-8.2.0-3) 8.2.0)
+
+To figure out what's wrong, I did a simple test with a seperate C file:
+```c
+#include <stdio.h>
+#include <stdlib.h>
+int main(int argc, char const *argv[])
+{
+    if(3.1416 != strtod("3.1416", NULL)){
+        printf("NOT EQUAL!\n");
+    }else{
+        printf("EQUAL.\n");
+    }
+    return 0;
+}
+```
+The interesting thing happens: **the output of this program depends on the C standard I use to compile it.**
+
+If I compile it with `gcc -std=c89` `gcc -std=c99` `gcc -std=c11` or  `gcc -std=c17`, the output of running the executable will be `NOT EQUAL!`. 
+
+If I compile it with `gcc`(no standard specified and therefore using `-std=gnu11`), the output is `EQUAL.`
+
+I don't know why this happens, but I think we'd better write `EXPECT_EQ_DOUBLE` in a more universal way despite the difference between OS and gcc version.
+
+首先感谢 Milo 先生的精彩教程，我在读过之后受益匪浅，并正在做 tutorial08 中留下的练习，我在练习时出现了两个问题无法独立解决，于是寻求您和其他 Watcher 的帮助，现将问题症状描述如下：
+
+1. 在 `test_copy()` 中 `lept_copy(&v2, &v1)` (line 479) 这一行，如果是在 Mac 下直接使用 Milo 先生给出的编译参数则会出现
+```
+Assertion failed: (src != NULL && dst != NULL && src != dst), function lept_copy, file /Users/ionizing/Documents/github/json-tutorial/draft/tutorial08_answer/leptjson.c, line 420.
+```
+经过断点测试，发现问题出在 `leptjson.c` 的 `lept_copy()` 对 `LEPT_ARRAY` 复制行为的相关代码中，直接原因是 `dst->u.a.e` 与 `src->u.a.e` 的地址相等（对，你没有看错，在不同次的 malloc 之后两个变量对应的地址相等 ！）；
+同样在 Mac 下，如果在编译参数中加上 `fsanitize=address` 则不会出现这个问题；
+在 Linux 下，无论是否使用 asan 都不会出现这个问题，绞尽脑汁后也想不到哪里出现了问题，此为第一个问题；
+
+2. 程序存在内存泄漏 (6 bytes) 。经过 `valgrind` 检查，问题出现在 `test_access_array()` 的 `#if 1 ... #endif` block 之后的 `lept_set_string(&e, "Hello", 5)` (line 614) 中， valgrind 认为 `lept_set_string()` 的实现中 `    v->u.s.s = (char*)malloc(len + 1);` 会导致 `v->u.s.s` 原来所指内存泄漏，这个问题在 Mac 和 Linux 都可以稳定复现。
+
+我的解答代码： [这里，直接搜索 `todo` 可以定位到我的修改处](https://github.com/Ionizing/json-tutorial/blob/draft/tutorial08_answer/leptjson.c)。
+我的系统环境：
+Mac: macOS 10.13.6, clang version 8.0.0 (tags/RELEASE_800/final by homebrew)
+Linux: ArchLinux, gcc version 9.1.0 (by pacman)
+
+如果还需要其他信息，还请各位在 reply 中指出。
+深夜打扰各位，再次感到抱歉。
+尝试运行了一下去掉第一个memcpy()的代码，利用valgrind检查出invalid read和invalid write问题，但想不通为什么会出现这种情况
+ 
+![image](https://user-images.githubusercontent.com/26712496/61822900-93449a80-ae0f-11e9-8399-d4f194b1268a.png)
+
+![TIM图片20190703183209](https://user-images.githubusercontent.com/38656355/60584976-32521580-9dc1-11e9-918b-c22d681d8c12.png)
+类内私有成员图
+![TIM图片20190703183551](https://user-images.githubusercontent.com/38656355/60585058-662d3b00-9dc1-11e9-9f70-d61dad615347.png)
+lept_parse_array()
+![TIM图片20190703183505](https://user-images.githubusercontent.com/38656355/60585083-71806680-9dc1-11e9-9251-1c861807b49c.png)
+编译器提示不可访问 但是ctrl+f5可以运行成功 
+不知道为什么
+下面是调试输出的信息：
+“Project4.exe”(Win32): 已加载“C:\Users\jhaom\source\repos\Project4\Debug\Project4.exe”。已加载符号。
+“Project4.exe”(Win32): 已加载“C:\Windows\SysWOW64\ntdll.dll”。已加载符号。
+“Project4.exe”(Win32): 已加载“C:\Windows\SysWOW64\kernel32.dll”。已加载符号。
+“Project4.exe”(Win32): 已加载“C:\Windows\SysWOW64\KernelBase.dll”。已加载符号。
+“Project4.exe”(Win32): 已加载“C:\Windows\SysWOW64\vcruntime140d.dll”。已加载符号。
+“Project4.exe”(Win32): 已加载“C:\Windows\SysWOW64\ucrtbased.dll”。已加载符号。
+线程 0x11490 已退出，返回值为 0 (0x0)。
+HEAP[Project4.exe]: Invalid address specified to RtlValidateHeap( 01210000, 01214F88 )
+Project4.exe 已触发了一个断点。
+
+第一，感谢作者给我们提提供这么好的库。
+第二，05_answer出现bug的地方是 assert(top==0)。
+第三，顺着该思路，我发现，解析数组错误后，堆栈的top不会指向原来初始的位置。
+第四，所以我自己手动加了一个 head，然后在返回之前，令c.top = head
+第五，这个和作者的解决方法虽然不一样，但是也能解决问题。 
+
+问题：05_answer的第五条：bug解释。这个bug的起因是作者认为每次push的时候，会留下一个指向堆内存的指针，但是实际的情况是，代码中并没有一个这样的指针。
+所以我不能清楚的明白问题出在哪？
+tutorial07中json生成器生成数字时，如果数字是科学计算法表示的，用`strtod(`)转换之后，可能不再是指数形式，也可能仍然是指数形式，但在指数部分会发生变化，如加上`+`号、在指数前加零。
+```
+expect: 1e+20 actual: 1e+020
+expect: 1.234e+20 actual: 1.234e+020
+expect: 1.234e-20 actual: 1.234e-020
+```

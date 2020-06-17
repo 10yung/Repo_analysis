@@ -1,0 +1,344 @@
+**Describe the bug**
+As title, StopAll should equivalent to  RemoveAll
+When incrementally updating the index removing/adding vectors, how much should I care to rebuild the index from time to time? Or only adding/removing vectors in an existing index is enough?
+**Describe the bug**
+Long-running `python` processes using the `SPTAGClient.py` library which hold a `SPTAGClient.AnnClient` object in memory and frequently call the `SPTAGClient.AnnClient.Search` method will result in a slow but obvious and linear (in number of searches) memory leak
+
+**To Reproduce**
+get an empty but compiled index. you may do this in any environment but to reproducibly do it in `docker`:
+1. `git clone` the repo (commit 0fdcd78 as of writing)
+2. `docker build -t sptag .`
+3. `docker run --rm -it sptag bash`
+
+build an example index. the following is a modification of the example in the python readme and assumes that you have the compiled SPTAG library as well as `numpy` installed
+
+```python
+import SPTAG
+import numpy as np
+
+n = 100
+
+def testBuild(algo, distmethod, x, out):
+    i = SPTAG.AnnIndex(algo, 'Float', x.shape[1])
+    i.SetBuildParam("NumberOfThreads", '4')
+    i.SetBuildParam("DistCalcMethod", distmethod)
+    if i.Build(x, x.shape[0]):
+        i.Save(out)
+
+x = (np.ones((n, 10), dtype=np.float32)
+     * np.reshape(np.arange(n, dtype=np.float32), (n, 1)))
+
+testBuild('BKT', 'L2', x, '/tmp/testindices')
+
+exit()
+```
+
+start the server. I used the following for `server.ini`:
+
+```
+[Service]
+ListenAddr=0.0.0.0
+ListenPort=8000
+ThreadNumber=8
+SocketThreadNumber=8
+
+[QueryConfig]
+DefaultMaxResultNumber=6
+DefaultSeparator=|
+
+[Index]
+List=BKT
+
+[Index_BKT]
+IndexFolder=/tmp/testindices/
+```
+
+and launched the services with
+
+```sh
+nohup /app/Release/server --mode socket --config server.ini &
+```
+
+do the memory profiling. at a high level here we are
+
+1. using the built-in `tracemalloc` to track the number of memory blocks reserved for each python object
+2. taking memory snapshots every 1, 10, 100, ... 100,000 requests and then trying a few other things (intentional GC, intentional index object deletion, sleep)
+3. looking at the resulting memory diffs and observing that the size of memory allocated as a result of AnnClient_Search calls grows with the number of requests
+
+```python
+import gc
+import tracemalloc
+
+tracemalloc.start()
+
+import SPTAGClient
+import numpy as np
+import time
+
+SNAPSHOT_REQUEST_NUMBERS = [1, 10, 100, 1000, 10000, 100000]
+F_SNP = '/tmp/after_{:0>6}_requests.snp'
+GC_SNP = '/tmp/after_{:0>6}_requests_then_gc.snp'
+GC_DEL_SNP = '/tmp/after_{:0>6}_requests_then_gc_del.snp'
+GC_DEL_GC_SNP = '/tmp/after_{:0>6}_requests_then_gc_del_gc.snp'
+GC_DEL_GC_SLEEP_SNP = '/tmp/after_{:0>6}_requests_then_gc_del_gc_sleep.snp'
+
+
+def make_snapshots(force_gc=False):
+    index = SPTAGClient.AnnClient('127.0.0.1', '8000')
+    while not index.IsConnected():
+        time.sleep(1)
+    print('connected!')
+    index.SetTimeoutMilliseconds(18000)
+    v = np.ones((10,), dtype=np.float32)
+    # dump once before we've made any requests
+    tracemalloc.take_snapshot().dump(F_SNP.format(0))
+    # record a trace after 1, 10, 100, 1000, 10000, and 100000 requests
+    for i in range(1, 100001):
+        index.Search(v, 6, 'Float', False)
+        if force_gc:
+            gc.collect()
+        if i in SNAPSHOT_REQUEST_NUMBERS:
+            print('recording snapshot at {}'.format(i))
+            tracemalloc.take_snapshot().dump(F_SNP.format(i))
+    # immediately force a garbage colleciton and take a snapshot
+    gc.collect()
+    tracemalloc.take_snapshot().dump(GC_SNP.format(i))
+    # delete the index and snapshot
+    del index
+    tracemalloc.take_snapshot().dump(GC_DEL_SNP.format(i))
+    # gc after delete
+    gc.collect()
+    tracemalloc.take_snapshot().dump(GC_DEL_GC_SNP.format(i))
+    # wait a minute and gc
+    time.sleep(60)
+    tracemalloc.take_snapshot().dump(GC_DEL_GC_SLEEP_SNP.format(i))
+
+
+def summarize_snapshot_results():
+    req_snapshots = {i: tracemalloc.Snapshot.load(F_SNP.format(i))
+                     for i in SNAPSHOT_REQUEST_NUMBERS}
+    diffs = {(i0, i1): req_snapshots[i1].compare_to(req_snapshots[i0], 'lineno')
+             for (i0, i1) in zip(SNAPSHOT_REQUEST_NUMBERS[:-1],
+                                 SNAPSHOT_REQUEST_NUMBERS[1:])}
+    # now also do the gc / del / sleep items
+    i_last = SNAPSHOT_REQUEST_NUMBERS[-1]
+    req_snapshots['gc'] = tracemalloc.Snapshot.load(GC_SNP.format(i_last))
+    req_snapshots['gc_del'] = tracemalloc.Snapshot.load(
+        GC_DEL_SNP.format(i_last))
+    req_snapshots['gc_del_gc'] = tracemalloc.Snapshot.load(
+        GC_DEL_GC_SNP.format(i_last))
+    req_snapshots['gc_del_gc_sleep'] = tracemalloc.Snapshot.load(
+        GC_DEL_GC_SLEEP_SNP.format(i_last))
+    diffs[i_last, 'gc'] = req_snapshots['gc'].compare_to(req_snapshots[i_last],
+                                                         'lineno')
+    diffs['gc', 'gc_del'] = req_snapshots['gc_del'].compare_to(
+        req_snapshots['gc'], 'lineno')
+    diffs['gc_del', 'gc_del_gc'] = req_snapshots['gc_del_gc'].compare_to(
+        req_snapshots['gc_del'], 'lineno')
+    diffs['gc_del_gc', 'gc_del_gc_sleep'] = req_snapshots[
+        'gc_del_gc_sleep'].compare_to(req_snapshots['gc_del_gc'], 'lineno')
+    # demonstrate that for each snapshot diff the largest increase in memory
+    # was related to invoking AnnClient_Search:
+    for ((i0, i1), diff) in diffs.items():
+        print(
+            'comparing memory usage between {} requests and {} requests'.format(
+                i0, i1))
+        # find the reference to AnnClient_Search
+        for (idx, d) in enumerate(diff):
+            try:
+                if '_SPTAGClient.AnnClient_Search' in d.traceback.format()[1]:
+                    ann_search_idx = idx
+                    d_ann_search = d
+                    break
+            except IndexError:
+                continue
+        print(
+            '_SPTAGClient.AnnClient_Search is {} out of {} for new '
+            'allocations'.format(
+                ann_search_idx, len(diff)))
+        print('{} new KiB'.format(d_ann_search.size_diff / 1024))
+        print('{} total KiB'.format(d_ann_search.size / 1024))
+        print('{} new'.format(d_ann_search.count_diff))
+        print('{} total_memory_blocks'.format(d_ann_search.count))
+        for line in d_ann_search.traceback.format():
+            print(line)
+        print()
+
+
+if __name__ == '__main__':
+    print('NOT FORCING GARBAGE COLLECTION')
+    make_snapshots(force_gc=False)
+    summarize_snapshot_results()
+
+    print('FORCING GARBAGE COLLECTION')
+    make_snapshots(force_gc=True)
+    summarize_snapshot_results()
+```
+
+
+**Expected behavior**
+I would expect roughly constant memory allocation size for the search index regardless of the number of requests previously submitted
+
+**Screen output**
+the following was the output of the above test script on my laptop in the current master commit docker container:
+
+```
+NOT FORCING GARBAGE COLLECTION
+connected!
+recording snapshot at 1
+recording snapshot at 10
+recording snapshot at 100
+recording snapshot at 1000
+recording snapshot at 10000
+recording snapshot at 100000
+comparing memory usage between 1 requests and 10 requests
+_SPTAGClient.AnnClient_Search is 3 out of 3002 for new allocations
+1.328125 new KiB
+1.53515625 total KiB
+55 new
+63 total_memory_blocks
+  File "/app/Release/SPTAGClient.py", line 125
+    return _SPTAGClient.AnnClient_Search(self, p_data, p_resultNum, p_valueType, p_withMetaData)
+
+comparing memory usage between 10 requests and 100 requests
+_SPTAGClient.AnnClient_Search is 0 out of 3001 for new allocations
+12.65625 new KiB
+14.19140625 total KiB
+540 new
+603 total_memory_blocks
+  File "/app/Release/SPTAGClient.py", line 125
+    return _SPTAGClient.AnnClient_Search(self, p_data, p_resultNum, p_valueType, p_withMetaData)
+
+comparing memory usage between 100 requests and 1000 requests
+_SPTAGClient.AnnClient_Search is 0 out of 3001 for new allocations
+126.5625 new KiB
+140.75390625 total KiB
+5400 new
+6003 total_memory_blocks
+  File "/app/Release/SPTAGClient.py", line 125
+    return _SPTAGClient.AnnClient_Search(self, p_data, p_resultNum, p_valueType, p_withMetaData)
+
+comparing memory usage between 1000 requests and 10000 requests
+_SPTAGClient.AnnClient_Search is 0 out of 3001 for new allocations
+1265.625 new KiB
+1406.37890625 total KiB
+54000 new
+60003 total_memory_blocks
+  File "/app/Release/SPTAGClient.py", line 125
+    return _SPTAGClient.AnnClient_Search(self, p_data, p_resultNum, p_valueType, p_withMetaData)
+
+comparing memory usage between 10000 requests and 100000 requests
+_SPTAGClient.AnnClient_Search is 0 out of 3001 for new allocations
+12656.25 new KiB
+14062.62890625 total KiB
+540000 new
+600003 total_memory_blocks
+  File "/app/Release/SPTAGClient.py", line 125
+    return _SPTAGClient.AnnClient_Search(self, p_data, p_resultNum, p_valueType, p_withMetaData)
+
+comparing memory usage between 100000 requests and gc requests
+_SPTAGClient.AnnClient_Search is 7 out of 3002 for new allocations
+-0.0625 new KiB
+14062.56640625 total KiB
+-1 new
+600002 total_memory_blocks
+  File "/app/Release/SPTAGClient.py", line 125
+    return _SPTAGClient.AnnClient_Search(self, p_data, p_resultNum, p_valueType, p_withMetaData)
+
+comparing memory usage between gc requests and gc_del requests
+_SPTAGClient.AnnClient_Search is 11 out of 3003 for new allocations
+0.0 new KiB
+14062.56640625 total KiB
+0 new
+600002 total_memory_blocks
+  File "/app/Release/SPTAGClient.py", line 125
+    return _SPTAGClient.AnnClient_Search(self, p_data, p_resultNum, p_valueType, p_withMetaData)
+
+comparing memory usage between gc_del requests and gc_del_gc requests
+_SPTAGClient.AnnClient_Search is 8 out of 3001 for new allocations
+0.0 new KiB
+14062.56640625 total KiB
+0 new
+600002 total_memory_blocks
+  File "/app/Release/SPTAGClient.py", line 125
+    return _SPTAGClient.AnnClient_Search(self, p_data, p_resultNum, p_valueType, p_withMetaData)
+
+comparing memory usage between gc_del_gc requests and gc_del_gc_sleep requests
+_SPTAGClient.AnnClient_Search is 7 out of 3001 for new allocations
+0.0 new KiB
+14062.56640625 total KiB
+0 new
+600002 total_memory_blocks
+  File "/app/Release/SPTAGClient.py", line 125
+    return _SPTAGClient.AnnClient_Search(self, p_data, p_resultNum, p_valueType, p_withMetaData)
+```
+
+**Desktop (please complete the following information):**
+ - OS: iOS
+ - Browser chrome
+ - Version commit 0fdcd78
+**Describe the bug**
+When I run `./server` in docker, nothing happens
+
+**To Reproduce**
+Steps to reproduce the behavior:
+1. git clone https://github.com/microsoft/SPTAG.git
+2. cd SPTAG
+3. docker build -t sptag .
+4. docker run -it --entrypoint bash sptag
+5. cd Release
+6. ./server
+
+**Expected behavior**
+server binary should print list of parameters if not provided
+
+**Desktop (please complete the following information):**
+ - OS: Ubuntu 19.10
+ - Version [e.g. 22]
+
+**Additional context**
+I also tried building SPTAG locally but the problem persists. When I run `./client` it works and prints list of parameters it expects but running server binary does nothing.
+
+for now, the index build and index search  go well in dataset which dimension is bigger than 8.
+However, when i use the random dataset 10M * 4,  there is a  "Segmentation fault". the detail position is as follow:
+Start to build BKTree 1
+1 BKTree built, 10000001 10000000
+build RNG graph!
+Parallel TpTree Partition begin 
+Segmentation fault (here).
+
+
+So, i wonder whether there exist a parameter that limits the input dataset dimension?
+
+
+**Describe the bug**
+Hello, everyone, There is an issue when trying to build from the repo with CMAKE : the problem seems to be that CMAKE cannot find Boost 1.67, and a rapid google search does not give me an answer whether I can install Boost or whether I should change the compiler.
+
+**To Reproduce**
+To reproduce : 
+I have tried it both on my machine (WSL, cmd & Powershell), and on a DSVM (Ubuntu 16.04).
+I git cloned the project, then from the SPTAG repo, did "mkdir build", then "cd build && cmake .. && make", or the adapted syntax depending on the OS.
+
+
+Hi, when i first cmake the file, it occurs a mistake: SPTAG-master/AnnService/src/Core/BKT/BKTIndex.cpp:260:39: error: expected primary-expression before ‘>’ token
+             ptr->m_pTrees.BuildTrees<T>(ptr);
+
+How do i solve it ?
+
+
+This provides further detail on how to build SPTAG on Ubuntu.
+
+- Install swig, cmake and boost requirements for SPTAG
+- Building SPTAG
+
+Note that there is a boost version mismatch issue reported here: https://github.com/microsoft/SPTAG/issues/26 
+Where only 1.67 is compatible at the moment. 
+This provides an end-to-end example for developers to get started with SPTAG on an image dataset. 
+
+Key additions:
+- Jupyter notebook example that shows a user how to do visual similarity search on a public image dataset. Downloads images, extracts features from images, and using SPTAG to perform the similarity search. 
+- Helper class (features_extractor.py) to do some image processing and extraction of features from images - this class is called from the notebook. 
+
+This PR aims to address the following requests:
+https://github.com/microsoft/SPTAG/issues/104
+

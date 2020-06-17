@@ -1,0 +1,169 @@
+As suggested in #425, this pull request makes it possible to easily extend rubyzip with additional decompressors.
+
+This is a funny one that has been exposed by fixing #395...
+
+The defaults for `restore_times`, `restore_permissions` and `restore_ownership` are separately specified in both `Zip::File` and `Zip::Entry` and they are out of sync.
+
+Current defaults for each option:
+
+| Option/Class | `Zip::File` | `Zip::Entry` |
+|--------:|:------------:|:--------------:|
+| `restore_times` | `false` | `true` |
+| `restore_permissions` | `false` | `false` |
+| `restore_ownership` | `false` | `false` |
+
+This isn't generally an issue as whatever is set in `Zip::File` is percolated through to `Zip::Entry` - except not always :grimacing:
+
+The following example shows how this can get confused:
+
+```ruby
+zip = ::Zip::File.open('test/data/globTest.zip')
+
+e1 = zip.find_entry('globTest/food.txt')
+e1.extract('f_test.txt')
+
+e2 = zip.get_entry('globTest/food.txt')
+e2.extract('g_test.txt')
+
+zip.close
+```
+
+`f_test.txt` has a timestamp of 18 May 2012; `g_test.txt` has the current time and date for its timestamp.
+
+This all occurs because the default for the above options are stored twice - and (kind of) need to be due to there not always being a `Zip::File` parent for every `Zip::Entry` - but also because while `Zip::File#get_entry` and `Zip::File#find_entry` are ostensibly doing the same thing, they are implemented very differently.
+
+The quick fix for this is fairly easy, and I'll work up a PR for it later.
+
+The main reason I am documenting this in a detailed issue is to ask: should these options be moved up to the top level, alongside `validate_entry_sizes`, _et al_? Or do we leave them where they are and risk them being out of sync again in the future? @jdleesmiller, @simonoff, I'd appreciate your thoughts, but I reckon moving them up is the right way to go - this would have the happy side-effect of simplifying various interfaces in `Zip::File`. Happy to also work this up as a PR if you agree.
+I find myself testing things in `irb` enough that this has proved useful, so I decided to commit it.
+
+It's purely a developer nicety so isn't stored in the gem.
+I have a scenario where I would like to create a zip that resolves to the same hash each time, similar to how the *nix `zip -X` flag works, but ideally more cross-platform. To that effect it would be nice to have an option to disable the storage of additional fields.
+
+Currently I can hack it in by doing something like this, but it would be nice to just have a flag I could set.
+
+```ruby
+require "zip"
+require "digest"
+
+File.write("a", "asdf")
+Zip.default_compression = Zlib::NO_COMPRESSION
+
+Zip::File.open("a.zip", Zip::File::CREATE) do |zipfile|
+  a = zipfile.add("a", "a")
+  a.time = ::Zip::DOSTime.new(2000)
+  a.extra = ::Zip::ExtraField.new
+  puts a.class
+end
+puts Digest::SHA2.hexdigest(File.read("a.zip"))
+File.unlink("a.zip")
+```
+Bug found by fuzzing rubyzip.
+
+When creating an `ExtraField` from a binary string, in the `#merge` method there is no check for the `binstr` length, resulting in either `id` or `len` variables possibly being set to nil. I created a quick fix that raises a `Zip::Error` if either of these variables are nil to prevent an unhandled `NoMethodError` when using them.
+
+## Raw crash
+```
+/home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/extra_field.rb:14:in `extra_field_type_exist': undefined method `+' for nil:NilClass (NoMethodError)
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/extra_field.rb:44:in `merge'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/extra_field.rb:6:in `initialize'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/entry.rb:373:in `new'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/entry.rb:373:in `read_c_dir_extra_field'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/entry.rb:387:in `read_c_dir_entry'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/entry.rb:205:in `read_c_dir_entry'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/central_directory.rb:127:in `block in read_central_directory_entries'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/central_directory.rb:126:in `times'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/central_directory.rb:126:in `read_central_directory_entries'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/central_directory.rb:138:in `read_from_stream'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:76:in `block in initialize'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:75:in `open'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:75:in `initialize'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:97:in `new'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:97:in `open'
+	from zip.rb:3:in `<main>'
+```
+
+[Reproduce with this file](https://github.com/zelivans/rubyzip/blob/upload_crashes/crashes/id:000010%2Csig:10%2Csrc:000000%2Cop:arith8%2Cpos:252%2Cval:-21) (extra_field.rb:14) [or this one](https://github.com/zelivans/rubyzip/blob/upload_crashes/crashes/id:000028%2Csig:10%2Csrc:000046%2Cop:arith8%2Cpos:252%2Cval:-12) (extra_field.rb:12)
+Bug found by fuzzing rubyzip.
+
+In the `#name_is_directory?` method the `@name` variable is used to check if the entry is a directory. This results in an unhandled `NoMethodError` when `@name` is nil.  In this case `@name` was set in `#read_c_dir_entry`, where I added a quick fix by setting it to an empty string when it would be set to nil.
+
+I do think some more serious refactoring might be needed to prevent bugs like this one from happening  with rubyzip but for now this solves this precise crash.
+
+## Raw crash
+```
+/home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/entry.rb:109:in `name_is_directory?': undefined method `end_with?' for nil:NilClass (NoMethodError)
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/entry.rb:346:in `set_ftype_from_c_dir_entry'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/entry.rb:390:in `read_c_dir_entry'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/entry.rb:205:in `read_c_dir_entry'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/central_directory.rb:127:in `block in read_central_directory_entries'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/central_directory.rb:126:in `times'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/central_directory.rb:126:in `read_central_directory_entries'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/central_directory.rb:138:in `read_from_stream'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:76:in `block in initialize'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:75:in `open'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:75:in `initialize'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:97:in `new'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:97:in `open'
+	from zip.rb:3:in `<main>'
+```
+
+[Reproduce with this file](https://github.com/zelivans/rubyzip/blob/upload_crashes/crashes/id:000049%2Csig:10%2Csrc:000145%2B000023%2Cop:splice%2Crep:2)
+Bug found by fuzzing rubyzip.
+
+In the `#read_central_directory_entries` method, `@cdir_offset` can be nil resulting in the call to `io.seek` raising an unhandled `TypeError` exception. It appears `@cdir_offset` is set in `#read_e_o_c_d` or `#read_64_e_o_c_d`, but I am not sure that it is considered a failure for it to be set to nil there, so in my fix I threw a `Zip::Error` exception just before trying to use the non-existent cdir_offset. 
+
+## Raw crash
+```
+/home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/central_directory.rb:121:in `seek': no implicit conversion from nil to integer (TypeError)
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/central_directory.rb:121:in `read_central_directory_entries'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/central_directory.rb:138:in `read_from_stream'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:76:in `block in initialize'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:75:in `open'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:75:in `initialize'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:97:in `new'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:97:in `open'
+	from zip.rb:3:in `<main>'
+```
+
+[Reproduce with this file](https://github.com/zelivans/rubyzip/blob/upload_crashes/crashes/id:000014%2Csig:10%2Csrc:000000%2Cop:ext_AO%2Cpos:461)
+Bug found by fuzzing rubyzip.
+
+`io.read(::Zip::CDIR_ENTRY_STATIC_HEADER_LENGTH)` can resolve to nil, resulting in an unhandled `NoMethodError` exception in the `#check_c_dir_entry_static_header_length` method. This can be simply fixed by using an empty string when this variable is nil. This is a quick fix for the issue, decide if this is okay or you want something more comprehensive.
+
+## Raw crash
+```
+/home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/entry.rb:355:in `check_c_dir_entry_static_header_length': undefined method `bytesize' for nil:NilClass (NoMethodError)
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/entry.rb:379:in `read_c_dir_entry'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/entry.rb:205:in `read_c_dir_entry'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/central_directory.rb:127:in `block in read_central_directory_entries'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/central_directory.rb:126:in `times'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/central_directory.rb:126:in `read_central_directory_entries'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/central_directory.rb:138:in `read_from_stream'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:76:in `block in initialize'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:75:in `open'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:75:in `initialize'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:97:in `new'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:97:in `open'
+	from zip.rb:3:in `<main>'
+```
+
+[Reproduce with this file](https://github.com/zelivans/rubyzip/blob/upload_crashes/crashes/id:000000%2Csig:10%2Csrc:000000%2Cop:flip1%2Cpos:251)
+Hi, I've been testing rubyzip with a Ruby fuzzing tool ([kisaten](https://github.com/zelivans/kisaten)) and found a few bugs. I wrote fixes for all the bugs and sending PRs now.
+
+In this bug it appears that `ExtraField` can leave some members empty (nil), specifically `mtime` for `UniversalTime` and `NTFS`. I don't know if this is expected behavior but I created a specific fix for this issue by checking nil value in the `#time` function, otherwise it raises a `NoMethodError` and crashes the execution.
+
+## Raw crash
+```
+/home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/entry.rb:490:in `==': undefined method `dos_equals' for nil:NilClass (NoMethodError)
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/entry_set.rb:53:in `=='
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/entry_set.rb:53:in `=='
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:343:in `!='
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:343:in `commit_required?'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:309:in `commit'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:334:in `close'
+	from /home/ariel/afl-kisaten/private/sandbox/rubyzip/rubyzip/lib/zip/file.rb:102:in `open'
+	from zip.rb:3:in `<main>'
+```
+
+[Reproduce the crash with this file](https://github.com/zelivans/rubyzip/blob/upload_crashes/crashes/id:000002%2Csig:10%2Csrc:000000%2Cop:flip1%2Cpos:252).

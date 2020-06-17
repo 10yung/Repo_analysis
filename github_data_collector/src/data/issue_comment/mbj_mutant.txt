@@ -1,0 +1,201 @@
+Hey @mbj, I asked you a question about this on twitter previously but failed to debug it myself.
+
+I'm experiencing a mismatch in the results between local machine and CI, and unfortunately I'm getting failures in the latter. The failure is about neutral mutation:
+
+```
+--- Neutral failure ---
+Original code was inserted unmutated. And the test did NOT PASS.
+Your tests do not pass initially or you found a bug in mutant / unparser.
+Subject AST:
+s(:def, :execute,
+  s(:args),
+  s(:begin,
+    s(:if,
+      s(:send, nil, :template_path), nil,
+      s(:return)),
+    s(:send,
+      s(:const, nil, :YAML), :load_file,
+      s(:send, nil, :template_path))))
+Unparsed Source:
+def execute
+  unless template_path
+    return
+  end
+  YAML.load_file(template_path)
+end
+```
+
+Local setup:
+* MacOS 10.14.6 w/ Ruby 2.5.3 -> pass
+* Docker (minideb/stretch-based w/ Ruby 2.5.3) -> pass
+
+CI setup:
+* Exactly same docker image running on Gitlab CI EE -> fail.
+
+At worst I will move this method elsewhere but I'd still like to understand the cause.
+
+Apart from that mutant has been absolutely stellar and helped me improve the codebase, and I wanted to say thank you for sharing it.
+Close #639
+A feature request I have would be to add two flags to the mutant cli:
+
+* `--skip-subject`
+* `--pending-subject`
+
+The `--skip-subject` flag should perform exactly the same as `--ignore-subject`, where it doesn't bother to mutate the subject nor run the subject's tests. This would be reserved for methods where attempting to mutate will cause an infinite loop and never finish.
+
+The `--pending-subject` flag should mutate the subject and run it's tests, and report failure if the subject *is* fully mutation covered. The expectation is that these methods are safe to mutate, but are expected to have alive mutations.
+
+Both of these flags should work with wildcards as well as explicit targets.
+
+The reason for these two flags is that we noticed we were using `--ignore-subject` for both cases, but we want `mutant` to tell us when something is 100% covered so we can adjust configuration so we can begin asserting the methods stay 100% covered in the future. We believe that less than 5% of the methods we are currently ignoring should be unconditionally skipped.
+Original (not desugared):
+
+```
+if foo
+  # do_a
+elsif bar
+  # do_b
+else
+  # do_c
+end
+```
+
+mutation:
+
+```
+if bar
+  # do_b
+else
+  # do_c
+end
+```
+In a commit with a removal of a method, the location of the removed code was used for subject selection. The method directly below had no coverage, and was selected, which caused the build to fail.
+mutant replaces the second argument to `raise` with `self`, leading to infinite recursion if that raise call is within `#to_s`, as raise tries to stringify that argument.
+
+minimal repro:
+
+```bash
+echo 'class C; def to_s; raise TypeError, "foo" end end' > c.rb
+echo 'RSpec.describe(C) { it("#to_s") { expect { C.new.to_s }.to raise_error(TypeError, "foo") } }' > spec/c_spec.rb
+bundle exec mutant --require './c' --use rspec C
+```
+
+this one raises `ArgumentError: marshal data too short`, but I've also seen `EOFError`.
+
+there might be other cases where inserting `self` within `#to_s` causes problems.
+
+
+To decrease the time until we get valuable feedback, `mutant` should print alive mutations to the console while it is still running.
+Using mutant git commit:   remote: https://github.com/mbj/mutant.git
+  revision: 6d46f49bbd2fde97d2de274a1a053199e2ef8110
+
+The pattern as I see it is a neutral failure is reported, then a EBADF bad file descriptor error on some file. Sometimes the file reported is a gem, sometimes a code file.
+
+Note the error at top indicates `fptr_finalize_flush` and the error below indicates `io_fillbuf`.
+```-----------------------
+PrepareProgress#needs_temp_themes_finished:/Users/tj/projects/AOT/app/lib/stage_progress/prepare_progress.rb:232
+- rspec:0:./spec/lib/stage_progress/prepare_progress_spec.rb:22/PrepareProgress#determine_complete has calculate the progress of a virgin cycle
+- rspec:1:./spec/lib/stage_progress/prepare_progress_spec.rb:31/PrepareProgress#determine_complete has calculate the progress of a real cycle
+neutral:PrepareProgress#needs_temp_themes_finished:/Users/tj/projects/AOT/app/lib/stage_progress/prepare_progress.rb:232:d41fb
+--- Neutral failure ---
+Original code was inserted unmutated. And the test did NOT PASS.
+Your tests do not pass initially or you found a bug in mutant / unparser.
+Subject AST:
+s(:def, :needs_temp_themes_finished,
+  s(:args),
+  s(:begin,
+    s(:if,
+      s(:send,
+        s(:send, nil, :themes), :blank?),
+      s(:return), nil),
+    s(:lvasgn, :active,
+      s(:send,
+        s(:send, nil, :active_themes), :size)),
+    s(:lvasgn, :temp,
+      s(:send, nil, :num_temp_themes)),
+    s(:send, nil, :add_stats,
+      s(:lvar, :active),
+      s(:send,
+        s(:lvar, :active), :+,
+        s(:lvar, :temp)),
+      s(:send,
+        s(:const, nil, :I18n), :t,
+        s(:str, "finish_temp_themes"),
+        s(:hash,
+          s(:pair,
+            s(:sym, :temp),
+            s(:lvar, :temp)))))))
+Unparsed Source:
+def needs_temp_themes_finished
+  if themes.blank?
+    return
+  end
+  active = active_themes.size
+  temp = num_temp_themes
+  add_stats(active, active + temp, I18n.t("finish_temp_themes", temp: temp))
+end
+-----------------------
+- 2 @ runtime: 0.8842679999943357
+  - rspec:0:./spec/lib/stage_progress/prepare_progress_spec.rb:22/PrepareProgress#determine_complete has calculate the progress of a virgin cycle
+  - rspec:1:./spec/lib/stage_progress/prepare_progress_spec.rb:31/PrepareProgress#determine_complete has calculate the progress of a real cycle
+Test Output:
+
+Randomized with seed 51352
+
+PrepareProgress
+  #determine_complete
+    has calculate the progress of a real cycle (FAILED - 1)
+
+Failures:
+
+  1) PrepareProgress#determine_complete has calculate the progress of a real cycle
+     Failure/Error: assessment_grammar_recommendations.reorder(nil).distinct.pluck(:code)
+
+     Errno::EBADF:
+       Bad file descriptor @ fptr_finalize_flush - /Users/tj/.rvm/rubies/ruby-2.5.3/lib/ruby/gems/2.5.0/gems/activerecord-5.2.2/lib/active_record/associations/join_dependency.rb
+     # ./app/lib/aa_stats.rb:55:in `points_needing_grammar_fixed'
+     # ./app/lib/stage_progress/prepare_progress.rb:11:in `points_needing_grammar_fixed'
+     # ./app/lib/stage_progress/prepare_progress.rb:110:in `needs_grammar_review'
+     # ./app/lib/stage_progress/prepare_progress.rb:54:in `top_level_cycle_checks'
+     # ./app/lib/stage_progress/prepare_progress.rb:38:in `determine_complete'
+     # ./app/lib/stage_progress/stage_progress_calculator.rb:36:in `block in completeness'
+     # ./app/lib/stage_progress/stage_progress_calculator.rb:34:in `each'
+     # ./app/lib/stage_progress/stage_progress_calculator.rb:34:in `completeness'
+     # ./spec/lib/stage_progress/prepare_progress_spec.rb:34:in `block (3 levels) in <top (required)>'
+     # ./spec/spec_helper.rb:53:in `block (3 levels) in <top (required)>'
+     # ./spec/spec_helper.rb:52:in `block (2 levels) in <top (required)>'
+     # /Users/tj/.bundle/ruby/2.5.0/mutant-6d46f49bbd2f/lib/mutant/env.rb:87:in `block in run_mutation_tests'
+     # /Users/tj/.bundle/ruby/2.5.0/mutant-6d46f49bbd2f/lib/mutant/isolation/fork.rb:171:in `call'
+     # /Users/tj/.bundle/ruby/2.5.0/mutant-6d46f49bbd2f/lib/mutant/isolation/fork.rb:81:in `block in start_child'
+     # /Users/tj/.bundle/ruby/2.5.0/mutant-6d46f49bbd2f/lib/mutant/isolation/fork.rb:80:in `fork'
+     # /Users/tj/.bundle/ruby/2.5.0/mutant-6d46f49bbd2f/lib/mutant/isolation/fork.rb:80:in `start_child'
+     # /Users/tj/.bundle/ruby/2.5.0/mutant-6d46f49bbd2f/lib/mutant/isolation/fork.rb:67:in `call'
+     # /Users/tj/.bundle/ruby/2.5.0/mutant-6d46f49bbd2f/lib/mutant/isolation/fork.rb:191:in `block (2 levels) in call'
+     # /Users/tj/.bundle/ruby/2.5.0/mutant-6d46f49bbd2f/lib/mutant/isolation/fork.rb:32:in `block in with'
+     # /Users/tj/.bundle/ruby/2.5.0/mutant-6d46f49bbd2f/lib/mutant/isolation/fork.rb:31:in `pipe'
+     # /Users/tj/.bundle/ruby/2.5.0/mutant-6d46f49bbd2f/lib/mutant/isolation/fork.rb:31:in `with'
+     # /Users/tj/.bundle/ruby/2.5.0/mutant-6d46f49bbd2f/lib/mutant/isolation/fork.rb:190:in `block in call'
+     # /Users/tj/.bundle/ruby/2.5.0/mutant-6d46f49bbd2f/lib/mutant/isolation/fork.rb:32:in `block in with'
+     # /Users/tj/.bundle/ruby/2.5.0/mutant-6d46f49bbd2f/lib/mutant/isolation/fork.rb:31:in `pipe'
+     # /Users/tj/.bundle/ruby/2.5.0/mutant-6d46f49bbd2f/lib/mutant/isolation/fork.rb:31:in `with'
+     # /Users/tj/.bundle/ruby/2.5.0/mutant-6d46f49bbd2f/lib/mutant/isolation/fork.rb:189:in `call'
+     # /Users/tj/.bundle/ruby/2.5.0/mutant-6d46f49bbd2f/lib/mutant/env.rb:81:in `run_mutation_tests'
+     # /Users/tj/.bundle/ruby/2.5.0/mutant-6d46f49bbd2f/lib/mutant/env.rb:49:in `kill'
+     # /Users/tj/.bundle/ruby/2.5.0/mutant-6d46f49bbd2f/lib/mutant/parallel/worker.rb:28:in `call'
+     # /Users/tj/.bundle/ruby/2.5.0/mutant-6d46f49bbd2f/lib/mutant/parallel/worker.rb:28:in `block in call'
+     # /Users/tj/.bundle/ruby/2.5.0/mutant-6d46f49bbd2f/lib/mutant/parallel/worker.rb:23:in `loop'
+     # /Users/tj/.bundle/ruby/2.5.0/mutant-6d46f49bbd2f/lib/mutant/parallel/worker.rb:23:in `call'
+     # ------------------
+     # --- Caused by: ---
+     # Errno::EBADF:
+     #   Bad file descriptor @ io_fillbuf - fd:10 /Users/tj/.rvm/rubies/ruby-2.5.3/lib/ruby/gems/2.5.0/gems/activerecord-5.2.2/lib/active_record/associations/join_dependency.rb
+     #   ./app/lib/aa_stats.rb:55:in `points_needing_grammar_fixed'
+
+Finished in 0.86997 seconds (files took 16 minutes 22 seconds to load)
+1 example, 1 failure
+
+Failed examples:
+
+rspec ./spec/lib/stage_progress/prepare_progress_spec.rb:31 # PrepareProgress#determine_complete has calculate the progress of a real cycle
+
+Randomized with seed 51352```

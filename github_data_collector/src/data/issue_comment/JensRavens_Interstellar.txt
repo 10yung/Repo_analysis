@@ -1,0 +1,142 @@
+
+Hi, 
+I'm huge fan of the project. It is really well done and using it is a breeze.
+
+Today, Apple released Xcode 10.2 with Swift 5 and now we have `Result` type built into the language. How do you think it influences the project? Should it replace Interstellar's `Result` type or would you like to keep them both by conforming to `ResultType` protocol? 
+I don't think it's possible to "silently" update an observable's value. Such a use-case kinda popped-up for me today... 
+
+Do you think it makes sense to add it to Interstellar's API?
+I am wrapping `URLSessionDataTask` instances in `Observable` instances via code similar to that listed below (I have removed the use of generics and replaced them with concrete types to, hopefully, make the example more clear).
+
+```swift
+// Where the conversion of the datatask to the signal occurs.
+func toObservable(url: URL, dataTaskToConvert: (URL, (Result<Data>) -> Void)) -> Observable<Result<Data>> {
+
+    let signal = Observable<Result<Data>>()
+
+    let value: URLSessionDataTask? = dataTaskToConvert(url) { result in
+        signal.update(result)
+    }
+    return signal
+}
+
+// Example API for consumer to make network requests without ugly callbacks.
+func fetch(url: URL) ->  Observable<Result<Data>> {
+    return toObservable(url: url, dataTaskToConvert: fetch)
+}
+
+// DataTask response handling is transformed to use an API with Interstellar's Result type like so:
+func fetch(url: URL, completion: @escaping (Result<Data>) -> Void) -> URLSessionDataTask {
+    let task = sharedUrlSession.dataTask(with: url) { data, response, error in
+        if let data = data {
+            completion(Result.success(data))
+            return
+        }
+
+        if let error = error {
+            completion(Result.error(error))
+            return
+        }
+
+        let sdkError = SDKError.invalidHTTPResponse(response: response)
+        completion(Result.error(sdkError))
+    }
+
+    task.resume()
+    return task
+}
+```
+
+Unfortunately, I haven't figured out a way to expose the underlying `URLSessionDataTask` to the client to cancel the request in a clean fashion. I think ideally, there would be somesort of method on the observable to stop the signal. My workaround currently is to return tuple of `(URLSessionDataTask, Observable<Result<Data>>)` rather than just the `Observable` so that the client can take advantage of the `Observable` API provided by Interstellar while also having the ability to cancel the request. However, I find the tuple API ugly to use, as client code would look like the following:
+
+```swift
+// must access the tuple element at index `1` (or named parameter)
+fetch(url: someURL).1.then { data in
+ // do stuff with data
+}.error { 
+    // handle error.
+}
+```
+
+I am relatively new to the reactive style of programming, so I am currently unable to figure out what a good strategy for disposing the observable and it's underlying might be. I looked into the section on `Disposable`s in the [README for ReactiveKit](https://github.com/ReactiveKit/ReactiveKit#disposing-signals), but I'm not sure how the same concept would integrate with Interstellar.
+
+Is there a way you might recommend cancelling the `URLSessionDataTask`? I would be very happy to work on a pull request (with a small bit of guidance to kick me off in the right direction) if you think this feature might be useful.
+Debounce seems to deliver the first skipped call to update, instead of the last call to update.
+
+I think this happens because the skipped calls to update are scheduled to be evaluated again 1) without previous skipped calls being cancelled, and 2) are scheduled to be evaluated again very close to each other temporally. Observable.delay uses DispatchQueue.asyncAfter which isn't very precise, so whichever one fires first (usually the first one scheduled in my search-as-you-type use case) will set the new `lastCalled` value and ignore the others.
+
+```
+// skip result if there was a newer result
+if currentTime.compare(lastCalled!) == .orderedDescending {
+    let s = Observable<T>()
+    s.delay(seconds - timeSinceLastCall!).subscribe(updateIfNeeded(observable))
+    s.update(value)
+}
+```
+In function `subscribe`
+
+```
+    public func subscribe(f: Result<T> -> Void) -> Signal<T> {
+        if let value = value {
+            f(value)
+        }
+        mutex.lock {
+            callbacks.append(f)
+        }
+        return self
+    }
+
+```
+
+ https://github.com/JensRavens/Interstellar/blob/master/Sources/Signal.swift#L145-L153
+
+it seems to me, there's a potential data race: access to `value` should be protected by the mutex.
+
+Proposed solution:
+
+```
+    public func subscribe(f: Result<T> -> Void) -> Signal<T> {
+        var v: Result<T>?
+        mutex.lock {
+            v = self.value
+            callbacks.append(f)
+        }
+        if let value = v {
+            f(value)
+        }
+        return self
+    }
+
+```
+
+Still, this is not a reliable solution: it's not guaranteed, that function `f` will be invoked _before_ any other mapping function which is invoked due to an update. These kind of issues can be solved only with introducing an "execution context" (for example a dispatch queue) which defines where the mapping function will be executed:
+
+```
+    public func subscribe(ec: ExecutionContext = <default>, f: Result<T> -> Void) -> Signal<T> {
+        mutex.lock {
+            if let value = self.value {
+                ec.execAsync { f(value) }
+            }
+            callbacks.append(f)
+        }
+        return self
+    }
+
+```
+
+Hi Jens,
+
+Just a suggestion, how about refactoring debounce to GCD source, so that we can schedule and cancel when needed, like https://github.com/onmyway133/Signal/blob/master/Pod/Classes/Signal%2BDebounce.swift and http://mokagio.github.io/tech-journal/2014/11/18/objective-c-throttling-with-gcd.html
+
+Merging multiple signals means you end up with a "lops sided" tuple. Is there a better way to merge multiple signals?
+
+```
+let signal = Signal("Hello")
+signal.merge(Signal("world"))
+.merge(Signal("how are you?"))
+.merge(Signal("42"))
+.next() {
+    print($0)        // ((("Hello", "world"), "how are you?"), "42")
+    print($0.0.0.1)  // world
+}
+```

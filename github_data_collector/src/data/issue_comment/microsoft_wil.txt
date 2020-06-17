@@ -1,0 +1,340 @@
+If exceptions aren't enabled using wil::com_ptr results in an error that isn't immediately clear without digging through the source. 
+`error C2039: 'com_ptr': is not a member of 'wil' `
+It should be pretty easy to add a struct that takes a compile time message and static_assert(false, message) if that class is instantiated to produce a clearer error message when using throwing types in binaries that don't support exceptions.
+Still looking into it, but it seems that in the following:
+```C++
+        HRESULT hr = S_OK;
+        try
+        {
+            throw std::bad_alloc();
+        }
+        catch (...)
+        {
+            hr = LOG_CAUGHT_EXCEPTION();
+            auto hrDirect = wil::ResultFromCaughtException();
+            REQUIRE(hr == hrDirect);
+        }
+```
+The `catch (...)` handler is not getting executed inside of `ResultTests::ExceptionHandling`. FWIW something similar _is_ working correctly:
+```C++
+        auto hr = []() -> HRESULT
+        {
+            try
+            {
+                throw std::bad_alloc();
+            }
+            catch (...)
+            {
+                RETURN_CAUGHT_EXCEPTION();
+            }
+        }();
+```
+The only difference is that the second example is within a lambda. Could be that Catch2 is doing something weird w.r.t. exception handling that's interfering with a newer update in MSVC. Still looking at it
+In your documentation you say: "To get started testing WIL, first make sure that you have a recent version of Visual Studio and the most recent Windows SDK installed."
+
+I use Visual Studio 2017 and Win10 SDK - and library can't be compiled because of some unknown attributes in header files. Looks like VS 2017 and/or Win10 SDK is not enough?
+
+Could you please mention in documentation exact version of VS and SDK which are required to use WIL ?
+New header `<wil/chrono.h>` defines `std::chrono` adapters for all fixed-frequency Windows timers and timestamps
+
+## General considerations
+
+User mode-only for now, because I don't know if `<chrono>` is kernel mode-safe. If we could get confirmation of the safety of `<chrono>` from the compiler people, we could add similar wrappers for functions like `KeQueryTickCount`, `KeQuerySystemTime`, etc. Alternatively, we could fork the LLVM `<chrono>` into a `wistd_chrono.h` header
+
+Where possible, functions have been made `constexpr` through `__WI_LIBCPP_CONSTEXPR_AFTER_CXX11`, so that it depends on the underlying `constexpr`-ness of `<chrono>` functions
+
+I haven't implemented DOS/FAT timestamps because, frankly, I think they aren't worth the effort
+
+The following timers have a variable frequency and can't have zero-overhead `std::chrono` adapters, so they aren't included for now:
+
+* `QueryPerformanceCounter`
+
+* The auxiliary counter... if there was a function to query it (what *is* the deal with it?)
+
+* The CPU timestamp register, as returned by intrinsics like `__rdtsc` or `__rdtscp`. This timer comes with additional considerations, such as:
+  
+  * Detecting availability: whether the architecture implements it, whether the sandbox/hypervisor/VM allows access to it, whether it has a stable frequency (e.g. constant or invariant TSC on Intel/AMD processors) etc.
+  
+  * Querying the frequency: hard (I tried! and I still don't have a good answer)
+  
+  * Instruction ordering: for example, `__rdtsc` is unordered, and needs a fence (`_mm_mfence` or `_mm_lfence`) for meaningful measurements, or alternatively `__rdtscp` can be used; but all solutions require an additional feature test... and even the feature test itself (`__cpuid`/`__cpuidex`) may, in turn, require a feature test
+
+Processor cycle counters (e.g. `QueryThreadCycleTime`) are out of scope, since they aren't time-based at all
+
+### Testing
+
+I don't know how to write test cases, but I could learn. All clock classes support a form of compile-time dependency injection, so writing tests for corner cases shouldn't be hard
+
+## Overview
+
+### Tick counter clocks
+
+The following *Clock*s are defined:
+
+* `tick_count_clock` :
+  
+  * `rep`: `DWORD`
+  
+  * `period`: `std::milli` (1ms)
+  
+  * `is_steady`: `true`
+  
+  * `now`: wraps `GetTickCount`
+
+* (`#if _WIN32_WINNT >= 0x0600`) `tick_count64_clock`:
+  
+  * `rep`: `ULONGLONG`
+  
+  * `period`, `is_steady`, `time_point`: same as `tick_count_clock`
+  
+  * `now`: wraps `GetTickCount64`
+
+#### Caveats
+
+Unlike standard C++ clocks, these clocks have an unsigned `rep`. This is intentional: the value returned by `GetTickCount` has a limited range, and we don't want to incur in undefined behavior dealing with signed under/overflow
+
+### System time clocks
+
+The following *Clock*s are defined:
+
+* `system_time_clock`:
+  
+  * `rep`: `LONGLONG`
+  
+  * `period`: `std::ratio_multiply<std::hecto, std::nano>` (100ns)
+  
+  * `is_steady`: `false`
+  
+  * `now`: wraps `GetSystemTimeAsFileTime`
+  
+  * `to_filetime` and `from_filetime`: conversion between `time_point` and raw `FILETIME`s
+  
+  * `to_system_clock` and `from_system_clock`: conversion between `time_point` and `std::chrono::system_clock::time_point`
+  
+  * `to_time_t`, `from_time_t`, `to_time32_t`, `from_time32_t`, `to_time64_t`, `from_time64_t`: conversion between `time_point` (100ns, Windows epoch) and `std::time_t`/`__time32_t`/`__time64_t` (1s, UNIX epoch)
+
+* (`#if _WIN32_WINNT >= _WIN32_WINNT_WIN8`) `precise_system_time_clock`:
+  
+  * `rep`, `period`, `time_point`, `is_steady`: same as `system_time_clock`
+  
+  * `to_filetime`, `from_filetime`, `to_system_clock`, `from_system_clock`, `to_time_t`, `from_time_t`, `to_time32_t`, `from_time32_t`, `to_time64_t`, `from_time64_t`: same as `system_time_clock`
+
+  * `now`: wraps `GetSystemTimePreciseAsFileTime`
+
+* `high_precision_system_time_clock`:
+  
+  * (`#if _WIN32_WINNT >= _WIN32_WINNT_WIN8`) alias for `precise_system_time_clock`
+  
+  * (`#else`) alias for `system_time_clock`
+
+#### Caveats
+
+`to_filetime` and `from_filetime` are implemented in-line, because including `win32_helpers.h` to use `wil::filetime` routines didn't seem worth it compared to the downsides:
+
+* `win32_helpers.h` pulls in extra dependencies and pollutes the namespace
+
+* `wil::filetime` routines aren't `constexpr` (nor `constexpr`-compatible)
+
+In `to_system_clock` and `from_system_clock`, we non-portably assume `std::chrono::system_clock::time_point` starts from the UNIX epoch. However, this is true in all C++ runtime library implementations I know of *and* it will be a requirement starting from C++20
+
+### Interrupt time clocks
+
+When targeting Windows 7 or later (`#if _WIN32_WINNT >= 0x0601`), the following *Clock* is defined:
+
+* `unbiased_interrupt_time_clock`:
+  
+  * `rep`: `LONGLONG`
+
+  * `period`: `std::ratio_multiply<std::hecto, std::nano>` (100ns)
+  
+  * `is_steady`: `true`
+  
+  * `now`: wraps `QueryUnbiasedInterruptTime`
+
+When targeting Windows 7 or later *and* using a Windows 10 or later SDK (`#ifdef NTDDI_WIN10`), the following *Clock*s are also defined:
+
+* `interrupt_time_clock`:
+  
+  * `rep`: `LONGLONG`
+
+  * `period`: `std::ratio_multiply<std::hecto, std::nano>` (100ns)
+  
+  * `is_steady`: `true`
+  
+  * `now`: wraps `QueryInterruptTime`
+
+* `precise_interrupt_time_clock`:
+  
+  * `rep`, `period`, `time_point`, `is_steady`: same as `interrupt_time_clock`
+  
+  * `now`: wraps `QueryInterruptTimePrecise`
+
+* `precise_unbiased_interrupt_time_clock`:
+  
+  * `rep`, `period`, `time_point`, `is_steady`: same as `unbiased_interrupt_time_clock`
+
+  * `now`: wraps `QueryUnbiasedInterruptTimePrecise`
+
+### Process and thread times
+
+#### Types
+
+The following types are defined:
+
+* `cpu_time_duration`: `std::chrono::duration<LONGLONG, std::ratio_multiply<std::hecto, std::nano>>`
+
+* `cpu_time`:
+  
+  ```cpp
+  enum class cpu_time
+  {
+      total,
+      kernel,
+      user,
+  };
+  ```
+
+* `execution_times`:
+  
+  ```cpp
+  struct execution_times
+  {
+      system_time_clock::time_point creation_time;
+      system_time_clock::time_point exit_time;
+      cpu_time_duration kernel_time;
+      cpu_time_duration user_time;
+  };
+  ```
+
+* `thread_times` and `process_times`: aliases for `execution_times`
+
+#### Functions
+
+The following functions are defined:
+
+* ```cpp
+  template<class ErrorPolicy>
+  thread_times get_thread_times(HANDLE thread = ::GetCurrentThread());
+  
+  thread_times get_thread_times(HANDLE thread = ::GetCurrentThread());
+  ```
+  
+  Returns the `thread_times` for the thread identified by the `thread` handle. Defaults to the current thread.
+  
+  Wraps `GetThreadTimes`, handling errors according to `ErrorPolicy`. `ErrorPolicy` defaults to `err_exception_policy` when calling the non-template overload
+
+* ```cpp
+  template<class ErrorPolicy>
+  cpu_time_duration get_thread_cpu_time(HANDLE thread = ::GetCurrentThread(), cpu_time kind = cpu_time::total);
+
+  cpu_time_duration get_thread_cpu_time(HANDLE thread = ::GetCurrentThread(), cpu_time kind = cpu_time::total);
+  ```
+  
+  Returns the CPU time usage specified by the `kind` argument for the thread identified by the `thread` handle. Defaults to the total (kernel + user) CPU time of the current thread.
+  
+  Wraps `GetThreadTimes`, handling errors according to `ErrorPolicy`. `ErrorPolicy` defaults to `err_exception_policy` when calling the non-template overload
+
+* ```cpp
+  template<class ErrorPolicy>
+  process_times get_process_times(HANDLE process = ::GetCurrentProcess());
+
+  process_times get_process_times(HANDLE process = ::GetCurrentProcess());
+  ```
+  
+  Returns the `process_times` for the process identified by the `process` handle. Defaults to the current process.
+  
+  Wraps `GetProcessTimes`, handling errors according to `ErrorPolicy`. `ErrorPolicy` defaults to `err_exception_policy` when calling the non-template overload
+
+* ```cpp
+  template<class ErrorPolicy>
+  cpu_time_duration get_process_cpu_time(HANDLE process = ::GetCurrentProcess(), cpu_time kind = cpu_time::total);
+
+  cpu_time_duration get_process_cpu_time(HANDLE process = ::GetCurrentProcess(), cpu_time kind = cpu_time::total);
+  ```
+  
+  Returns the CPU time usage specified by the `kind` argument for the process identified by the `process` handle. Defaults to the total (kernel + user) CPU time of the current process.
+  
+  Wraps `GetProcessTimes`, handling errors according to `ErrorPolicy`. `ErrorPolicy` defaults to `err_exception_policy` when calling the non-template overload
+
+#### Clocks
+
+The following *Clock*s are defined:
+
+* `current_thread_cpu_time_clock`:
+  
+  * `rep`, `period`: same as `cpu_time_duration`
+  
+  * `duration`: `cpu_time_duration`
+  
+  * `now<ErrorPolicy>`: wraps `get_thread_cpu_time` with default arguments and the specified `ErrorPolicy`, returning the total CPU time used by the current thread
+  
+  * `now`: wraps `now`, passing `err_exception_policy` as its `ErrorPolicy`
+
+* `current_process_cpu_time_clock`:
+  
+  * `rep`, `period`: same as `cpu_time_duration`
+
+  * `duration`: `cpu_time_duration`
+  
+  * `now<ErrorPolicy>`: wraps `get_process_cpu_time` with default arguments and the specified `ErrorPolicy`, returning the total CPU time used by the current process
+  
+  * `now`: wraps `now`, passing `err_exception_policy` as its `ErrorPolicy`
+
+#### Caveats
+
+Only error policies that interrupt execution (e.g. `err_failfast_policy`, `err_exception_policy`) are meaningfully supported. Policies that return error codes will be effectively ignored, and errors will cause undefined values to be returned
+
+CPU time clocks were only defined for the current process and current thread, so that they could be stateless classes. The *Clock* concept doesn't mandate statelessness, but it's unclear to me how statefulness conceptually interacts with `time_point`
+
+CPU time clocks were only defined for total time, because I couldn't think of a good, unambiguous API for passing a `cpu_time` argument
+2020 is a leap year and there are lot of times developers do things like manipulate SYSTEMTIME or FILETIME or convert from one to another, and they do not take into account leap years. C# has [AddYears()](https://docs.microsoft.com/en-us/dotnet/api/system.datetime.addyears?view=netframework-4.8) for this.
+
+WIL should implement safe date manipulation methods like C# so that 2020 isn't a mess.
+Per the thread on #51, adopt one of Raymond's suggestions.  I personally like the intermediate std::tuple approach. This may require yet another layer of indirection if the tuple instantiation triggers the "no mixing C++ & SEH in a single frame" requirement.
+Any chance you would publish on conan?
+Raymond pointed this out here: https://github.com/microsoft/wil/wiki/Windows-Runtime-helpers
+
+this should be fixed.
+PathCch.h is included in win32_helpers.h:
+https://github.com/microsoft/wil/blob/master/include/wil/win32_helpers.h#L18
+
+However, the functions declared in this header are only available on Windows 8 or higher. An include guard could be used to cover this case:
+```
+#if (_WIN32_WINNT >= _WIN32_WINNT_WIN8)
+#include <PathCch.h>
+#endif
+```
+But after quickly inspecting win32_helpers.h, I couldn't find any references to the symbols in PathCch.h and it compiles without any errors in my project without this include.
+
+If the PathCch.h include has no function, I propose it should be removed.
+
+When the diagnostics level is set to 0 using the following define:
+#define RESULT_DIAGNOSTICS_LEVEL 0
+In a release build (with all optimizations etc), I do expect that Return_Hr is not called in the generated code. However, this is not the case when using the RETURN_IF_FAILED macro:
+
+```
+if ( hr < 0 )
+  {
+    wil::details::in1diag0::Return_Hr(retaddr, hr);
+    return hr;
+  }
+```
+
+A possible solution might be do define different helper macros, depending on RESULT_DIAGNOSTICS_LEVEL. E.g.
+
+```
+#if RESULT_DIAGNOSTICS_LEVEL == 0
+#undef RETURN_HR_FAIL
+#define RETURN_HR_FAIL RETURN_HR_FAIL_EXPECTED
+#undef RETURN_IF_WIN32_BOOL_FALSE
+#define RETURN_IF_WIN32_BOOL_FALSE RETURN_IF_WIN32_BOOL_FALSE_EXPECTED
+#undef RETURN_LAST_ERROR_IF_NULL
+#define RETURN_LAST_ERROR_IF_NULL RETURN_LAST_ERROR_IF_NULL_EXPECTED
+#undef RETURN_LAST_ERROR_IF
+#define RETURN_LAST_ERROR_IF RETURN_LAST_ERROR_IF_EXPECTED
+#undef RETURN_IF_WIN32_ERROR
+#define RETURN_IF_WIN32_ERROR RETURN_IF_WIN32_ERROR_EXPECTED
+#undef RETURN_HR_IF
+#define RETURN_HR_IF RETURN_HR_IF_EXPECTED
+#endif 
+```

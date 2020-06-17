@@ -1,0 +1,126 @@
+The plan is to add Cassandra itself as a compile time dependency, where we call the Java code that is responsible to validate and type check the query (properly happens you prepare a statement). 
+
+The Java code will be called from a macro.
+
+Note that the solution must NOT start Cassandra server, not even in memory.
+
+The solutions should provide 2 methods that look something like this:
+```
+// Allow us to create Schema representation from schema.cql file
+def createSchema(schemaDefinitionStatements: Seq[String]): Either[String, Schema]
+
+// Allow us to know the signature of the query (how many selected rows, what are the types) how many bind markers, what are their types? 
+def schemaCheck(schema: Schema, query: String): Either[String, QuerySignature]
+```
+These 2 function should call Cassandra's source code.
+
+A proof of concept can be written in a seperate Gist/Repo.
+
+Useful links:
+https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/schema/Schema.java
+https://github.com/apache/cassandra/blob/trunk/test/unit/org/apache/cassandra/cql3/CQLTester.java#L810
+I get the following error:
+
+```bash
+[error] /home/citrullin/git/scala-troy/src/main/scala/model/PageImpressionByYearMonth.scala:19: Can't find schema file /schema/
+[error]   val getByYearMonth = withSchema {
+```
+
+Let's take a look into the code.
+
+```scala
+package model
+
+import com.datastax.driver.core.{Cluster, Session}
+import connection.ConnectionProvider
+import entity.PageImpression
+import troy.dsl._
+import troy.driver.DSL._
+
+import scala.concurrent.Future
+
+class PageImpressionByYearMonth(connection: ConnectionProvider) {
+  import scala.concurrent.ExecutionContext.Implicits.global
+  val cluster = connection.cluster
+  implicit val session: Session = connection.session
+
+  val keyspace = "analytics"
+  val tableName = "pageimpressionbyyearmonth"
+
+  val getByYearMonth = withSchema {
+    (year: Int, month: Int) =>
+    cql"""
+          SELECT * FROM analytics.pageimpressionbyyearmonth WHERE year = $year AND month = $month
+      """.prepared.executeAsync.as(PageImpression)
+  }
+
+  def get(year: Int, month: Int): Future[Seq[PageImpression]] = getByYearMonth(year, month)
+}
+```
+
+The schema file is in probject/src/main/resources/schema.cql and project/src/test/resources/schema.cql. I also checked probject/src/main/resources/schmea/schema.cql and probject/src/test/resources/schema.cql. I think there is something wrong with the relative path. Instead of a relative path it seems like it uses a absolute path.
+
+Need to tap into Cassandra's mechanism for grouping modifications to multiple partitions into a single statement.
+Making some basic calls, I'm getting exceptions when I compile:
+
+```
+[error] ApiKey.scala:19: exception during macro expansion: java.lang.StackOverflowError
+[error]   def create: (ApiKey) => Future[ApiKey] = withSchema {
+[error]                                                       ^
+{
+  import _root_.troy.driver.InternalDsl._;
+  import _root_.troy.driver.codecs.PrimitivesCodecs._;
+  val prepared = implicitly[com.datastax.driver.core.Session].prepare("\n            SELECT api_key, name, active\n            FROM api.api_keys\n            WHERE api_key = ?\n        ");
+  ((apiKey: java.util.UUID) => {
+    def parser(row: _root_.com.datastax.driver.core.Row) = ApiKey(column[java.util.UUID](0)(row).as[CDT.Uuid], column[String](1)(row).as[CDT.Text], column[Boolean](2)(row).as[CDT.Boolean]);
+    bind(prepared, param(apiKey).as[CDT.Uuid]).executeAsync(ApiKeyRecord.this.session, scala.concurrent.ExecutionContext.Implicits.global).oneOption(scala.concurrent.ExecutionContext.Implicits.global).parseAs(parser)
+  })
+}
+```
+
+Here's my schema:
+
+```sql
+CREATE KEYSPACE api WITH replication = {'class': 'SimpleStrategy' , 'replication_factor': '1'};
+
+CREATE TABLE api.api_keys (
+  api_key uuid,
+  name text,
+  active boolean,
+  PRIMARY KEY (api_key)
+);
+```
+
+Here's my calling code that's "breaking"
+
+```scala
+class ApiTokenRecord(implicit session: Session) {
+
+  def create = withSchema { (token: UUID, apiKey: UUID, email: String, expiration: DateTime) =>
+    cql"""
+      INSERT INTO kiko.api_tokens (api_token, api_key, email, expiration_time)
+      VALUES ($token, $apiKey, $email, $expiration)
+      """.prepared.executeAsync.map(_ => true)
+  }
+}
+```
+
+Am I doing something wrong?
+https://cassandra.apache.org/doc/latest/cql/functions.html?highlight=aggregate#user-defined-aggregates
+http://docs.datastax.com/en/cql/3.3/cql/cql_reference/cqlCreateAggregate.html
+
+
+http://docs.datastax.com/en/cql/3.3/cql/cql_using/useQueryStdAggregate.html
+
+- [ ] min
+- [ ] max
+- [ ] avg
+- [ ] sum
+- [ ] count (not to be confused with `SELECT COUNT(*)`
+https://github.com/cassandra-scala/troy/pull/133/files#diff-f6475383148e9691c21b9608bf26f992R268
+http://docs.datastax.com/en/cql/3.3/cql/cql_reference/escape_char_r.html
+According to http://docs.datastax.com/en/cql/3.3/cql/cql_reference/ucase-lcase_r.html
+
+Troy's CQL Parser should 
+- [ ] support double quoted identifiers (especially column names in select clause and create table)
+- [ ] lower case identifiers, unless they are double quoted. 

@@ -1,0 +1,83 @@
+Closes #67 as per https://github.com/d-unseductable/ruru/issues/67#issuecomment-353020580
+I haven't been able to find any documentation about how worker threads which don't interact directly with ruby objects are handled in terms of `Drop`. In my case I have existing rust code which establishes a long-running thread worker to handle incoming "jobs" via a channel. The thread "lives" in a struct that implements `Drop`, which tells the thread to stop waiting for new messages and terminate when it's dropped (glossing over details here). In this case, my expectation is the rust/`ruru` interface to ruby can cleanly send data (perhaps copied data) from ruby over the channel to the thread worker. Would the thread worker need to be setup with the `Thread` struct in `ruru` (`Thread::call_without_gvl`)? Or could I use `std::thread`? Will `Drop` be called when the parent struct is destroyed?
+
+Thanks for any help you can provide. 
+Ruru has been inactive for some time so an official fork has been made called [Rutie](https://github.com/danielpclark/rutie) .  Much additional work and development has been done now in Rutie and it's actively maintained.
+Resolves #97
+My understanding is that Ruby's strings are sequences of arbitrary bytes, even if the associated encoding is UTF-8. So the natural mapping to Rust would be as `[u8]` and `Vec<u8>` instead of `str` and `String` for most purposes. A couple of helpers using `str` should be fine (e.g. the `from_utf8` function).
+
+Functions which convert a ruby string to `&str` or `String` without verifying UTF-8 validity must be marked `unsafe`, otherwise they're unsound.
+The docs recommend inheriting from `Data` following this idiom:
+
+```
+let data_class = Class::from_existing("Data");
+Class::new("MyClass", Some(&Data)).define(...)
+```
+
+On Ruby 2.5, this prints `warning: constant ::Data is deprecated` every time `Data` is accessed. I guess that there is some way to access this via the C extension API but I haven't found it yet.
+This accompanies https://github.com/steveklabnik/ruby-sys/pull/31.
+
+Basically a re-export of a `ruby-sys` feature I added to conditionally link `libruby` when it's needed (for running Rust tests). Normally `libruby` isn't needed due to how the interpreter dynamically loads c-extensions (see https://github.com/steveklabnik/ruby-sys/pull/25).
+The `rb_str_new` method we have is good for making C strings in to Ruby string objects.  From here we can go further and implement the string with `rb_str_initialize` to help also set the encoding.
+
+```c
+VALUE
+rb_str_initialize(VALUE str, const char *ptr, long len, rb_encoding *enc)
+{
+    STR_SET_LEN(str, 0);
+    rb_enc_associate(str, enc);
+    rb_str_cat(str, ptr, len);
+    return str;
+}
+```
+
+So I believe we should add the method `rb_enc_associate` to **ruby_sys**.  We'll also likely need to implement encoding structs and have a C `rb_encoding` type mapped to `ruru::Encoding`.
+
+```h
+typedef const OnigEncodingType rb_encoding;
+```
+
+The obvious places to look are `string.c`, `encoding.c` and `encoding.h`.  But the `OnigEncodingType` (`onigmo.h`) is a C Regex thing for helping with encodings so I don't know how complex that would be.
+I believe this is good to go except for most of the documentation was copied from the Ruby doc.  So I'll likely need to revise it.  I don't mind if you merge it.  This doesn't effect any current systems, implementations, or behavior.
+
+The `full_message` method is commented out as it would cause a panic if used as is.  In Ruby it outputs:
+
+```
+"\e[1mTraceback \e[m(most recent call last):\n(irb):10:in `full_message': \e[1msomething went wrong (\e[4;1mStandardError\e[m\e[1m)\n\e[m"
+```
+
+## TODO
+
+* [x] Update documentation
+* [x] Add alternative to `raise` for `rb_exc_raise` which works best with this.
+* [ ] Wait for `ruby-sys` update and update `Cargo.toml`
+I've put comments through numerous issues on this and it doesn't make sense to me to leave any of this discussion so scattered so I'm opening this issue to discuss the merits of designing the default behavior where ever `AnyObject` would return to be `Result<AnyObject, AnyException>`.
+
+### Pros
+
+* For anyone developing a Rust app and using Ruby from it then this would allow for  _“The Rust Way”_ of handling Ruby exceptions to be well written and used.  As well as have the advantage of Rust's question mark syntax `let val = some_result?;`.
+
+### Cons
+
+* Implementing this behavior would require the majority of features to be run through Ruby's `rb_protect` which will catch exceptions and allows us to build the `Result`.  This adds cost to the performance.  When writing a Ruby program and using Rust to gain performance you don't necessarily want this added cost in performance as the major draw to use Rust in Ruby is all about performance.
+* probable re-write & major version change
+
+### Exceptions to the Rule
+
+Some scenarios won't “ever” _\*cough\* \*cough\*_ call for an exception to be raised like when doing equality checks.  Equality checks simply make sense to return the `bool` type for convenience.  Although any method that can be monkey-patched and rewritten may raise exceptions in which case that should use `protect`.  The choice for design and usage would then come down to how strict to adhere to _The Rust Way_ pattern in case of risk, or provide the end user more of a choice.  My thoughts on this point is to be more relaxed on enforcing the return type and trust the developers to understand the risks and choose there own implementation decisions.
+
+### Alternatives
+
+Looking at a Helix PR [`with_protect` example](https://github.com/tildeio/helix/pull/64/files#diff-0da00d93f7f2448e58df2feedba11596L110 ) gave me the idea to have an `impl WithProtect on FnOnce()` trait.  It's just a rough idea but it would be something like lazily produce a `FnOnce()` closure and have that take `&self` for the method definition in the WithProtect trait to route the code through something like my `protect_send` method (https://github.com/d-unseductable/ruru/pull/88).  So we could do `my_closure.with_protect()` to run it.
+
+### Strictness
+
+If the need for `safety` comes first and we choose a relaxed stance on enforcing `Result` return types then it would come down to where we choose to draw the line.  Like, for example, when instantiating a new object both `new` and `initialize` methods are **highly** likely to raise an exception if the startup standards for that object are not met.  However the alternative method `allocate` is nearly guaranteed to never do anything that would raise an exception so this would be one method not needing the `Result` return type.
+
+Choosing a form of this as a relaxed standard will require a more case by case decision on implementing it.  That would likely be the sole choice of the author of this project on his beliefs and weighting on the likeliness of any particular method to raise an exception.
+
+### My Stance
+
+I'm not too picky about this change being implemented.  With `protect_send` #88 and `eval` #79 developers should have enough to take the risk out of most scenarios.  But this will require programmers to be more defensive and more on guard with their code when working with ruru.  Perhaps the easiest solution would be the alternative I've proposed here above.
+
+I leave this RFC here open for discussion.

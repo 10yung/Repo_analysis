@@ -1,0 +1,271 @@
+Feedback on cbc69683919ea4d045372cdef6812b52b0a5708b in 4.0.
+
+As far as I can tell there's no way to set a database-wide default `objectPolicy` and `metadataPolicy`. This is a bit of a drag as we don't necessarily know the names of all the collections in order to specify the policies during database setup.
+
+Ideas:
+- Allow `setObjectPolicy:forCollection:` to set a policy for a `nil` collection and use that as the default policy. It looks like the method implementation already accepts `nil` and turns it into `@""`, it's just that the consumer of `getObjectPolicies:metadataPolicies:` doesn't seem to check `@""` as a fallback.
+- Re-add new methods to set default object and metadata policies that are used as a fallback
+
+Happy to make a PR that does one of those, but not sure what the design intention was when making this change.
+Hi,
+
+Pardon me if I am asking a trivial question but this is something I am unable to figure out.
+As per my understanding, the YapDatabase instance is the one which just opens the database file. Then we use YapDatabaseConnection to open a Sqlite connection. 
+How do we close this connection? Like in FMDB we have a dedicated method to close an open database connection.
+
+In one of the issues I found a way to handle the closing by use of a notification but that happens when the YapDatabase instance is deallocated. Is there an exposed API to force close an open instance? Otherwize how will we accomplish this?
+We should support SPM before we add much more swift code. SPM doesn't support mixed language targets so it's probably best to come up with a non-painful way to support SPM now rather than waiting until there's even more swift code to deal with. 
+
+The main pain point is exposing the public headers of the C-language code.
+Resolves #495 
+The Xcode project no longer builds due to several files not being included in the project
+
+Files in question:
+* YapDatabaseTypes.h
+* YapDatabaseConnectionProxy.h/m
+* YapDatabaseConnectionPool.h/m
+* YapDatabaseCollectionConfig.h/m
+* YapDatabaseConnectionConfig.h/m
+* YDBLogMessage.h/m
+* YapDatabaseLogging.m doesn't exist, but is in the compile sources build phase
+
+Databases created with SQLCipher 3.x are not compatible with SQLCipher 4.x by default. 
+
+For more details:
+* https://discuss.zetetic.net/t/upgrading-to-sqlcipher-4/3283
+* https://www.zetetic.net/sqlcipher/sqlcipher-api/#cipher_compatibility
+Hello,
+
+This issue is more of a question than exactly an issue. According to Apple documentation NSCoding is vulnerable to object substitution attacks. It recommends using NSSecureCoding instead.
+
+We got this warning in a security scan of an application that uses YapDatabase. I’d like to ask if YapDatabase handles this vulnerability.
+
+Best regards
+## Problem:
+When I for example I want to display a maximum of two items in a specific group and do this:
+```objc
+[mappings setRangeOptions:[YapDatabaseViewRangeOptions fixedRangeWithLength:2 offset:0 from:YapDatabaseViewBeginning] forGroup:@"group"]
+```
+there will be a bug if the group contains < N items when this call is made. Internally, YapDatabase sets the length of the range options to MIN(length, objectCount), and then forgets about this value.
+
+This is a problem when the view and mappings are created first, and then data comes in from a network request to populate the groups. The range options will forever be 0 in length.
+
+If this was intended, I'd love to understand why!
+
+## Solution
+Never overwrite the `maxLength` of fixed range options
+We're getting this crash quite often when updating a view from changes with view mappings. It's happening (presumably) when there are many updates happening at the same time. It's possible that this crash is due to a bug in `UITableView` (it also happens in `UICollectionView`). The crash is reproducible both on simulator and device. The frequency of the crashes seem directly related to how big the changeset is.
+
+```
+attempt to perform an insert and a move to the same index path (<NSIndexPath: 0xbd250b35a3c418f2> {length = 2, path = 4 - 2})
+```
+
+Sometimes the crash will instead be this:
+```
+attempt to insert row 3 into section 9, but there are only 2 rows in section 9 after the update
+```
+
+I have made a sample view controller that will quickly reproduce this crash. However, it's not deterministic and will happen on different changesets every time, even if the changes are exactly the same on each run.
+
+The interesting thing is, that it doesn't seem like YapDatabase actually reports a move and insert to the same index path, since then the assert inside `yapDatabaseModified:` should've fired, which is what leads me to believe that the crash might be in `UITable/CollectionView`.
+
+Has anyone else ran into this? Could it be a YapDatabase-issue? We're unfortunately getting this _a lot_, and we might have to turn off animated updates completely.
+
+## Possible fix
+Ignoring all `YapDatabaseViewChangeUpdate` seems to completely fix all crashes. Possibly related to [this crash](https://stackoverflow.com/a/33436182/393269) also [observed here](https://badoo.com/techblog/blog/2015/10/08/batch-updates-for-uitableview-and-uicollectionview/). It appears that reloads simply aren't compatible with other collection updates.
+
+## Solution!
+When doing many/quick updates, reloads must be performed individually. In `yapDatabaseModified:`, here's one way to fix all the crashes:
+
+1. In your objectAtIndexPath:-function, cache the `NSIndexPath` -> `YapCollectionKey`-pair
+2. In `yapDatabaseModified`:
+    1. From the notifications, filter out all `YapDatabaseRowChange`s with of type `YapDatabaseViewChangeUpdate`
+    2. Call `reloadRowsAtIndexPaths` for these updates. The table view will call cellForRowAt:.. which should return an object according to the cache mentioned in 1.
+    3. Clear the cache
+    4. Update the viewMappings to grab the changes the normal way
+    5. Perform all the batch updates the normal way, but _skip all `YapDatabaseViewChangeUpdate`_!
+
+Implementation example [here](https://github.com/yapstudios/YapDatabase/issues/489#issuecomment-496676495)
+
+The cache is needed because when you call `reloadItemsAtIndexPaths:`, the viewConnection will be at the latest database snapshot, but the viewMappings will not, so it seems that the rowids doesn't match. The cache makes sure that we always fetch the correct object because we have associated index paths with a collection/key-pair.
+
+## Reproducing view controller
+Just add it as the initial view controller of an empty project.
+
+```objc
+#import "ViewController.h"
+#import "AppDelegate.h"
+#import <YapDatabase/YapDatabaseAutoView.h>
+
+@interface ViewController ()
+@property (nonatomic, strong) YapDatabase *database;
+@property (nonatomic, strong) YapDatabaseConnection *connection;
+@property (nonatomic, strong) YapDatabaseConnection *writeConnection;
+@property (nonatomic, strong) YapDatabaseViewMappings *mappings;
+@end
+
+@implementation ViewController
+
+#define RND(MAX) MAX>0?(rand()%MAX):0
+
+- (void)loadDatabase
+{
+    NSURL *library = [[[NSFileManager defaultManager] URLsForDirectory:NSLibraryDirectory inDomains:NSUserDomainMask] firstObject];
+    NSURL *databaseURL = [library URLByAppendingPathComponent:@"/database.sqlite"];
+    self.database = [[YapDatabase alloc] initWithPath:databaseURL.path];
+    [[self.database newConnection] readWriteWithBlock:^(YapDatabaseReadWriteTransaction *transaction) {
+        [transaction removeAllObjectsInAllCollections];
+    }];
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    srand(10); // Used to reproduce changesets
+    [self loadDatabase];
+    self.connection = self.database.newConnection;
+    self.writeConnection = self.database.newConnection;
+    [self registerView];
+    [self setupViewMappings];
+    [self.tableView reloadData];
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(yapDatabaseModified:) name:YapDatabaseModifiedNotification object:nil];
+    [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer * _Nonnull timer) {
+        [self changeData];
+    }];
+}
+
+- (void)registerView {
+    if ([self.database registeredExtension:@"view"]) {
+        return;
+    }
+    YapDatabaseView *view = [[YapDatabaseAutoView alloc] initWithGrouping:[YapDatabaseViewGrouping withObjectBlock:^NSString *(YapDatabaseReadTransaction *transaction, NSString *collection, NSString *key, NSDictionary *object) {
+        return [object[@"section"] stringValue];
+    }] sorting:[YapDatabaseViewSorting withObjectBlock:^NSComparisonResult(YapDatabaseReadTransaction *transaction, NSString *group, NSString *collection1, NSString *key1, NSDictionary *object1, NSString *collection2, NSString *key2, NSDictionary *object2) {
+        return [object1[@"value"] compare:object2[@"value"]];
+    }]];
+    [self.database registerExtension:view withName:@"view"];
+}
+
+- (void)setupViewMappings {
+    NSMutableArray *groups = [NSMutableArray new];
+    for (int i = 0; i < 10; ++i) {
+        [groups addObject:@(i).stringValue];
+    }
+    self.mappings = [YapDatabaseViewMappings mappingsWithGroups:groups view:@"view"];
+    self.mappings.isDynamicSectionForAllGroups = YES;
+    [self.connection beginLongLivedReadTransaction];
+    [self.connection readWithBlock:^(YapDatabaseReadTransaction *transaction) {
+        [self.mappings updateWithTransaction:transaction];
+    }];
+}
+
+- (void)yapDatabaseModified:(NSNotification *)notification {
+    NSArray *notifications = [self.connection beginLongLivedReadTransaction];
+    NSArray *sectionChanges = nil;
+    NSArray *rowChanges = nil;
+    [[self.connection ext:@"view"] getSectionChanges:&sectionChanges
+                                          rowChanges:&rowChanges
+                                    forNotifications:notifications
+                                        withMappings:self.mappings];
+    if ([sectionChanges count] == 0 & [rowChanges count] == 0) {
+        return;
+    }
+
+    [self.tableView performBatchUpdates:^{
+        for (YapDatabaseViewSectionChange *sectionChange in sectionChanges) {
+            switch (sectionChange.type) {
+                case YapDatabaseViewChangeDelete:
+                    [self.tableView deleteSections:[NSIndexSet indexSetWithIndex:sectionChange.index] withRowAnimation:UITableViewRowAnimationAutomatic];
+                    break;
+                case YapDatabaseViewChangeInsert:
+                    [self.tableView insertSections:[NSIndexSet indexSetWithIndex:sectionChange.index] withRowAnimation:UITableViewRowAnimationAutomatic];
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        for (YapDatabaseViewRowChange *rowChange in rowChanges) {
+            switch (rowChange.type) {
+                case YapDatabaseViewChangeDelete:
+                    [self.tableView deleteRowsAtIndexPaths:@[rowChange.indexPath] withRowAnimation:UITableViewRowAnimationAutomatic];
+                    break;
+                case YapDatabaseViewChangeInsert:
+                    [self.tableView insertRowsAtIndexPaths:@[rowChange.newIndexPath] withRowAnimation:UITableViewRowAnimationAutomatic];
+                    break;
+                case YapDatabaseViewChangeMove:
+                    for (YapDatabaseViewRowChange *c in rowChanges) {
+                        if (c.type == YapDatabaseViewChangeInsert) {
+                            NSAssert(![c.newIndexPath isEqual:rowChange.newIndexPath], @"Move and insert to same index path");
+                        }
+                    }
+                    [self.tableView moveRowAtIndexPath:rowChange.indexPath toIndexPath:rowChange.newIndexPath];
+                    break;
+                case YapDatabaseViewChangeUpdate :
+                    [self.tableView reloadRowsAtIndexPaths:@[rowChange.indexPath] withRowAnimation:UITableViewRowAnimationNone];
+                    break;
+            }
+        }
+    } completion:nil];
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
+    return self.mappings.numberOfSections;
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return [self.mappings numberOfItemsInSection:section];
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    return [self.mappings groupForSection:section];
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"cell"];
+    __block NSDictionary *obj = nil;
+    [self.connection readWithBlock:^(YapDatabaseReadTransaction *transaction) {
+        obj = [(YapDatabaseViewTransaction *)[transaction ext:@"view"] objectAtIndexPath:indexPath withMappings:self.mappings];
+    }];
+    cell.textLabel.text = [obj[@"value"] stringValue];
+    return cell;
+}
+
+- (void)changeData {
+    [self.writeConnection asyncReadWriteWithBlock:^(YapDatabaseReadWriteTransaction *transaction) {
+        // Delete some keys
+        {
+            NSArray *existingKeys = [transaction allKeysInCollection:@"collection"];
+            NSUInteger numberOfKeysToDelete = RND(existingKeys.count);
+            NSMutableSet *keysToDelete = [NSMutableSet new];
+            for (int i = 0; i < numberOfKeysToDelete; ++i) {
+                [keysToDelete addObject:existingKeys[RND(existingKeys.count)]];
+            }
+            [transaction removeObjectsForKeys:keysToDelete.allObjects inCollection:@"collection"];
+        }
+
+        // Move some objects around
+        {
+            NSArray *existingKeys = [transaction allKeysInCollection:@"collection"];
+            NSUInteger numberOfKeysToMove = RND(existingKeys.count);
+            for (int i = 0; i < numberOfKeysToMove; ++i) {
+                NSString *key = existingKeys[RND(existingKeys.count)];
+                NSMutableDictionary *obj = [[transaction objectForKey:key inCollection:@"collection"] mutableCopy];
+                obj[@"section"] = @(RND(10));
+                obj[@"value"] = @(RND(100));
+                [transaction setObject:[obj copy] forKey:key inCollection:@"collection"];
+            }
+        }
+
+        // Insert objects so we have between 0-80 items in total
+        {
+            NSUInteger count = [transaction numberOfKeysInCollection:@"collection"];
+            NSUInteger target = MAX(RND(80), count);
+            for (NSUInteger i = count; i < target; ++i) {
+                [transaction setObject:@{@"section": @(RND(10)), @"value": @(RND(100))} forKey:[NSUUID UUID].UUIDString inCollection:@"collection"];
+            }
+        }
+    }];
+}
+
+@end
+```

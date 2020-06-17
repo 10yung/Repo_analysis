@@ -1,0 +1,121 @@
+This updates the installation instructions to point out that miri is only available on nightly, and encodes this assumption into the installation instructions.
+
+It took me a bit of research to find out *why* miri wasn't installing on `windows-msvc`:
+```txt
+C:\Users\yoshu> rustup component add miri
+error: component 'miri' for target 'x86_64-pc-windows-msvc' is unavailable for download for channel stable
+```
+
+I thought it must 've been something with the `msvc` target, but it turned out I was running on `stable`, and miri can only be installed on `nightly`. Having that be clearer in the installation instructions would've saved me some time debugging. Thanks!
+r? @RalfJung 
+Fixes #1057
+
+I'm using my original approach from PR #1048. Ideally, we would
+distinguish between build-deps/dependencies/'final crate' via a
+different approach (e.g. the target directory). However, I
+haven't been able to get that to work just yet.
+
+However, everything should be working with the approach I'm using. At a
+minimum, we can use this PR to verify that everything works as expected
+when we don't actually produce native build outputs.
+It would be good to build Miri's libstd with debug assertions -- the performance is already horrible anyway, and this way we get better testing.
+See the discussion at https://github.com/rust-lang/miri/pull/1101#discussion_r355505476: we'd like variants of `resolve_path` that specifically check the value *or* type namespace.
+
+To my surprise, according to what @oli-obk said, this is actually herd to do? Given that this is the basis of name resolution in rustc, I would have expected that to be much simpler than getting a weird "lookup in whatever namespace", which seems to be the operation we have right now.
+cc @spastorino @RalfJung 
+
+The way we represent statics and promoteds in MIR changed from them being an explicit place to them just being a constant that is a reference to the static (https://github.com/rust-lang/rust/pull/67000). Since this was supported before anyway, we remove the special case of statics being referencable both via a `Place` and via a constant.
+
+This change may have broken how stacked borrows process references to statics. We should run miri on a few examples and see whether the borrows assigned change in a significant way.
+
+related discussion on zulip: https://rust-lang.zulipchat.com/#narrow/stream/146212-t-compiler.2Fconst-eval/topic/promoteds.20are.20not.20places
+Currently, we [have a test](https://github.com/rust-lang/miri/blob/master/tests/compile-fail/intptrcast_alignment_check.rs) that asserts that code is not allowed to rely on any 'extra' information provided by the intprcast (e.g. a `[u16; 2]` array that happens to have alignment '4').
+
+However, this is a perfectly legitimate thing for code to do. I propose that we add a `intprcast-alignment` option which enables the following behavior:
+
+When we check the alignment for a memory access, we see if we have a recorded base address for the allocation (i.e. if a pointer within the allocation was ever cast to an integer).
+
+If we do *not* have a base address, we use the current alignment checking behavior (i.e. check the static alignment of the type). This will catch cases where the code is definitely wrong - if the pointer was never cast to an integer, the code cannot possibly know that it happened to have 'extra' alignment.
+
+If we *do* have a base address, then we do the alignment check based on the actual base address. This will allow some incorrect code, like:
+
+```rust
+let mut my_arr: [u8; 100]`
+my_arr.as_ptr() as usuze; // Dummy cast
+unsafe { *(my_arr.as_mut_ptr() as *mut u16) = 25 }
+```
+
+Depending on what alignment we pick for the base address of `my_addr`, this may or may not work. This means that whether or not this program passes now depends on the random seed.
+
+While this isn't ideal, I don't see a way of allowing the [intptrcast_alignment_check](https://github.com/rust-lang/miri/blob/master/tests/compile-fail/intptrcast_alignment_check.rs) to pass without also causing 'spurious passes' (code which really should fail, but doesn't).
+Several tests are currently [disabled on Windows](https://github.com/rust-lang/miri/pull/693/commits/80f9484c8680e54a31916d6410a5eea2ddb1e237), due to Miri's lack of support for a number of Windows API functions:
+
+* `GetProcAddress`
+* `GetModuleHandleW`
+* `AcquireSRWLockShared`
+
+Implementing `GetProcAddress` and `GetModuleHandleW` will require us to extend our current handling of `dlsym` to support Windows. This is currently blocked on https://github.com/rust-lang/rust/pull/66470, since we need the ability to read wide strings.
+Once https://github.com/rust-lang/miri/pull/693 is merged, we will have support for unwind panics. However, we will not support abort panics, due to a quirk in how `libpanic_abort` is compiled.
+
+I've opend a rust PR to fix the underlying issue: https://github.com/rust-lang/rust/pull/66489. Once it's merged (or another solution is found), we can re-enable [these tests](https://github.com/rust-lang/miri/pull/693/commits/b06d99b8a00a2b1433b0ccaabe4b4b86bdd786b2)
+It would be great if we could build libstd as well as dependent crates (in `cargo miri`) without codegen ("check" mode). This would (a) save time, (b) avoid having to generate MIR that works *both* in Miri *and* when compiled normally, and (c) hopefully drastically simplify cross-building.
+
+@Aaron1011 looked into this mostly due to (b), as this turned into quite a challenge for unwinding. I am copying from [his post](https://github.com/rust-lang/miri/pull/1048#issuecomment-554108470):
+
+---
+
+The long-term solution is to switch to using `cargo check`. This completely disables codegen in a way that's built into the compiler. We will no longer need to worry about any assumptions made by the codegen backend, since that code will simply never be executed.
+
+However, this turned out to be more complicated than I anticipated. There are several moving parts here:
+
+1. Making `xargo` run `cargo check`
+
+Currently, `xargo` unconditionally uses `cargo build` when compiling `libstd`. I've opened a PR to add a `cargo_mode = "check"` option to `Xargo.toml`: https://github.com/japaric/xargo/pull/267
+
+2. Making `cargo-miri` run `cargo check`.
+
+This is complicated by the fact that we currently run `cargo rustc` in order to pass arguments to the last (and only to the last) invocation of `rustc`. Sadly, there appears to be no way to combine `cargo check` and `cargo rustc` - you can either use `cargo rustc` and have no way to skip codegen, or use `cargo check` and have no way to pass final-crate-specific rustc arguments.
+
+To work around this issue, I've added [a hack to serialize arguments to an environment variable](https://github.com/rust-lang/miri/pull/1048/files#diff-013e9d4c90918d7fcefde17b70e674f5R490). When we compile the final crate, we deserialize these arguments from the environment variable, and manually pass them to the `rustc` invocation.
+
+3. Making build dependencies use the proper `libstd`.
+
+This is *by far* the trickiest part of this entire PR. When Cargo invokes our `cargo-miri` wrapper, we have three cases to worry about:
+
+1. Build dependencies (including build scripts): We pass through all arguments completely unmodified to rustc. Miri does not interact in any way with build scripts, so we want to treat them as if we were doing a normal run of cargo.
+
+2. Normal dependencies: We add our custom sysroot, but still invoke rustc. Since we are in cargo check mode, this will cause rustc to produce metadata for the normal dependenices of our runtime crate, using our custom libstd.
+
+3. The target itself (e.g. a test or a binary): We invoke miri, and actually begin execution.
+
+Handles these three cases ensures that build dependencies are built using the normal platform `libstd` (as if `cargo-miri` did not exist), while normal dependencies and our target crate are built against our custom libstd).
+
+Unfortunately, distinguishing between these three cases is a huge pain. I'm currently relying on the following tricks:
+
+1. Use `CARGO_MANIFEST_DIR` to detect when our target crate is being built.
+
+The `CARGO_MANIFEST_DIR` is set by Cargo to the directory containing the manifest of the package currently being built. During the initial, non-wrapper invocation of `cargo miri` (e.g. when the user types `cargo miri run` on the command line), we determine the manifest directly for the crate they are building. We then compare this to `CARGO_MANIFEST_DIR` when we are being invoked by Cargo as a wrapper.
+
+However, this fails to distinguish between a `build.rs` and the actual compilation, since both use the same manifest directory. This brings us to the second trick.
+
+2. Inspect the `--emit=` flag passed to `rustc` by `Cargo.`
+
+This trick relies on the fact that we are using `cargo check` to build the crate. When Cargo compiles a build dependency, the `--emit=` flag will always contain `link`- this is because we always need to produce a runnable binary for build scripts.
+
+When we are building normal dependencies, the `--emit=` flag will *not* contain `link`. This is how `cargo check` tells `rustc` not to perform codegen  - the `--emit=` flag will be `--emit=dep-info,metadata`.
+
+By checking for the presence of `link`, we can determine whether or not Cargo is trying to compile a build dependency. Note that the same crate could theoretically be build as both - e.g. you could add `[dependencies] cc=x.y.z` and `[build-dependencies] cc=x.y.z` to your `Cargo.toml`.
+
+### Adding more information to Cargo
+
+While I believe assumptions behind the above Cargo hacks are fairly sound, this is not really a viable long-term solution. For example, Cargo could choose to stop passing the `--emit` flag if `rustc` would have it default to what Cargo already wanted.
+
+Ideally, Cargo would set an environment variable to let us know which of the three cases we are in - target crate, build dependency, or normal dependency. I'm currently working on a PR that does just that.
+
+### Conclusion
+
+I think our best path forward is to:
+
+1. Land `cargo check` support in `xargo`
+2. Merge some form of this PR, possible in multiple pieces. Depending on how long review takes, it might make sense to merge the `eh_catch_typeinfo` hack into `rustc` so that nightly users can have a (somewhat) working Miri again
+3. Work with the Cargo team to expose the information we need in a cleaner way. I think this information could be of use to other Cargo wrappers. In particular, build dependencies have very different semantics from regular dependencies (e.g. they will be built for a different target during cross-compilation), but wrappers have no clean way of determining which they are building.

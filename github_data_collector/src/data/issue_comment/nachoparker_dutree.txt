@@ -1,0 +1,99 @@
+I am using version [0.2.15](https://github.com/nachoparker/dutree/archive/v0.2.15.zip)
+Installed latest version of rust for ubuntu (`sudo apt-get update && sudo apt-get install rustc`)
+```
+kurdtpage@ubuntu:~/dutree-0.2.15/src$ rustc main.rs
+error[E0463]: can't find crate for `dutree`
+  --> main.rs:37:1
+   |
+37 | extern crate dutree;
+   | ^^^^^^^^^^^^^^^^^^^^ can't find crate
+
+error: aborting due to previous error
+
+For more information about this error, try `rustc --explain E0463`.
+```
+run cargo build
+get the error:
+
+extern crate unicode_segmentation;
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ can't find crate
+lack of something?
+I see there is the `-x` option, but no example.
+
+> -x, --exclude NAME  exclude matching files or directories
+
+It only accepts full filename? Would it be possible to support matching a filter pattern? `-p --pattern PATTERN` Where you can use a pattern for filtering the results via globs, include/exclude extensions `*.webp,*.jpg`(only match these), or exclude `*.gif,preview*`.
+
+In my case, I just wanted to identify results with a certain file extension, doesn't seem possible currently? 
+
+Thanks for the great tool, it's been helpful, using some native system commands on a server wasn't working in large directories, either raising an error that the arg list was too long, or being unresponsive for a long time with no feedback. dutree handled these directories like a champ! :)
+implements #14 
+
+The implementation is fairly rudimentary and doesn't allow to change depth, aggregate or other options.
+
+Something that the standard `du` gets correct but `dutree` does not is avoid double-counting the usage of multiple directory entires that refer to the same files (hard links). Since you are generally using `du` to account for total disk usage, you wouldn't want to double-count files that are stored once but have multiple directory entries.
+
+For example:
+
+```
+$ tree --inodes
+.
+├── [116445601]  bar
+├── [116445607]  d
+│   ├── [116445608]  a
+│   └── [116445601]  b
+└── [116445601]  foo
+
+1 directory, 4 files
+
+$ du -ha .
+4.0K	./bar
+4.0K	./d/a
+4.0K	./d
+8.0K	.
+
+$ dutree
+[ dutest 327 B ]
+├─ d             │                        █████████████████│  44%         145 B
+│  ├─ b          │                        ░░░░░░░░░░░░░░░░░│   4%           6 B
+│  └─ a          │                        ░░░░░░░░░░░░░░░░░│   2%           3 B
+├─ bar           │                                         │   1%           6 B
+└─ foo           │                                         │   1%           6 B
+
+$ dutree --usage
+[ dutest 16.00 KiB ]
+├─ d             │                      ███████████████████│  50%      8.00 KiB
+│  ├─ a          │                      ░░░░░░░░░░█████████│  50%      4.00 KiB
+│  └─ b          │                      ░░░░░░░░░░█████████│  50%      4.00 KiB
+├─ bar           │                                █████████│  25%      4.00 KiB
+└─ foo           │                                █████████│  25%      4.00 KiB
+```
+
+As we can see, `dutree --usage` overestimates the space used significantly compared to `du`
+
+How these should be displayed is a bit of an open question. `du` prints files from the bottom up, and skips displaying files for which it has already covered the give inode. However, for `dutree` it might make sense to still show the individual files in the tree structure, but skip adding them to the common parent size. I'm not sure which approach would be better.
+Tools like `dutree` or `du` are generally used for finding files to clean up to free up space. The space that will be freed up corresponds to the files block usage on disk, not the file size, which could be smaller due to not using entire blocks, or larger due to a file having holes.
+
+While there may be some circumstances where the file size is useful to know, for instance if transferring to some other system which doesn't support holes in files and does't round to block boundaries, for the most common use cases `--usage` is the better metric, and it's even implicit in the name, where `du` stands for "disk usage."
+I compared `dutree` to my usual go-to solution of `du -h -d3 | sort -h` on my `src` directory, and it is much slower.
+
+This is on macOS, and this is after having run these a few times to warm up caches.
+
+I suspect the reason for this is that you're doing too many syscalls; the code [seems to use `Path` to refer to files in many places](https://github.com/nachoparker/dutree/blob/master/src/lib.rs#L475), and then does various tests on those paths, which mean extra system calls to query the same information multiple times. I would recommend instead passing around `DirEntry`, from which many attributes can be queried without extra system calls, or even better using the [`walkdir` crate](https://docs.rs/walkdir/2.2.7/walkdir/) which is a pretty well optimized directory walker that provides its own slightly richer `DirEntry` that caches additional metadata.
+
+    $ time sh -c 'du -h -d3 | gsort -h'
+    ...
+    real	0m36.430s
+    user	0m1.801s
+    sys	0m14.163s
+    $ time dutree --aggr=100m -d3
+    ...
+    163.37 real        11.67 user       104.74 sys
+
+
+It would be useful if it was possible to save a log with current disk usage to later come back and run a diff against the log instead of another directory. My usecase is i have a server that's slowly filling up und i have no idea where the space is going.
+
+Nice tool by the way.
+`-x` should have been "stay on one filesystem" instead of "exclude", for parity with `du` and `ncdu`.
+
+Anyway, there should be something like `-X` then to avoid going to other filesystems mounted below this one and options to avoid following symlinks (or maybe it should not follow symlinks by default unless `-L`).

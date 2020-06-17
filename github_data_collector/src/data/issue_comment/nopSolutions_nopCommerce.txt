@@ -1,0 +1,197 @@
+nopCommerce version: 4.30
+
+i used this code to retrieve number of products for each category in homepage but always `category.NumberOfProducts` return null:
+
+>@model TopMenuModel
+ var rootCategories = Model.Categories.Where(x => x.IncludeInTopMenu).ToList();
+ foreach (var category in rootCategories)
+{
+                    var categoryLineModel = new TopMenuModel.CategoryLineModel
+                    {
+                        Category = category
+                    };
+                 var temp = category.NumberOfProducts;
+  }
+
+i checked  assigning some products to category .
+why `category.NumberOfProducts` return null?
+
+
+There's no need to display this label in most cases (when we have only one store). Let's hide it in this case
+Updated to dotnet core 3.1.
+
+Fixes:
+
+https://github.com/nopSolutions/nopCommerce/issues/4259
+https://github.com/nopSolutions/nopCommerce/pull/4235
+
+Found the root cause for:
+
+https://github.com/dotnet/runtime/issues/1218
+
+IQueryables referencing a DBContext were put in the cache and on a next request reused from a different thread. This triggers a double dispose / free. Will create a repro for this for the .net core team.
+
+For now I check in the memory cache whether the type that is going to be cached is the return value of a linq operator.
+
+https://github.com/nopSolutions/nopCommerce/commit/30602faaeed42b4e4de2124c7caacc1026179e5b
+
+https://github.com/nopSolutions/nopCommerce/commit/f1c77ec861f583a0cd2628904d1fdb8ae4647685
+
+Rebased onto upstream develop for an easy merge.
+
+So the inevitable has happened and there are now remote code execution vulnerabilities that target asp.net core. 2.2 is not fixed as it is not a LTS release.
+
+https://devblogs.microsoft.com/dotnet/net-core-january-2020/
+
+We now have NO other choice but to take our nopcommerce site that was in preview down and look for another platform.
+
+Please not that we have TRIED to upgrade to dotnet core 3.1 but this was impossible. See:
+
+#4235 (comment)
+
+Please @AndreiMaz @RomanovM You are now exposing your users to remote code execution exploits.
+
+
+While testing a payment provider which sends the order to an external administration I came across the following situation. This occurs when there is a discount applied to a assigned product which is limited with a maximum discounted quantity.
+
+**nopCommerce version:** 
+4.20
+
+**Steps to reproduce the problem:** 
+ 1. Add a new discount
+    - Discount type: Assigned to products
+    - Discount amount: 5
+    - Maximum discounted quantity: 48
+    - Assign to product
+ 2. Add assigned product to cart with an amount above 48. For example 72. 
+ 3. Place order
+ 4. Open PDF invoice of product.
+
+The unit price is displayed like this:
+![image](https://user-images.githubusercontent.com/3949189/72260295-d3dcde00-3612-11ea-8b98-38a5e09f8ebe.png)
+When calculating the price manually: € 10.29 * 72 = € 740,88‬. While the displayed price of € 860.88 is in fact correct, the unit price is different for the first 48 and the other 24 items and is not displayed within the order. 
+The order/order item entity should contain the unit price for each item based on the different discounts. For example you would be able to add another discount for the first 10 items. 
+
+Maybe these should be extracted to 3 different order lines. So you would get:
+10x €5.29
+38x €10.29
+24x €15.29
+
+**Places where this is happening:**
+ - PDF invoice
+ - Order history > details
+ - Admin > orders
+ - Payment providers
+ - Maybe more
+nopCommerce version: all
+
+Steps to reproduce the problem: when we import/export product with attributes and conditions, conditions not support import/export.
+
+As the Redis cache implementation suffers from major network latency problems due to the single item fetches over the network and the implementation of RemoveWithPrefix as individual item synchronizations, (see https://github.com/nopSolutions/nopCommerce/issues/3875), I've implemented a new Distributed Inmemory Caching service that tackles these problems. Note that it does not require Redis or any backend cache server anymore as it simply synchronizes all memory caches.
+
+It works by queuing all changes to the in memory cache array during a page request for distribution later. The queue is emptied at the end of the request to multiple clients that will distribute the changes to the other webservers on a configurable flush interval (default 30 seconds). This results in two netwerk calls per server pair per 30 seconds IF there is any cache information to sync. The network calls are a few kilobytes to 10ths of kilobytes and contain between 1 and some 1000s of cache messages and take only a few miliseconds to process.
+
+The sync mechanism uses [DotNetty](https://github.com/Azure/DotNetty) to setup an async gzipped message pipeline over TCP that is fast and low latency. It completely bypasses the Http Pipeline.
+
+The cache is smart enough to code "Clear" and "RemoveWithPrefix" into single messages and replay them on the other server. The cache also compares the entries on the target server based on a time stamp so it is important that all web servers are synchronized using NTP. 
+
+I don't think it is wise to scale this beyond maybe 10 web frontends as it's push based so you'll end up with a lot of cache traffic when scaling to dozens of servers. I have not tested it with more than 3 nodes so YMMV.
+
+Performance is roughly identical to the in memory cache. Remember that it can take up to 30 seconds (the sync interval) for changes in the cache to propagate to another server. This is not a problem in practice.
+
+The scheduled tasks need some sort of locking mechanism to prevent multiple web frontends running the same task. The distributed cache cannot be used to synchronize the locks as it's only synchronized at fixed intervals. That is why this change includes a simple ILocker implementation using SQL Server.
+
+Configuration is done in appSettings.json. The following settings are defined:
+
+```json
+     // Enable the distributed Memory Cache
+    "DistributedCacheEnabled": true,
+
+    // Peers to communicate with. May include your own IP.
+    "DistributedCachePeers": "10.0.0.133,10.0.0.100",
+    
+     // Port to listen on for cache requests.
+    "DistributedCachePort": 5432,
+
+    // 30 second cache sync interval.
+    "DistributedCacheSyncInterval": 30,
+
+    // 60 second cache expiration cleanup interval.
+    "DistributedExpirationScanInterval": 60,
+
+    // Enable the Sql server locker
+    "SqlLockerEnabled": true,
+```
+
+Configuration should be the same on all peers. I'd like some feedback from people running nopcommerce clusters whether this makes a difference and is a good addition to NopCommerce.
+Need improvement:
+As per existing code for all plugin `DbContext` few methods are the same for all plugins and some of them implementation is not required at all (throw NotImplementedException).
+This code id repetitive. It is against the DRY principle.
+
+Possible Solution:
+Create new abstract base class (e.g. `BaseDbContext : DbContext, IDbContext`).
+All new `PLUGINNAMEObjectContext` and `NopObjectContext` will use `BaseDbContext` as a base class.
+nopCommerce Version: 4.00, 4.10, 4.20
+
+Steps to reproduce the problem: 
+Setup a multi-store
+Go to Admin > Configuration > Setting > Catalog setting >  on the "Search" section "Search page. Page size options" value is not saved in another store.
+
+I have checked there is a very small change in the view page.
+
+nopCommerce version: 4.20
+
+Steps to reproduce the problem: 
+Wrong reservation in ProductService in method ReserveInventory when ReservedQuantity bigger than StockQuantity  and set postive reservation and set value wrong.
+
+```csharp
+   Action pass = () =>
+            {
+                foreach (var item in productInventory)
+                {
+                    var selectQty = Math.Min(item.StockQuantity - item.ReservedQuantity, qty);
+                    item.ReservedQuantity += selectQty;
+                    qty -= selectQty;
+
+                    if (qty <= 0)
+                        break;
+                }
+            };
+
+// 1st pass: Applying reserved
+ pass();
+
+if (qty > 0)
+{
+     // 2rd pass: Booking negative stock!
+      var pwi = productInventory[0];
+       pwi.ReservedQuantity += qty;
+ }
+ ```
+
+
+it's must change to:
+```csharp
+   Action pass = () =>
+            {
+                foreach (var item in productInventory)
+                {
+                    var selectQty = Math.Min(Math.Max(0, item.StockQuantity - item.ReservedQuantity), qty);
+                    item.ReservedQuantity += selectQty;
+                    qty -= selectQty;
+
+                    if (qty <= 0)
+                        break;
+                }
+            };
+
+// 1st pass: Applying reserved
+ pass();
+
+if (qty > 0)
+{
+     // 2rd pass: Booking negative stock!
+      var pwi = productInventory[0];
+       pwi.ReservedQuantity += qty;
+ }
+ ```

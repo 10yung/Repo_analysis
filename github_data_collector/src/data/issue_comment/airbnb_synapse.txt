@@ -1,0 +1,231 @@
+This PR adds the following:
+
+* capability for Synapse to run a custom command to validate HAProxy config prior to writing the config file (config is held in a "staging" file before that)
+    - *Note:* this does not affect reloading, just writing the config. HAProxy will still get restarted, but it will continue to use good config.
+   - The goal is that the "production" config file (i.e. that used by the `HAProxy` process) will always be valid.
+* configuration for HAProxy validation
+* unit tests for those additions
+
+Because of state file caching, it is still possible that certain bad state will remain in Synapse (in-memory and in cache file). However, that state will not propagate to HAProxy; HAProxy will remain with the last good state.
+
+## Tests
+### 1. Local Testing of bad haproxy config in ZK
+Synapse does not write bad HAProxy config:
+```
+I, [2020-01-16T15:58:57.760357 #79492]  INFO -- Synapse::ServiceWatcher::ZookeeperWatcher: synapse: no config_for_generator data from mango-test for service mango-test; keep existing config_for_generator
+I, [2020-01-16T15:58:58.237389 #79492]  INFO -- Synapse::Synapse: synapse: configuring haproxy
+I, [2020-01-16T15:58:58.238499 #79492]  INFO -- Synapse::ConfigGenerator::Haproxy: @watcher config: {"mango-test"=>{"frontend"=>["mode http"], "backend"=>["mode http", "option httpchk /health", "http-check expect string OK"]}}
+I, [2020-01-16T15:58:58.238539 #79492]  INFO -- Synapse::ConfigGenerator::Haproxy: @frontends_cache: {"mango-test"=>["\nfrontend mango-test", ["\tmode http"], "\tbind localhost:3213 ", "\tdefault_backend mango-test"]}
+I, [2020-01-16T15:58:58.238569 #79492]  INFO -- Synapse::ConfigGenerator::Haproxy: @backends_cache: {"mango-test"=>["\nbackend mango-test", ["\tmode http", "\toption httpchk /health", "\thttp-check expect string OK"], ["\tserver i-{HOST1} {IP1} cookie i-{HOST1} check inter 2s rise 3 fall 2 id 1", "\tserver i-{HOST2} {IP2} cookie i-{HOST2} check inter 2s rise 3 fall 2 id 1"]]}
+I, [2020-01-16T15:58:58.238619 #79492]  INFO -- Synapse::ConfigGenerator::Haproxy: @watcher_revisions: {"mango-test"=>2}
+E, [2020-01-16T15:58:58.245069 #79492] ERROR -- Synapse::ConfigGenerator::Haproxy: synapse: invalid generated HAProxy config (checked via haproxy -c -f /usr/local/etc/haproxy/haproxy-staging.cfg): [ALERT] 015/155858 (80168) : parsing [/usr/local/etc/haproxy/haproxy-staging.cfg:29] : 'server i-{HOST}' : 'id' : custom id 1 already used at /usr/local/etc/haproxy/haproxy-staging.cfg:28 ('server i-{HOST}')
+[ALERT] 015/155858 (80168) : Error(s) found in configuration file : /usr/local/etc/haproxy/haproxy-staging.cfg
+[ALERT] 015/155858 (80168) : Fatal errors found in configuration.
+
+I, [2020-01-16T15:58:58.245358 #79492]  INFO -- Synapse::ConfigGenerator::Haproxy: synapse: checked HAProxy config located at /usr/local/etc/haproxy/haproxy-staging.cfg; status: false
+I, [2020-01-16T15:58:58.245397 #79492]  INFO -- Synapse::ConfigGenerator::Haproxy: synapse: at time 21 waiting until 39 to restart
+```
+
+Running HAProxy config is still valid, while "staging" is invalid:
+```
+$ haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg
+Configuration file is valid
+
+$ haproxy -c -f /usr/local/etc/haproxy/haproxy-staging.cfg
+[ALERT] 015/160311 (88063) : parsing [/usr/local/etc/haproxy/haproxy-staging.cfg:29] : 'server i-{HOST}' : 'id' : custom id 1 already used at /usr/local/etc/haproxy/haproxy-staging.cfg:28 ('server i-{HOST}')
+[ALERT] 015/160311 (88063) : Error(s) found in configuration file : /usr/local/etc/haproxy/haproxy-staging.cfg
+[ALERT] 015/160311 (88063) : Fatal errors found in configuration.
+```
+
+### 2. Normal behavior: HAProxy configuration is valid (`mango-test`)
+```
+I, [2020-01-17T00:23:40.639575 #5450]  INFO -- Synapse::ServiceWatcher::ZookeeperWatcher: synapse: zk exists at /production/secure/services/mango-canary/services for 1 times
+I, [2020-01-17T00:23:40.640891 #5450]  INFO -- Synapse::ServiceWatcher::ZookeeperWatcher: synapse: discovering backends for service mango-canary
+I, [2020-01-17T00:23:40.640984 #5450]  INFO -- Synapse::ServiceWatcher::ZookeeperWatcher: synapse: zk list children at /production/secure/services/mango-canary/services for 1 times
+I, [2020-01-17T00:23:40.644566 #5450]  INFO -- Synapse::ServiceWatcher::ZookeeperWatcher: synapse: discovered 2 backends for service mango-canary
+I, [2020-01-17T00:23:40.644614 #5450]  INFO -- Synapse::ServiceWatcher::ZookeeperWatcher: synapse: no config_for_generator data from mango-canary for service mango-canary; keep existing config_for_generator
+I, [2020-01-17T00:23:41.462955 #5450]  INFO -- Synapse::Synapse: synapse: configuring haproxy
+I, [2020-01-17T00:23:41.467110 #5450]  INFO -- Synapse::ConfigGenerator::Haproxy: synapse: restart required because we have a new backend mango-canary/i-{HOST}
+I, [2020-01-17T00:23:41.467710 #5450]  INFO -- Synapse::ConfigGenerator::Haproxy: synapse: reconfigured haproxy via /var/haproxy/stats1.sock
+I, [2020-01-17T00:23:41.530083 #5450]  INFO -- Synapse::ConfigGenerator::Haproxy: synapse: checked HAProxy config located at /etc/haproxy/haproxy-staging.cfg; status: true
+I, [2020-01-17T00:23:41.634800 #5450]  INFO -- Synapse::ConfigGenerator::Haproxy: synapse: restarted haproxy
+```
+
+### 3. Behavior with invalid haproxy config (`mango-test`)
+```
+I, [2020-01-17T00:31:22.976560 #5450]  INFO -- Synapse::ConfigGenerator::Haproxy: synapse: restart required because we have a new backend mango-canary/i-badconfig_randomip:2048
+I, [2020-01-17T00:31:22.977113 #5450]  INFO -- Synapse::ConfigGenerator::Haproxy: synapse: reconfigured haproxy via /var/haproxy/stats1.sock
+I, [2020-01-17T00:31:22.982254 #5450]  INFO -- Synapse::ConfigGenerator::Haproxy: synapse: restart required because haproxy_server_options changed for i-{HOST}
+E, [2020-01-17T00:31:23.071370 #5450] ERROR -- Synapse::ConfigGenerator::Haproxy: synapse: invalid generated HAProxy config (checked via sudo haproxy -c -f /etc/haproxy/haproxy-staging.cfg): [ALERT] 016/003122 (6935) : parsing [/etc/haproxy/haproxy-staging.cfg:286] : 'server i-badconfig_randomip:2048' : invalid address: 'randomip' in 'randomip:2048'
+
+[ALERT] 016/003122 (6935) : parsing [/etc/haproxy/haproxy-staging.cfg:288] : 'server i-{HOST}' : 'id' : custom id 1 already used at /etc/haproxy/haproxy-staging.cfg:287 ('server i-{HOST}')
+[ALERT] 016/003122 (6935) : Error(s) found in configuration file : /etc/haproxy/haproxy-staging.cfg
+[ALERT] 016/003123 (6935) : Fatal errors found in configuration.
+
+I, [2020-01-17T00:31:23.071532 #5450]  INFO -- Synapse::ConfigGenerator::Haproxy: synapse: checked HAProxy config located at /etc/haproxy/haproxy-staging.cfg; status: false
+I, [2020-01-17T00:31:23.177268 #5450]  INFO -- Synapse::ConfigGenerator::Haproxy: synapse: restarted haproxy
+```
+
+Running HAProxy config is valid because it is unchanged:
+```
+$ sudo haproxy -c -f /etc/haproxy/haproxy.cfg
+Configuration file is valid
+
+$ sudo haproxy -c -f /etc/haproxy/haproxy-staging.cfg
+[ALERT] 016/003421 (7404) : parsing [/etc/haproxy/haproxy-staging.cfg:286] : 'server i-badconfig_randomip:2048' : invalid address: 'randomip' in 'randomip:2048'
+
+[ALERT] 016/003421 (7404) : parsing [/etc/haproxy/haproxy-staging.cfg:288] : 'server i-{HOST}' : 'id' : custom id 1 already used at /etc/haproxy/haproxy-staging.cfg:287 ('server i-{HOST}')
+[ALERT] 016/003421 (7404) : Error(s) found in configuration file : /etc/haproxy/haproxy-staging.cfg
+[ALERT] 016/003421 (7404) : Fatal errors found in configuration.
+
+ $ sudo service haproxy status
+haproxy is running.
+```
+
+### 4. `do_checks = false` behavior with valid haproxy config
+No check is performed:
+```
+I, [2020-01-17T01:05:25.729172 #12131]  INFO -- Synapse::ServiceWatcher::ZookeeperWatcher: synapse: zk list children at /production/secure/services/mango-canary/services for 1 times
+I, [2020-01-17T01:05:25.730542 #12131]  INFO -- Synapse::ServiceWatcher::ZookeeperWatcher: synapse: discovered 1 backends for service mango-canary
+I, [2020-01-17T01:05:25.730588 #12131]  INFO -- Synapse::ServiceWatcher::ZookeeperWatcher: synapse: no config_for_generator data from mango-canary for service mango-canary; keep existing config_for_generator
+I, [2020-01-17T01:05:26.664936 #12131]  INFO -- Synapse::Synapse: synapse: configuring haproxy
+I, [2020-01-17T01:05:26.669463 #12131]  INFO -- Synapse::ConfigGenerator::Haproxy: synapse: restart required because we added new section mango-canary
+I, [2020-01-17T01:05:26.670212 #12131]  INFO -- Synapse::ConfigGenerator::Haproxy: synapse: reconfigured haproxy via /var/haproxy/stats1.sock
+I, [2020-01-17T01:05:26.788794 #12131]  INFO -- Synapse::ConfigGenerator::Haproxy: synapse: restarted haproxy
+```
+
+### 5. `do_checks = False` behavior with *invalid* haproxy config
+No check is performed, but HAProxy will fail to restart:
+```
+I, [2020-01-17T01:07:23.061730 #12131]  INFO -- Synapse::ServiceWatcher::ZookeeperWatcher: synapse: no config_for_generator data from mango-canary for service mango-canary; keep existing config_for_generator
+I, [2020-01-17T01:07:23.884589 #12131]  INFO -- Synapse::Synapse: synapse: configuring haproxy
+I, [2020-01-17T01:07:23.887874 #12131]  INFO -- Synapse::ConfigGenerator::Haproxy: synapse: restart required because we have a new backend mango-canary/i-myhost2_1.1.1.2:1026
+I, [2020-01-17T01:07:23.888533 #12131]  INFO -- Synapse::ConfigGenerator::Haproxy: synapse: reconfigured haproxy via /var/haproxy/stats1.sock
+[ALERT] 016/010723 (12829) : parsing [/etc/haproxy/haproxy.cfg:287] : 'server i-myhost2_1.1.1.2:1026' : 'id' : custom id 1 already used at /etc/haproxy/haproxy.cfg:286 ('server i-myhost_1.1.1.1:1025')
+[ALERT] 016/010723 (12829) : Error(s) found in configuration file : /etc/haproxy/haproxy.cfg
+[ALERT] 016/010723 (12829) : Fatal errors found in configuration.
+E, [2020-01-17T01:07:23.959745 #12131] ERROR -- Synapse::ConfigGenerator::Haproxy: failed to reload haproxy via sudo service haproxy reload:  * Reloading haproxy haproxy
+   ...fail!
+```
+
+And the "production" config is invalid:
+```
+ $ sudo haproxy -c -f /etc/haproxy/haproxy.cfg
+[ALERT] 016/010751 (12902) : parsing [/etc/haproxy/haproxy.cfg:287] : 'server i-myhost2_1.1.1.2:1026' : 'id' : custom id 1 already used at /etc/haproxy/haproxy.cfg:286 ('server i-myhost_1.1.1.1:1025')
+[ALERT] 016/010751 (12902) : Error(s) found in configuration file : /etc/haproxy/haproxy.cfg
+[ALERT] 016/010751 (12902) : Fatal errors found in configuration.
+```
+
+## Reviewers
+@anson627 @austin-zhu @Jason-Jian 
+cc: @Ramyak
+[internal ticket: TR-703]
+
+to avoid security issue
+Having upgraded to the most recent version of synaps, my logs are flooded with messages from collectd: 
+
+`collectd[1605]: statsd plugin: Unable to parse line: "synapse.watcher.ping.count:1|c|#watcher_name:storereader-raw_ca"`
+
+Initial investigation suggests that the statsd implementation introduced recently is formatted specifically for DataDog, so will not work with "standard" collectd. (apologies if I've got this wrong, it's Friday afternoon and I want to go home).
+
+Need a way to turn off the datadogging.
+If no keys are provided in @discovery / ENV, synapse is susceptible to entering an unrecoverable failure if it tries to get keys from metadata service when it is unavailable.
+Note that this upgrade changes minimum required ruby version from
+1.9.3-p551 to 2.1.8.
+
+```
+$ bundle audit check
+Name: nokogiri
+Version: 1.6.8.1
+Advisory: CVE-2016-4658
+Criticality: Unknown
+URL: https://github.com/sparklemotion/nokogiri/issues/1615
+Title: Nokogiri gem contains several vulnerabilities in libxml2 and libxslt
+Solution: upgrade to >= 1.7.1
+
+Name: nokogiri
+Version: 1.6.8.1
+Advisory: CVE-2017-5029
+Criticality: Unknown
+URL: https://github.com/sparklemotion/nokogiri/issues/1634
+Title: Nokogiri gem contains two upstream vulnerabilities in libxslt 1.1.29
+Solution: upgrade to >= 1.7.2
+
+Name: nokogiri
+Version: 1.6.8.1
+Advisory: CVE-2016-4658
+Criticality: Unknown
+URL: https://github.com/sparklemotion/nokogiri/issues/1615
+Title: Nokogiri gem contains several vulnerabilities in libxml2 and libxslt
+Solution: upgrade to >= 1.7.1
+
+Name: nokogiri
+Version: 1.6.8.1
+Advisory: CVE-2017-5029
+Criticality: Unknown
+URL: https://github.com/sparklemotion/nokogiri/issues/1634
+Title: Nokogiri gem contains two upstream vulnerabilities in libxslt 1.1.29
+Solution: upgrade to >= 1.7.2
+
+Vulnerabilities found!
+```
+
+Reviewers: @chase-childers @lap1817 
+Hi guys, 
+did you have try synapse to replace RDS?
+I have tried it and the result 
+
+I, [2017-04-28T09:59:05.870663 #15534]  INFO -- Synapse::Synapse: synapse: starting...
+I, [2017-04-28T09:59:05.870740 #15534]  INFO -- Synapse::ServiceWatcher::Ec2tagWatcher: Connecting to EC2 region: ap-southeast-1
+I, [2017-04-28T09:59:06.592645 #15534]  INFO -- Synapse::ServiceWatcher::Ec2tagWatcher: synapse: ec2tag watcher looking for instances tagged with Name=staging-synapse
+I, [2017-04-28T09:59:06.592795 #15534]  INFO -- Synapse::Synapse: synapse: configuring haproxy
+W, [2017-04-28T09:59:06.616788 #15534]  WARN -- Synapse::ConfigGenerator::Haproxy: synapse: restart required because socket command show stat
+ failed with error #<Errno::ECONNREFUSED: Connection refused - connect(2) for /run/haproxy/admin.sock>
+I, [2017-04-28T09:59:06.646909 #15534]  INFO -- Synapse::ConfigGenerator::Haproxy: synapse: restarted haproxy
+W, [2017-04-28T09:59:06.820603 #15534]  WARN -- Synapse::ServiceWatcher::Ec2tagWatcher: synapse: no backends for service proddb; using default servers: [{"name"=>"staging-synapse", "host"=>"staging-database.blabla.rds.amazonaws.com", "port"=>5432}]
+
+thanks
+haproxy supports relative port addresses, prefixed by a "+" or "-".
+
+If this is set the server port is determined by adding the value to the client's port. In the base service_watcher there is currently a check to verify that the override port is an integer which breaks existing configurations. 
+
+I assume nginx doesn't support a similar behaviour, would you accept a patch or should we just maintain our own version?
+The `DefaultProvider` takes aws keys from environment variables / config if available, otherwise falling back to ec2 metadata IAM role.  If you are using keys from the latter, they refresh automatically when they get near to expiry.  If the metadata service is down at this point, Synapse enters a broken state, where it has no credentials and cannot recover.  We have seen this in our production environment.
+
+I'm currently looking at a patch whereby I specifically select the `EC2Provider` if no keys are provided by the environment / config, inserting the following into `ec2tag.rb` before the call to `AWS::EC2.new`:
+
+`      unless ((@discovery['aws_access_key_id'] || ENV['aws_access_key_id']) \
+              && (@discovery['aws_secret_access_key'] || ENV['aws_secret_access_key'] ))
+        AWS.config(:credential_provider => AWS::Core::CredentialProviders::EC2Provider.new(:retries => 0))
+      end
+`
+
+Does this seem like a reasonable approach? Happy to submit a PR.
+Migrated to v2 of AWS-SDK
+Updated rspec tests
+Updated README.md to cover new functionality
+
+This adds the ability to define a "tag_hash" key in the options block for the ec2tag watcher.
+
+I had the use case of wanting to target only the intersection of two tags -- such as 
+```
+tag_hash:
+  environment: staging
+  some_service: installed
+```
+
+And the existing watcher functionality did not suffice. 
+
+This is backwards compatible with existing synapse.yaml configuration files (and the tag_name/tag_value keys for ec2tag)
+
+Cheers,
+Alex
+Really useful for local dev where an image might not have a tag yet.
+
+The fix here was to use `split` instead of `rpartition` because `rpartition` has some unexpected behavior when there is no match.
+
+```
+"foo:bar".rpartition(":")    # ["foo", ":", "bar"]
+
+"foo".rpartition(":")        # ["", "", "foo"]
+```

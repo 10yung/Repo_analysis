@@ -1,0 +1,202 @@
+When attempting to export a Q8BERT model to ONNX, TorchScript reports a runtime error.
+
+Since the quantized forward methods embed Tensors with grads from layer instance attributes rather than input parameters, exporting the model has to be done with explicit torch script tracing; however that creates a traced model with lacks fidelity with the python model, as branching behavior is not captured.
+
+However, attempting to create a script model with TorchScript, which should encode that behavior results in a missing config attribute on the BertModel superclass.
+
+**To Reproduce**
+Steps to reproduce the behavior:
+1. Train a Q8Bert model:
+
+```
+ nlp-train transformer_glue \
+            --task_name mrpc \
+            --model_name_or_path bert-base-uncased \
+            --model_type quant_bert \
+            --learning_rate 2e-5 \
+            --output_dir $DATA_DIR \
+            --data_dir $GLUE_DIR  \
+            --evaluate_during_training \
+            --do_lower_case \
+            --per_gpu_train_batch_size 32 \
+            --per_gpu_eval_batch_size 32 \
+            --max_seq_length 128
+```
+2.  Load the 8bit model for inference
+
+```
+import torch
+from nlp_architect.models.transformers.quantized_bert import QuantizedBertForSequenceClassification
+
+model = QuantizedBertForSequenceClassification.from_pretrained(configs.data_dir, from_8bit=True)
+device = torch.device("cuda")
+model.to(device)
+model.eval()
+
+```
+3. Attempt to create the script model
+```
+script_model = torch.jit.script(model)
+```
+4. This produces the error:
+
+```
+Traceback (most recent call last):
+  File "convert-torch-q8bert-via-onnx-to-tensorflow.py", line 105, in <module>
+    script_model = torch.jit.script(model)
+  File "/home/krhys/.local/share/virtualenvs/q8bert-_S0V57VU/lib/python3.7/site-packages/torch/jit/__init__.py", line 1203, in script
+    return torch.jit.torch.jit._recursive.recursive_script(obj)
+  File "/home/krhys/.local/share/virtualenvs/q8bert-_S0V57VU/lib/python3.7/site-packages/torch/jit/_recursive.py", line 173, in recursive_script
+    return copy_to_script_module(mod, overload_stubs + stubs)
+  File "/home/krhys/.local/share/virtualenvs/q8bert-_S0V57VU/lib/python3.7/site-packages/torch/jit/_recursive.py", line 95, in copy_to_script_module
+    torch.jit._create_methods_from_stubs(script_module, stubs)
+  File "/home/krhys/.local/share/virtualenvs/q8bert-_S0V57VU/lib/python3.7/site-packages/torch/jit/__init__.py", line 1423, in _create_methods_from_stubs
+    self._c._create_methods(self, defs, rcbs, defaults)
+  File "/home/krhys/.local/share/virtualenvs/q8bert-_S0V57VU/lib/python3.7/site-packages/torch/jit/_recursive.py", line 195, in make_strong_submodule
+    new_strong_submodule = recursive_script(module)
+  File "/home/krhys/.local/share/virtualenvs/q8bert-_S0V57VU/lib/python3.7/site-packages/torch/jit/_recursive.py", line 173, in recursive_script
+    return copy_to_script_module(mod, overload_stubs + stubs)
+  File "/home/krhys/.local/share/virtualenvs/q8bert-_S0V57VU/lib/python3.7/site-packages/torch/jit/_recursive.py", line 95, in copy_to_script_module
+    torch.jit._create_methods_from_stubs(script_module, stubs)
+  File "/home/krhys/.local/share/virtualenvs/q8bert-_S0V57VU/lib/python3.7/site-packages/torch/jit/__init__.py", line 1423, in _create_methods_from_stubs
+    self._c._create_methods(self, defs, rcbs, defaults)
+RuntimeError:
+module has no attribute 'config':
+at /home/krhys/.local/share/virtualenvs/q8bert-_S0V57VU/lib/python3.7/site-packages/transformers/modeling_bert.py:675:15
+        # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
+        # ourselves in which case we just need to make it broadcastable to all heads.
+        if attention_mask.dim() == 3:
+            extended_attention_mask = attention_mask[:, None, :, :]
+
+        # Provided a padding mask of dimensions [batch_size, seq_length]
+        # - if the model is a decoder, apply a causal mask in addition to the padding mask
+        # - if the model is an encoder, make the mask broadcastable to [batch_size, num_heads, seq_length, seq_length]
+        if attention_mask.dim() == 2:
+            if self.config.is_decoder:
+               ~~~~~~~~~~~ <--- HERE
+                batch_size, seq_length = input_shape
+                seq_ids = torch.arange(seq_length, device=device)
+                causal_mask = seq_ids[None, None, :].repeat(batch_size, seq_length, 1) <= seq_ids[None, :, None]
+                extended_attention_mask = causal_mask[:, None, :, :] * attention_mask[:, None, None, :]
+            else:
+                extended_attention_mask = attention_mask[:, None, None, :]
+
+        # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
+        # masked positions, this operation will create a tensor which is 0.0 for
+'__torch__.nlp_architect.models.transformers.quantized_bert.QuantizedBertModel.forward' is being compiled since it was called from '__torch__.nlp_architect.models.transformers.quantized_bert.QuantizedBertForSequenceClassification.forward'
+at /home/krhys/.local/share/virtualenvs/q8bert-_S0V57VU/lib/python3.7/site-packages/transformers/modeling_bert.py:1014:8
+    def forward(self, input_ids=None, attention_mask=None, token_type_ids=None,
+                position_ids=None, head_mask=None, inputs_embeds=None, labels=None):
+
+        outputs = self.bert(input_ids,
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~...  <--- HERE
+                            attention_mask=attention_mask,
+                            token_type_ids=token_type_ids,
+                            position_ids=position_ids,
+                            head_mask=head_mask,
+                            inputs_embeds=inputs_embeds)
+
+        pooled_output = outputs[1]
+
+        pooled_output = self.dropout(pooled_output)
+```
+
+**Expected behavior**
+
+It should produce a script model without error
+
+**Environment setup: **
+ - OS (Linux/Mac OS): Ubuntu Xenial
+ - Python version: 3.7
+
+**Additional context**
+
+It may be possible to create pure helper quantized forward functions with explicit arguments which have the `@torch.jit.script` annotations which are called by the quantized layer forward methods
+
+Note that the HuggingFace transformers Bert model can be exported to ONNX.
+Hi,
+we’d greatly appreciate any feedback regarding any plans, as announced here [1], of integrating the new cross-doc coreference resolution approach by Barhom et al. into NLP-Architect. Also, we were wondering if there is a published paper/preprint on the approach that is currently part of NLP Architect, cf. [2]?
+Cheers!
+Anastasia
+[1]: https://www.intel.ai/crossdocument-coreference-nlp/#gs.rsys05
+[2]: http://nlp_architect.nervanasys.com/cross_doc_coref.html
+
+Hello, 
+I am executing examples/cross_doc_coref/cross_doc_coref_sieves.py, and got the following error: 
+
+FileNotFoundError: Referent Dict file not found or not in path:C:\Users\annaz\PycharmProjects\nlp_architect\dataset\coref.dict1.tsv
+
+How could I get this file?
+
+Thank you in advance. 
+Best, 
+Anastasia
+
+I'm using the ABSA UI to classify a large set of reviews. However, when I select "Classify" ->"Raw Data," I get this runtime error: 
+
+RuntimeError: Parser not initialized (try parse=True at init )
+
+
+However, I _also_ get the same error message when I provide parsed data. 
+
+Here is my output:
+
+error: RuntimeError('Parser not initialized (try parse=True at init )')
+Traceback (most recent call last):
+  File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/bokeh/server/protocol_handler.py", line 100, in handle
+    work = yield handler(message, connection)
+  File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/tornado/gen.py", line 735, in run
+    value = future.result()
+  File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/tornado/gen.py", line 748, in run
+    yielded = self.gen.send(value)
+  File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/bokeh/server/session.py", line 70, in _needs_document_lock_wrapper
+    result = yield yield_for_all_futures(func(self, *args, **kwargs))
+  File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/bokeh/server/session.py", line 257, in _handle_patch
+    message.apply_to_document(self.document, self)
+  File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/bokeh/protocol/messages/patch_doc.py", line 107, in apply_to_document
+    doc.apply_json_patch(self.content, setter)
+  File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/bokeh/document/document.py", line 394, in apply_json_patch
+    patched_obj.set_from_json(attr, value, models=references, setter=setter)
+  File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/bokeh/core/has_props.py", line 347, in set_from_json
+    descriptor.set_from_json(self, json, models, setter)
+  File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/bokeh/core/property/descriptors.py", line 618, in set_from_json
+    models, setter)
+  File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/bokeh/core/property/descriptors.py", line 327, in set_from_json
+    self._internal_set(obj, json, setter=setter)
+  File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/bokeh/core/property/descriptors.py", line 769, in _internal_set
+    self._real_set(obj, old, value, hint=hint, setter=setter)
+  File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/bokeh/core/property/descriptors.py", line 838, in _real_set
+    self._trigger(obj, old, value, hint=hint, setter=setter)
+  File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/bokeh/core/property/descriptors.py", line 915, in _trigger
+    obj.trigger(self.name, old, value, hint, setter)
+  File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/bokeh/model.py", line 717, in trigger
+    super(Model, self).trigger(attr, old, new, hint=hint, setter=setter)
+  File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/bokeh/util/callback_manager.py", line 161, in trigger
+    self._document._notify_change(self, attr, old, new, hint, setter, invoke)
+  File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/bokeh/document/document.py", line 1005, in _notify_change
+    self._trigger_on_change(event)
+  File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/bokeh/document/document.py", line 1095, in _trigger_on_change
+    self._with_self_as_curdoc(event.callback_invoker)
+  File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/bokeh/document/document.py", line 1113, in _with_self_as_curdoc
+    return f()
+  File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/bokeh/util/callback_manager.py", line 159, in invoke
+    callback(attr, old, new)
+  File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/nlp_architect/solutions/absa_solution/ui.py", line 329, in infer_file_callback
+    opinion_lex=SENTIMENT_OUT / 'opinions.csv')
+  File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/nlp_architect/solutions/absa_solution/sentiment_solution.py", line 77, in run
+    sentiment_doc = inference.run(parsed_doc=parsed_doc)
+  File "/Library/Frameworks/Python.framework/Versions/3.7/lib/python3.7/site-packages/nlp_architect/models/absa/inference/inference.py", line 66, in run
+    raise RuntimeError("Parser not initialized (try parse=True at init )")
+RuntimeError: Parser not initialized (try parse=True at init )
+
+
+* Need to check Transformer models are working (forward)
+* Combine tests with a new validation scheme
+**Describe the bug**
+mobile version of website with blue colors instead of NLP Architect
+With your 8-bit quantized GNMT model, I understand that the weights are quantized to 8-bit and then treated as floating point during inference. Does this mean that the 8-bit weights are interacting with float32 activations? Or are the activations also effectively quantized to 8-bit?
+
+Feature related to new ml model for NLP architect library
+
+negation understanding model needs to be implemented
+

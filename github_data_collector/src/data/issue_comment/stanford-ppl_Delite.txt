@@ -1,0 +1,628 @@
+Using an implicit class, we could add a .toVector method on the ForgeArray type that would convert the data into a DenseVector type. E.g.
+
+    val x: ForgeArray[Int] = ...
+    val y: DenseVector[Int] = x.toVector
+
+This would be equivalent to the following (current way):
+
+    val y: DenseVector[Int] = DenseVector(x)
+
+
+ 
+I suggest turning all build warnings into compiler errors. I have noticed that there are lots of potentially fatal errors lurking in Delite's codebase. There are many (>50) instances of code that relies upon not-present functionality. Specifically, pattern matching on something's type when that type information will not be present due to Java's runtime type erasure.
+
+The standard ways to do this behavior w/in Scala use `ClassTag`s. There's also `TypeTag`s and `Manifest`s, which are built for this exact thing. [1] However, there's an incompatibility w/ `TypeTag` for Scala 2.10 (iirc): only works on 2.11.
+
+In my experience, I've been able to do a lot of runtime type checking by using a `ClassTag`, getting the actual type's runtime type (as a `Class` instance), then checking to see if that is the same type that we're looking for. This is a good resource [2].
+
+For the flag, we'd have to go to `project/Build.scala` and add the following setting:
+```
+scalacOptions += "-Xfatal-warnings",
+```
+
+
+[1] http://docs.scala-lang.org/overviews/reflection/typetags-manifests.html
+[2] https://scalerablog.wordpress.com/2015/12/21/classtag-class-and-war-stories/
+Enable overriding of delite config from delite.properties file
+
+
+After making `mapRows` pure in OptiML, we encountered an illegal instance of horizontal fusion in the DenseMatrixSuite's testMapAll(). The code to trigger the fusion error is:
+
+```
+def main() = {
+    val x = DenseMatrix.zeros(10,10)
+    val b = x mapRows { i => DenseVector.ones(10) }
+    println(b == DenseMatrix.ones(10,10))
+  }
+```
+
+The result of this is a `java.lang.RuntimeException: Couldn't find following op: x509`, and the generated kernel is:
+
+```
+object kernel_x509x824 {
+def apply(resourceInfo:generated.scala.ResourceInfo,x509:Array[Double]):
+generated.scala.DeliteOpMultiLoop[activation_x509x824] { ... }
+```
+
+The horizontally fused kernel x509x824 also expects x509 as an input. It seems to be caused by the fact that the outer loop and inner loop have the same constant size (10) in the example, and the inner loop has no dependency on the outer loop's bound symbol (i). 
+
+To reproduce, use the following hashes:
+Forge: stanford-ppl/Forge@939141a3f522e59802350757d960594d9f1c6291
+Delite: e68606458e3ce4a01073c8278f5de16e790551ec
+LMS:  TiarkRompf/virtualization-lms-core@afeb9efa26298af091037b6a57974a34fd29be69
+
+and run the code snippet pasted above in OptiML.
+
+In OptiML logistic regression, we are getting a duplicated symbol emitted that appears to be a scheduling bug related to some interaction between Multiloop SoA and loop fusion (it does not occur if either one is turned off).
+
+The exact behavior we are seeing is a while loop kernel generated like the following:
+
+```
+def apply(resourceInfo:generated.scala.ResourceInfo,x1231:Int,x1135:Int,x1296:Array[Double],x1229:Array[Double],x628:generated.scala.DenseVectorDouble,x1301:generated.scala.Ref[Double],x1356:generated.scala.Ref[Int],x1355:generated.scala.Ref[generated.scala.DenseVectorDouble]):
+Unit = {
+val x1880 = while ({
+// ...
+} {
+// ...
+val x1135 = x1134.length
+// ...
+})
+```
+
+Notice that x1135 is re-emitted, despite being an input to the kernel. This also occurs in normal kernel generation, but because x1135 is emitted as a kernel (a separate file), that file is simply overwritten, so the program still compiles and runs correctly.
+
+To reproduce, use the following hashes:
+Forge: stanford-ppl/Forge@3de62bb94599902a7846173443dc40bce6908a79
+Delite: c301618a2086b862a15bb099812e60195fed7240
+LMS:  TiarkRompf/virtualization-lms-core@81ee4b132535707984b113d8ed2f14dcda7579da
+
+and run the program LogRegCompiler from OptiML. When running delite LogRegCompiler, you should see the following walk-time compilation error:
+
+```
+generatedCache/scala/src/kernels/x1880.scala:24: error: not found: value x1134
+val x1135 = x1134.length
+            ^
+one error found
+```
+
+My hypothesis (though unproven) is that the problematic symbol may be being injected into the scope during fusion, which is somehow affected by the split SoA loops. It's possible this could be fixed by Vera's new implementation, or at least made easier to debug.
+
+Hi,
+I am trying to generate a CUDA code for DenseMatrix.inv statement in OptiML and I realized that in the DenseMatrixOps the DenseMatrixInverse case class inherits/extends a DeliteOpSingleWithManifest, which according to my experience will allow emitting only a sequential/Scala code as it is not a parallel op. I maybe wrong about this as I am still getting to understand some of these things.
+
+If I am right about this, do you think it's possible to try implementing DenseMatrixInverse using DeliteOpIndexedLoop or DeliteOpForEach with the concept of Guass-Jordan elimination algorithm. I have tried this with pure CUDA and it seems to work fine although I have not compared any speed-ups with the sequential pure C version. My plan was to try it first but my advisors suggested I find out first before any attempt.  Please advice.
+
+Here is the code I tried on OptiML and my new DSL (OptiSDR), which currently adotpts/inherits most functionality from OptiLA. 
+
+```
+        val m1 = DenseMatrix.rand(10000,4250)
+        val invm1 = m1.inv
+```
+
+The following OptiML code triggers this bug:
+
+```
+val ipiv = DenseVector(5,7,10,8,8,9,10,9,10,10)
+val P_indices = (0::10).mutable
+println("P_indices before: " )
+P_indices.pprint
+var i = 0
+while (i < ipiv.length) {
+  val swap = P_indices(i)
+  P_indices(i) = P_indices(ipiv(i)-1)
+  P_indices(ipiv(i)-1) = swap
+  i += 1
+}
+println("P_indices after: " )
+P_indices.pprint
+```
+
+The P_indices value will not be correctly updated unless there is an effect inside the while loop body like println(P_indices(i)) or changing "val swap" to "var swap". I tried various other things, like disabling fusion and SoA, and trying to hide the structness of P_indices (to see if struct rewrites were the problem), but nothing else worked.
+
+Anyone have any idea what's going on?
+
+var i = 0
+if (foo) i = 1.0 else i = 2
+
+results in a runtime generated code type error. This should be caught earlier.
+
+I was playing with the new example app snippets and it seems like fusion is broken in some cases. Here's a simplified version of Example1:
+
+``` scala
+    // DenseVector, DenseMatrix
+object Example1ARunner extends OptiMLApplicationRunner with Example1A
+trait Example1A extends OptiMLApplication { 
+  def main() = {  
+    // 10000x1 DenseVector
+    val v1 = Vector.rand(10000)
+
+    // perform some simple infix operations
+    val v2 = (v1+10)*2-5
+
+    // take the pointwise natural log of v2 and sum results
+    val logv2Sum = log(v2).sum
+
+    print(logv2Sum)
+
+    // print the first 10 elements to the screen
+    v2(0::10).pprint   
+  }
+}
+```
+
+In the generated code, only the *2-5, log and sum are fused, but the rand initialization and +10 remain separate.
+
+Ideally, we'd just compute the first 10 elements anyways...
+
+Generated code:
+
+``` scala
+/*****************************************
+  Emitting Generated Code                  
+*******************************************/
+class Application extends ((Array[java.lang.String])=>(Unit)) {
+def apply(x0:Array[java.lang.String]): Unit = {
+def x11_block = { 
+val x1 = new generated.scala.DoubleDenseVector(10000,true)
+val x2 = x1._length
+var x9: Unit = ()
+var x3 = 0
+// SHOULD BE FUSED WITH CONSUMERS
+while (x3 < x2) {  // begin fat loop x9
+val x4 = x1._data(x3)
+val x5 = generated.scala.Global.randRef.nextDouble()
+val x6 = x5.asInstanceOf[Double]
+val x7 = x1._data(x3) = x6
+x9 = {
+x7
+}
+x3 += 1
+} // end fat loop x9
+x1
+}
+val x11 = x11_block
+val x12 = x11._length
+val x71_data = {
+val x15 = x12
+val x17 = x11._isRow
+val x18 = new generated.scala.DoubleDenseVector(x15,x17)
+x18
+}
+var x71_size = 0
+var x13 = 0
+// SHOULD BE FUSED WITH CONSUMERS
+while (x13 < x12) {  // begin fat loop x71
+val x20 = x11._data(x13)
+val x21 = x20 + 10.0
+val x14 = x21
+val x16 = x71_data
+val x23 = x16._data(x13) = x14
+x13 += 1
+} // end fat loop x71
+val x16 = x71_data
+val x71 = x16
+val x72 = x71._length
+val x77 = x71._isRow
+val x338_data = {
+val x133 = x72
+val x135 = new generated.scala.DoubleDenseVector(x133,x77)
+x135
+}
+var x338_size = 0
+val x371_zero = {
+0.0
+}
+var x371: Double = x371_zero
+var x73 = 0
+while (x73 < x72) {  // begin fat loop x338,x371
+val x80 = x71._data(x73)
+val x81 = x80 * 2.0
+val x287 = x81 - 5.0
+val x323 = java.lang.Math.log(x287)
+val x132 = x287
+val x134 = x338_data
+val x336 = x134._data(x73) = x132
+val x247 = x371
+val x248 = x323
+val x249 = x247 + x248
+x371 = x249
+x73 += 1
+} // end fat loop x338,x371
+val x134 = x338_data
+val x338 = x134
+val x372 = print(x371)
+// SHOULD BE ABLE TO HANDLE SLICES MORE EFFICIENTLY
+def x350_block = { 
+val x253 = new generated.scala.DoubleDenseVector(10,x77)
+var x255 : Int = 0
+val x347 = while (x255 < 10) {
+val x344 = x338._data(x255)
+val x345 = x253._data(x255) = x344
+x345
+x255 = x255 + 1
+}
+val x348 = x253// unsafe immutable
+x348
+}
+val x350 = x350_block
+val x351 = x350._isRow
+def x381_block = { 
+val x379 = {
+def x379thenb(): Unit = {
+val x373 = print("[ ")
+val x353 = x350._length
+var x267 : Int = 0
+val x374 = while (x267 < x353) {
+val x354 = x350._data(x267)
+val x355 = print(x354)
+val x356 = print(" ")
+x356
+x267 = x267 + 1
+}
+val x375 = print("]\n")
+x375
+}
+def x379elseb(): Unit = {
+val x353 = x350._length
+var x275 : Int = 0
+val x377 = while (x275 < x353) {
+val x276 = print("[")
+val x361 = x350._data(x275)
+val x362 = print(x361)
+val x363 = print("]\n")
+x363
+x275 = x275 + 1
+}
+x377
+}
+if (x351) {
+x379thenb()
+} else { 
+x379elseb()
+}
+}
+x379
+}
+val x381 = x381_block
+()
+}
+}
+/*****************************************
+  End of Generated Code                  
+*******************************************/
+/* all definitions:
+TP(Sym(1),Reflect(DenseVectorNew(Const(10000),Const(true)),Summary(false,false,false,false,true,List(),List(),List(),List()),List()))
+TP(Sym(2),Reflect(DenseVectorLength(Sym(1)),Summary(false,false,false,false,false,List(Sym(1)),List(Sym(1)),List(),List()),List(Sym(1))))
+TP(Sym(4),Reflect(DenseVectorApply(Sym(1),Sym(3)),Summary(false,false,false,false,false,List(Sym(1)),List(Sym(1)),List(),List()),List()))
+TP(Sym(5),Reflect(RandDouble(),Summary(true,true,false,false,false,List(),List(),List(),List()),List()))
+TP(Sym(6),RepAsInstanceOf(Sym(5),Double,Double))
+TP(Sym(7),Reflect(DenseVectorUpdate(Sym(1),Sym(3),Sym(6)),Summary(false,false,false,false,false,List(Sym(1)),List(Sym(1)),List(Sym(1)),List(Sym(1))),List(Sym(4))))
+TP(Sym(8),Reify(Sym(7),Summary(true,true,false,false,false,List(Sym(1)),List(Sym(1)),List(Sym(1)),List(Sym(1))),List(Sym(4), Sym(5), Sym(7))))
+TP(Sym(9),Reflect(VectorMutableMap(VInterface(Sym(1)  [Double]),<function1>),Summary(false,false,false,false,false,List(),List(),List(Sym(1)),List(Sym(1))),List(Sym(1), Sym(2))))
+TP(Sym(10),Reify(Sym(1),Summary(false,false,false,false,false,List(),List(),List(),List()),List(Sym(1), Sym(2), Sym(9))))
+TP(Sym(11),Reflect(DenseVectorObjectRand(Const(10000)),Summary(true,true,false,false,false,List(),List(),List(),List()),List()))
+TP(Sym(12),Reflect(DenseVectorLength(Sym(11)),Summary(false,false,false,false,false,List(Sym(1)),List(Sym(1)),List(),List()),List()))
+TP(Sym(17),Reflect(DenseVectorIsRow(Sym(11)),Summary(false,false,false,false,false,List(Sym(1)),List(Sym(1)),List(),List()),List()))
+TP(Sym(18),Reflect(DenseVectorNew(Sym(15),Sym(17)),Summary(false,false,false,false,true,List(),List(),List(),List()),List()))
+TP(Sym(19),Reify(Sym(18),Summary(false,false,false,false,true,List(Sym(1)),List(Sym(1)),List(),List()),List(Sym(17), Sym(18))))
+TP(Sym(20),Reflect(DenseVectorApply(Sym(11),Sym(13)),Summary(false,false,false,false,false,List(Sym(1)),List(Sym(1)),List(),List()),List()))
+TP(Sym(21),ArithPlus(Sym(20),Const(10.0)))
+TP(Sym(22),Reify(Sym(21),Summary(false,false,false,false,false,List(Sym(1)),List(Sym(1)),List(),List()),List(Sym(20))))
+TP(Sym(23),Reflect(DenseVectorUpdate(Sym(16),Sym(13),Sym(14)),Summary(false,false,false,false,false,List(Sym(16)),List(Sym(16)),List(Sym(16)),List(Sym(16))),List()))
+TP(Sym(24),Reify(Sym(23),Summary(false,false,false,false,false,List(Sym(16)),List(Sym(16)),List(Sym(16)),List(Sym(16))),List(Sym(23))))
+TP(Sym(28),Reflect(DenseVectorLength(Sym(16)),Summary(false,false,false,false,false,List(Sym(16)),List(Sym(16)),List(),List()),List()))
+TP(Sym(29),Reflect(DenseVectorRawData(Sym(16)),Summary(false,false,false,false,false,List(Sym(16)),List(Sym(16)),List(),List()),List()))
+TP(Sym(30),Reflect(DeliteArrayLength(Sym(29)),Summary(false,false,false,false,false,List(Sym(16)),List(Sym(16)),List(),List()),List()))
+TP(Sym(31),ArithMinus(Sym(30),Sym(28)))
+TP(Sym(32),OrderingLT(Sym(31),Const(1)))
+TP(Sym(33),ArithPlus(Sym(28),Const(1)))
+TP(Sym(34),ArithTimes(Sym(30),Const(2)))
+TP(Sym(35),MathMax(Const(4),Sym(34)))
+TP(Sym(36),Reflect(NewVar(Sym(35)),Summary(false,false,false,false,true,List(),List(),List(),List()),List()))
+TP(Sym(37),Reflect(ReadVar(Variable(Sym(36))),Summary(false,false,false,false,false,List(Sym(36)),List(Sym(36)),List(),List()),List()))
+TP(Sym(38),OrderingLT(Sym(37),Sym(33)))
+TP(Sym(39),Reify(Sym(38),Summary(false,false,false,false,false,List(Sym(36)),List(Sym(36)),List(),List()),List(Sym(37))))
+TP(Sym(40),Reflect(ReadVar(Variable(Sym(36))),Summary(false,false,false,false,false,List(Sym(36)),List(Sym(36)),List(),List()),List()))
+TP(Sym(41),ArithTimes(Sym(40),Const(2)))
+TP(Sym(42),Reflect(Assign(Variable(Sym(36)),Sym(41)),Summary(false,false,false,false,false,List(Sym(36)),List(Sym(36)),List(Sym(36)),List(Sym(36))),List(Sym(40))))
+TP(Sym(43),Reify(Const(()),Summary(false,false,false,false,false,List(Sym(36)),List(Sym(36)),List(Sym(36)),List(Sym(36))),List(Sym(40), Sym(42))))
+TP(Sym(44),Reflect(DeliteWhile(Block(Sym(39)),Block(Sym(43))),Summary(false,false,false,false,false,List(Sym(36)),List(Sym(36)),List(Sym(36)),List()),List(Sym(36))))
+TP(Sym(45),Reflect(ReadVar(Variable(Sym(36))),Summary(false,false,false,false,false,List(Sym(36)),List(Sym(36)),List(),List()),List(Sym(36), Sym(44))))
+TP(Sym(46),Reflect(DeliteArrayNew(Sym(45)),Summary(false,false,false,false,true,List(),List(),List(),List()),List()))
+TP(Sym(47),Reflect(DeliteArrayCopy(Sym(29),Const(0),Sym(46),Const(0),Sym(28)),Summary(false,false,false,false,false,List(Sym(16), Sym(46)),List(Sym(16), Sym(46)),List(),List()),List(Sym(46))))
+TP(Sym(48),Reflect(ObjectUnsafeImmutable(Sym(46)),Summary(false,false,false,false,false,List(Sym(46)),List(Sym(46)),List(),List()),List(Sym(46))))
+TP(Sym(49),Reflect(DenseVectorSetRawData(Sym(16),Sym(48)),Summary(false,false,false,false,false,List(Sym(16)),List(Sym(16)),List(Sym(16)),List(Sym(16))),List(Sym(28), Sym(29), Sym(30), Sym(47))))
+TP(Sym(50),Reify(Sym(49),Summary(false,false,false,false,false,List(Sym(16)),List(Sym(16)),List(Sym(16)),List(Sym(16))),List(Sym(36), Sym(44), Sym(45), Sym(46), Sym(47), Sym(48), Sym(49))))
+TP(Sym(51),Reflect(DeliteIfThenElse(Sym(32),Block(Sym(50)),Block(Const(())),false),Summary(false,false,false,false,false,List(Sym(16)),List(),List(Sym(16)),List()),List(Sym(28), Sym(29), Sym(30))))
+TP(Sym(52),Reflect(DenseVectorRawData(Sym(16)),Summary(false,false,false,false,false,List(Sym(16)),List(Sym(16)),List(),List()),List(Sym(51))))
+TP(Sym(53),Reflect(DenseVectorLength(Sym(16)),Summary(false,false,false,false,false,List(Sym(16)),List(Sym(16)),List(),List()),List(Sym(51))))
+TP(Sym(54),ArithMinus(Sym(53),Sym(28)))
+TP(Sym(55),Reflect(DeliteArrayCopy(Sym(52),Sym(28),Sym(52),Sym(33),Sym(54)),Summary(false,false,false,false,false,List(Sym(16)),List(Sym(16)),List(),List()),List(Sym(51))))
+TP(Sym(56),ArithPlus(Sym(53),Const(1)))
+TP(Sym(57),Reflect(DenseVectorSetLength(Sym(16),Sym(56)),Summary(false,false,false,false,false,List(Sym(16)),List(Sym(16)),List(Sym(16)),List(Sym(16))),List(Sym(28), Sym(29), Sym(30), Sym(51), Sym(52), Sym(53), Sym(55))))
+TP(Sym(58),Reflect(DenseVectorUpdate(Sym(16),Sym(28),Sym(14)),Summary(false,false,false,false,false,List(Sym(16)),List(Sym(16)),List(Sym(16)),List(Sym(16))),List(Sym(28), Sym(29), Sym(30), Sym(51), Sym(52), Sym(53), Sym(55), Sym(57))))
+TP(Sym(59),Reify(Sym(58),Summary(false,false,false,false,false,List(Sym(16)),List(Sym(16)),List(Sym(16)),List(Sym(16))),List(Sym(29), Sym(30), Sym(51), Sym(52), Sym(53), Sym(55), Sym(57), Sym(58))))
+TP(Sym(60),Reflect(DenseVectorInsert(Sym(16),Sym(28),Sym(14)),Summary(false,false,false,false,false,List(),List(),List(Sym(16)),List(Sym(16))),List(Sym(28))))
+TP(Sym(61),Reify(Const(true),Summary(false,false,false,false,false,List(Sym(16)),List(Sym(16)),List(Sym(16)),List(Sym(16))),List(Sym(28), Sym(60))))
+TP(Sym(62),Reflect(DenseVectorSetLength(Sym(16),Sym(15)),Summary(false,false,false,false,false,List(Sym(16)),List(Sym(16)),List(Sym(16)),List(Sym(16))),List()))
+TP(Sym(63),Reify(Sym(62),Summary(false,false,false,false,false,List(Sym(16)),List(Sym(16)),List(Sym(16)),List(Sym(16))),List(Sym(62))))
+TP(Sym(64),Reflect(DenseVectorIsRow(Sym(16)),Summary(false,false,false,false,false,List(Sym(16)),List(Sym(16)),List(),List()),List()))
+TP(Sym(65),Reflect(DenseVectorNew(Sym(15),Sym(64)),Summary(false,false,false,false,true,List(),List(),List(),List()),List()))
+TP(Sym(66),Reify(Sym(65),Summary(false,false,false,false,true,List(Sym(16)),List(Sym(16)),List(),List()),List(Sym(64), Sym(65))))
+TP(Sym(67),DenseVectorRawData(Sym(27)))
+TP(Sym(68),Reflect(DenseVectorRawData(Sym(16)),Summary(false,false,false,false,false,List(Sym(16)),List(Sym(16)),List(),List()),List()))
+TP(Sym(69),Reflect(DeliteArrayCopy(Sym(67),Sym(25),Sym(68),Sym(26),Sym(15)),Summary(false,false,false,false,false,List(Sym(16)),List(Sym(16)),List(),List()),List()))
+TP(Sym(70),Reify(Sym(69),Summary(false,false,false,false,false,List(Sym(16)),List(Sym(16)),List(),List()),List(Sym(68), Sym(69))))
+TP(Sym(71),Reflect(VectorPlusScalar(VInterface(Sym(11)  [Double]),Const(10.0)),Summary(false,false,false,false,false,List(Sym(1)),List(),List(),List()),List()))
+TP(Sym(72),DenseVectorLength(Sym(71)))
+TP(Sym(77),DenseVectorIsRow(Sym(71)))
+TP(Sym(78),Reflect(DenseVectorNew(Sym(75),Sym(77)),Summary(false,false,false,false,true,List(),List(),List(),List()),List()))
+TP(Sym(79),Reify(Sym(78),Summary(false,false,false,false,true,List(),List(),List(),List()),List(Sym(78))))
+TP(Sym(80),DenseVectorApply(Sym(71),Sym(73)))
+TP(Sym(81),ArithTimes(Sym(80),Const(2.0)))
+TP(Sym(82),Reflect(DenseVectorUpdate(Sym(76),Sym(73),Sym(74)),Summary(false,false,false,false,false,List(Sym(76)),List(Sym(76)),List(Sym(76)),List(Sym(76))),List()))
+TP(Sym(83),Reify(Sym(82),Summary(false,false,false,false,false,List(Sym(76)),List(Sym(76)),List(Sym(76)),List(Sym(76))),List(Sym(82))))
+TP(Sym(87),Reflect(DenseVectorLength(Sym(76)),Summary(false,false,false,false,false,List(Sym(76)),List(Sym(76)),List(),List()),List()))
+TP(Sym(88),Reflect(DenseVectorRawData(Sym(76)),Summary(false,false,false,false,false,List(Sym(76)),List(Sym(76)),List(),List()),List()))
+TP(Sym(89),Reflect(DeliteArrayLength(Sym(88)),Summary(false,false,false,false,false,List(Sym(76)),List(Sym(76)),List(),List()),List()))
+TP(Sym(90),ArithMinus(Sym(89),Sym(87)))
+TP(Sym(91),OrderingLT(Sym(90),Const(1)))
+TP(Sym(92),ArithPlus(Sym(87),Const(1)))
+TP(Sym(93),ArithTimes(Sym(89),Const(2)))
+TP(Sym(94),MathMax(Const(4),Sym(93)))
+TP(Sym(95),Reflect(NewVar(Sym(94)),Summary(false,false,false,false,true,List(),List(),List(),List()),List()))
+TP(Sym(96),Reflect(ReadVar(Variable(Sym(95))),Summary(false,false,false,false,false,List(Sym(95)),List(Sym(95)),List(),List()),List()))
+TP(Sym(97),OrderingLT(Sym(96),Sym(92)))
+TP(Sym(98),Reify(Sym(97),Summary(false,false,false,false,false,List(Sym(95)),List(Sym(95)),List(),List()),List(Sym(96))))
+TP(Sym(99),Reflect(ReadVar(Variable(Sym(95))),Summary(false,false,false,false,false,List(Sym(95)),List(Sym(95)),List(),List()),List()))
+TP(Sym(100),ArithTimes(Sym(99),Const(2)))
+TP(Sym(101),Reflect(Assign(Variable(Sym(95)),Sym(100)),Summary(false,false,false,false,false,List(Sym(95)),List(Sym(95)),List(Sym(95)),List(Sym(95))),List(Sym(99))))
+TP(Sym(102),Reify(Const(()),Summary(false,false,false,false,false,List(Sym(95)),List(Sym(95)),List(Sym(95)),List(Sym(95))),List(Sym(99), Sym(101))))
+TP(Sym(103),Reflect(DeliteWhile(Block(Sym(98)),Block(Sym(102))),Summary(false,false,false,false,false,List(Sym(95)),List(Sym(95)),List(Sym(95)),List()),List(Sym(95))))
+TP(Sym(104),Reflect(ReadVar(Variable(Sym(95))),Summary(false,false,false,false,false,List(Sym(95)),List(Sym(95)),List(),List()),List(Sym(95), Sym(103))))
+TP(Sym(105),Reflect(DeliteArrayNew(Sym(104)),Summary(false,false,false,false,true,List(),List(),List(),List()),List()))
+TP(Sym(106),Reflect(DeliteArrayCopy(Sym(88),Const(0),Sym(105),Const(0),Sym(87)),Summary(false,false,false,false,false,List(Sym(76), Sym(105)),List(Sym(76), Sym(105)),List(),List()),List(Sym(105))))
+TP(Sym(107),Reflect(ObjectUnsafeImmutable(Sym(105)),Summary(false,false,false,false,false,List(Sym(105)),List(Sym(105)),List(),List()),List(Sym(105))))
+TP(Sym(108),Reflect(DenseVectorSetRawData(Sym(76),Sym(107)),Summary(false,false,false,false,false,List(Sym(76)),List(Sym(76)),List(Sym(76)),List(Sym(76))),List(Sym(87), Sym(88), Sym(89), Sym(106))))
+TP(Sym(109),Reify(Sym(108),Summary(false,false,false,false,false,List(Sym(76)),List(Sym(76)),List(Sym(76)),List(Sym(76))),List(Sym(95), Sym(103), Sym(104), Sym(105), Sym(106), Sym(107), Sym(108))))
+TP(Sym(110),Reflect(DeliteIfThenElse(Sym(91),Block(Sym(109)),Block(Const(())),false),Summary(false,false,false,false,false,List(Sym(76)),List(),List(Sym(76)),List()),List(Sym(87), Sym(88), Sym(89))))
+TP(Sym(111),Reflect(DenseVectorRawData(Sym(76)),Summary(false,false,false,false,false,List(Sym(76)),List(Sym(76)),List(),List()),List(Sym(110))))
+TP(Sym(112),Reflect(DenseVectorLength(Sym(76)),Summary(false,false,false,false,false,List(Sym(76)),List(Sym(76)),List(),List()),List(Sym(110))))
+TP(Sym(113),ArithMinus(Sym(112),Sym(87)))
+TP(Sym(114),Reflect(DeliteArrayCopy(Sym(111),Sym(87),Sym(111),Sym(92),Sym(113)),Summary(false,false,false,false,false,List(Sym(76)),List(Sym(76)),List(),List()),List(Sym(110))))
+TP(Sym(115),ArithPlus(Sym(112),Const(1)))
+TP(Sym(116),Reflect(DenseVectorSetLength(Sym(76),Sym(115)),Summary(false,false,false,false,false,List(Sym(76)),List(Sym(76)),List(Sym(76)),List(Sym(76))),List(Sym(87), Sym(88), Sym(89), Sym(110), Sym(111), Sym(112), Sym(114))))
+TP(Sym(117),Reflect(DenseVectorUpdate(Sym(76),Sym(87),Sym(74)),Summary(false,false,false,false,false,List(Sym(76)),List(Sym(76)),List(Sym(76)),List(Sym(76))),List(Sym(87), Sym(88), Sym(89), Sym(110), Sym(111), Sym(112), Sym(114), Sym(116))))
+TP(Sym(118),Reify(Sym(117),Summary(false,false,false,false,false,List(Sym(76)),List(Sym(76)),List(Sym(76)),List(Sym(76))),List(Sym(88), Sym(89), Sym(110), Sym(111), Sym(112), Sym(114), Sym(116), Sym(117))))
+TP(Sym(119),Reflect(DenseVectorInsert(Sym(76),Sym(87),Sym(74)),Summary(false,false,false,false,false,List(),List(),List(Sym(76)),List(Sym(76))),List(Sym(87))))
+TP(Sym(120),Reify(Const(true),Summary(false,false,false,false,false,List(Sym(76)),List(Sym(76)),List(Sym(76)),List(Sym(76))),List(Sym(87), Sym(119))))
+TP(Sym(121),Reflect(DenseVectorSetLength(Sym(76),Sym(75)),Summary(false,false,false,false,false,List(Sym(76)),List(Sym(76)),List(Sym(76)),List(Sym(76))),List()))
+TP(Sym(122),Reify(Sym(121),Summary(false,false,false,false,false,List(Sym(76)),List(Sym(76)),List(Sym(76)),List(Sym(76))),List(Sym(121))))
+TP(Sym(123),Reflect(DenseVectorIsRow(Sym(76)),Summary(false,false,false,false,false,List(Sym(76)),List(Sym(76)),List(),List()),List()))
+TP(Sym(124),Reflect(DenseVectorNew(Sym(75),Sym(123)),Summary(false,false,false,false,true,List(),List(),List(),List()),List()))
+TP(Sym(125),Reify(Sym(124),Summary(false,false,false,false,true,List(Sym(76)),List(Sym(76)),List(),List()),List(Sym(123), Sym(124))))
+TP(Sym(126),DenseVectorRawData(Sym(86)))
+TP(Sym(127),Reflect(DenseVectorRawData(Sym(76)),Summary(false,false,false,false,false,List(Sym(76)),List(Sym(76)),List(),List()),List()))
+TP(Sym(128),Reflect(DeliteArrayCopy(Sym(126),Sym(84),Sym(127),Sym(85),Sym(75)),Summary(false,false,false,false,false,List(Sym(76)),List(Sym(76)),List(),List()),List()))
+TP(Sym(129),Reify(Sym(128),Summary(false,false,false,false,false,List(Sym(76)),List(Sym(76)),List(),List()),List(Sym(127), Sym(128))))
+TP(Sym(130),VectorTimesScalar(VInterface(Sym(71)  [Double]),Const(2.0)))
+TP(Sym(135),Reflect(DenseVectorNew(Sym(133),Sym(77)),Summary(false,false,false,false,true,List(),List(),List(),List()),List()))
+TP(Sym(136),Reify(Sym(135),Summary(false,false,false,false,true,List(),List(),List(),List()),List(Sym(135))))
+TP(Sym(137),DenseVectorApply(Sym(130),Sym(131)))
+TP(Sym(138),ArithMinus(Sym(137),Const(5.0)))
+TP(Sym(139),Reflect(DenseVectorUpdate(Sym(134),Sym(131),Sym(132)),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(Sym(134)),List(Sym(134))),List()))
+TP(Sym(140),Reify(Sym(139),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(Sym(134)),List(Sym(134))),List(Sym(139))))
+TP(Sym(144),Reflect(DenseVectorLength(Sym(134)),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(),List()),List()))
+TP(Sym(145),Reflect(DenseVectorRawData(Sym(134)),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(),List()),List()))
+TP(Sym(146),Reflect(DeliteArrayLength(Sym(145)),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(),List()),List()))
+TP(Sym(147),ArithMinus(Sym(146),Sym(144)))
+TP(Sym(148),OrderingLT(Sym(147),Const(1)))
+TP(Sym(149),ArithPlus(Sym(144),Const(1)))
+TP(Sym(150),ArithTimes(Sym(146),Const(2)))
+TP(Sym(151),MathMax(Const(4),Sym(150)))
+TP(Sym(152),Reflect(NewVar(Sym(151)),Summary(false,false,false,false,true,List(),List(),List(),List()),List()))
+TP(Sym(153),Reflect(ReadVar(Variable(Sym(152))),Summary(false,false,false,false,false,List(Sym(152)),List(Sym(152)),List(),List()),List()))
+TP(Sym(154),OrderingLT(Sym(153),Sym(149)))
+TP(Sym(155),Reify(Sym(154),Summary(false,false,false,false,false,List(Sym(152)),List(Sym(152)),List(),List()),List(Sym(153))))
+TP(Sym(156),Reflect(ReadVar(Variable(Sym(152))),Summary(false,false,false,false,false,List(Sym(152)),List(Sym(152)),List(),List()),List()))
+TP(Sym(157),ArithTimes(Sym(156),Const(2)))
+TP(Sym(158),Reflect(Assign(Variable(Sym(152)),Sym(157)),Summary(false,false,false,false,false,List(Sym(152)),List(Sym(152)),List(Sym(152)),List(Sym(152))),List(Sym(156))))
+TP(Sym(159),Reify(Const(()),Summary(false,false,false,false,false,List(Sym(152)),List(Sym(152)),List(Sym(152)),List(Sym(152))),List(Sym(156), Sym(158))))
+TP(Sym(160),Reflect(DeliteWhile(Block(Sym(155)),Block(Sym(159))),Summary(false,false,false,false,false,List(Sym(152)),List(Sym(152)),List(Sym(152)),List()),List(Sym(152))))
+TP(Sym(161),Reflect(ReadVar(Variable(Sym(152))),Summary(false,false,false,false,false,List(Sym(152)),List(Sym(152)),List(),List()),List(Sym(152), Sym(160))))
+TP(Sym(162),Reflect(DeliteArrayNew(Sym(161)),Summary(false,false,false,false,true,List(),List(),List(),List()),List()))
+TP(Sym(163),Reflect(DeliteArrayCopy(Sym(145),Const(0),Sym(162),Const(0),Sym(144)),Summary(false,false,false,false,false,List(Sym(134), Sym(162)),List(Sym(134), Sym(162)),List(),List()),List(Sym(162))))
+TP(Sym(164),Reflect(ObjectUnsafeImmutable(Sym(162)),Summary(false,false,false,false,false,List(Sym(162)),List(Sym(162)),List(),List()),List(Sym(162))))
+TP(Sym(165),Reflect(DenseVectorSetRawData(Sym(134),Sym(164)),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(Sym(134)),List(Sym(134))),List(Sym(144), Sym(145), Sym(146), Sym(163))))
+TP(Sym(166),Reify(Sym(165),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(Sym(134)),List(Sym(134))),List(Sym(152), Sym(160), Sym(161), Sym(162), Sym(163), Sym(164), Sym(165))))
+TP(Sym(167),Reflect(DeliteIfThenElse(Sym(148),Block(Sym(166)),Block(Const(())),false),Summary(false,false,false,false,false,List(Sym(134)),List(),List(Sym(134)),List()),List(Sym(144), Sym(145), Sym(146))))
+TP(Sym(168),Reflect(DenseVectorRawData(Sym(134)),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(),List()),List(Sym(167))))
+TP(Sym(169),Reflect(DenseVectorLength(Sym(134)),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(),List()),List(Sym(167))))
+TP(Sym(170),ArithMinus(Sym(169),Sym(144)))
+TP(Sym(171),Reflect(DeliteArrayCopy(Sym(168),Sym(144),Sym(168),Sym(149),Sym(170)),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(),List()),List(Sym(167))))
+TP(Sym(172),ArithPlus(Sym(169),Const(1)))
+TP(Sym(173),Reflect(DenseVectorSetLength(Sym(134),Sym(172)),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(Sym(134)),List(Sym(134))),List(Sym(144), Sym(145), Sym(146), Sym(167), Sym(168), Sym(169), Sym(171))))
+TP(Sym(174),Reflect(DenseVectorUpdate(Sym(134),Sym(144),Sym(132)),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(Sym(134)),List(Sym(134))),List(Sym(144), Sym(145), Sym(146), Sym(167), Sym(168), Sym(169), Sym(171), Sym(173))))
+TP(Sym(175),Reify(Sym(174),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(Sym(134)),List(Sym(134))),List(Sym(145), Sym(146), Sym(167), Sym(168), Sym(169), Sym(171), Sym(173), Sym(174))))
+TP(Sym(176),Reflect(DenseVectorInsert(Sym(134),Sym(144),Sym(132)),Summary(false,false,false,false,false,List(),List(),List(Sym(134)),List(Sym(134))),List(Sym(144))))
+TP(Sym(177),Reify(Const(true),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(Sym(134)),List(Sym(134))),List(Sym(144), Sym(176))))
+TP(Sym(178),Reflect(DenseVectorSetLength(Sym(134),Sym(133)),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(Sym(134)),List(Sym(134))),List()))
+TP(Sym(179),Reify(Sym(178),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(Sym(134)),List(Sym(134))),List(Sym(178))))
+TP(Sym(180),Reflect(DenseVectorIsRow(Sym(134)),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(),List()),List()))
+TP(Sym(181),Reflect(DenseVectorNew(Sym(133),Sym(180)),Summary(false,false,false,false,true,List(),List(),List(),List()),List()))
+TP(Sym(182),Reify(Sym(181),Summary(false,false,false,false,true,List(Sym(134)),List(Sym(134)),List(),List()),List(Sym(180), Sym(181))))
+TP(Sym(183),DenseVectorRawData(Sym(143)))
+TP(Sym(184),Reflect(DenseVectorRawData(Sym(134)),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(),List()),List()))
+TP(Sym(185),Reflect(DeliteArrayCopy(Sym(183),Sym(141),Sym(184),Sym(142),Sym(133)),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(),List()),List()))
+TP(Sym(186),Reify(Sym(185),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(),List()),List(Sym(184), Sym(185))))
+TP(Sym(187),VectorMinusScalar(VInterface(Sym(130)  [Double]),Const(5.0)))
+TP(Sym(192),Reflect(DenseVectorNew(Sym(190),Sym(77)),Summary(false,false,false,false,true,List(),List(),List(),List()),List()))
+TP(Sym(193),Reify(Sym(192),Summary(false,false,false,false,true,List(),List(),List(),List()),List(Sym(192))))
+TP(Sym(194),DenseVectorApply(Sym(187),Sym(188)))
+TP(Sym(195),MathLog(Sym(194)))
+TP(Sym(196),Reflect(DenseVectorUpdate(Sym(191),Sym(188),Sym(189)),Summary(false,false,false,false,false,List(Sym(191)),List(Sym(191)),List(Sym(191)),List(Sym(191))),List()))
+TP(Sym(197),Reify(Sym(196),Summary(false,false,false,false,false,List(Sym(191)),List(Sym(191)),List(Sym(191)),List(Sym(191))),List(Sym(196))))
+TP(Sym(201),Reflect(DenseVectorLength(Sym(191)),Summary(false,false,false,false,false,List(Sym(191)),List(Sym(191)),List(),List()),List()))
+TP(Sym(202),Reflect(DenseVectorRawData(Sym(191)),Summary(false,false,false,false,false,List(Sym(191)),List(Sym(191)),List(),List()),List()))
+TP(Sym(203),Reflect(DeliteArrayLength(Sym(202)),Summary(false,false,false,false,false,List(Sym(191)),List(Sym(191)),List(),List()),List()))
+TP(Sym(204),ArithMinus(Sym(203),Sym(201)))
+TP(Sym(205),OrderingLT(Sym(204),Const(1)))
+TP(Sym(206),ArithPlus(Sym(201),Const(1)))
+TP(Sym(207),ArithTimes(Sym(203),Const(2)))
+TP(Sym(208),MathMax(Const(4),Sym(207)))
+TP(Sym(209),Reflect(NewVar(Sym(208)),Summary(false,false,false,false,true,List(),List(),List(),List()),List()))
+TP(Sym(210),Reflect(ReadVar(Variable(Sym(209))),Summary(false,false,false,false,false,List(Sym(209)),List(Sym(209)),List(),List()),List()))
+TP(Sym(211),OrderingLT(Sym(210),Sym(206)))
+TP(Sym(212),Reify(Sym(211),Summary(false,false,false,false,false,List(Sym(209)),List(Sym(209)),List(),List()),List(Sym(210))))
+TP(Sym(213),Reflect(ReadVar(Variable(Sym(209))),Summary(false,false,false,false,false,List(Sym(209)),List(Sym(209)),List(),List()),List()))
+TP(Sym(214),ArithTimes(Sym(213),Const(2)))
+TP(Sym(215),Reflect(Assign(Variable(Sym(209)),Sym(214)),Summary(false,false,false,false,false,List(Sym(209)),List(Sym(209)),List(Sym(209)),List(Sym(209))),List(Sym(213))))
+TP(Sym(216),Reify(Const(()),Summary(false,false,false,false,false,List(Sym(209)),List(Sym(209)),List(Sym(209)),List(Sym(209))),List(Sym(213), Sym(215))))
+TP(Sym(217),Reflect(DeliteWhile(Block(Sym(212)),Block(Sym(216))),Summary(false,false,false,false,false,List(Sym(209)),List(Sym(209)),List(Sym(209)),List()),List(Sym(209))))
+TP(Sym(218),Reflect(ReadVar(Variable(Sym(209))),Summary(false,false,false,false,false,List(Sym(209)),List(Sym(209)),List(),List()),List(Sym(209), Sym(217))))
+TP(Sym(219),Reflect(DeliteArrayNew(Sym(218)),Summary(false,false,false,false,true,List(),List(),List(),List()),List()))
+TP(Sym(220),Reflect(DeliteArrayCopy(Sym(202),Const(0),Sym(219),Const(0),Sym(201)),Summary(false,false,false,false,false,List(Sym(191), Sym(219)),List(Sym(191), Sym(219)),List(),List()),List(Sym(219))))
+TP(Sym(221),Reflect(ObjectUnsafeImmutable(Sym(219)),Summary(false,false,false,false,false,List(Sym(219)),List(Sym(219)),List(),List()),List(Sym(219))))
+TP(Sym(222),Reflect(DenseVectorSetRawData(Sym(191),Sym(221)),Summary(false,false,false,false,false,List(Sym(191)),List(Sym(191)),List(Sym(191)),List(Sym(191))),List(Sym(201), Sym(202), Sym(203), Sym(220))))
+TP(Sym(223),Reify(Sym(222),Summary(false,false,false,false,false,List(Sym(191)),List(Sym(191)),List(Sym(191)),List(Sym(191))),List(Sym(209), Sym(217), Sym(218), Sym(219), Sym(220), Sym(221), Sym(222))))
+TP(Sym(224),Reflect(DeliteIfThenElse(Sym(205),Block(Sym(223)),Block(Const(())),false),Summary(false,false,false,false,false,List(Sym(191)),List(),List(Sym(191)),List()),List(Sym(201), Sym(202), Sym(203))))
+TP(Sym(225),Reflect(DenseVectorRawData(Sym(191)),Summary(false,false,false,false,false,List(Sym(191)),List(Sym(191)),List(),List()),List(Sym(224))))
+TP(Sym(226),Reflect(DenseVectorLength(Sym(191)),Summary(false,false,false,false,false,List(Sym(191)),List(Sym(191)),List(),List()),List(Sym(224))))
+TP(Sym(227),ArithMinus(Sym(226),Sym(201)))
+TP(Sym(228),Reflect(DeliteArrayCopy(Sym(225),Sym(201),Sym(225),Sym(206),Sym(227)),Summary(false,false,false,false,false,List(Sym(191)),List(Sym(191)),List(),List()),List(Sym(224))))
+TP(Sym(229),ArithPlus(Sym(226),Const(1)))
+TP(Sym(230),Reflect(DenseVectorSetLength(Sym(191),Sym(229)),Summary(false,false,false,false,false,List(Sym(191)),List(Sym(191)),List(Sym(191)),List(Sym(191))),List(Sym(201), Sym(202), Sym(203), Sym(224), Sym(225), Sym(226), Sym(228))))
+TP(Sym(231),Reflect(DenseVectorUpdate(Sym(191),Sym(201),Sym(189)),Summary(false,false,false,false,false,List(Sym(191)),List(Sym(191)),List(Sym(191)),List(Sym(191))),List(Sym(201), Sym(202), Sym(203), Sym(224), Sym(225), Sym(226), Sym(228), Sym(230))))
+TP(Sym(232),Reify(Sym(231),Summary(false,false,false,false,false,List(Sym(191)),List(Sym(191)),List(Sym(191)),List(Sym(191))),List(Sym(202), Sym(203), Sym(224), Sym(225), Sym(226), Sym(228), Sym(230), Sym(231))))
+TP(Sym(233),Reflect(DenseVectorInsert(Sym(191),Sym(201),Sym(189)),Summary(false,false,false,false,false,List(),List(),List(Sym(191)),List(Sym(191))),List(Sym(201))))
+TP(Sym(234),Reify(Const(true),Summary(false,false,false,false,false,List(Sym(191)),List(Sym(191)),List(Sym(191)),List(Sym(191))),List(Sym(201), Sym(233))))
+TP(Sym(235),Reflect(DenseVectorSetLength(Sym(191),Sym(190)),Summary(false,false,false,false,false,List(Sym(191)),List(Sym(191)),List(Sym(191)),List(Sym(191))),List()))
+TP(Sym(236),Reify(Sym(235),Summary(false,false,false,false,false,List(Sym(191)),List(Sym(191)),List(Sym(191)),List(Sym(191))),List(Sym(235))))
+TP(Sym(237),Reflect(DenseVectorIsRow(Sym(191)),Summary(false,false,false,false,false,List(Sym(191)),List(Sym(191)),List(),List()),List()))
+TP(Sym(238),Reflect(DenseVectorNew(Sym(190),Sym(237)),Summary(false,false,false,false,true,List(),List(),List(),List()),List()))
+TP(Sym(239),Reify(Sym(238),Summary(false,false,false,false,true,List(Sym(191)),List(Sym(191)),List(),List()),List(Sym(237), Sym(238))))
+TP(Sym(240),DenseVectorRawData(Sym(200)))
+TP(Sym(241),Reflect(DenseVectorRawData(Sym(191)),Summary(false,false,false,false,false,List(Sym(191)),List(Sym(191)),List(),List()),List()))
+TP(Sym(242),Reflect(DeliteArrayCopy(Sym(240),Sym(198),Sym(241),Sym(199),Sym(190)),Summary(false,false,false,false,false,List(Sym(191)),List(Sym(191)),List(),List()),List()))
+TP(Sym(243),Reify(Sym(242),Summary(false,false,false,false,false,List(Sym(191)),List(Sym(191)),List(),List()),List(Sym(241), Sym(242))))
+TP(Sym(244),VectorMap(VInterface(Sym(187)  [Double]),<function1>))
+TP(Sym(246),DenseVectorApply(Sym(244),Sym(245)))
+TP(Sym(249),ArithPlus(Sym(247),Sym(248)))
+TP(Sym(250),VectorSum(VInterface(Sym(244)  [Double])))
+TP(Sym(251),Reflect(Print(Sym(250)),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(11))))
+TP(Sym(252),IndexVectorRangeNew(Const(0),Const(10)))
+TP(Sym(253),Reflect(DenseVectorNew(Const(10),Sym(77)),Summary(false,false,false,false,true,List(),List(),List(),List()),List()))
+TP(Sym(254),Until(Const(0),Const(10)))
+TP(Sym(256),DenseVectorApply(Sym(187),Sym(255)))
+TP(Sym(257),Reflect(DenseVectorUpdate(Sym(253),Sym(255),Sym(256)),Summary(false,false,false,false,false,List(Sym(253)),List(Sym(253)),List(Sym(253)),List(Sym(253))),List()))
+TP(Sym(258),Reify(Sym(257),Summary(false,false,false,false,false,List(Sym(253)),List(Sym(253)),List(Sym(253)),List(Sym(253))),List(Sym(257))))
+TP(Sym(259),Reflect(RangeForeach(Const(0),Const(10),Sym(255),Block(Sym(258))),Summary(false,false,false,false,false,List(Sym(253)),List(),List(Sym(253)),List()),List(Sym(253))))
+TP(Sym(260),Reflect(ObjectUnsafeImmutable(Sym(253)),Summary(false,false,false,false,false,List(Sym(253)),List(Sym(253)),List(),List()),List(Sym(253), Sym(259))))
+TP(Sym(261),Reify(Sym(260),Summary(false,false,false,false,false,List(),List(),List(),List()),List(Sym(253), Sym(259), Sym(260))))
+TP(Sym(262),VectorApplyIndices(VInterface(Sym(187)  [Double]),VInterface(Sym(252)  [Int])))
+TP(Sym(263),DenseVectorIsRow(Sym(262)))
+TP(Sym(264),Reflect(Print(Const([ )),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(251))))
+TP(Sym(265),DenseVectorLength(Sym(262)))
+TP(Sym(266),Until(Const(0),Sym(265)))
+TP(Sym(268),DenseVectorApply(Sym(262),Sym(267)))
+TP(Sym(269),Reflect(Print(Sym(268)),Summary(true,true,false,false,false,List(),List(),List(),List()),List()))
+TP(Sym(270),Reflect(Print(Const( )),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(269))))
+TP(Sym(271),Reify(Sym(270),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(269), Sym(270))))
+TP(Sym(272),Reflect(RangeForeach(Const(0),Sym(265),Sym(267),Block(Sym(271))),Summary(true,false,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(251), Sym(264))))
+TP(Sym(273),Reflect(Print(Const(]\n)),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(251), Sym(264), Sym(272))))
+TP(Sym(274),Reify(Sym(273),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(264), Sym(272), Sym(273))))
+TP(Sym(276),Reflect(Print(Const([)),Summary(true,true,false,false,false,List(),List(),List(),List()),List()))
+TP(Sym(277),DenseVectorApply(Sym(262),Sym(275)))
+TP(Sym(278),Reflect(Print(Sym(277)),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(276))))
+TP(Sym(279),Reflect(Print(Const(]\n)),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(276), Sym(278))))
+TP(Sym(280),Reify(Sym(279),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(276), Sym(278), Sym(279))))
+TP(Sym(281),Reflect(RangeForeach(Const(0),Sym(265),Sym(275),Block(Sym(280))),Summary(true,false,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(251))))
+TP(Sym(282),Reify(Sym(281),Summary(true,false,false,false,false,List(),List(),List(),List()),List(Sym(281))))
+TP(Sym(283),Reflect(DeliteIfThenElse(Sym(263),Block(Sym(274)),Block(Sym(282)),false),Summary(true,false,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(251))))
+TP(Sym(284),Reify(Sym(283),Summary(true,false,false,false,false,List(),List(),List(),List()),List(Sym(283))))
+TP(Sym(285),Reflect(VectorPPrint(VInterface(Sym(262)  [Double])),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(251))))
+TP(Sym(286),Reify(Const(()),Summary(true,true,false,false,false,List(Sym(1)),List(Sym(1)),List(),List()),List(Sym(11), Sym(12), Sym(71), Sym(251), Sym(285))))
+TP(Sym(287),ArithMinus(Sym(81),Const(5.0)))
+TP(Sym(288),Reflect(DenseVectorUpdate(Sym(134),Sym(73),Sym(132)),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(Sym(134)),List(Sym(134))),List()))
+TP(Sym(289),Reify(Sym(288),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(Sym(134)),List(Sym(134))),List(Sym(288))))
+TP(Sym(290),VectorMinusScalar(VInterface(Sym(130)  [Double]),Const(5.0)))
+TP(Sym(291),DenseVectorApply(Sym(290),Sym(188)))
+TP(Sym(292),MathLog(Sym(291)))
+TP(Sym(293),VectorMap(VInterface(Sym(290)  [Double]),<function1>))
+TP(Sym(294),VectorSum(VInterface(Sym(293)  [Double])))
+TP(Sym(295),Reflect(Print(Sym(294)),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(11))))
+TP(Sym(296),DenseVectorApply(Sym(290),Sym(255)))
+TP(Sym(297),Reflect(DenseVectorUpdate(Sym(253),Sym(255),Sym(296)),Summary(false,false,false,false,false,List(Sym(253)),List(Sym(253)),List(Sym(253)),List(Sym(253))),List()))
+TP(Sym(298),Reify(Sym(297),Summary(false,false,false,false,false,List(Sym(253)),List(Sym(253)),List(Sym(253)),List(Sym(253))),List(Sym(297))))
+TP(Sym(299),Reflect(RangeForeach(Const(0),Const(10),Sym(255),Block(Sym(298))),Summary(false,false,false,false,false,List(Sym(253)),List(),List(Sym(253)),List()),List(Sym(253))))
+TP(Sym(300),Reflect(ObjectUnsafeImmutable(Sym(253)),Summary(false,false,false,false,false,List(Sym(253)),List(Sym(253)),List(),List()),List(Sym(253), Sym(299))))
+TP(Sym(301),Reify(Sym(300),Summary(false,false,false,false,false,List(),List(),List(),List()),List(Sym(253), Sym(299), Sym(300))))
+TP(Sym(302),VectorApplyIndices(VInterface(Sym(290)  [Double]),VInterface(Sym(252)  [Int])))
+TP(Sym(303),DenseVectorIsRow(Sym(302)))
+TP(Sym(304),Reflect(Print(Const([ )),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(295))))
+TP(Sym(305),DenseVectorLength(Sym(302)))
+TP(Sym(306),DenseVectorApply(Sym(302),Sym(267)))
+TP(Sym(307),Reflect(Print(Sym(306)),Summary(true,true,false,false,false,List(),List(),List(),List()),List()))
+TP(Sym(308),Reflect(Print(Const( )),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(307))))
+TP(Sym(309),Reify(Sym(308),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(307), Sym(308))))
+TP(Sym(310),Reflect(RangeForeach(Const(0),Sym(305),Sym(267),Block(Sym(309))),Summary(true,false,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(295), Sym(304))))
+TP(Sym(311),Reflect(Print(Const(]\n)),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(295), Sym(304), Sym(310))))
+TP(Sym(312),Reify(Sym(311),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(304), Sym(310), Sym(311))))
+TP(Sym(313),DenseVectorApply(Sym(302),Sym(275)))
+TP(Sym(314),Reflect(Print(Sym(313)),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(276))))
+TP(Sym(315),Reflect(Print(Const(]\n)),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(276), Sym(314))))
+TP(Sym(316),Reify(Sym(315),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(276), Sym(314), Sym(315))))
+TP(Sym(317),Reflect(RangeForeach(Const(0),Sym(305),Sym(275),Block(Sym(316))),Summary(true,false,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(295))))
+TP(Sym(318),Reify(Sym(317),Summary(true,false,false,false,false,List(),List(),List(),List()),List(Sym(317))))
+TP(Sym(319),Reflect(DeliteIfThenElse(Sym(303),Block(Sym(312)),Block(Sym(318)),false),Summary(true,false,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(295))))
+TP(Sym(320),Reify(Sym(319),Summary(true,false,false,false,false,List(),List(),List(),List()),List(Sym(319))))
+TP(Sym(321),Reflect(VectorPPrint(VInterface(Sym(302)  [Double])),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(295))))
+TP(Sym(322),Reify(Const(()),Summary(true,true,false,false,false,List(Sym(1)),List(Sym(1)),List(),List()),List(Sym(11), Sym(12), Sym(71), Sym(295), Sym(321))))
+TP(Sym(323),MathLog(Sym(287)))
+TP(Sym(324),VectorSum(VInterface(Sym(293)  [Double])))
+TP(Sym(325),Reflect(Print(Sym(324)),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(11))))
+TP(Sym(326),Reflect(Print(Const([ )),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(325))))
+TP(Sym(327),Reflect(RangeForeach(Const(0),Sym(305),Sym(267),Block(Sym(309))),Summary(true,false,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(325), Sym(326))))
+TP(Sym(328),Reflect(Print(Const(]\n)),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(325), Sym(326), Sym(327))))
+TP(Sym(329),Reify(Sym(328),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(326), Sym(327), Sym(328))))
+TP(Sym(330),Reflect(RangeForeach(Const(0),Sym(305),Sym(275),Block(Sym(316))),Summary(true,false,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(325))))
+TP(Sym(331),Reify(Sym(330),Summary(true,false,false,false,false,List(),List(),List(),List()),List(Sym(330))))
+TP(Sym(332),Reflect(DeliteIfThenElse(Sym(303),Block(Sym(329)),Block(Sym(331)),false),Summary(true,false,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(325))))
+TP(Sym(333),Reify(Sym(332),Summary(true,false,false,false,false,List(),List(),List(),List()),List(Sym(332))))
+TP(Sym(334),Reflect(VectorPPrint(VInterface(Sym(302)  [Double])),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(325))))
+TP(Sym(335),Reify(Const(()),Summary(true,true,false,false,false,List(Sym(1)),List(Sym(1)),List(),List()),List(Sym(11), Sym(12), Sym(71), Sym(325), Sym(334))))
+TP(Sym(336),Reflect(DenseVectorUpdate(Sym(134),Sym(73),Sym(132)),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(Sym(134)),List(Sym(134))),List()))
+TP(Sym(337),Reify(Sym(336),Summary(false,false,false,false,false,List(Sym(134)),List(Sym(134)),List(Sym(134)),List(Sym(134))),List(Sym(336))))
+TP(Sym(338),VectorMinusScalar(VInterface(Sym(130)  [Double]),Const(5.0)))
+TP(Sym(339),DenseVectorApply(Sym(338),Sym(188)))
+TP(Sym(340),MathLog(Sym(339)))
+TP(Sym(341),VectorMap(VInterface(Sym(338)  [Double]),<function1>))
+TP(Sym(342),VectorSum(VInterface(Sym(341)  [Double])))
+TP(Sym(343),Reflect(Print(Sym(342)),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(11))))
+TP(Sym(344),DenseVectorApply(Sym(338),Sym(255)))
+TP(Sym(345),Reflect(DenseVectorUpdate(Sym(253),Sym(255),Sym(344)),Summary(false,false,false,false,false,List(Sym(253)),List(Sym(253)),List(Sym(253)),List(Sym(253))),List()))
+TP(Sym(346),Reify(Sym(345),Summary(false,false,false,false,false,List(Sym(253)),List(Sym(253)),List(Sym(253)),List(Sym(253))),List(Sym(345))))
+TP(Sym(347),Reflect(RangeForeach(Const(0),Const(10),Sym(255),Block(Sym(346))),Summary(false,false,false,false,false,List(Sym(253)),List(),List(Sym(253)),List()),List(Sym(253))))
+TP(Sym(348),Reflect(ObjectUnsafeImmutable(Sym(253)),Summary(false,false,false,false,false,List(Sym(253)),List(Sym(253)),List(),List()),List(Sym(253), Sym(347))))
+TP(Sym(349),Reify(Sym(348),Summary(false,false,false,false,false,List(),List(),List(),List()),List(Sym(253), Sym(347), Sym(348))))
+TP(Sym(350),VectorApplyIndices(VInterface(Sym(338)  [Double]),VInterface(Sym(252)  [Int])))
+TP(Sym(351),DenseVectorIsRow(Sym(350)))
+TP(Sym(352),Reflect(Print(Const([ )),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(343))))
+TP(Sym(353),DenseVectorLength(Sym(350)))
+TP(Sym(354),DenseVectorApply(Sym(350),Sym(267)))
+TP(Sym(355),Reflect(Print(Sym(354)),Summary(true,true,false,false,false,List(),List(),List(),List()),List()))
+TP(Sym(356),Reflect(Print(Const( )),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(355))))
+TP(Sym(357),Reify(Sym(356),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(355), Sym(356))))
+TP(Sym(358),Reflect(RangeForeach(Const(0),Sym(353),Sym(267),Block(Sym(357))),Summary(true,false,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(343), Sym(352))))
+TP(Sym(359),Reflect(Print(Const(]\n)),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(343), Sym(352), Sym(358))))
+TP(Sym(360),Reify(Sym(359),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(352), Sym(358), Sym(359))))
+TP(Sym(361),DenseVectorApply(Sym(350),Sym(275)))
+TP(Sym(362),Reflect(Print(Sym(361)),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(276))))
+TP(Sym(363),Reflect(Print(Const(]\n)),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(276), Sym(362))))
+TP(Sym(364),Reify(Sym(363),Summary(true,true,false,false,false,List(),List(),List(),List()),List(Sym(276), Sym(362), Sym(363))))
+TP(Sym(365),Reflect(RangeForeach(Const(0),Sym(353),Sym(275),Block(Sym(364))),Summary(true,false,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(343))))
+TP(Sym(366),Reify(Sym(365),Summary(true,false,false,false,false,List(),List(),List(),List()),List(Sym(365))))
+TP(Sym(367),Reflect(DeliteIfThenElse(Sym(351),Block(Sym(360)),Block(Sym(366)),false),Summary(true,false,false,false,false,List(),List(),List(),List()),List(Sym(11), Sym(343))))
+TP(Sym(368),Reify(Sym(367),Summary(true,false,false,false,false,List(),List(),List(),List()),List(Sym(367))))
+TP(Sym(369),Reflect(VectorPPrint(VInterface(Sym(350)  [Double])),Summary(true,true,false,false,f
+```

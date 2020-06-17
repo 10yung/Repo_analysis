@@ -1,0 +1,162 @@
+Hi!
+
+I've implemented more table sizes for fixed-base scalar multiplication. The motivation here is primarily to allow for memory/time optimisations for signature verifications (cf. https://github.com/isislovecruft/ed25519-dalek/blob/feature/public-key-precomputation_r1/src/traits.rs and https://github.com/isislovecruft/ed25519-dalek/blob/feature/public-key-precomputation_r1/src/precomputed.rs) where a user who needs to verify many signatures with the same public key can dynamically chose to recompute larger/smaller tables, but it's also likely useful for systems which use Chaum-Pedersen commitments or Okamoto commitments or any other NIZK proof/sigma protocol which uses two basepoints.
+
+I've benchmarked this (see my separate `feature/dynamic-tables-sizes-benches` branch) and the results so far on a few different chipsets seem to indicate speedups as long as the table fits in the L1D subcache.  I've implemented tables up to the limit (as self-imposed by `Scalar.to_radix_2w()`) of radix-256, which are ~480KB tables, as commonly used server builds these days (such as the Xeon E5-2686 v4s found on AWS, and those internal to other large companies) often have 512KB L1{I,D} caches.
+
+This is currently implemented via a new `BasepointTable` trait, which makes them not semver compatible with 2.0.0, however I can remove the trait for now and add it back in when we're ready for a 3.0.0, if that's preferable. I'd like to be able to start using this now (or at least, I want it before releasing `ed25519-dalek-1.0.0`, so if we want the trait removed, I'd like to instead add a marker trait for the different sizes of tables, so that the `ed25519-dalek` code can generalise over them as "public keys".
+
+Another implementation note: I opted for implementing these via macros, as it required the least amount of changes to existing code.
+
+Also, naming question: Should we consider renaming `EdwardsBasepointTable` to something more generic, like `EdwardsPrecomputedPointTable`, etc.?
+
+Please review!
+
+Now that we've had a 1.0.0 series for a while and are about to cut a 2.0.0, it might be nice to have tests for the public API to ensure that breaking changes are caught automatically.
+As we continue to add backends, it would be handy to have a more modular way to choose which backend is being used and to use a custom backend (e.g. for developers working on hardware that hasn't been publicly released yet) which we might not want to (or be able to) maintain within our crate.
+
+Would it be feasible to create some sort of "backend trait" which describes what methods we expect out of the field arithmetic? And on that note, would it be possible to also separate out the scalar arithmetic so that someone could develop a chip-specific field implementation but reuse the 64-bit serial scalars?
+
+I'm imagining providing a trait that's something like:
+
+```rust
+#![feature(trait_alias)]                                                                                                                                                                                                          
+                                                                                                                                                                                                                                  
+use core::ops::{Add, AddAssign, Sub, SubAssign};                                                                                                                                                                                  
+                                                                                                                                                                                                                                  
+pub trait FieldArithmetic = Sized + Add + AddAssign + Sub + SubAssign; // ...                                                                                                                                                     
+                                                                                                                                                                                                                                  
+pub trait FieldElement {                                                                                                                                                                                                          
+    fn zero() -> Self;                                                                                                                                                                                                            
+    fn one() -> Self;                                                                                                                                                                                                             
+    fn from_u64(x: u64) -> Self;                                                                                                                                                                                                  
+    // ...                                                                                                                                                                                                                        
+}                                                                                                                                                                                                                                 
+                                                                                                                                                                                                                                  
+pub trait FieldBackend = FieldArithmetic + FieldElement;                                                                                                                                                                          
+                                                                                                                                                                                                                                  
+pub trait ScalarArithmetic = Sized + Add + AddAssign + Sub + SubAssign; // ...                                                                                                                                                    
+                                                                                                                                                                                                                                  
+pub trait ModularScalar {                                                                                                                                                                                                         
+    fn zero() -> Self;                                                                                                                                                                                                            
+    fn one() -> Self;                                                                                                                                                                                                             
+    fn from_u64(x: u64) -> Self;                                                                                                                                                                                                  
+    // ...                                                                                                                                                                                                                        
+}                                                                                                                                                                                                                                 
+                                                                                                                                                                                                                                  
+pub trait ScalarBackend = ScalarArithmetic + ModularScalar;                                                                                                                                                                       
+                                                                                                                                                                                                                                  
+pub trait Backend = FieldBackend + ScalarBackend;                      
+```
+
+Unfortunately that requires the experimental trait aliases feature.  I'm not sure if there's a better way to do it?
+
+Thoughts? Opinions?
+We should probably enable https://doc.rust-lang.org/nightly/cargo/reference/unstable.html#namespaced-features when available to avoid things like our "std" feature trampling/getting trampled by anything using curve25519-dalek with a dependency on an alternative version/implementation of `std`.
+
+```
+let cached_identity = CachedPoint::from(ExtendedPoint::identity());
+println!("cached identity = {:?}", cached_identity);
+```
+```
+cached identity = CachedPoint(FieldElement2625x4([u32x8(121647, 121666, 33554432, 0, 243332, 67108845, 0, 33554431), u32x8(67108863, 0, 33554431, 0, 0, 67108863, 0, 33554431), u32x8(67108863, 0, 33554431, 0, 0, 67108863, 0, 33554431), u32x8(67108863, 0, 33554431, 0, 0, 67108863, 0, 33554431), u32x8(67108863,0, 33554431, 0, 0, 67108863, 0, 33554431)]))
+```
+The print info above is different from `CACHEDPOINT_IDENTITY` value in `src/backend/vector/avx2/constants.rs` ?
+```
+/// The identity element as a `CachedPoint`.
+pub(crate) static CACHEDPOINT_IDENTITY: CachedPoint = CachedPoint(FieldElement2625x4([
+    u32x8::new(121647, 121666, 0, 0, 243332, 67108845, 0, 33554431),
+    u32x8::new(67108864, 0, 33554431, 0, 0, 67108863, 0, 33554431),
+    u32x8::new(67108863, 0, 33554431, 0, 0, 67108863, 0, 33554431),
+    u32x8::new(67108863, 0, 33554431, 0, 0, 67108863, 0, 33554431),
+    u32x8::new(67108863, 0, 33554431, 0, 0, 67108863, 0, 33554431),
+]));
+```
+Moving here from https://github.com/dalek-cryptography/x25519-dalek/issues/42
+I was trying to test out the `avx512ifma` backend, but getting the following error
+
+Building with 
+```
+> RUSTFLAGS="-C target_feature=+avx512ifma" cargo +nightly bench --no-default-features --features=std,simd_backend
+```
+
+```
+LLVM ERROR: Cannot select: 0x7f774b281888: v4i64 = X86ISD::VPMADD52L 0x7f774b2b93a8, 0x7f774b2818f0, 0x7f774b281c30
+  0x7f774b2b93a8: v4i64 = X86ISD::VSRLI 0x7f774b281820, Constant:i8<51>
+    0x7f774b281820: v4i64,ch = load<(dereferenceable load 32 from %ir.13)> 0x7f774b281208, 0x7f774b2817b8, undef:i64
+      0x7f774b2817b8: i64 = add nuw 0x7f774b281068, Constant:i64<128>
+        0x7f774b281068: i64,ch = CopyFromReg 0x7f774b379e58, Register:i64 %1
+          0x7f774b281000: i64 = Register %1
+        0x7f774b281750: i64 = Constant<128>
+      0x7f774b2812d8: i64 = undef
+    0x7f774b281270: i8 = Constant<51>
+  0x7f774b2818f0: v4i64 = X86ISD::VBROADCAST 0x7f774b2bc3a8
+    0x7f774b2bc3a8: i64,ch = load<(load 8 from constant-pool)> 0x7f774b379e58, 0x7f774b281d00, undef:i64
+      0x7f774b281d00: i64 = X86ISD::WrapperRIP TargetConstantPool:i64<i64 19> 0
+        0x7f774b281d68: i64 = TargetConstantPool<i64 19> 0
+      0x7f774b2812d8: i64 = undef
+  0x7f774b281c30: v4i64 = and 0x7f774b281340, 0x7f774b2b97b8
+    0x7f774b281340: v4i64,ch = load<(dereferenceable load 32 from %ir.5)> 0x7f774b281208, 0x7f774b281068, undef:i64
+      0x7f774b281068: i64,ch = CopyFromReg 0x7f774b379e58, Register:i64 %1
+        0x7f774b281000: i64 = Register %1
+      0x7f774b2812d8: i64 = undef
+    0x7f774b2b97b8: v4i64 = X86ISD::VBROADCAST 0x7f774b281af8
+      0x7f774b281af8: i64,ch = load<(load 8 from constant-pool)> 0x7f774b379e58, 0x7f774b281c98, undef:i64
+        0x7f774b281c98: i64 = X86ISD::WrapperRIP TargetConstantPool:i64<i64 2251799813685247> 0
+          0x7f774b281b60: i64 = TargetConstantPool<i64 2251799813685247> 0
+        0x7f774b2812d8: i64 = undef
+In function: _ZN50_$LT$T$u20$as$u20$core..convert..Into$LT$U$GT$$GT$4into17hb66a3d1abfd3e3a6E
+error: Could not compile `curve25519-dalek`.
+warning: build failed, waiting for other jobs to finish...
+LLVM ERROR: Cannot select: 0x7fd212bae2d8: v4i64 = X86ISD::VPMADD52L 0x7fd212741820, 0x7fd212baea90, 0x7fd212bae410
+  0x7fd212741820: v4i64 = X86ISD::VSRLI 0x7fd212741bc8, Constant:i8<51>
+    0x7fd212741bc8: v4i64,ch = load<(dereferenceable load 32 from %ir.11)> 0x7fd2127411a0, 0x7fd212bae3a8, undef:i64
+      0x7fd212bae3a8: i64 = add nuw 0x7fd212741888, Constant:i64<128>
+        0x7fd212741888: i64,ch = CopyFromReg 0x7fd212c05fd8, Register:i64 %1
+          0x7fd212741d00: i64 = Register %1
+        0x7fd212a9ac30: i64 = Constant<128>
+      0x7fd212bae068: i64 = undef
+    0x7fd212bae340: i8 = Constant<51>
+  0x7fd212baea90: v4i64 = X86ISD::VBROADCAST 0x7fd2127ce270
+    0x7fd2127ce270: i64,ch = load<(load 8 from constant-pool)> 0x7fd212c05fd8, 0x7fd212a9ac98, undef:i64
+      0x7fd212a9ac98: i64 = X86ISD::WrapperRIP TargetConstantPool:i64<i64 19> 0
+        0x7fd212741dd0: i64 = TargetConstantPool<i64 19> 0
+      0x7fd212bae068: i64 = undef
+  0x7fd212bae410: v4i64 = and 0x7fd212741068, 0x7fd212a9a618
+    0x7fd212741068: v4i64,ch = load<(dereferenceable load 32 from %ir.3)> 0x7fd2127411a0, 0x7fd212741888, undef:i64
+      0x7fd212741888: i64,ch = CopyFromReg 0x7fd212c05fd8, Register:i64 %1
+        0x7fd212741d00: i64 = Register %1
+      0x7fd212bae068: i64 = undef
+    0x7fd212a9a618: v4i64 = X86ISD::VBROADCAST 0x7fd212a9a478
+      0x7fd212a9a478: i64,ch = load<(load 8 from constant-pool)> 0x7fd212c05fd8, 0x7fd212a9a6e8, undef:i64
+        0x7fd212a9a6e8: i64 = X86ISD::WrapperRIP TargetConstantPool:i64<i64 2251799813685247> 0
+          0x7fd212bae270: i64 = TargetConstantPool<i64 2251799813685247> 0
+        0x7fd212bae068: i64 = undef
+In function: _ZN50_$LT$T$u20$as$u20$core..convert..Into$LT$U$GT$$GT$4into17h84437aaee38c4845E
+error: Could not compile `curve25519-dalek`.
+```
+
+Rust version:
+
+```
+rustc 1.35.0-nightly (96d700f1b 2019-04-10)
+binary: rustc
+commit-hash: 96d700f1b7bc9c53fa0d11567adb1ed2c1c27e79
+commit-date: 2019-04-10
+host: x86_64-unknown-linux-gnu
+release: 1.35.0-nightly
+LLVM version: 8.0
+```
+
+Any ideas, if this is an error on the rust compiler or the linking code being used in the backend? 
+There is a line of research implementing Curve25519 in constant time on Cortex-M4 microcontrollers by using multiply-and-accumulate instructions that this microcontroller has.
+To my knowledge, this starts in [1], with an implementation [2] which unfortunately has LG copyrights. The latest I know of is [3], based on [5] and has no copyright restrictions.
+
+While https://github.com/dalek-cryptography/curve25519-dalek/issues/187 blocks this, would there be interest in adding support for such a backend? Should this happen in this repository?
+
+
+[1] http://www.cs.haifa.ac.il/~orrd/LC17/paper39.pdf
+[2] https://github.com/hayatofujii/curve25519-cortex-m4
+[3] https://github.com/BjoernMHaase/fe25519
+[4] https://ches.2017.rump.cr.yp.to/fe534b32e52fcacee026786ff44235f0.pdf
+[5] https://eprint.iacr.org/2018/286.pdf

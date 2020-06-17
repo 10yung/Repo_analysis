@@ -1,0 +1,133 @@
+Close #37.
+Add support for customizing the logger with the following features of backup (rotated) log files:
+* **`TimeFormat`** - set a custom time format to use for the timestamp in the backup file name: `foo-<timestamp>.log`. If not set, the default time format is used, as was done until now, to keep backward compatibility.
+* **`BackupDir`** - set a custom directory location where the backup log files shall be saved to when the log is rotated. If not set, the backup files are saved in the same directory as the active log file, as was done until now, to keep backward compatibility.
+Is that possible to rotate logger based on daily instead maxSize ?  Since we want to rotate log file daily irrespectie of the log file size.
+
+
+Thanks,
+Sriram
+Previously, each lumberjack logger starts its own mill goroutine the first time
+that the logger writes to a file, and the goroutine is never stopped. The
+project has an open pull request,
+https://github.com/natefinch/lumberjack/pull/80, to stop the goroutine when the
+logger is closed. However, even with that design, each open logger will always
+have a mill goroutine that is active (even if it is not performing work). It
+also means that a logger will never be garbage-collected (and hence its file
+will never be closed) unless it is explicitly closed. Furthemore, even if a
+logger is explicitly closed, if Write is called on any references to that
+logger, that will restart the persistent mill goroutine and reintroduce the
+leaked file handle.
+
+This change modifies the mill goroutine logic. It still maintains the overall
+design of synchronously rotating and asynchronously deleting and compressing
+(milling) the old, rotated log files, and that if a request to mill comes in
+while one call is already happening, another mill will be executed after the
+current one to ensure any newly rotated files are not missed. There is at most
+one active mill goroutine which is in the process of performing a single pass
+of deletions and compressions of rotated log files, and at most one queued mill
+goroutine which is just waiting on a mutex. Now, each mill goroutine exits once
+a single pass is done and future calls to mill will start a new goroutine (if
+one is not already queued.)
+
+This modification allows for lumberjack loggers to be garbage-collected, which
+allows it to close file handles gracefully without an explicit call to "close".
+
+The downside to this new approach is in the case where rotations are constantly
+happening, rather than having a single goroutine simply process each mill pass,
+a new goroutine must be started for each pass.
+
+---
+
+We have an internal fork of lumberjack that contains this change that we are
+using in production.
+
+An alternative approach was sketched after the fact that is not in use
+internally but would have at most one mill goroutine per logger at any time,
+rather than one active and one queued as in this approach. This alternative
+design is shown here:
+
+https://github.com/jdhenke/lumberjack/pull/2
+Note that in the `go.mod` and `go.sum` files there are a few other modules listed, which are listed because Go v1.12 and above include the versions of dependencies of the test files as well, to ensure that the entire module can be rebuilt and retested exactly how it was on the developer's workstation.
+
+While I am not a huge fan of listing and requiring test dependencies as if they were production dependencies, it is how the Go module system currently works.
+Related to #65, making it a tiny bit difficult to continue using this excellent logging library in the age of Go modules.
+
+```
+*  (HEAD -> v2.0, origin/v2.0, origin/HEAD)94d9e49: Deen 2019-04-12 use 0755 to create new dir (#68)
+* 4b74a4d: 康晓宁 2019-04-12 fix a typo (#62)
+* 2e8fbee: Juan Osorio Robles 2019-04-11 Make default file permissions more restrictive (#83)
+*  (tag: v2.0.0)7d6a187: Nate Finch 2018-08-17 Fix test timing (#64)
+* aee4629: Tyler Butters 2017-09-11 Update docs, adding `Compress` setting details (#49)
+* df99d62: Nate Finch 2017-05-31 switch to travis (#44)
+*  (tag: v2.1, origin/master)a96e638: Joel Sing 2017-06-01 Add support for log file compression (#43)
+*  (tag: v2.0)dd45e6a: Nate Finch 2016-11-04 update docs w/ backup format info
+```
+
+### What problem does this PR solve? <!--add issue link with summary if exists-->
+
+Fix the problem of truncating file when opening a new log file.
+
+Related:  https://superuser.com/questions/881777/what-happens-when-i-truncate-a-file-that-is-in-use
+
+When I started a program with `lumberjack`, a new log file was created. Then I truncated the log file in another process, but I saw many characters like `^@` in the log file when I opened the file using Vim.
+
+### What is changed and how it works?
+Add the `O_APPEND` flag when opening a new log file.
+Hi.
+Can you clarify the statement "Lumberjack assumes that only one process is writing to the output files. Using the same lumberjack configuration from multiple processes on the same machine will result in improper behavior."
+
+Does this mean that only one goroutine within an executable can use log.Write, or that only one executable can write to any particular file?
+
+Thank you.
+
+Currently, every instance of a lumberjack logger that has ever performed a write will have an associated running goroutine. Because this goroutine references the logger, the logger is never garbage-collected, even if it otherwise goes out of scope. Because the logger holds a handle to the file it is logging to, this can leak file descriptors.
+
+If #56 is fixed using the currently proposed solution, then calling `Close()` on the logger will stop the goroutine, which will allow it to be GC'd.
+
+However, given that not all callers will call `Close()`, it would be nice to have a design where, if a logger is GC'd, that would ensure that the associated file handles would be closed.
+
+The branch at https://github.com/jdhenke/lumberjack/tree/avoid-goroutine-cleanup demonstrates an approach that implements this fix. In this approach, the "mill" goroutine ends once its work is complete. Locks are used to ensure that only 1 mill routine is running for a logger at any given time, and subsequent requests will queue mill work.
+
+The following test demonstrates the file handle GC behavior. This test fails with the current code, but succeeds on the branch linked above:
+
+```go
+func TestFileHandleReleasedOnGC(t *testing.T) {
+	dir := makeTempDir("TestFileHandleReleasedOnGC", t)
+	defer os.RemoveAll(dir)
+	filename := logFile(dir)
+
+	equals(0, len(linesWithString(lsofOutput(t), ".log")), t)
+
+	logger1 := &Logger{
+		Filename: filename,
+	}
+	_, _ = logger1.Write([]byte("foo!"))
+
+	equals(1, len(linesWithString(lsofOutput(t), ".log")), t)
+
+	_ = logger1
+	runtime.GC()
+
+	// there should be no more references to the logger, so GC should have closed file handle
+	equals(0, len(linesWithString(lsofOutput(t), ".log")), t)
+}
+
+func linesWithString(content, find string) []string {
+	var output []string
+	for _, line := range strings.Split(content, "\n") {
+		if strings.Contains(line, find) {
+			output = append(output, line)
+		}
+	}
+	return output
+}
+
+func lsofOutput(t *testing.T) string {
+	lsofOutput, err := exec.Command("lsof", "-p", strconv.Itoa(os.Getpid())).Output()
+	require.NoError(t, err)
+	return string(lsofOutput)
+}
+```
+
+Another advantage of this approach is that a logger will only have a `mill` goroutine running when it is actively doing `mill` work (whereas currently every logger that has ever performed a write will have an associated goroutine).

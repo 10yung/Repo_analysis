@@ -1,0 +1,266 @@
+clone also the request body in the CloneRequest method, so shadow backends get the same body sent to regular backends
+**Describe the bug**
+production backend is ok, but shadowed backend reports error:
+```
+I/O error while reading input message; nested exception is org.apache.catalina.connector.ClientAbortException: java.io.EOFException: Unexpected EOF read on the socket
+```
+
+**To Reproduce**
+Steps to reproduce the behavior:
+1. Configuration used
+```json
+{
+          "endpoint": "/{path0}/{path1}/{path2}/{path3}",
+          "method": "PUT",
+          "extra_config": {},
+          "output_encoding": "json",
+          "concurrent_calls": 1,
+          "headers_to_pass": [
+            "*"
+          ],
+          "querystring_params": ["*"],
+          "backend": [
+            {
+              "url_pattern": "/{path0}/{path1}/{path2}/{path3}",
+              "encoding": "json",
+              "sd": "static",
+              "extra_config": {},
+              "host": [
+                "http://CONTAINER-A"
+              ],
+              "disable_host_sanitize": true
+            },
+            {
+              "url_pattern": "/{path0}/{path1}/{path2}/{path3}",
+              "encoding": "json",
+              "sd": "static",
+              "extra_config": {
+                "github.com/devopsfaith/krakend/proxy": {
+                  "shadow": true
+                }
+              },
+              "host": [
+                "http://CONTAINER-B"
+              ],
+              "disable_host_sanitize": true
+            }
+          ]
+        }
+```
+2. Steps to run the software
+image: devopsfaith/krakend:1.0
+
+**Expected behavior**
+A clear and concise description of what you expected to happen.
+
+**Logs**
+If applicable, any logs and debugging information
+
+**Additional context**
+remove CONTAINER-B, it's OK; remove CONTAINER-A, turn off shadow, it's OK.
+
+**Describe the bug**
+
+During normal operation of our Krakend based API GW we observed a panic in our version of the CustomErrorEndpointHandler. Our version is based on https://github.com/devopsfaith/krakend/blob/master/router/gin/endpoint.go#L28 and has two changes:
+1. we set a value on the context with `c.Set(...)`
+2. we do not return the two headers `core.KrakenHeaderName` and `router.CompleteResponseHeaderName`
+
+Other than that, the code is not altered, especially the section that is mentioned in the stack trace (see below) is not changed.
+
+The line of code, that is stated of as the root cause of the panic because of a "invalid memory address or nil pointer dereference" does not make sense, because in [`if isCacheEnabled {`](https://github.com/devopsfaith/krakend/blob/master/router/gin/endpoint.go#L54) the reference variable is a boolean (not a pointer) and therefore it does not seam possible for this variable to be nil.
+
+The comment in the mentioned function `sigpanic` in the [runtime](https://github.com/golang/go/blob/go1.12.12/src/runtime/signal_unix.go#L390) package mentiones, that it "arranges the stack to look like the function where the signal occurred called
+ sigpanic" so we asked ourselves, if this "arranging" could be off by one (or even more) lines. This led to the question, if the real cause for the nil pointer is the call to `c.Header(...)` on the next line.
+
+Interesting is the fact, that the request, that is logged (see last line) has a duration of a little bit above of 3 sec and our timeout in the configuration is set to 3 sec.
+Based on this observation, it is our guess, that the problem is somehow because of a data race, that only happens, in very rare cases of exact timing, that is if the proxy request just returns before the timeout exceeds. We looked into the code to figure out, where this could lead to a problem (we assumed to reuse of the context objects by gin and the overwriting of the ResponseWriters could be the source of the problem, which would map to the stated assumption above, that the call to `c.Header(...)` could be part of the problem), but we have not been successful so far. 
+
+Have you heard or observed similar panics?
+What do you think about the suggestion below in "Additional context"?
+
+**To Reproduce**
+
+We are currently not able to reproduce the error, it only happens very rarely.
+
+**Expected behavior**
+
+The code should not panic.
+
+**Logs**
+
+```
+2020/01/14 09:49:14 [Recovery] 2020/01/14 - 09:49:14 panic recovered:
+runtime error: invalid memory address or nil pointer dereference
+/usr/local/go/src/runtime/panic.go:82 (0x4412c0)
+	panicmem: panic(memoryError)
+/usr/local/go/src/runtime/signal_unix.go:390 (0x4410ef)
+	sigpanic: panicmem()
+/usr/src/app/handler_factory.go:64 (0xa4fb5f)
+	CustomErrorEndpointHandler.func1: if isCacheEnabled {
+/go/pkg/mod/github.com/devopsfaith/krakend-ratelimit@v0.0.0-20190404110207-d63774e96e82/juju/router/gin/gin.go:96 (0x9f7c58)
+	NewTokenLimiterMw.func1.1: next(c)
+/go/pkg/mod/github.com/gin-gonic/gin@v1.4.0/context.go:124 (0x99c359)
+	(*Context).Next: c.handlers[c.index](c)
+/usr/src/app/metrics_middleware.go:166 (0xa506cb)
+	middleware.func1: c.Next()
+/go/pkg/mod/github.com/gin-gonic/gin@v1.4.0/context.go:124 (0x99c359)
+	(*Context).Next: c.handlers[c.index](c)
+/usr/src/app/router_engine.go:50 (0xa4e72f)
+	jsonErrorBody: c.Next()
+/go/pkg/mod/github.com/gin-gonic/gin@v1.4.0/context.go:124 (0x99c359)
+	(*Context).Next: c.handlers[c.index](c)
+/usr/src/app/router_engine.go:46 (0xa4e6d2)
+	strictTransportSecurityHeader: c.Next()
+/go/pkg/mod/github.com/gin-gonic/gin@v1.4.0/context.go:124 (0x99c359)
+	(*Context).Next: c.handlers[c.index](c)
+/go/pkg/mod/github.com/gin-gonic/gin@v1.4.0/recovery.go:83 (0x9af629)
+	RecoveryWithWriter.func1: c.Next()
+/go/pkg/mod/github.com/gin-gonic/gin@v1.4.0/context.go:124 (0x99c359)
+	(*Context).Next: c.handlers[c.index](c)
+/go/pkg/mod/github.com/gin-gonic/gin@v1.4.0/logger.go:240 (0x9ae6d0)
+	LoggerWithConfig.func1: c.Next()
+/go/pkg/mod/github.com/gin-gonic/gin@v1.4.0/context.go:124 (0x99c359)
+	(*Context).Next: c.handlers[c.index](c)
+/go/pkg/mod/github.com/gin-gonic/gin@v1.4.0/gin.go:389 (0x9a5b71)
+	(*Engine).handleHTTPRequest: c.Next()
+/go/pkg/mod/github.com/gin-gonic/gin@v1.4.0/gin.go:351 (0x9a53a3)
+	(*Engine).ServeHTTP: engine.handleHTTPRequest(c)
+/usr/local/go/src/net/http/server.go:2774 (0x6c3517)
+	serverHandler.ServeHTTP: handler.ServeHTTP(rw, req)
+/usr/local/go/src/net/http/server.go:1878 (0x6bf100)
+	(*conn).serve: serverHandler{c.server}.ServeHTTP(w, w.req)
+/usr/local/go/src/runtime/asm_amd64.s:1337 (0x459060)
+	goexit: BYTE	$0x90	// NOP
+[GIN] 2020/01/14 - 09:49:14 | 500 |  3.001676485s | xxx.xxx.xxx.xxx | GET      <redacted>
+```
+
+**Additional context**
+
+We observed, that in Krakend in most cases, where new timeouts are derived from the global request timeout, only a percentage of the global timeout is used (e.g. [concurrent.go](https://github.com/devopsfaith/krakend/blob/master/proxy/concurrent.go#L16) and [merging.go](https://github.com/devopsfaith/krakend/blob/master/proxy/merging.go#L23)) and we asked ourselves if it would be beneficial to do the same in [endpoint.go](https://github.com/devopsfaith/krakend/blob/master/router/gin/endpoint.go#L35).
+
+Hi,
+
+One of the backend services for my app uses graphql api. How can I add that as a backend and expose it as an endpoint in krakend?
+**Is your feature request related to a problem? Please describe.**
+below tells validator can accept jwt token from Authorization or a certain key in Cookie.
+https://www.krakend.io/docs/authorization/jwt-validation/
+any plan to support extracting jwt token from designated header like: x-mycompany-auth or etc?
+
+**Describe the solution you'd like**
+krakend-jose/validator supports http header name apart form cookie "cookie_key" when fetching jwt token
+
+**Describe alternatives you've considered**
+did not think of any alternatives so far.
+
+**Additional context**
+Add any other context or screenshots about the feature request here.
+
+**Is your feature request related to a problem? Please describe.**
+Given that krakend stateless and every configuration change requires a restart, it would be nice to minimize downtime.
+
+**Describe the solution you'd like**
+One solution is to use endless http server (https://github.com/fvbock/endless/) or something similar. It allows us to finish requests on the old version, and all new requests are already going to the latest version.
+
+**Additional context**
+I use such a custom version of krakend with endless. If there are problems with this proposal, it would be nice to add at least the ability to change the http server globally.
+
+HI:
+I need help, thanks！
+1   I want to output the response header of the backend feedback to the client. Is there any parameter that can be configured?  I haven't seen it for a long time.
+2  Transform headers ，  Seems to have no effect, the client does not see the response header。
+"endpoint": "/foo",
+"extra_config": {
+    "github.com/devopsfaith/krakend-martian": {
+        "header.Modifier": {
+          "scope": ["request", "response"],
+          "name": "X-Martian",
+          "value": "true"
+        }
+    }
+}
+
+
+**Is your feature request related to a problem? Please describe.**
+Add support of WebAssembly for plugin system. 
+It could simplify development plugin in different language using simple API.
+
+Interesting project https://www.solo.io/products/webassembly-hub/ like an example.
+**Is your feature request related to a problem? Please describe.**
+Ability to divide traffic between releases and/or weights
+
+**Describe the solution you'd like**
+It would be a nice feature that simplify deployment of backends
+Hi, thanks for this great project.
+
+I think I found a bug on the krakend-httpsecure extension, or at best, on the [krakend documentation](https://www.krakend.io/docs/endpoints/security/). The documentation says we can use this extension at endpoint or root level, but I could't make it work at endpoint level. I'm interested on defining the "allowed_hosts" at root level and override it on some endpoints, nevertheless even if I only configure it at endpoint level, it doesn't work.
+
+Here is the configuration file I've created to test the allowed_hosts option.
+
+```
+{
+  "version": 2,
+  "name": "test",
+  "extra_config": {
+    "github_com/devopsfaith/krakend-httpsecure": {
+      "allowed_hosts": [
+        "no-host"
+      ]
+    }
+  },
+  "endpoints": [
+    {
+      "endpoint": "/test",
+      "method": "GET",
+      "extra_config": {
+        "github.com/devopsfaith/krakend-httpsecure": {
+          "allowed_hosts": [
+            "localhost:8080"
+          ]
+        }
+      },
+      "backend": [
+        {
+           "host": "https://jsonplaceholder.typicode.com",
+           "url_pattern": "/todos/1"
+        }  
+      ]
+    }
+  ]
+}
+```
+
+I'm using Docker to run this test with the command bellow:
+
+`docker run -p 8080:8080 -v $PWD/config:/etc/krakend/ devopsfaith/krakend:1.0 run --config /etc/krakend/krakend-test.json`
+
+In this example, krakend always return "Bad Host", even though it's overwritten at the endpoint level.
+
+If I configure it only at the endpoint level, the configuration is ignored and the Host header verification isn't executed:
+```
+{
+  "version": 2,
+  "name": "test",
+  "endpoints": [
+    {
+      "endpoint": "/test",
+      "method": "GET",
+      "extra_config": {
+        "github.com/devopsfaith/krakend-httpsecure": {
+          "allowed_hosts": [
+            "no-host"
+          ]
+        }
+      },
+      "backend": [
+        {
+           "host": "https://jsonplaceholder.typicode.com",
+           "url_pattern": "/todos/1"
+        }  
+      ]
+    }
+  ]
+}
+```
+Is there anything wrong with my configuration or is this really a bug?
+
+Cheers!

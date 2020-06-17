@@ -1,0 +1,125 @@
+```rust
+fn main() {
+    let orig: Vec<u32> = vec![1, 2];
+    let coded = bincode::config().limit(100).serialize(&orig).unwrap();
+    println!("{:?}", coded);
+    let res: Vec<u32> = bincode::config().limit(1).deserialize(&coded).unwrap();
+}
+```
+The above program runs without errors.
+
+Size limits seem to mostly work when encoding, but they fail to prevent the attacks they are meant to protect from.
+
+It looks to me like the size of chars isn't counted either when decoding.
+
+Maybe size limits should be removed? At least my use-case doesn't want a size limit.
+
+If they are kept, the code should be refactored so that it is impossible to read bytes without advancing the size counter. That would be fairly easy especially if the dependency on `io::Read` in de/mod.rs is replaced with `BincodeRead`.
+
+Based on https://github.com/servo/bincode/issues/206#issuecomment-335221752 it may be a good idea to avoid read_exact for performance anyway.
+I did some cleanup while studying the source of bincode.
+I was getting a bunch of warnings like this:
+```
+warning: use of deprecated item 'try': use the `?` operator instead
+   --> bincode/src/ser/mod.rs:416:9
+    |
+416 |         try!(self.add_value(variant_index));
+    |         ^^^
+```
+With the latest compiler `cargo 1.40.0 (bc8e4c8be 2019-11-22)`
+
+This change tries to fix them.
+As far as I can see, `bincode::serialize` cannot actually return an `Err`.
+
+If it cannot, maybe this could be documented (and hopefully the return type changed to `Vec<u8>` if/when v2 gets out)?
+
+If it can, hopefully the ways in which it can return an `Err` could be documented, as there is no obvious case I could think of?
+
+Anyway, thank you for bincode! I'm still starting using it, but it looks really neat :)
+https://github.com/servo/bincode/commit/80722cc106ef4b34342a2e5a6f88a2c31f1d6890 
+
+https://github.com/servo/bincode/blob/12f1415b9ec5d2eec7712784da7690571b56a7d6/Cargo.toml#L4-L6
+
+This strips tests from the published crate, but all the `dev-dependencies` are still listed.
+
+This means consumers (eg: Linux Vendors such as debian, gentoo, fedora) are unable to run any useful tests for Quality Assurance purposes, but the Cargo configuration will still require dependencies to be fetched, and built, in order to run no tests.
+
+The tests themselves don't seem problematic or bloaty, so I don't see any *good* reason to be avoiding a mere 15k.
+
+If publishing with the whole test suite is undesirable, perhaps split the test suite into 2, and then only strip some of it, not all of it? 
+
+
+
+It seems like using `Config::with_serializer` bypasses the `Config` checks for some reason.
+
+Using the branch https://github.com/servo/bincode/pull/288, I can reproduce this issue:
+
+```rust
+struct Acceptor<T> {
+    value: T,
+}
+
+impl<T> Acceptor<T> {
+    fn new(value: T) -> Self {
+        Self { value }
+    }
+}
+
+impl<'a, T> SerializerAcceptor for Acceptor<T>
+where
+    T: Serialize,
+{
+    type Output = StdResult<(), Error>;
+
+    fn accept<S>(self, serializer: S) -> Self::Output
+    where
+        S: Serializer<Ok = (), Error = Error>,
+    {
+        self.value.serialize(serializer)
+    }
+}
+
+#[test]
+fn too_big_serialize_acceptor() {
+    let acceptor = Acceptor::new(0u32);
+    let mut buf = vec![];
+    // This doesn't error!
+    assert!(config().limit(3).with_serializer(&mut buf, acceptor).is_err());
+
+    let acceptor = Acceptor::new(0u32);
+    assert!(config().limit(4).with_serializer(&mut buf, acceptor).is_ok());
+}
+```
+
+Which produces this error :
+```
+thread 'too_big_serialize_acceptor' panicked at 'assertion failed: config().limit(3).with_serializer(&mut buf, acceptor).is_err()',
+````
+This allows the user to retreive concrete types from the
+serializer & deserializer output.
+
+This closes https://github.com/servo/bincode/issues/287.
+Currently its not possible to return any meaningfull error type from the `SerializerAcceptor` trait. This is because the `accept` method is generic so you can't know ahead of time the `S::Error` type of the `Serializer`.
+
+```rust
+pub trait SerializerAcceptor {
+    /// The return type for the accept method
+    type Output;
+    /// Accept a serde::Serializer and do whatever you want with it.
+    fn accept<T: serde::Serializer>(self, T) -> Self::Output;
+}
+```
+edit: Removed dumb stuff
+In the documentation is says:
+```
+str is encoded as (u64, &[u8]), where the u64 is the number of bytes contained in the encoded string.
+```
+
+I am looking for a way around this to explicitly control how the length is serialized. This is similar to: https://github.com/servo/bincode/issues/182
+and 
+https://github.com/servo/bincode/issues/238
+
+I could not find a good way to implement this even manually. I can create a custom type and implement Serialize, but calling `serialize_bytes()` adds a length prefix and there doesn't appear to be any other way to induce a call to `write_all()`.
+
+Would it be possible to do this by adding a Bincode specific trait extending Serialize perhaps? 
+If that can be solved Deserialization seems like it should be straight forward. 

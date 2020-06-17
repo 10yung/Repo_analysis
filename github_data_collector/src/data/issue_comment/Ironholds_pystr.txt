@@ -1,0 +1,151 @@
+Any interest in a function that mimics the Python built-in function `in`, for string/char vectors? I know `in` is not a `str` method, but `in` is one of the more convenient functions that I use all the time with strings in Python, so figured there may be interest here.
+
+I started working on this for fun, if there's interest I'd be happy to submit a PR. What I've built so far allows for the following operations:
+```r
+# Function template....does x exist in table
+x %pystr_in% table
+
+# string in string
+table <- "I like cats quite a bit"
+"cats" %pystr_in% table # TRUE
+"frogs" %pystr_in% table # FALSE
+
+# string in char vector
+table <- c("dogs", "cats", "ducks")
+"cats" %pystr_in% table # TRUE
+"frogs" %pystr_in% table # FALSE
+
+# string in environment keys
+table <- new.env()
+table$cats <- "blah1"
+table$dogs <- "blah2"
+"cats" %pystr_in% table # TRUE
+"blah1" %pystr_in% table # FALSE
+
+# string in list
+table <- list("dogs", "cats", "ducks")
+"cats" %pystr_in% table # TRUE
+"frogs" %pystr_in% table # FALSE
+
+# char vector in list
+table <- list(c(1, 2, 3), c("yay", "cats"), c("dogs", "are", "okay")) 
+c("yay", "cats") %pystr_in% table # TRUE
+c("yay", "dogs") %pystr_in% table # FALSE
+```
+
+Some methods are built in c++, some just in base R. Here's all the code I have so far:
+R code:
+```r
+# Helper function
+is_missing <- function(x) {
+  if (is.na(x) || is.null(x) || length(x) == 0) {
+    return(TRUE)
+  }
+  FALSE
+}
+
+# Main function
+`%pystr_in%` <- function(x, table) {
+  UseMethod("%pystr_in%", table)
+}
+
+# Character vector method
+`%pystr_in%.default` <- function(x, table) {
+  stopifnot(is.character(x))
+  if (!is.character(table)) {
+    stop("arg 'table' must be a character vector, list, or environment")
+  }
+  
+  # If x is missing or has length greater than 1, or table is missing, 
+  # return FALSE.
+  if (is_missing(x) || length(x) > 1 || is_missing(table)) return(FALSE)
+  
+  if (length(table) > 1) {
+    return(pystr_in_(x, table)) # string in char vect
+  } else {
+    return(grepl(x, table, fixed = TRUE)) # string in string
+  }
+}
+
+# List method
+`%pystr_in%.list` <- function(x, table) {
+  # If x is missing or table has length 0, return FALSE.
+  if (is_missing(x) || length(table) < 1) return(FALSE)
+
+  # If x has length 1, use `==`. Else if x has length 
+  # greater than 1, look for identical vector match within table.
+  if (length(x) == 1 ) {
+    return(any(table == x)) # string in list
+  } else {
+    return(pystr_in_(x, table)) # char vect in list
+  }
+}
+
+# Environment method
+`%pystr_in%.environment` <- function(x, table) {
+  # If x is missing or table has length 0, return FALSE.
+  if (is_missing(x) || length(table) < 1) return(FALSE)
+  
+  return(exists(x, envir = table, inherits = FALSE)) # string in env keys
+}
+```
+c++ code:
+```c++
+#include <Rcpp.h>
+using namespace Rcpp;
+
+// Function for string in char vector lookups
+bool pystr_in_charvect(CharacterVector x, CharacterVector table) {
+  if(is_true(all(is_na(table)))) return false;
+  
+  IntegerVector res = match(x, table);
+  if(res[0] == NA_INTEGER) {
+    return false;
+  }
+  return true;
+}
+
+// Template function for char vector in list lookups and list in list lookups
+template<typename T>
+bool pystr_in_list(const T &x, List &table) {
+  unsigned int x_len = x.size();
+  bool out = false;
+  SEXPTYPE x_sexp = TYPEOF(x);
+  
+  List::iterator it;
+  List::iterator tbl_end = table.end();
+  for(it = table.begin(); it != tbl_end; ++it) {
+    if(TYPEOF(*it) != x_sexp || LENGTH(*it) != x_len) {
+      continue;
+    }
+    
+    T curr_tbl = *it;
+    if(is_true(all(curr_tbl == x))) {
+      out = true;
+      break;
+    }
+  }
+  
+  return out;
+}
+
+// Exported function
+// [[Rcpp::export]]
+bool pystr_in_(SEXP &x, SEXP &table) {
+  if(LENGTH(x) == 1 && TYPEOF(table) == STRSXP) {
+    CharacterVector x_ = CharacterVector(x);
+    CharacterVector table_ = CharacterVector(table);
+    return pystr_in_charvect(x_, table_);
+  }
+  
+  if(TYPEOF(table) == VECSXP) {
+    List table_ = List(table);
+    switch (TYPEOF(x)) {
+      case STRSXP: return pystr_in_list<CharacterVector>(x, table_);
+      case VECSXP: return pystr_in_list<List>(x, table_);
+    }
+  }
+  
+  return false;
+}
+```

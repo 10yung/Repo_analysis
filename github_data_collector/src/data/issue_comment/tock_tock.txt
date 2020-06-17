@@ -1,0 +1,282 @@
+While reviewing #1551, I noticed this:
+
+```rust
+        // start comparator
+        regs.events_ready.set(0);
+        regs.tasks_start.set(1);
+        // wait for comparator to be ready
+        // delay is on order of 3 microseconds so spin wait is OK
+        while regs.events_ready.get() == 0 {}
+    }
+```
+
+We do stuff like this in a few places, but as we start busy-looping on more complex peripherals, I wonder if we perhaps introduce the possibility for the kernel to hang in a way that's challenging to debug. Should we have a kernel primitive of some form that safely spins?
+
+```rust
+fn wait_for_hardware<F: Frequency> (fn: [closure type], max_µs: u32) -> bool {
+     // Compute max number of tries given `max_us` and core speed
+     let max_tries = ...
+     while (max_tries) {
+          if (fn()) return true;
+     }
+     false
+}
+
+        // wait for comparator to be ready
+        if ! wait_for_hardware(|| {regs.events_ready.get() == 0}, 3) {
+              return InitializationError; //?
+              panic!("useful error message"); //?
+        }
+```
+
+Or is this the kind of situation where we'd never really be able to do anything useful in the case of failure?
+### Pull Request Overview
+This pull adds an implementation for an Analog Comparator for the nrf52840. It doesn't modify the HIL interface. It adds the required drivers and interrupts to the nrf52. 
+I will most likely create a second PR later to modify the analog comparator HIL, as well as this implementation and the sam4l implementation. 
+
+### Testing Strategy
+
+This pull request was tested by Langston Nashold. 
+I used existing tests for the analog comparator to test both interrupt and polling-based comparison. I placed connecting VIN+ to the VDD and the VIN- to ground. I then switched the two connections, which created the appropriate changes in the comparator's output. I haven't tested it on the nrf52dk yet, however. 
+
+### Todo
+ - [ ] Test on nrf52832 chip
+ - [ ] Rebase commits
+
+### Documentation Updated
+
+- [ ] Updated the relevant files in `/docs`, or no updates are required.
+
+### Formatting
+
+- [X] Ran `make formatall`.
+
+If there is a panic, the kernel does not print out processor state unless there are processes:
+
+https://github.com/tock/tock/blob/1e7e3f14a440a756383087d318614eed7868dca0/kernel/src/debug.rs#L60
+
+prints CPU state by calling `panic_process_info', which in turn prints its information through Process:
+
+```    if !procs.is_empty() {
+        procs[0].as_ref().map(|process| {
+            process.fault_fmt(writer);
+        });
+    }
+
+    // print data about each process
+    let _ = writer.write_fmt(format_args!("\r\n---| App Status |---\r\n"));
+    for idx in 0..procs.len() {
+        procs[idx].as_ref().map(|process| {
+            process.process_detail_fmt(writer);
+        });
+    }
+```
+
+Getting debug output for a kernel panic should not require having a user process (e.g., if your entire system is in the kernel). It seems like this approach was used mostly so debug doesn't need a reference to `chip`. E.g., `Process::fault_fmt` just uses the chip reference:
+
+```    unsafe fn fault_fmt(&self, writer: &mut dyn Write) {
+        self.chip.userspace_kernel_boundary().fault_fmt(writer);
+    }
+```
+
+Would it make more sense for debug to have a direct reference to a UserspaceKernelBoundary? Better yet, it seems like this debug output functionality should be in a separate trait.
+### Pull Request Overview
+
+This pull request adds a new `IoWrite` trait in the kernel, to write arbitrary bytes instead of UTF-8 strings (fixes https://github.com/tock/tock/issues/1449). Until now, the `flush` function was using `str::from_utf8_unchecked`, even though the bytes are actually not UTF-8 (even with only UTF-8 input, the underlying ring buffer may wrap-around in the middle on a UTF-8 character).
+
+In practice, the underlying implementations work byte-by-byte to send debug output, so a more general trait to write byte slices can be plugged in.
+
+This `IoWrite` trait is similar to `std::io::Write`, except that the latter doesn't exist in `no_std` (because `std::io::Error` isn't compatible - see https://github.com/rust-lang/rust/issues/68315 and https://github.com/rust-lang/rfcs/issues/2262).
+
+
+### Testing Strategy
+
+This pull request was tested by Travis.
+
+
+### TODO or Help Wanted
+
+This pull request still needs support for byte-by-byte writing on the arty-e21 board. I'm not even sure the current `debug!` macro is what we want to do in a panic handler.
+
+
+### Documentation Updated
+
+- [x] Updated the relevant files in `/docs`, or no updates are required.
+
+### Formatting
+
+- [x] Ran `make formatall`.
+### Pull Request Overview
+
+This pull request:
+- Updates the arty board to use the `DebugWriterComponent`.
+- Removes the `pub static mut` buffers from the `kernel/src/debug.rs` and uses `static_init` to create them in the component instead. This is less error-prone as discussed in https://github.com/tock/tock/issues/1545, and can be more flexible as it allows to more easily increase the buffer size in a specific board.
+
+
+### Testing Strategy
+
+This pull request was tested by Travis. I don't have an arty board to test on.
+
+I also checked that the code size is the same on all boards before/after this change.
+
+
+### TODO or Help Wanted
+
+N/A
+
+
+### Documentation Updated
+
+- [x] Updated the relevant files in `/docs`, or no updates are required.
+
+### Formatting
+
+- [x] Ran `make formatall`.
+### Pull Request Overview
+
+It has been about 3 months, so a good time to stay current. Also motivated by https://github.com/rust-lang/rust/pull/67887 which should make debugging easier.
+
+Changes
+- New warning about `()` not needed.
+- Update to update script.
+
+
+### Testing Strategy
+
+travis
+
+
+### TODO or Help Wanted
+
+n/a
+
+
+### Documentation Updated
+
+- [x] Updated the relevant files in `/docs`, or no updates are required.
+
+### Formatting
+
+- [x] Ran `make formatall`.
+
+## Problem description
+
+Despite the existing [`static_init` macro](https://github.com/tock/tock/blob/master/kernel/src/common/utils.rs) to initialize static data, there are still many uses of "raw" `static mut` buffers or other data. `git grep "^static mut"` and `git grep "^pub static mut"` yield many results across the code base.
+
+However, `static mut` is fundamentally unsafe, because it's relatively easy to alias static data from anywhere in the program. There are indeed evidence of why it is fundamentally problematic in the Rust language - and it may even be deprecated in the future:
+- "Why is static mut bad?" https://users.rust-lang.org/t/why-is-static-mut-bad/32888/6
+- "Consider deprecation of UB-happy `static mut`" https://github.com/rust-lang/rust/issues/53639
+
+In particular, given the pervasive definition of `unsafe` functions in Tock, it's quite easy to forget that accessing `static mut` data is unsafe and why it is unsafe. All one needs to do to alias a `static mut BUF` is to write `&mut BUF` in an unsafe block of code (and a large chunk of Tock's code is wrapped in `unsafe` functions). This was one of my concerns in https://github.com/tock/tock/issues/1447.
+
+An example is the debug-writer component, which eagerly creates mutable references to the kernel's `INTERNAL_BUF` and `OUTPUT_BUF` static mut objects.
+
+https://github.com/tock/tock/blob/b25a1f80e6db330988b6c8ce039b80351cc7402f/boards/components/src/debug_writer.rs#L41-L56
+
+On the other hand the `static_init` macro "hides" the underlying static buffer (it's private to the macro's block of code), and returns a single `&'static mut` reference instead. The advantage of `&'static mut` over plain `static mut` is that it requires much more effort to alias it. Although it's still possible to alias in unsafe code, one needs to write something like `&mut *(buf as *mut T)` to alias the reference, and the `as *mut T` part is much more visible as a red flag that unsafe aliasing is happening.
+
+Here is another toy example showing how much effort is required to alias data in both cases (when the code is not globally wrapped in an `unsafe` block).
+
+```rust
+static mut FOO: [u8; 128] = [0; 128];
+static mut BAR: [u8; 128] = [0; 128];
+
+fn main() {
+    foo();
+    bar(unsafe { &mut BAR });
+}
+
+fn foo() {
+    let x = unsafe { &mut FOO };
+    let y = unsafe { &mut FOO };
+    // Undefined behavior because x and y both alias FOO.
+    concurrent(x, y);
+}
+
+fn bar(buf: &'static mut [u8]) {
+    // error[E0503]: cannot use `*buf` because it was mutably borrowed
+    //let alias = &mut *buf;
+    
+    // To alias the static data, one needs to cast to a raw *mut pointer and
+    // then reborrow it.
+    let alias = unsafe { &mut *(buf as *mut [u8]) };
+    
+    // Undefined behavior because buf and alias both alias BAR.
+    concurrent(buf, alias);
+}
+
+// Rust's aliasing rules assume that `left` and `right` don't alias.
+fn concurrent(left: &mut [u8], right: &mut [u8]) {
+    left[0] = 0;
+    right[1] = 1;
+    left[2] = 2;
+    right[3] = 3;
+    println!("{:?}", left);
+}
+```
+
+## Proposal
+
+- Audit all uses of plain `static mut` data in Tock, and replace them with `&'static mut` (or `&'a mut`) references that are initialized with the `static_mut` macro in boards.
+- Understand if there are cases where `static_init` isn't enough, and why.
+In going through the Rust unstable features being used, we noticed use of `exclusive_range_pattern`.  This is only being used in a handful of places -- and at least at first blush, it feels like it's being used incorrectly.  For example, at https://github.com/tock/tock/blob/master/chips/e310x/src/chip.rs#L51-L58:
+
+```rust
+            while let Some(interrupt) = plic::next_pending() {
+                match interrupt {
+                    interrupts::UART0 => uart::UART0.handle_interrupt(),
+                    index @ interrupts::GPIO0..interrupts::GPIO31 => {
+                        gpio::PORT[index as usize].handle_interrupt()
+                    }
+                    _ => debug!("Pidx {}", interrupt),
+                }
+```
+It appears that GPIO31 in this case can indeed be a valid GPIO interrupt -- but the exclusive range is in this case eliding the handling of it.  (If this code is correct, it seems that a better way to phrase it would be with an inclusive pattern (`..=`) to `GPIO30` and then call out the fallthrough of `GPIO31`.)  In the other places that enable `exclusive_range_pattern`, it is not in fact used. (This was in part noticed by the OpenTitan port, which copied use `exclusive_range_pattern` and then introduced a bug in UART handling as a result -- so it is indeed error-prone.)
+
+It seems like use of `exclusive_range_pattern` should be removed; happy to open a pull request with this removal if and as needed.
+
+
+### Pull Request Overview
+
+This pull request updates the USB HIL and implements it on the nrf52 chip. There are still unimplemented parts (isochronous endpoints, handling of "USB events"), but I tested it on the USB [echo app](https://github.com/tock/libtock-c/tree/master/examples/tests/usb) for bulk endpoints, and some interrupt endpoints (example not public yet, though the logic in the chip is pretty much the same for interrupt and bulk).
+
+Notable changes to the HIL in order to support this chip as well as interrupt endpoints:
+- The `UsbController` and `Client` traits now take a lifetime parameter. This is ultimately to use lifetime-bound buffers, as previously discussed in https://github.com/tock/tock/pull/1427.
+- Unified the `endpoint_*_enable` methods to take the transfer type as parameter. This avoids code duplication down the road, as interrupt and bulk endpoints are handled very similarly by the nrf52 chip. Similarly, `bulk_*` methods in the USB client are replaced by `packet_*` methods. And `Bulk(In|Out)Result` enums are generalized to interrupts as well.
+- Added a possibility to enable an endpoint both for IN and OUT directions. Some protocols such as USB-HID have such bi-directional endpoints.
+- Split `endpoint_bulk_resume` into `endpoint_resume_in` and `endpoint_resume_out` functions, to specify which direction should be resumed, given that an endpoint can now be both IN and OUT directions.
+- Due to the way nrf52 triggers USB events, I had to remove the `delayed_in` check in `capsules/src/usb/usbc_client.rs`, otherwise the driver never initiates IN transactions (from the device to the host). I had a look at the sam4l code and this doesn't seem problematic ("superfluous" resumes are ignored).
+
+I propagated these changes on the sam4l, but not implementing the new combinations there as I don't have a board to test on. Code compiles though.
+
+Isochronous endpoints are left un-implemented.
+
+Another thing to note: some revisions of the nrf52840 chip need many more errata to function properly. As I don't have the hardware to test, and to keep things simple, these extra errata are not implemented. If one enables the USB stack on such chip, it will panic, given that the rest of the code will be unstable on these chips.
+
+### Testing Strategy
+
+This pull request was tested by:
+- Running the USB bulk-echo test [app](https://github.com/tock/libtock-c/tree/master/examples/tests/usb) with the [host test program](https://github.com/tock/tock/tree/master/tools/usb/bulk-echo).
+- Testing a USB-interrupt-based (HID) protocol.
+
+
+### TODO or Help Wanted
+
+This pull request still needs:
+- ~~The interrupt service to listen to USB (https://github.com/tock/tock/pull/1505).~~
+- Adding the `usb_user` driver to the board. It's what I added on top of this pull-request to test bulk-echo, and I can integrate it to this pull-request if needed.
+- There are still a few things to implement, but given how big USB is, I don't think a single pull-request should implement it all (similarly to sam4l). The goal is to give a basis to experiment and iterate on.
+
+
+### Documentation Updated
+
+- [ ] Updated the relevant files in `/docs`, or no updates are required.
+
+### Formatting
+
+- [x] Ran `make formatall`.
+Hi there!
+Is there any ongoing effort in making tock use the TrustZone-M or porting it completely to be executed in the Secure World?
+If not, would you consider it a desirable goal for tock-os?
+
+Thanks you!

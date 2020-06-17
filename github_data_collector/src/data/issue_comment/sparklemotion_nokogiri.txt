@@ -1,0 +1,297 @@
+The gem-test-java job has never been stable, but I tried to make sure it would use the version-under-test in 1f0d41c. Since that commit, we had Hoe issues (see 6c6a8a7) and racc issues (see https://github.com/ruby/racc/issues/125).
+
+Now, we're seeing what I think is a real failure of the version-under-test changes from 1f0d41c, and it's blocking PRs from going green:
+
+(from https://ci.nokogiri.org/teams/nokogiri-core/pipelines/nokogiri-pr/jobs/gem-test-java/builds/47)
+```
++ pushd gems
+/tmp/build/3c897710/gems /tmp/build/3c897710
+++ ls nokogiri-2020.0115.0138-java.gem
+++ head -n1
++ gemfile=nokogiri-2020.0115.0138-java.gem
++ sha256sum nokogiri-2020.0115.0138-java.gem
+9de938110aec26ae3460ec456f8fa043c1e204d9f6affa4869857a05479fa66a  nokogiri-2020.0115.0138-java.gem
++ gem install nokogiri-2020.0115.0138-java.gem
+Successfully installed nokogiri-2020.0115.0138-java
+1 gem installed
++ gem list -d nokogiri
+
+*** LOCAL GEMS ***
+
+nokogiri (2020.0115.0138)
+    Platform: java
+    Authors: Aaron Patterson, Mike Dalessio, Yoko Harada, Tim Elliott,
+    Akinori MUSHA, John Shahid, Lars Kanis
+    Homepage: https://nokogiri.org
+    License: MIT
+    Installed at: /usr/local/bundle
+
+    Nokogiri (鋸) is an HTML, XML, SAX, and Reader parser
++ nokogiri -v
+# Nokogiri (2020.0115.0138)
+    ---
+    warnings: []
+    nokogiri: 2020.0115.0138
+    ruby:
+      version: 2.5.7
+      platform: java
+      description: jruby 9.2.9.0 (2.5.7) 2019-10-30 458ad3e OpenJDK 64-Bit Server VM 25.232-b09
+        on 1.8.0_232-b09 +jit [linux-x86_64]
+      engine: jruby
+      jruby: 9.2.9.0
+    xerces: Xerces-J 2.12.0
+    nekohtml: NekoHTML 1.9.21
++ popd
+/tmp/build/3c897710
++ pushd nokogiri
+/tmp/build/3c897710/nokogiri /tmp/build/3c897710
+++ pwd
++ export BUNDLE_GEMFILE=/tmp/build/3c897710/nokogiri/Gemfile
++ BUNDLE_GEMFILE=/tmp/build/3c897710/nokogiri/Gemfile
++ bundle -v
+Bundler version 2.1.4
++ bundle config
+Settings are listed in order of priority. The top value will be used.
+path
+Set via BUNDLE_PATH: "/usr/local/bundle"
+
+app_config
+Set via BUNDLE_APP_CONFIG: "/usr/local/bundle"
+
+silence_root_warning
+Set via BUNDLE_SILENCE_ROOT_WARNING: true
+
+gemfile
+Set via BUNDLE_GEMFILE: "/tmp/build/3c897710/nokogiri/Gemfile"
+
+bin
+Set via BUNDLE_BIN: "/usr/local/bundle/bin"
+
++ bundle add nokogiri --skip-install
+Fetching gem metadata from https://rubygems.org/.................
+Resolving dependencies......................................................
++ bundle install --local
+Resolving dependencies......
+Could not find hoe-3.21.0 in any of the sources
++ bundle install
+Fetching gem metadata from https://rubygems.org/.................
+Resolving dependencies........
+Your bundle is locked to nokogiri (2020.0115.0138-java), but that version could
+not be found in any of the sources listed in your Gemfile. If you haven't
+changed sources, that means the author of nokogiri (2020.0115.0138-java) has
+removed it. You'll need to update your bundle to a version other than nokogiri
+(2020.0115.0138-java) that hasn't been removed in order to install.
+```
+
+
+## What problem is this PR intended to solve?
+
+**Avoidable extra memory allocation**
+
+While profiling a project to optimize memory usage, the following came to my notice:
+```
+Allocated String Report
+-----------------------------------
+    154375  ""
+     88132  nokogiri-1.10.7/lib/nokogiri/xml/node.rb:767
+```
+which is:
+https://github.com/sparklemotion/nokogiri/blob/e6b3229ec53ddf70f1d198bba0d3fc13fde842a8/lib/nokogiri/xml/node.rb#L767
+
+The explanation is that **`'a string of any length' * 0 == ""`**.
+
+`String#*` generates a *new string* even if string literals are frozen via the pragma.
+Therefore, if the above line was executed (with `indent_times == 0`) a 100 times, there would be an allocation of 100 empty strings (irrespective of `indent_text`) .
+
+This PR replaces this deterministic allocation with a single frozen string literal.
+(*Hope the native method doesn't mutate it*).
+
+**Have you included adequate test coverage?**
+
+No change in behavior.
+
+
+**Does this change affect the C or the Java implementations?**
+
+N/A
+
+The existing signature conflicts with one added to JRuby 9.2.9.
+Specifically, the new signature in JRuby returns RubyArray, which
+causes a compilation error on this line in Nokogiri because it
+attempts to use a more general return type.
+
+We would prefer to keep the specific return type in JRuby.
+
+* If we patch JRuby, then 9.2.9 will never be able to compile any
+  version of Nokogiri.
+* If we patch Nokogiri, all versions of JRuby can compile current
+  and future Nokogiri. Versions prior to 9.2.9 will be able to
+  compile all existing releases of Nokogiri.
+
+I do not believe the change in 9.2.9 breaks anything at runtime,
+since the JVM does not care about this particular return type
+mismatch unless someone actually returns a non-RubyArray object.
+
+Fixes #1968
+XmlNodeSet defines a `to_a` method here: https://github.com/sparklemotion/nokogiri/blob/84a554f0c7b78bf82bdd928d27ae038cf29dd0bb/ext/java/nokogiri/XmlNodeSet.java#L395
+
+JRuby originally defined a superclass `to_a` method (in RubyBasicObject) that did not take a `ThreadContext` parameter. However in JRuby 9.2.9, we made another set of changes to pass `ThreadContext` through more methods, including the `to_a` in RubyBasicObject. This added a new signature `RubyArray to_a(ThreadContext)` with the old `RubyArray to_a()` left deprecated.
+
+As a result, the method in XmlNodeSet no longer compiles because it attempts to return a more general type (IRubyObject as opposed to RubyArray).
+This change affects the Java gem and is an attempt to start using Maven artifacts for all the jar dependencies in Nokogiri.
+
+See #1253. The commented versions can't be found on Maven Central. Until we can resolve them, they would have to remain as bare jar files in the repository and gem.
+
+Next step for this PR would be to get the gem building using jar-dependencies and remove the properly-versioned jars from the repository.
+
+Sometime between Sept 8 and Sept 15, 2019, code coverage broke and is being calculated before tests are actually run.
+
+The loading mechanism must include the ruby-version specific path.
+
+This is a fixup to commit 252acd99aa7d9749d820b5b6ce3848e319ad282d .
+
+---
+
+**What problem is this PR intended to solve?**
+
+Loading of fat binary gems fails on master branch on Windows with 
+```
+        12: from C:/Ruby27-x64/bin/nokogiri:23:in `<main>'
+        11: from C:/Ruby27-x64/bin/nokogiri:23:in `load'
+        10: from C:/Ruby27-x64/lib/ruby/gems/2.7.0/gems/nokogiri-1.10.4-x64-mingw32/bin/nokogiri:6:in `<top (required)>'
+         9: from C:/Ruby27-x64/lib/ruby/2.7.0/rubygems/core_ext/kernel_require.rb:156:in `require'
+         8: from C:/Ruby27-x64/lib/ruby/2.7.0/rubygems/core_ext/kernel_require.rb:168:in `rescue in require'
+         7: from C:/Ruby27-x64/lib/ruby/2.7.0/rubygems/core_ext/kernel_require.rb:168:in `require'
+         6: from C:/Ruby27-x64/lib/ruby/gems/2.7.0/gems/nokogiri-1.10.4-x64-mingw32/lib/nokogiri.rb:17:in `<top (required)>'
+         5: from C:/Ruby27-x64/lib/ruby/2.7.0/rubygems/core_ext/kernel_require.rb:92:in `require'
+         4: from C:/Ruby27-x64/lib/ruby/2.7.0/rubygems/core_ext/kernel_require.rb:92:in `require'
+         3: from C:/Ruby27-x64/lib/ruby/gems/2.7.0/gems/nokogiri-1.10.4-x64-mingw32/lib/nokogiri/version.rb:2:in `<top (required)>'
+         2: from C:/Ruby27-x64/lib/ruby/gems/2.7.0/gems/nokogiri-1.10.4-x64-mingw32/lib/nokogiri/version.rb:113:in `<module:Nokogiri>'
+         1: from C:/Ruby27-x64/lib/ruby/2.7.0/rubygems/core_ext/kernel_require.rb:92:in `require'
+C:/Ruby27-x64/lib/ruby/2.7.0/rubygems/core_ext/kernel_require.rb:92:in `require': cannot load such file -- nokogiri/nokogiri (LoadError)
+```
+
+**Have you included adequate test coverage?**
+
+Possibly we could implement a test queue for binary builds, but so far there is none.
+
+**Does this change affect the C or the Java implementations?**
+
+Only the C implementation. And only the master branch, not the released gems.
+
+```
+ERROR:  Error installing nokogiri:
+        The last version of nokogiri (>= 0) to support your Ruby & RubyGems was 1.10.7. Try installing it with `gem install nokogiri -v 1.10.7`
+        nokogiri requires Ruby version >= 2.3, < 2.7.dev. The current ruby version is 2.7.0.dev.
+```
+**Describe the bug**
+
+The rumor has it that `nokogiri` builds [incorrectly][1]. From what I can gather it exports (not hides) `libxml2`'s symbols. As a result, if `libxml2.so` is loaded before `nokogiri.so`, `nokogiri` is bound to use the system library, not the one embedded in the binary. And as a resullt it has to [check][2] whether that's the case.
+
+The solution is supposedly to add [`-Wl,--exclude-libs,ALL` or `-fvisibility=hidden`][3].
+
+[1]: https://stackoverflow.com/a/59419800/52499
+[2]: https://github.com/sparklemotion/nokogiri/blob/v1.10.7/lib/nokogiri/version.rb#L40
+[3]: https://stackoverflow.com/questions/2222162/how-to-apply-fvisibility-option-to-symbols-in-static-libraries
+
+**To Reproduce**
+
+`docker-compose.yml`:
+
+```yaml
+version: '3'
+
+services:
+  ruby:
+    build: .
+    volumes:
+      - ./:/app
+```
+
+`Dockerfile`:
+
+```dockerfile
+FROM ruby:2-alpine3.10
+RUN apk add build-base imagemagick6-dev
+WORKDIR /app
+```
+
+`Gemfile`:
+
+```ruby
+source 'https://rubygems.org'
+gem 'nokogiri', '1.10,7'
+gem 'rmagick', '4.0.0'
+```
+
+`1.rb`:
+
+```ruby
+require 'rmagick'
+require 'nokogiri'
+```
+
+```
+$ docker-compose run ruby sh
+
+/app # cat /etc/issue
+Welcome to Alpine Linux 3.10
+Kernel \r on an \m (\l)
+
+/app # apk info -vv | grep libxml
+libxml2-2.9.9-r3 - XML parsing library, version 2
+
+/app # bundle
+Fetching gem metadata from https://rubygems.org/.............
+Resolving dependencies...
+Using bundler 2.1.2
+Fetching mini_portile2 2.4.0
+Installing mini_portile2 2.4.0
+Fetching nokogiri 1.10.7
+Installing nokogiri 1.10.7 with native extensions
+Fetching rmagick 4.0.0
+Installing rmagick 4.0.0 with native extensions
+Bundle complete! 2 Gemfile dependencies, 4 gems now installed.
+Bundled gems are installed into `/usr/local/bundle`
+
+/app # bundle exec ruby 1.rb
+WARNING: Nokogiri was built against LibXML version 2.9.10, but has dynamically loaded 2.9.9
+```
+
+**Expected behavior**
+
+It produces no warnings.
+
+
+**Environment**
+
+```
+$ nokogiri -v
+# Nokogiri (1.10.7)
+    ---
+    warnings: []
+    nokogiri: 1.10.7
+    ruby:
+      version: 2.6.5
+      platform: x86_64-linux-musl
+      description: ruby 2.6.5p114 (2019-10-01 revision 67812) [x86_64-linux-musl]
+      engine: ruby
+    libxml:
+      binding: extension
+      source: packaged
+      libxml2_path: "/usr/local/bundle/gems/nokogiri-1.10.7/ports/x86_64-pc-linux-musl/libxml2/2.9.10"
+      libxslt_path: "/usr/local/bundle/gems/nokogiri-1.10.7/ports/x86_64-pc-linux-musl/libxslt/1.1.34"
+      libxml2_patches:
+      - 0001-Revert-Do-not-URI-escape-in-server-side-includes.patch
+      - 0002-Remove-script-macro-support.patch
+      - 0003-Update-entities-to-remove-handling-of-ssi.patch
+      - 0004-libxml2.la-is-in-top_builddir.patch
+      libxslt_patches: []
+      compiled: 2.9.10
+      loaded: 2.9.10
+```
+
+**Describe the bug**
+
+The "Tutorials" hyperlink on https://nokogiri.org/ is broken (FF and chromium on mageia linux v8).
+

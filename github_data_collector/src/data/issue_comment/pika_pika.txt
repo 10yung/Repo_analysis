@@ -1,0 +1,302 @@
+## Proposed Changes
+
+As pointed out in #1255 the tornado consumer example in the documentation has some bugs and cannot be used as it is right now. I introduced named arguments for most of the broken method calls.
+
+## Types of Changes
+
+- [ ] Bugfix (non-breaking change which fixes issue #NNNN)
+- [ ] New feature (non-breaking change which adds functionality)
+- [ ] Breaking change (fix or feature that would cause existing functionality to not work as expected)
+- [x] Documentation (correction or otherwise)
+- [ ] Cosmetics (whitespace, appearance)
+
+## Checklist
+
+- [x] I have read the `CONTRIBUTING.md` document
+- [ ] All tests pass locally with my changes
+- [ ] I have added tests that prove my fix is effective or that my feature works
+- [ ] I have added necessary documentation (if appropriate)
+
+https://pika.readthedocs.io/en/stable/examples/tornado_consumer.html
+
+Running this example throwed TypeError (`exchange must be a str or unicode str`). And this is caused by the sequence of positional arguments.
+
+```python3
+def setup_exchange(self, exchange_name):
+        """Setup the exchange on RabbitMQ by invoking the Exchange.Declare RPC
+        command. When it is complete, the on_exchange_declareok method will
+        be invoked by pika.
+
+        :param str|unicode exchange_name: The name of the exchange to declare
+
+        """
+        LOGGER.info('Declaring exchange %s', exchange_name)
+        self._channel.exchange_declare(self.on_exchange_declareok,
+                                       exchange_name,
+                                       self.EXCHANGE_TYPE)
+```
+
+And this is the source of method `Channel.exchange_declare` in `channel.py`
+```python
+    def exchange_declare(self,
+                         exchange,
+                         exchange_type='direct',
+                         passive=False,
+                         durable=False,
+                         auto_delete=False,
+                         internal=False,
+                         arguments=None,
+                         callback=None):
+```
+
+Passing keyword arguments could simply fix this error.
+
+```python3
+        self._channel.exchange_declare(callback=self.on_exchange_declareok,
+                                       exchange=exchange_name,
+                                       exchange_type=self.EXCHANGE_TYPE)
+
+```
+It would be useful to have a dedicated enum which spells out all the fixed values available for python consumption much like you find in the .net RabbitMQ client
+
+https://github.com/rabbitmq/rabbitmq-dotnet-client/blob/master/projects/client/RabbitMQ.Client/src/client/api/ExchangeType.cs
+
+This source will likely be something like...
+
+```
+from enum import Enum
+
+class ExchangeType(Enum) :
+    direct = "Exchange type used for AMQP direct exchanges."
+    fanout = "Exchange type used for AMQP fanout exchanges."
+    headers = "Exchange type used for AMQP headers exchanges."
+    topic = "Exchange type used for AMQP topic exchanges."
+```
+
+This will give folks the option to use enum references in their client code like
+
+```
+channel = self.connection.channel()
+channel.exchange_declare(exchange='foo', exchange_type=ExchangeType.direct.name)
+```
+pika version: 1.1.0
+
+As a result of interface link flapping a socket underneath pika's connection to RabbitMQ became dead. Since this state transition has not been properly processed by client code any subsequent `publish()` to pika's `Channel` then caused this:
+```
+  File "/opt/venv/lib/python3.6/site-packages/pika/adapters/blocking_connection.py", line 2210, in basic_publish
+    mandatory=mandatory)
+  File "/opt/venv/lib/python3.6/site-packages/pika/channel.py", line 421, in basic_publish
+    self._raise_if_not_open()
+  File "/opt/venv/lib/python3.6/site-packages/pika/channel.py", line 1389, in _raise_if_not_open
+    raise exceptions.ChannelWrongStateError('Channel is closed.')
+pika.exceptions.ChannelWrongStateError: Channel is closed.
+```
+
+As a result:
+a code like
+```python
+try:
+    self.channel.basic_publish(*a, **k)
+except (exceptions.ConnectionClosed, exceptions.ChannelClosed) as error:
+    log.debug('Try to reconnect in 5 seconds')
+    time.sleep(5)
+    self.reconnect()
+```
+would fail.
+
+This behaviour was implemented at https://github.com/pika/pika/commit/761ef5cf8e484fe8d52909e767ceef69afc82d3a
+
+But I disagree in total with the approach since it brakes the whole typed exception support of python itself. Typed exceptions are supported for the user of code can just quickly match the error yielded by runtime despite what's the actual reason. The commit mentioned brakes this and offers code users to revert to strings patterns matching. Instead of raising the same exception in cases:
+- channel is in `opening` state but is not ready to operate
+- channel is [already] closed
+
+one should provide a special type of an exception for each of the cases if the error recovery is supposed to differ, IMO.
+
+For these two cases error recovery approaches obviously to me differ in total. For the channel in `opening` state it's `wait a little then try again` (but don't reconnect since there's no reason for it); for the channel is in closed state it could be `recover via reconnect`. Right now the code user differs what approach to use only with the Exception.args parsing.
+There is no value in first cancelling all consumers then immediately closing the channel as the consumers will be correctly cleaned up when the channel is closed by RabbitMQ. Consider removing the code around this line: https://github.com/pika/pika/blob/master/pika/channel.py#L544
+
+In RabbitMQ 3.8 we will ship a feature that may require that basic.cancel is _not_ sent before closing the channel for certain guarantees to hold.
+
+I am opening this issue after a conversation with @lukebakken 
+[here the thread](https://groups.google.com/d/msg/rabbitmq-users/Sks6AF0x0wk/YwNDvALSAgAJ)
+ 
+# RabbitMQ test with different libraries
+
+I made a few tests with different client libraries.
+
+### Environment:
+ - Laptop 12 cores, 32 gb ram
+ - Two rabbitmq nodes in cluster ( same machine)
+ - RabbitMQ version 3.7.13 - Erlang 21.2.4 
+ - 64 async threads for each server 
+ - Ubuntu 18.04
+ - Two Python processes running 
+ 
+ 
+```
+(.venv3) ➜  py-amqp git:(master) ✗ pip freeze
+amqp==2.4.2
+atomicwrites==1.3.0
+attrs==19.1.0
+librabbitmq==2.0.0
+more-itertools==6.0.0
+pika==0.13.1
+pluggy==0.9.0
+py==1.8.0
+PyAMQP==0.0.7.1
+pytest==4.3.1
+six==1.12.0
+vine==1.3.0
+(.venv3) ➜  py-amqp git:(master) ✗
+```
+ 
+ 
+
+Here is the code:
+
+``` python
+
+import time
+import uuid
+import sys
+class PyAmqpTest:
+
+    def publish(self, rm):
+        c = amqp.Connection(host=rm)
+        channel = c.channel()
+        qname = str(uuid.uuid4())
+        message = amqp.Message(
+            channel=channel,
+            body='the quick brown fox jumps over the lazy dog',
+            properties=dict(content_type='application/json',
+                            content_encoding='utf-8'))
+
+        channel.queue_declare(queue=qname, auto_delete=False)
+        print("start: %s" % (time.ctime(time.time())))
+        for i in range(1, 900000):
+            channel.basic_publish(message, routing_key=qname)
+        print("end: %s" % (time.ctime(time.time())))
+
+    def thread_publish(self, rm):
+        for i in range(1, 15):
+            _thread.start_new_thread(self.publish, (rm,))
+
+
+print('starting .. %s' % sys.argv[1])
+x = PyAmqpTest()
+x.thread_publish(sys.argv[1])
+
+input("Press Enter to continue...")
+```
+
+# py-amqp
+```
+import amqp as amqp
+```
+and then 
+```
+python3 py_amqp_publish.py localhost:5674 
+python3 py_amqp_publish.py localhost:5672
+```
+around 18.000 messages per second
+
+
+# librabbitmq
+
+```
+import librabbitmq as amqp
+```
+and then 
+```
+python3 py_amqp_publish.py localhost:5674 
+python3 py_amqp_publish.py localhost:5672
+```
+around 102.000 messages per second
+
+# Pika
+
+```python
+import _thread
+
+import pika
+import time
+import uuid
+import sys
+
+
+class PyPikaTest:
+
+    def publish(self, rm):
+        c = pika.BlockingConnection(pika.ConnectionParameters(port=rm))
+
+        channel = c.channel()
+        qname = str(uuid.uuid4())
+        channel.queue_declare(queue=qname, auto_delete=False)
+        _properties = pika.BasicProperties(
+            content_type='application/json',
+            content_encoding='utf-8'
+        )
+        print("start: %s" % (time.ctime(time.time())))
+        for i in range(1, 900000):
+            channel.basic_publish(
+                exchange='',
+                routing_key=qname,
+                properties=_properties,
+                body='the quick brown fox jumps over the lazy dog'
+            )
+        print("end: %s" % (time.ctime(time.time())))
+
+    def thread_publish(self, rm):
+        for i in range(1, 15):
+            _thread.start_new_thread(self.publish, (rm,))
+
+
+print('starting .. %s' % sys.argv[1])
+x = PyPikaTest()
+x.thread_publish(sys.argv[1])
+
+input("Press Enter to continue...")
+```
+
+So:
+```
+python3 py_pika_publish.py 5672
+python3 py_pika_publish.py 5674
+```
+
+about 11.000 messages per second
+
+
+---
+Thank you
+
+hi. we're using pika 0.13.0.
+we get the 'Tried to handle an error where no error existed' error log while consuming messages...
+the reason i open this issue, is that we studied it a little bit.
+first of all, looking at 0.13.0 code, we see that 
+ this line https://github.com/pika/pika/blob/df10c154e7d1948e0943b0fe07a26021868e3d23/pika/adapters/base_connection.py#L421 gets called (with error=None), and then it leads to this line: https://github.com/pika/pika/blob/df10c154e7d1948e0943b0fe07a26021868e3d23/pika/adapters/base_connection.py#L354
+the event we get is 25 (8 bit is on, so it's an error). but the error log is written because 'error' is None.
+
+the culprit, is this line: https://github.com/pika/pika/blob/df10c154e7d1948e0943b0fe07a26021868e3d23/pika/adapters/select_connection.py#L831, that calles the handle_error function, with no 'error' param, making it the default None...
+
+the weird part, is the way we encountered it.
+we're using the blocking_connection.consume() generator. for some older reason, we passed inactivity_timeout=0.01, which worked fine...
+when we changed it to inactivity_timeout=0.0, the error log started to appear. (and when we changed it back, it disappeared again...)
+
+i thought you might want to look at it. although, i noticed that at the master branch, the lines i mentioned above, are not existent. is there a release coming soon with the new code?
+
+thanks!
+See this commit for more details:
+
+https://github.com/ruby-amqp/bunny/commit/2d10591ffbc402208560843d673d8ee54a776cc6
+I recently revisited how Langohr, Bunny, March Hare and RabbitMQ Objective-C clients provision RabbitMQ on CI. I'd be happy to submit a PR that does the same thing for Pika if there's interest (I am not sure why the `.travis.yml` is so extensive, very likely there are reasons for that).
+
+The gist of the idea can be found [in this Debian/Ubuntu-specific script](https://github.com/ruby-amqp/bunny/blob/master/bin/ci/install_on_debian.sh). Another trick I adopted from the original author of the Objective-C client is [using `lsof -i` to determine service availability](https://github.com/ruby-amqp/bunny/blob/master/.travis.yml#L7).
+
+Lastly, I migrated to Ubuntu Xenial for all of the above [except the Objective-C client].
+
+@lukebakken would you agree this would be an improvement for Pika? My favorite part is that we will be testing with the latest versions of Erlang and RabbitMQ without the need to manually bump
+versions.
+We are using `BlockingConnection` and `basic_get` and no callback function.  How come we got a lot of Duplicate callback found for "0:Connection.Unblocked" errors?  We use pika 0.11.2
+
+Any idea? or thoughts?

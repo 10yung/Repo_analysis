@@ -1,0 +1,143 @@
+To keep code clean and prepare to add authentication support.
+Signed-off-by: koushiro <koushiro.cqx@gmail.com>
+1. When calling `GetFeature`, it uses `get_feature_async` and then
+immediately calls `wait`:
+
+https://github.com/tikv/grpc-rs/blob/5d6070df20769b1ecf36edb10ab93cc793788510/tests-and-examples/examples/route_guide/client.rs#L45-L46
+
+Is this different from just calling `get_feature`? E.g.:
+
+```rust
+match client.get_feature(point) {
+```
+
+2. When calling `RecordRoute`, there's a loop where stuff is sent to
+the sink, and then after that the sink is closed:
+
+https://github.com/tikv/grpc-rs/blob/5d6070df20769b1ecf36edb10ab93cc793788510/tests-and-examples/examples/route_guide/client.rs#L92-L104
+
+What's going on with `mut sink`? It looks like the result of
+`sink.send` is being assigned to the outer `sink` variable, and then
+the resulting `sink` from the last iteration of the loop is
+closed. What is the `Sink` being created by `send.sink`? And why does
+only the last one get closed?
+
+3. The client example makes frequent use of `wait`, which I assume
+just blocks the current thread until the `Future` finishes. What
+should the code look like if I want to use `async/await` (I assume
+this would need the futures compat feature, but I don't know what the
+details would look like.)
+
+4. Similar question for the server example. How can I write a server
+that uses `async/await`?
+When using the built-in cmake to build zlib, it changes the source tree
+as madler/zlib#162 describes. This leads to the failure during
+[generating the docs][1]. So let's switch to libz-sys instead, which
+uses its own custom script to build zlib, and leave source tree as it
+is. Switching to libz-sys can also reduce the package size as we can
+ignore more sub modules. It should improve compile time if libz-sys is
+also a dependency of other crates.
+
+The only shortcoming is that libz-sys may not be compatible with
+grpcio, but I believe the chance is quite small given it's such a small
+library. And giving it's such a small library, the benifits like compile
+time or package size described above may be too small to be observed.
+
+[1]: https://docs.rs/crate/grpcio/0.5.0-alpha.5/builds/196235.
+Current API design returns `Stream` and `Sink` for streaming APIs, so that users can choose whichever executors they want. But it has limitations:
+1. Usually only spawning the final futures into the client/context can achieve less context switch and maximum throughput.
+2. If spawning the futures back to client/context, there are always code path executed multiple times unnecessary. For example, we always know `Sink::start_send` provided by grpcio can only accept one message at a time. All other messages can be accepted only after next `CompletionQueue::next` is executed at lease once. But a properly implemented future adapter usually will execute additional `poll_complete` or `start_send` to get a `NotReady` result, which will lock and poll unnecessary.
+
+If we accept `Stream` and `Sink` as in parameter instead, we can control the timing more precisely and provide best practice out of box. Taking `RouteGuide` as an example, the current API is:
+```
+fn route_chat(&self) -> (ClientDuplexSender<RouteNote>, ClientDuplexReceiver<RouteNote>)
+```
+New API becomes:
+```
+fn route_chat(&self, nodes: impl Stream<Item=RouteNote>, sink: impl Sink<Item=RouteNote>)
+```
+
+However the new APIs may not be friendly for users as it requires a constructed `Stream` and `Sink`.
+**Describe the bug**
+Random crashing when sending large amounts of data through a stream.
+
+We get the error:
+`RpcStatus { status: Unknown, details: Some("Stream removed") }`
+The following lines are logged by grpc just before the error is returned:
+```
+1 ssl_transport_security.cc:472] Corruption detected.
+1 ssl_transport_security.cc:448] error:0906D06C:PEM routines:PEM_read_bio:no start line
+1 secure_endpoint.cc:208]     Decryption error: TSI_DATA_CORRUPTED
+```
+
+**To Reproduce**
+Unfortunately, the crashing is random, so I don't have a magic recipe to create it.
+The idea is i'm sending large amounts of data through a bi-dir stream, which are then buffered 500 by 500 on the server side then answers are sent back to the client.
+
+**Expected behavior**
+Stream to process normally.
+
+**System information**
+* CPU architecture: x64
+* Distribution and kernel version: docker `debian:stretch`
+* Any other system details we should know?: Using the openssl version (stretch's `openssl` package with feature `openssl`)
+
+I need to link against `openssl` because I'm using other crates that depend on specifically openssl (and not google's fork).
+In the current implementation of `Sink`s in grpc-rs, every `start_send` will call `grpc_call_start_batch` to send one message. It makes grpc use much CPU. However, we can just put messages into buffer during calling `Sink::start_send`, but send them out when calling `Sink::poll_complete`. For both `Sink::send_all` or `Stream::forward`, `poll_complete` will be called after some `start_send`s, so it's ok. It should increase throughput, especially for overload cases.
+This PR make CallTag reusable for streaming calls.
+
+### Task list:
+- [x] PR for implementation
+- [x] Benchmark result
+
+cmd =   run_performance_tests.py -l rust --regex="protobuf_async_streaming_qps_unconstrained"
+
+patched:
+```
+    "summary": {
+        "qps": 234351.00498567906,
+        "qpsPerServerCore": 29293.875623209882,
+        "serverSystemTime": 114.42147575010864,
+        "serverUserTime": 256.5736543796901,
+        "clientSystemTime": 107.05968081256268,
+        "clientUserTime": 261.4261360318102,
+        "latency50": 26100874.227000326,
+        "latency90": 42682913.54405692,
+        "latency95": 48302108.33178213,
+        "latency99": 59592629.7964869,
+        "latency999": 73441534.96942693,
+        "serverCpuUsage": 98.63780712017383,
+        "serverQueriesPerCpuSec": 63165.638530005344,
+        "clientQueriesPerCpuSec": 63598.37862759732
+    },
+```
+
+master:
+```
+    "summary": {
+        "qps": 223173.67406802665,
+        "qpsPerServerCore": 27896.70925850333,
+        "serverSystemTime": 110.80008140794565,
+        "serverUserTime": 247.1210806457719,
+        "clientSystemTime": 103.7189808973478,
+        "clientUserTime": 288.99209207086545,
+        "latency50": 27239652.07925871,
+        "latency90": 45297378.5011097,
+        "latency95": 51277266.075107805,
+        "latency99": 64065653.403193906,
+        "latency999": 80688517.3868167,
+        "serverCpuUsage": 98.96864169693933,
+        "serverQueriesPerCpuSec": 62350.62384103099,
+        "clientQueriesPerCpuSec": 56828.97413134331
+    },
+```
+For steaming calls, every subsequent messages will allocate a Batch OpSet and a new tag. By design grpc core does not expect user to send next message for the same call until last tag is returned. Hence these two allocations can be reused messages.
+
+To reuse batch and tag, we need to refactor current `CallTag` implement to allow a long live batch. batch should also be implemented in rust as operation sets so that we have more flexible and safe way to refactor.
+There have been a lot of alpha releases. And I don't see any problem from tests and benches. Maybe it's time to bump a GA release. But before doing so, I still need to make sure what's left undone.
+
+The only one PR that can still change the interfaces and need to be merged into 0.5.0 is #382.
+
+And #375 brings a new version of gRPC C core. I think it's better that a new GA release catches up with updated C core.
+
+/cc @overvenus @hunterlxt @nrc Do you have any other PRs that needs to be included?

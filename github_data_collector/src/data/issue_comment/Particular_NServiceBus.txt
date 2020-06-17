@@ -1,0 +1,127 @@
+I have a scenario where i would like to publish an event when a specific message was moved to the error queue. I would also like to extract a property from the message.
+
+I attempted to solve it by a configuration like this
+```csharp
+endpointConfiguration
+    .Recoverability()
+    .Failed(settings => settings.OnMessageSentToErrorQueue(failedMessage => 
+        MovedToErrorQueue(failedMessage, () => _endpointInstance)));
+
+private async Task MovedToErrorQueue(FailedMessage failedMessage, Func<IEndpointInstance> getEndpointInstance)
+{
+    if (SomehowGetMessageFrom(failedMessage) is MyCommand command)
+     {
+        await getEndpointInstance().Publish(new MyCommandDeliveryFailedEvent(command.id));
+     }
+}
+```
+
+however the `FailedMessage` type seems a bit sparse and i'm not sure how i would go about extracting message data from that so my next attempt was to add a behavior like this
+```csharp
+private class AddMyPropToHeader : Behavior<IIncomingLogicalMessageContext>
+{
+    public override async Task Invoke(IIncomingLogicalMessageContext context, Func<Task> next)
+    {
+        if (context.Message.Instance is MyCommand command)
+        {
+            context.Headers.Add("My_Command_Id", command.Id.ToString());
+        }
+
+        await next().ConfigureAwait(false);
+    }
+}
+```
+... to the pipeline and in the error handler pick this header up from `FailedMessage.Headers` but the custom header i added is not available there so it seems my only option now is for the sender of the message to add the header, which seems like a somewhat ugly solution... Is that correct or is there perhaps a better way?
+Since the 7.2.0 release (with changes to the [PropertySagaFinder](https://github.com/Particular/NServiceBus/commit/18d7d088ff8d7e6dc43473692cb8967425ef662e#diff-cf6ed88327208633a4b7668be682bf12)), some of our sagas are giving exceptions, resulting in failed messages.
+
+Example exception message:
+`System.Exception: Message <SomeMessageType> mapped to saga <SomeSaga> has attempted to assign null to the correlation property ProcessId. Correlation properties cannot be assigned null.`
+
+We have a message type named "ProcessSucceeded" that looks as follows:
+```
+{
+  "ParentProcessId": "92d8511e-f7a4-451d-89bc-fcc988216bb1",
+  "ProcessId": "b8e73037-8941-4cb8-8bb7-9576e5460928",
+  "TenantId": "SomeTenant"
+}
+```
+
+The correlation property here is "ParentProcessId" and is configured as follows:
+```
+mapper.ConfigureMapping<ProcessSucceeded>(msg => msg.ParentProcessId)
+    .ToSaga(data => data.ProcessId);
+```
+
+(To clarify, we have processes that can have sub-processes. In the saga for the parent process, we want to handle success-messages of type ProcessSucceeded that are published by the sub-process.)
+
+However, not all of our processes have a parent process (because they ARE the parent process). So the "ParentProcessId" property is set to null. In case a messages arrives with the property set to null, we can safely drop it (not handle the message). This worked well in version 7.1.10, but no longer works in 7.2.0 because the correlation property is validated against null values explicitly. Is there a way for you to allow null correlation properties, but drop the messages in which they appear?
+
+We are currently unable to update to the latest version.
+Endpoint can throw with an exception "Learning transport does not support custom saga finders" at start when a saga message mapping is on a message that does not match a naming convention. This is a very confusing error as there were no custom saga finders present.
+The `configurationBuilderCustomization` parameter which allows customization of the endpoint configuration in the `IEndpointSetupTemplate.GetConfiguration` method currently doesn't allow the customizations to use async code. This requires some code to use `GetAwaiter().GetResult`, e.g. here: https://github.com/Particular/NServiceBus.Gateway/blob/master/src/NServiceBus.Gateway.AcceptanceTests/GatewayEndpoint.cs#L13
+
+    public interface IEndpointSetupTemplate
+    {
+        Task<EndpointConfiguration> GetConfiguration(RunDescriptor runDescriptor, EndpointCustomizationConfiguration endpointConfiguration, Action<EndpointConfiguration> configurationBuilderCustomization);
+    }
+Other [similar projects have started to drop it ](https://masstransit-project.com/getting-started/upgrade-v6.html ) and given that [MS support ended 2016](https://support.microsoft.com/en-us/help/17455/lifecycle-faq-net-framework) we can also consider dropping it.
+
+What would be the highest new full framework we can lock on?
+
+Or can we go `netstandard2.0` only?
+Removes the building of the dispatcher and make the subscribe unsubscribe terminator stage connectors that go into the dispatch pipeline
+
+- Less builder access
+- Allows to properly intercept and stamp messages even in acceptance tests for subscribe and unsubscribe calls without having to decorate the dispatcher
+- Hardcoded previous step ids to be backward compatible
+
+Found no doco that says these have to be terminators
+With the refactoring efforts around the hosting, receive and send components, a lot of workarounds had to be added for backwards compatibility. With the next major version, those workarounds can/should be removed in order to simplify the code quite a bit.
+
+* Remove the internal settings access by the component's `Settings` classes
+* Change transport initialization by removing the marked obsolete methods in the `SendComponent` to the component's regular Initialization process.
+* Consider removal of `featureComponent.RegisterFeatureEnabledStatusInSettings(hostingConfiguration);` functionality in `EndpointCreator.Initialize` that is needed to allow transports to know if the `TimeoutManager` is enabled or not (needed to for backwards compatibility around native timeouts)
+   * Consider removing feature state completely from settings
+* Remove obsolete marked methods in `HostComponent`
+
+I am trying to add a Behavior like below to the pipeline in order to access IMessageHandlerContext but the behavior is not picked up.
+
+```c#
+ configuration.RegisterComponents(c => c.ConfigureComponent<ContextBehaviour>(DependencyLifecycle.InstancePerCall));
+
+            configuration.Pipeline.Register(@behavior: typeof(ContextBehaviour), "test");
+
+            container.Register(Component.For<ContextAccessor>());
+```
+
+And that is the definition of the Behavior
+```c#
+ public class ContextBehaviour : Behavior<IInvokeHandlerContext>
+    {
+        public override  Task Invoke(IInvokeHandlerContext context, Func<Task> next)
+        {
+            var contextAccessor = context.Builder.Build<ContextAccessor>();
+            // throw new Exception("Context behaviour invoke issue");
+            contextAccessor.Context = context;
+            return next();
+        }
+        public class Registration : RegisterStep
+        {
+            public Registration()
+                : base(stepId: "ContextBehaviour", behavior: typeof(ContextBehaviour), description: "Sets IMessageHandlerContext for ContextAccessor")
+            {
+            }
+        }
+
+
+        
+    }
+    public class ContextAccessor
+    {
+        public IMessageHandlerContext Context { get; set; }
+    }
+```
+
+We have a Behavior<IIncomingPhysicalMessageContext> added to the pipleline and that is working. However, the above one doesn't work and Invoke method for  is never called. I am not sure if I need to replace another behavior or something else is missing. 
+Trying out the impact of PublicApiGenerator 10 beta 3 on NServiceBus
+The test has been excluded because at the time of release 7.2 it was incompatible with NHibernate. PR #5466 was raised to make it compatible.

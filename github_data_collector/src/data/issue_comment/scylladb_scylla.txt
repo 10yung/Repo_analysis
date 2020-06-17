@@ -1,0 +1,304 @@
+This issue replaces issue #5596 and is a first step towards #5062 (global tables).
+Today, we create a single "alternator" keyspace, and put all Alternator tables inside it. Among other things, this means that all Alternator tables need to live on the same set of DCs. This makes sense today, when all Alternator tables are global, but if in the future we want to be compatible with DynamoDB and allow different tables to live on different subsets of DCs (with the default being that a table only lives on a single DC - see issue #5062), we can't have multiple tables share the same keyspace - we need a separate keyspace for each table, so as to allow us later to change the DC choice of each table, separately. We should switch to a separate keyspace per table **now**, otherwise users will not be able to upgrade Scylla with existing data once #5062 is done.
+
+Currently, when all tables are global, we should do what is described in issue #5596 so that they remain global as the cluster acquires new DCs.
+
+But beyond that, we should already consider how we will support the full global tables vs local tables feature (#5062). This will affect how we name the keyspace, and table inside it - we need a way which will support all the possible ways that global and local tables are used and created, and keeping in mind that Scylla does not currently allow moving tables between keyspaces, and doesn't even allow renaming tables or keyspaces. This isn't trivial, and I propose the following plan:
+
+1. The first time that a table named X is created (from DC Y), it will get keyspace X and table name X.
+2. After keyspace X already exists, creating a second table with the same name "X", now in a different DC Z, will get keyspace "X_Z", table name X. (note - this can only happen after we add the capability of creating a non-global table).
+3. Since both tables may remain alive and separate, reading from table X on a client in DC Z will need to inspect both keyspaces X and X_Z and find the one which has DC Z in its replication.
+4. In the old technique for creating a global table, the second table called X (in keyspace X_Z) remains empty and is then joined into a global table. This is easy - we remove the keyspace X_Z and update keyspace X to include the new DC. 
+5. In the new (2019) technique of creating a global table, the user asks to modify the DCs of table X without creating another empty table first. We can do this by modifying keyspace X.
+6. But there's a snag - above we created an invariant that a global table X will always be in a keyspace X (and not, say, X_Z).  But theoretically (we need to test this in practice!) DynamoDB may allow two global tables with the same name... E.g., we may have one global table X on DCs Y and Z, and another one with the same name X in DCs Q and W. Only one keyspace can be called "X". If the other one will be "X_Q" for example, how would a read on DC W know to look up a keyspace called X_Q? I don't have a pretty solution for this. Maybe we should just forbid this situation, and not allow two global tables with the same name to exist? I doubt anybody really wants this confusing situation? 
+7. We should mark Alternator keyspace somehow, perhaps with a common prefix (but note the name length limit issue...) or in another way, so users cannot access non-Alternator tables with the Alternator API.
+*Installation details*
+Scylla version (or git commit hash): 3.2.0-0.20200115.f9b11c9b30
+Cluster size: 5 nodes (i3en.3xlarge)
+OS (RHEL/CentOS/Ubuntu/AWS AMI): ami-0ec60cbb06af7ab75
+
+The test run deletes from table with large partitions.
+For large partition creation scylla-bench was used. I write 1000 partitions with 100K rows in each partition.
+
+The writes run in parallel to deletions.
+
+The data from few partitions was deleted using the query:
+```
+delete from scylla_bench.test where pk in (251, 253, 255, 257, 259, 261, 263, 265, 267, 269)
+```
+
+After that during trying to read from one of partitions 
+```
+select min(ck) as min_ck, max(ck) as max_ck from scylla_bench.test where pk=263
+```
+
+Got error:
+```
+< t:2020-01-19 08:15:48,523 f:asyncorereactor.py l:438  c:cassandra.connection p:ERROR > Error decoding response from Cassandra. ver(3); flags(0000); stream(12); op(0); offset(9); len(118); buffer: b'\x83\x00\x00\x0c\x00\x00\x00\x00v\x00\x00\x15\x00\x00^Operation failed for scylla_bench.test - received 1 responses a
+nd 1 failures from 2 CL=QUORUM.\x00\x04\x00\x00\x00\x01\x00\x00\x00\x02\x00\x06SIMPLE' < t:2020-01-19 08:15:48,523 f:asyncorereactor.py l:438  c:cassandra.connection p:ERROR > Error decoding response from Cassandra. ver(3); flags(0000); stream(12); op(0); offset(9); len(118); buffer: b'\x83\x00\x00\x0c\x00\x00\x00\x
+00v\x00\x00\x15\x00\x00^Operation failed for scylla_bench.test - received 1 responses and 1 failures from 2 CL=QUORUM.\x00\x04\x00\x00\x00\x01\x00\x00\x00\x02\x00\x06SIMPLE'
+```
+
+And Cassandra lost connection:
+```
+< t:2020-01-19 08:15:48,523 f:asyncorereactor.py l:438  c:cassandra.connection p:ERROR >   File "cassandra/connection.py", line 609, in cassandra.connection.Connection.process_msg
+< t:2020-01-19 08:15:48,523 f:asyncorereactor.py l:438  c:cassandra.connection p:ERROR >   File "cassandra/protocol.py", line 1149, in cassandra.protocol._ProtocolHandler.decode_message
+< t:2020-01-19 08:15:48,523 f:asyncorereactor.py l:438  c:cassandra.connection p:ERROR >   File "cassandra/protocol.py", line 133, in cassandra.protocol.ErrorMessage.recv_body
+< t:2020-01-19 08:15:48,523 f:asyncorereactor.py l:438  c:cassandra.connection p:ERROR >   File "cassandra/protocol.py", line 319, in cassandra.protocol.WriteFailureMessage.recv_error_info
+< t:2020-01-19 08:15:48,523 f:asyncorereactor.py l:438  c:cassandra.connection p:ERROR > KeyError: 'LE'
+```
+
+Next time when read from the test table, operation time out error is received:
+```
+< t:2020-01-19 08:23:33,872 f:nemesis.py      l:910  c:sdcm.nemesis         p:DEBUG > sdcm.nemesis.DeleteByPartitionsMonkey: Choose partitions for delete query: select min(ck) as min_ck, max(ck) as max_ck from scylla_bench.test where pk=261
+
+< t:2020-01-19 08:24:08,433 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR > sdcm.nemesis.DeleteByPartitionsMonkey: Unhandled exception in method <function DeleteByPartitionsMonkey.disrupt at 0x7f0cd5b31a60> < t:2020-01-19 08:24:08,433 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR > sdcm.nemesis.DeleteByPartitionsMonkey: Unhandled exception in method <function DeleteByPartitionsMonkey.disrupt at 0x7f0cd5b31a60>
+< t:2020-01-19 08:24:08,433 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR > Traceback (most recent call last):
+< t:2020-01-19 08:24:08,433 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR >   File "/sct/sdcm/nemesis.py", line 1750, in wrapper
+< t:2020-01-19 08:24:08,433 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR >     result = method(*args, **kwargs)
+< t:2020-01-19 08:24:08,433 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR >   File "/sct/sdcm/nemesis.py", line 1949, in disrupt
+< t:2020-01-19 08:24:08,433 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR >     self.distrupt_delete_by_partitions()
+< t:2020-01-19 08:24:08,433 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR >   File "/sct/sdcm/nemesis.py", line 988, in distrupt_delete_by_partitions
+< t:2020-01-19 08:24:08,433 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR >     partitions_for_delete = self.choose_partitions_for_delete(10, ks_cf)
+< t:2020-01-19 08:24:08,433 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR >   File "/sct/sdcm/nemesis.py", line 911, in choose_partitions_for_delete
+< t:2020-01-19 08:24:08,433 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR >     result = session.execute(cmd, timeout=3600)
+< t:2020-01-19 08:24:08,433 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR >   File "cassandra/cluster.py", line 2134, in cassandra.cluster.Session.execute
+< t:2020-01-19 08:24:08,433 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR >   File "cassandra/cluster.py", line 4026, in cassandra.cluster.ResponseFuture.result
+< t:2020-01-19 08:24:08,433 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR > cassandra.ReadTimeout: Error from server: code=1200 [Coordinator node timed out waiting for replica nodes' responses] message="Operation timed out for scylla_bench.test - received only 0 responses from 2 CL=QUORUM." info={'consistency': 'QUORUM', 'required_responses': 2, 'received_responses': 0}
+```
+
+and
+
+```
+< t:2020-01-19 08:31:22,025 f:nemesis.py      l:910  c:sdcm.nemesis         p:DEBUG > sdcm.nemesis.DeleteByPartitionsMonkey: Choose partitions for delete query: select min(ck) as min_ck, max(ck) as max_ck from scylla_bench.test where pk=255
+
+< t:2020-01-19 08:31:54,845 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR > sdcm.nemesis.DeleteByPartitionsMonkey: Unhandled exception in method <function DeleteByPartitionsMonkey.disrupt at 0x7f0cd5b31a60> < t:2020-01-19 08:31:54,845 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR > sdcm.nemesis.DeleteByPartitionsMonkey: Unhandled exception in method <function DeleteByPartitionsMonkey.disrupt at 0x7f0cd5b31a60>
+< t:2020-01-19 08:31:54,845 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR > Traceback (most recent call last):
+< t:2020-01-19 08:31:54,845 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR >   File "/sct/sdcm/nemesis.py", line 1750, in wrapper
+< t:2020-01-19 08:31:54,845 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR >     result = method(*args, **kwargs)
+< t:2020-01-19 08:31:54,845 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR >   File "/sct/sdcm/nemesis.py", line 1949, in disrupt
+< t:2020-01-19 08:31:54,845 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR >     self.distrupt_delete_by_partitions()
+< t:2020-01-19 08:31:54,845 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR >   File "/sct/sdcm/nemesis.py", line 988, in distrupt_delete_by_partitions
+< t:2020-01-19 08:31:54,845 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR >     partitions_for_delete = self.choose_partitions_for_delete(10, ks_cf)
+< t:2020-01-19 08:31:54,845 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR >   File "/sct/sdcm/nemesis.py", line 911, in choose_partitions_for_delete
+< t:2020-01-19 08:31:54,845 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR >     result = session.execute(cmd, timeout=3600)
+< t:2020-01-19 08:31:54,845 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR >   File "cassandra/cluster.py", line 2134, in cassandra.cluster.Session.execute
+< t:2020-01-19 08:31:54,845 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR >   File "cassandra/cluster.py", line 4026, in cassandra.cluster.ResponseFuture.result
+< t:2020-01-19 08:31:54,845 f:nemesis.py      l:1760 c:sdcm.nemesis         p:ERROR > cassandra.ReadTimeout: Error from server: code=1200 [Coordinator node timed out waiting for replica nodes' responses] message="Operation timed out for scylla_bench.test - received only 1 responses from 2 CL=QUORUM." info={'consistency': 'QUORUM', 'required_responses': 2, 'received_responses': 1}
+```
+
+All nodes are up (status from node that select was run):
+```
+Status=Up/Down
+|/ State=Normal/Leaving/Joining/Moving
+--  Address       Load       Tokens       Owns    Host ID                               Rack
+UN  10.0.44.211   235.22 GB  256          ?       5dfd4c6a-ea6b-46d8-b85c-8addce3113f7  1a
+UN  10.0.167.102  281.42 GB  256          ?       2e003b21-809b-42a9-b2fb-79812513472b  1a
+UN  10.0.40.201   234.65 GB  256          ?       60ab7a93-53fc-4ef1-831f-2ae94166a8a3  1a
+UN  10.0.122.13   283 GB     256          ?       58e76df1-0236-4b0f-89a8-dcd5ba52c71f  1a
+UN  10.0.46.13    292.29 GB  256          ?       60c9aa29-0034-45e0-9f76-2904e359d8d0  1a
+```
+
+ But I am not able to run this query manually, receive same error (it happens almost immediately despite I defined ```--request-timeout=3600```):
+```
+[centos@longevity-large-partitions-4d-julia-db-node-aad6969d-2 ~]$ cqlsh 34.250.89.251 9042 --request-timeout=3600
+
+cqlsh> CONSISTENCY QUORUM
+Consistency level set to QUORUM.
+cqlsh> select min(ck) as min_ck, max(ck) as max_ck from scylla_bench.test where pk=261;
+ReadTimeout: Error from server: code=1200 [Coordinator node timed out waiting for replica nodes' responses] message="Operation timed out for scylla_bench.test - received only 1 responses from 2 CL=QUORUM." info={'received_responses': 1, 'required_responses': 2, 'consistency': 'QUORUM'}
+```
+
+Load on the nodes is about 17%
+![Screenshot from 2020-01-19 10-46-53](https://user-images.githubusercontent.com/34435448/72677836-2d2c8d80-3aa9-11ea-90ee-f533e63a69f8.png)
+
+Test table:
+```
+Test table:
+CREATE TABLE scylla_bench.test (
+    pk bigint,
+    ck bigint,
+    v blob,
+    PRIMARY KEY (pk, ck)
+) WITH CLUSTERING ORDER BY (ck ASC)
+    AND bloom_filter_fp_chance = 0.01
+    AND caching = {'keys': 'ALL', 'rows_per_partition': 'ALL'}
+    AND comment = ''
+    AND compaction = {'class': 'SizeTieredCompactionStrategy'}
+    AND compression = {}
+    AND crc_check_chance = 1.0
+    AND dclocal_read_repair_chance = 0.0
+    AND default_time_to_live = 0
+    AND gc_grace_seconds = 864000
+    AND max_index_interval = 2048
+    AND memtable_flush_period_in_ms = 0
+    AND min_index_interval = 128
+    AND read_repair_chance = 0.0
+    AND speculative_retry = 'NONE';
+```
+
+Test log: 
+[sct.log.zip](https://github.com/scylladb/scylla/files/4082446/sct.log.zip)
+ 
+
+Split from issue #5583 
+
+When adding one million integers, adding an identity function causes a slowdown of about 13.5 seconds. The slowdown is about the same in both the best (14.5 seconds) and worst (20.3 seconds) case, which means UDF seem to just add a constant overhead for each call.
+
+This tracks just reducing the UDF overhead, not improving scylla's overall aggregation performance.
+
+Got while running dtests in jenkins:
+https://jenkins.scylladb.com/view/nexts/job/scylla-master/job/next/1503/artifact/logs-release.2/
+
+https://jenkins.scylladb.com/view/nexts/job/scylla-master/job/next/1503/artifact/logs-release.2/1579267089825_secondary_indexes_test.TestLocalIndexes.test_stop_node_during_local_index_build/node1.log
+Could scylla support function as a filter?
+E.g.
+`select id, WriteTime(created_on) as time from mytable where time > 1577410333393001; `
+
+for table:
+```
+CREATE TABLE mykeyspace.mytable (
+    id text PRIMARY KEY,
+    created_on timestamp,
+) WITH compaction = {'class': 'org.apache.cassandra.db.compaction.SizeTieredCompactionStrategy', 'max_threshold': '32', 'min_threshold': '4'};
+```
+
+per PiotrS:
+ @psarna :
+I think the simplest way to implement this would be to allow aliases in the where clause (e.g. SELECT writetime(v) as writetime_of_v, v FROM t where writetime_of_v > 5 )
+When a node does not have gossip STATUS application_state, we currently
+use an empty string to present such state in get_gossip_status.
+
+It is better to use an explicit "UNKNOWN" to present it. It makes the
+log easier to understand when the status is unknown.
+
+ Before:
+
+   'gossip - InetAddress n2 is now UP, status ='
+
+ After:
+
+   'gossip - InetAddress n2 is now UP, status = UNKNOWN'
+
+This patch is safe because the STATUS_UNKNOWN is never sent over the
+cluster. So the presentation is only internal to the node.
+
+Fixes #5520
+Fedora 31 version of systemd macros does not work correctly on CentOS7,
+since CentOS7 does not support "file trigger" feature.
+To fix the issue we need to override macros with CentOS7 version.
+
+See scylladb/scylla-jmx#94
+As a followup to 0bde5906b3337be7691a8fd62d3dfe98e07437e4
+This series implements suggestions from @avikivity and @espindola 
+It simplifies the template definitions for `accumulator_for`,
+adds some debug logging for the overflow values,
+and adds unit tests for float and double sum overflow.
+
+Test: unit(dev),
+paging_test:TestPagingWithIndexingAndAggregation.test_filter_{indexed,non_indexed,pk}_column(dev)
+*Installation details*
+Scylla version (or git commit hash): unstable/branch-3.2:202001152008
+Cluster size:1 node
+OS (RHEL/CentOS/Ubuntu/AWS AMI): ubuntu/ dtest
+
+Created cluster with one node. Created several keyspaces which contains several tables. Filled with data: partition contains several rows.
+After that run snapshot operations in parallel:
+create snapshot,
+clear snapshot
+listsnapshots.
+
+the list snapshot periodically failed with next error:
+```
+NodetoolError: Nodetool command '/home/abykov/.ccm/scylla-repository/unstable/branch-3.2/202001152008/scylla-java-tools/bin/nodetool -h 127.0.0.1 -p 7100 listsnapshots' failed; exit status: 2; stdout: Snapshot Details: 
+; stderr: error: Scylla API server HTTP GET to URL '/storage_service/snapshots/size/true' failed: filesystem error: stat failed: No such file or directory [/home/abykov/.dtest/dtest-GEXxMt/test/node1/data/ks12/table_cf1-fc1c5e50387811ea9011000000000000/snapshots/1579190338768/mc-1-big-Filter.db]
+-- StackTrace --
+java.lang.IllegalStateException: Scylla API server HTTP GET to URL '/storage_service/snapshots/size/true' failed: filesystem error: stat failed: No such file or directory [/home/abykov/.dtest/dtest-GEXxMt/test/node1/data/ks12/table_cf1-fc1c5e50387811ea9011000000000000/snapshots/1579190338768/mc-1-big-Filter.db]
+	at com.scylladb.jmx.api.APIClient.getException(APIClient.java:139)
+	at com.scylladb.jmx.api.APIClient.getRawValue(APIClient.java:186)
+	at com.scylladb.jmx.api.APIClient.getRawValue(APIClient.java:208)
+	at com.scylladb.jmx.api.APIClient.getLongValue(APIClient.java:511)
+	at org.apache.cassandra.service.StorageService.trueSnapshotsSize(StorageService.java:592)
+	at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.lang.reflect.Method.invoke(Method.java:498)
+	at sun.reflect.misc.Trampoline.invoke(MethodUtil.java:71)
+	at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.lang.reflect.Method.invoke(Method.java:498)
+	at sun.reflect.misc.MethodUtil.invoke(MethodUtil.java:275)
+	at com.sun.jmx.mbeanserver.StandardMBeanIntrospector.invokeM2(StandardMBeanIntrospector.java:112)
+	at com.sun.jmx.mbeanserver.StandardMBeanIntrospector.invokeM2(StandardMBeanIntrospector.java:46)
+	at com.sun.jmx.mbeanserver.MBeanIntrospector.invokeM(MBeanIntrospector.java:237)
+	at com.sun.jmx.mbeanserver.PerInterface.invoke(PerInterface.java:138)
+	at com.sun.jmx.mbeanserver.MBeanSupport.invoke(MBeanSupport.java:252)
+	at com.sun.jmx.interceptor.DefaultMBeanServerInterceptor.invoke(DefaultMBeanServerInterceptor.java:819)
+	at com.sun.jmx.mbeanserver.JmxMBeanServer.invoke(JmxMBeanServer.java:801)
+	at com.scylladb.jmx.utils.APIMBeanServer.invoke(APIMBeanServer.java:168)
+	at javax.management.remote.rmi.RMIConnectionImpl.doOperation(RMIConnectionImpl.java:1468)
+	at javax.management.remote.rmi.RMIConnectionImpl.access$300(RMIConnectionImpl.java:76)
+	at javax.management.remote.rmi.RMIConnectionImpl$PrivilegedOperation.run(RMIConnectionImpl.java:1309)
+	at javax.management.remote.rmi.RMIConnectionImpl.doPrivilegedOperation(RMIConnectionImpl.java:1401)
+	at javax.management.remote.rmi.RMIConnectionImpl.invoke(RMIConnectionImpl.java:829)
+	at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.lang.reflect.Method.invoke(Method.java:498)
+	at sun.rmi.server.UnicastServerRef.dispatch(UnicastServerRef.java:357)
+	at sun.rmi.transport.Transport$1.run(Transport.java:200)
+	at sun.rmi.transport.Transport$1.run(Transport.java:197)
+	at java.security.AccessController.doPrivileged(Native Method)
+	at sun.rmi.transport.Transport.serviceCall(Transport.java:196)
+	at sun.rmi.transport.tcp.TCPTransport.handleMessages(TCPTransport.java:573)
+	at sun.rmi.transport.tcp.TCPTransport$ConnectionHandler.run0(TCPTransport.java:834)
+	at sun.rmi.transport.tcp.TCPTransport$ConnectionHandler.lambda$run$0(TCPTransport.java:688)
+	at java.security.AccessController.doPrivileged(Native Method)
+	at sun.rmi.transport.tcp.TCPTransport$ConnectionHandler.run(TCPTransport.java:687)
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+	at java.lang.Thread.run(Thread.java:748)
+```
+steps to reproduce
+1. create cluster and  node
+2. create keyspaces and tables
+3. fill data (better large amount of data)
+4. run nodetool snapshot ( to create snapshots for all keyspaces and tables
+5. run in parallel next operations:
+5.1 nodetool snapshot
+5.2 nodetool cleansnapshots
+5.2 nodetool listsnapshots
+
+
+
+Hi there
+
+**The environment:**
+
+*Installation details*
+- Scylla version: 3.0.7
+- Cluster size: 23 nodes + 1 joining
+- OS: Ubuntu 18.04.3 LTS
+
+*Hardware details* 
+- Platform: Azure VM
+- Hardware: Standard L16s_v2 (16 vcpus, 128 GiB memory)
+- Disks: 30 GB Premium SSD for the OS; 2x1.8 TB NVMe SSD for data (RAID0, 3.5 TB effectively)
+
+**The problem:**
+
+A new node is unable to join the cluster when the average disk usage is high within the cluster (~85%+).
+The problem does not occur with lower disk usages (ie. 70%).
+This has also occured before when the cluster was smaller (10-15 nodes or so).
+The joining process starts as it should, but after about 5% disk being filled on the joining node (~180 GB) it stops. It does not do so momentarily, the process simply slows until there is no progress. 
+The same goes for CPU usage (100% on most of the cores, then almost idle).
+By tracing traffic on the network interface one can also see something similar - the joining process starts with the new node being connected to all nodes and actively streaming data from about 16 of them. And then slows down, by the end the transfers are of magnitude of Bps / kBps.
+There are no failure-related logs on the joining node.
+A way to restart the joining process is to look at `nodetool netstats` on the joining node and then restart scylla processes and all nodes displayed within until `nodetool netstats` shows no streams. Then the joining process runs for another 5% (ie. 5% --> 10%) and then the story repeats itself.
+
+**The expected behaviour:**
+
+I understand that this particular case is stretching recommended operational conditions in terms of free disk space, but I still think one of two outcomes should happen:
+- new node joins with no issues
+- new node does not join, but fails explicitly, instead of going in loops without a clearly logged errors

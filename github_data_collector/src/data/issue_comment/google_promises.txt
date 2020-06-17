@@ -1,0 +1,145 @@
+I have this list of promises chained by then, while current then will dispatch async to main to next runloop, while we want the work to be done immediately/inplace when some condition is met. 
+Say user type on keyboard and triggered the list of promises to be chained, while we want the the work of then to be called synchronously instead of just return. sth like
+
+ if(IsOnMain && promise.isFulfilled) { workOfThen()}
+
+Is there a way to expose api like a synchronousThenIfPossible? Thanks
+This is to address the issue described in this ticket: https://github.com/google/promises/issues/130
+Hi, I'm sorry to cross post this with stackoverflow, but there was no tag related to google-promises.
+
+I'm working on a framework that uses promises internally, and I'd like the framework to work cross platform for iOS, macos and tvOS.
+
+When building my framework for distribution with cocoapods, the lint check is failing specifically for macos, but not the other platforms. 
+
+I've described the error in this ticket: https://stackoverflow.com/questions/58171317/umbrella-header-for-module-fblpromises-does-not-include-header-headers-promi
+
+If I can get some help, i'd very much appreciate it. 
+`                getAllUsers(gsuiteName: gsuiteName).then(uploadUsers(arr1: currentUsersEM,arr2: currentUsersUS)).then(newScreen())`
+
+Am trying to use this library for the first time and am running into this error when chaining promises together: 
+
+> Cannot convert value of type 'Promise<Any>' to expected argument type '(Any) throws -> Void' Error in Swift
+
+Here is the code for getAllUsers() and uploadUsers():
+` func getAllUsers(gsuiteName: String) -> Promise<Any>{
+    
+        Database.database().reference().child("Messages").child(gsuiteName).child("USERS").observe(.value) { (snapshot) in
+            //when(
+            for child in snapshot.children{
+                self.currentUsersEM.append((child as AnyObject).value as String)
+                self.currentUsersUS.append((child as AnyObject).key as String)
+            }
+            self.currentUsersEM.append((Auth.auth().currentUser?.email)!)
+            self.currentUsersUS.append(self.username.text!)
+        }
+        return Promise {
+            return nil
+        }
+    }
+    func uploadUsers(arr1: Array<String>, arr2: Array<String>) -> Promise<Any>{
+        for usCount in 0..<(arr1.count){
+            print("USERNAME\(arr1[usCount] as! String)")
+            print("EMAIL\(arr2[usCount] as! String)")
+            //Database.database().reference().child("Messages").child(gsuiteName).child("USERS").setValue([currentUsersUS[usCount] as! String :currentUsersEM[usCount] as! String])
+        }
+        return Promise{
+            return nil
+        }
+    }
+    func newScreen(){
+        let changeRequest = Auth.auth().currentUser?.createProfileChangeRequest()
+        changeRequest?.displayName = self.username.text
+        changeRequest?.commitChanges { (error) in
+            self.performSegue(withIdentifier: "goToChat", sender: self)
+            //}
+        }
+    }`
+Overview
+=======
+
+No type information is persisted when wrapping an Objective-C `FBLPromise` value in a `Promise`, nor when deriving an Objective-C value through `Promise.asObjCPromise()`. The `Value` generic type on both `init` and `asObjCPromise` is not the same `Value` type that is on the class, and as such they can be freely parameterized to any combination of distinct values.
+
+Symptoms
+========
+
+Erasure when wrapping
+-----------------------
+The following compiles and runs without issue, demonstrating the erasure when wrapping Objective-C:
+```swift
+let objCPromise = FBLPromise<NSString>.__pending()
+let swiftPromise = Promise<Int>(objCPromise)
+
+objCPromise.__onQueue(.main, then: { value in
+  print(value)
+  return value
+})
+swiftPromise.fulfill(2)
+```
+Of course, doing anything with `value` that would not be understood by a Swift `Int` causes a runtime failure.
+
+Fulfilling in the other direction with incorrect types also compiles and runs:
+```swift
+let objCPromise = FBLPromise<NSString>.__pending()
+let swiftPromise = Promise<Int>(objCPromise)
+
+swiftPromise.then(on: .main) { _ in }
+objCPromise.__fulfill("A value")
+```
+This snippet fails at runtime regardless of the contents of the `then` block, as the coercion back to `Int` fails.
+
+Erasure when unwrapping
+--------------------------
+The following also compiles and runs without issue, demonstrating the erasure when moving from Swift to Objective-C:
+```swift
+let swiftPromise = Promise<Int>.pending()
+let objCStringPromise: FBLPromise<NSString> = swiftPromise.asObjCPromise()
+let objCPromisePromise: FBLPromise<Promise<Int>> = swiftPromise.asObjCPromise()
+let objCDateFormatterPromise: FBLPromise<DateFormatter> = swiftPromise.asObjCPromise()
+
+objCStringPromise.__onQueue(.main, then: { value in
+  print(value)
+  return value
+})
+
+swiftPromise.fulfill(2)
+```
+All derived Objective-C Promises can be interacted with as if they are the declared types, and, again, fail at runtime when interacted with in a way that the real underlying type doesn't understand.
+
+As in the previous section, fulfilling in the other direction with incorrect types also compiles and runs:
+```swift
+let swiftPromise = Promise<Int>.pending()
+let objCStringPromise: FBLPromise<NSString> = swiftPromise.asObjCPromise()
+
+swiftPromise.then(on: .main) { _ in }
+objCPromise.__fulfill("A value")
+```
+Again, this snippet fails at runtime regardless of the contents of the `then` block, as the coercion back to `Int` fails.
+
+Root Cause
+=========
+The concrete type used to populate a generic type parameter in a function is resolved at the call site, and function-level generic type parameters are unrelated to the type parameters of the enclosing class.
+
+Within a given `Promise` instance, there is a `Value` symbol `Promise<Value>` that is usually what is being interacted with. In the two critical methods, `init` and `asObjCPromise`, they are being shadowed. Concretely, those methods look like `Promise<Value>.init<Value>` and `Promise<Value>.asObjCPromise<Value>`, which, to stress the difference in parameters, are entirely equivalent to `Promise<T>.init<U>` and `Promise<T>.asObjCPromise<V>` (`U` and `V` intentionally varied from each other).
+
+As a result, the `Value` on the Objective-C `FBLPromise` is entirely erased from the perspective of the Swift `Promise` when wrapped in `init`. Likewise, the `Value` on the Swift `Promise` is entirely erased from the perspective of the Objective-C `FBLPromise` when unwrapping through `asObjCPromise`.
+
+Possible Solution
+============
+The two `Value` parameters can be unified by way of exposing them in an extension that applies the necessary `Value: AnyObject` constraint on the Swift `Promise`'s `Value`:
+```swift
+extension Promise where Value: AnyObject {
+  public convenience init(_ objCPromise: FBLPromise<Value>) {
+    /* ... */
+  }
+
+  public func asObjCPromise() -> FBLPromise<Value> {
+    /* ... */
+  }
+}
+```
+
+This has a few immediate drawbacks:
+* The now-convenience `init` is today the primary designated initializer. This would require some reconfiguration.
+* It's no longer simple to turn a `Promise<String>` into a `FBLPromise<NSString>` - the types must match exactly, so the Swift entity would also need to be `Promise<NSString>`. It's possible that this can be addressed with some fancier generic constraints.
+
+The latter issue may break a number of existing clients in cases that were actually fine. 

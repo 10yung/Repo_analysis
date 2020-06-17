@@ -1,0 +1,124 @@
+Hello,
+
+I am using a "/dev/null" like handle when my application is in quiet mode to hide the progress bar.
+
+On unix, `tty::move_cursor_up` returns a string which is output to the handle.
+On windows,` tty::move_cursor_up` print to the console and return an empty string whatever the handle is, making my trick to have a quiet mode totally failing.
+
+I do not know if the windows code could be fixed easily. Otherwise what about introducing a quiet mode ?
+Here is what I see:
+
+```
+7.85 GB / 13.96 GB ╢██████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░╟ 56.26 % 1.41 GB/s 4s
+7.82 GB / 7.82 GB ╢██████████████████████████████████████████████████████╟ 100.00 % 39.08 GB/s 
+3.37 GB / 21.79 GB ╢██████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░╟ 15.49 % 664.74 MB/s 28s
+```
+
+Instead, it would be nice to see something like following:
+
+
+```
+7.85 GB / 13.96 GB ╢██████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░╟  56.26 %   1.41 GB/s  4s
+7.82 GB /  7.82 GB ╢██████████████████████████████████████████████████╟ 100.00 %  39.08 GB/s 
+3.37 GB / 21.79 GB ╢██████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░╟  15.49 % 664.74 MB/s 28s
+```
+This leads to lots of noise in logs files in my tools, since I am running some progress bars on kubernetes clusters.
+
+It would be great if ProgressBar would output either nothing or a line-by-line progress report (without using `\r`) when it cannot detect a terminal.
+1. add non-blocking `flush` method
+2. add `set_finish` to set behavior when a ProgressBar is finished
+   * Keep: the current behavior, keep the progress bar in line
+   * Remove: remove the progress bar in self.lines, reduce self.nlines by 1
+   * Graduate: like Remove, but print the finished progress bar above the MultiBar (wouldn't update anymore)
+Added the possibility to move the progress bar away from the edges of the screen, the right margin option doesn't work in the multibar mode
+Using the pattern in the examples on the website, MultiBar::listen will likely hang if an error occurs as the ProgressBar::finish function will never get called. It'd be nice if listen would stop blocking if there aren't any more progress bars.
+This library suffers from exactly the same problem as [this](https://github.com/mitsuhiko/indicatif/issues/53).
+
+It doesn't flicker though, [unlike indicatif](https://github.com/mitsuhiko/indicatif/issues/42) so that's good!
+I wrote the following module for my project
+
+https://gist.github.com/winstonewert/7a003b6c745226313ade0689e053fec3
+
+It provide a ProgressFile which wraps a std::fs::File object and adds a progress bar for processing through the file. It automatically fetches the size of the file and sets the units to Bytes. Its really nifty for programs which process large files.
+
+I've found it quite useful and use it everywhere. I'm wondering if there would be interest in including this in pbr if I contributed it?
+The "broadcast writing (simple file copying)" example on the [README.md](https://github.com/a8m/pb/blob/1747edaf2fc839b9542a0476c070ee6fb3effa07/README.md) no longer compiles. This is because `Writer::broadcast()` was never stabilized and [removed from Nightly libstd on Mar 8, 2016](https://github.com/rust-lang/rust/commit/b53764c73bd722ea22142bace6249d5950066253#diff-668f8f358d4a93474b396dcb3727399eL1128).
+
+I think a simple workaround is to change the example as the followings:
+
+```rust
+extern crate pbr;
+
+use std::io::copy;
+use pbr::{ProgressBar, Units};
+use std::fs::File;
+use std::io::Write;
+
+fn main() {
+    let mut file = File::open("/usr/share/dict/words").unwrap();
+    let n_bytes = file.metadata().unwrap().len() as usize;
+    let mut pb = ProgressBar::new(n_bytes as u64);
+    pb.set_units(Units::Bytes);
+    let mut handle = File::create("copy-words").unwrap();
+    {
+        let mut tee = TeeWriter::new(&mut handle, &mut pb);
+        copy(&mut file, &mut tee).unwrap();
+    }
+    pb.finish_print("done");
+}
+
+/// Tee (T-Split) Writer writes the same data to two child writers.
+struct TeeWriter<'a, T1: Write + 'a, T2: Write + 'a> {
+    w1: &'a mut T1,
+    w2: &'a mut T2,
+}
+
+impl<'a, T1, T2> TeeWriter<'a, T1, T2>
+where
+    T1: Write + 'a,
+    T2: Write + 'a,
+{
+    fn new(w1: &'a mut T1, w2: &'a mut T2) -> Self {
+        Self { w1, w2 }
+    }
+}
+
+impl<'a, T1, T2> Write for TeeWriter<'a, T1, T2>
+where
+    T1: Write + 'a,
+    T2: Write + 'a,
+{
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let size1 = self.w1.write(buf)?;
+        let size2 = self.w2.write(buf)?;
+        Ok(size1.min(size2))
+    }
+
+    #[inline]
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.w1.flush()?;
+        self.w2.flush()
+    }
+}
+```
+
+Or, for convenience, maybe we can add something like `TeeWriter` above to this crate.
+
+I could work on either ideas. Please let me know your thoughts.
+I'd like to use a progress indicator showing time and thoughput, current total bytes.
+
+Currently the counter box always shows the total:
+```rust
+        // counter box
+        if self.show_counter {
+            let (c, t) = (self.current as f64, self.total as f64);
+            prefix = prefix +
+                     &match self.units {
+                Units::Default => format!("{} / {} ", c, t),
+                Units::Bytes => format!("{} / {} ", kb_fmt!(c), kb_fmt!(t)),
+            };
+        }
+```
+
+Maybe a `show_total` could be added which switches to another counter format string like `{}`

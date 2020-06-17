@@ -1,0 +1,402 @@
+Output of `restic version`
+--------------------------
+
+restic 0.9.6 (v0.9.6-40-gd70a4a93) compiled with go1.12.15 on linux/amd64
+
+What should restic do differently? Which functionality do you think we should add?
+----------------------------------------------------------------------------------
+
+Connect successfully to a restic rest server that is secured by TLS v1.3 **only**
+
+What are you trying to do?
+--------------------------
+
+I have a restic rest server behind an nginx reverse proxy that enforces TLS v1.3 - and I am trying to backup to this rest server.
+
+```
+./restic -r rest:https://secret.com/path/ init
+Fatal: create repository at rest:https://secret.com/path/ failed: Post https://secret.com/path/?create=true: remote error: tls: protocol version not supported
+```
+
+By playing with the nginx configuration I was able to verify that this error occurs when TLS v1.2 (or lower) is disabled:
+```
+ssl_protocols TLSv1.3; # <-- causes restic client to fail with above error message
+ssl_protocols TLSv1.3 TLSv1.2; # <-- works with restic
+```
+
+Did restic help you today? Did it make you happy in any way?
+------------------------------------------------------------
+
+Not yet, sorry folks ::/ .. maybe later
+
+## What is the purpose of this change? What does it change?
+Using Docker, Restic fails to build using Go 1.11 and needs Go 1.13 so I updated the build script.
+
+## Was the change discussed in an issue or in the forum before?
+I created an issue in #2551 
+
+## Checklist
+* [x]  I have read the [Contribution Guidelines](https://github.com/restic/restic/blob/master/CONTRIBUTING.md#providing-patches)
+* [ ]  I have added tests for all changes in this PR
+* [ ]  I have added documentation for the changes (in the manual)
+* [ ]  There's a new file in `changelog/unreleased/` that describes the changes for our users (template [here](https://github.com/restic/restic/blob/master/changelog/TEMPLATE))
+* [ ]  I have run `gofmt` on the code in all commits
+* [x]  All commit messages are formatted in the same style as [the other commits in the repo](https://github.com/restic/restic/blob/master/CONTRIBUTING.md#git-commits)
+* [x]  I'm done, this Pull Request is ready for review
+
+
+## Output of `restic version`
+n/a
+
+## How did you run restic exactly?
+The issue is not directly related to restic but with the way its Docker image is built when you run:
+```
+./docker/build.sh
+```
+
+## What backend/server/service did you use to store the repository?
+n/a
+
+## Expected behavior
+A `restic/restic:latest` Docker image is built
+
+## Actual behavior
+```
+go build github.com/restic/restic/internal/errors: module requires Go 1.13
+go build github.com/restic/restic/internal/debug: module requires Go 1.13
+go build github.com/restic/restic/internal/hashing: module requires Go 1.13
+go build github.com/restic/restic/internal/textfile: module requires Go 1.13
+go build github.com/restic/restic/internal/ui/table: module requires Go 1.13
+go build github.com/restic/restic/internal/selfupdate: module requires Go 1.13
+build failed: exit status 1
+exit status 1
+```
+
+## Steps to reproduce the behavior
+From the root of the repo, run:
+```
+./docker/build.sh
+```
+
+## Do you have any idea what may have caused this?
+Yes. During the build of binary, it requires Go version 1.13. The current version used is 1.11.
+
+
+## Do you have an idea how to solve the issue?
+Yes. Use Docker image of Go with version 1.13
+
+## Did restic help you or made you happy in any way?
+Absolutely!
+
+
+I'm currently running a long backup operation and would like to improve my cron scripts at the same time. I'd like to see how the `forget` command would affect my backups. Since this is a read-only operation, acquiring a lock on the repository shouldn't be necessary.
+
+
+**Output of `restic version`**
+> restic 0.9.5 compiled with go1.12.9 on linux/amd64
+
+
+**How did you run restic exactly?**
+Command:
+`restic forget -H 16 -d 7 -w 4 -m 18 -y 4 --no-lock -n --password-file=/path/to/password-file -r /path/to/repo`
+
+
+Output:
+> repository c63c41de opened successfully, password is correct
+> Fatal: unable to create lock in backend: repository is already locked by PID 23156 on hostname by root (UID 0, GID 0)
+> lock was created at 2020-01-15 23:55:25 (49m50.228631411s ago)
+> storage ID 8179edd2
+
+
+**What backend/server/service did you use to store the repository?**
+A locally mounted disk formatted with ext4.
+
+
+**Expected behavior**
+Show how the `forget` command with the given parameters would affect the specified backup repository, without requiring its own lock. Stated differently, `restic forget --no-lock -n [...]` or `restic forget --no-lock --dry-run [...]` should work regardless of whether another process has locked the repository.
+
+
+**Actual behavior**
+Restic refuses to perform the command if another process has locked the repository.
+
+
+**Steps to reproduce the behavior**
+1. Start a backup, or any other operation requiring a lock on the repository.
+2. In another session, attempt to run the `forget` command mentioned above
+
+
+**Do you have any idea what may have caused this?**
+A missing or incorrectly written check.
+
+
+**Do you have an idea how to solve the issue?**
+Add a special case within the `forget` command that bypasses the attempt to lock the repository if `--dry-run` (or `-n`) and `--no-lock` are specified, or remove the check preventing this behaviour in this situation.
+
+
+**Did restic help you today? Did it make you happy in any way?**
+Yes, it just saved my system/data from a RAID corruption. Restic didn't really make me "happy" so much as "less sad".
+I would like to discuss how to improve the actual situation of `prune` (and `rebuild-index` which is used within `prune`) as there are quite some issues about it.
+
+So far I see the following issues:
+
+1. It uses too much memory (#1723). This is because of general memory problems with the index in `internal/repository`, see #1988 but also because `internal/index` is used additional to the first index structure. This is the reason most users start complaining about memory consumption when using `prune`.
+2. It is too slow, see  #1599, #2024, #2162. This is mainly because it reads all pack files (twice?). This completely makes 'prune' unusable for remote repositories with low bandwidth. Also not parallelized (#1470).
+3. It is not customizable. Repacking is slow/expensive but cannot be turned of or customized (#1985, #2305)
+4. It does too many things and is too complicated (#2227). It first rebuilds the index from pack files, then walks all snapshots and all dirs within to get the used blobs, then finds the packs where to delete these blobs and rewrites all those packs. Finally the index is again re-created completely from the resulting pack files. Hence it not only removes things, but reorganizes the repository and is even able to recover from some broken repo issues. However this is one source for the performance problems.
+
+There are already some proposals to fix specific issues, see #1994, #2340, #2507.
+
+I also started a rebuild of prune functionalities in #2513. Here I only used the index from `internal/repository` to clean unused blobs from the index, remove unused blobs and optionally repack if requested by the user. This solves IMO Points 1. to 3. and has already been successfully used by me and others for production repostitories.
+
+About 1.: Using #2513 and the new commands, `internal/index` is no longer used and could also be removed if `prune` is substituted by these commands.
+About 4.: There is so far a command missing to "repack" the index files if wanted (to get rid of small index files) and there is no way implemented to recover the index from the pack files. (i.e. the functionality of `rebuild-index`)
+I can propose to work on these issues in #2513, if wanted.
+
+So my question is: Where should `prune` and `rebuild-index` go to?
+Is it a way to complete #2513 and then use all of this functionality in a new `prune` command?
+It would be great to get some direction here!
+
+<!--
+Thank you very much for contributing code or documentation to restic! Please
+fill out the following questions to make it easier for us to review your
+changes.
+
+You do not need to check all the boxes below all at once, feel free to take
+your time and add more commits. If you're done and ready for review, please
+check the last box.
+-->
+
+What is the purpose of this change? What does it change?
+--------------------------------------------------------
+This PR intents to fix Issue #2526 
+`Backup.Run` counts errors but does not take any action on them. This PR changes this behaviour by returning an error if errors occured previously.
+
+Was the change discussed in an issue or in the forum before?
+------------------------------------------------------------
+Issue #2526 
+
+Checklist
+---------
+
+- [x] I have read the [Contribution Guidelines](https://github.com/restic/restic/blob/master/CONTRIBUTING.md#providing-patches)
+- [ ] I have added tests for all changes in this PR
+- [ ] I have added documentation for the changes (in the manual)
+- [ ] There's a new file in `changelog/unreleased/` that describes the changes for our users (template [here](https://github.com/restic/restic/blob/master/changelog/TEMPLATE))
+- [x] I have run `gofmt` on the code in all commits
+- [ ] All commit messages are formatted in the same style as [the other commits in the repo](https://github.com/restic/restic/blob/master/CONTRIBUTING.md#git-commits)
+- [ ] I'm done, this Pull Request is ready for review
+
+What is the purpose of this change? What does it change?
+--------------------------------------------------------
+Fix a race condition in the json output for the backup command that can cause mangled output. In addition the change also ensures that the backup summary is always printed after all status messages.
+
+It also renames `internal/ui/jsonstatus/status` to `internal/ui/json/backup` to prevent confusion with termstatus.
+
+Was the change discussed in an issue or in the forum before?
+------------------------------------------------------------
+closes #2389
+
+Checklist
+---------
+
+- [x] I have read the [Contribution Guidelines](https://github.com/restic/restic/blob/master/CONTRIBUTING.md#providing-patches)
+- [ ] I have added tests for all changes in this PR
+- [x] I have added documentation for the changes (in the manual): Not applicable
+- [x] There's a new file in `changelog/unreleased/` that describes the changes for our users (template [here](https://github.com/restic/restic/blob/master/changelog/TEMPLATE))
+- [x] I have run `gofmt` on the code in all commits
+- [x] All commit messages are formatted in the same style as [the other commits in the repo](https://github.com/restic/restic/blob/master/CONTRIBUTING.md#git-commits)
+- [x] I'm done, this Pull Request is ready for review
+
+What is the purpose of this change? What does it change?
+--------------------------------------------------------
+
+Adds the possibility to show various repository statistics without walking trees, i.e. should be very fast.
+
+The output looks like:
+```
+restic -r /path/to/repo stats --mode repository
+enter password for repository: 
+repository f1a1cc2c opened successfully, password is correct
+scanning...
+
+Repository content:
+==================
+                      count |    raw size |      crypto |   encr size
+---------------------------------------------------------------------
+key files:                1 |         0 B |       450 B |       450 B
+snapshot files:           1 |       214 B |        32 B |       246 B
+index files:              1 |  10.323 MiB |        32 B |  10.323 MiB
+pack files:              11 |  41.284 MiB |         0 B |  41.284 MiB
+---------------------------------------------------------------------
+all files:               14 |  51.606 MiB |       514 B |  51.607 MiB
+
+percentage:
+                      count |    raw size |      crypto |   encr size
+---------------------------------------------------------------------
+key files:            7.14% |       0.00% |      87.55% |       0.00%
+snapshot files:       7.14% |       0.00% |       6.23% |       0.00%
+index files:          7.14% |      20.00% |       6.23% |      20.00%
+pack files:          78.57% |      80.00% |       0.00% |      80.00%
+---------------------------------------------------------------------
+all files:          100.00% |     100.00% |     100.00% |     100.00%
+
+statistics - file size:
+                        min |         max |         avg
+-------------------------------------------------------
+key files:            450 B |       450 B |       450 B
+snapshot files:       246 B |       246 B |       246 B
+index files:     10.323 MiB |  10.323 MiB |  10.323 MiB
+pack files:       2.545 MiB |   4.023 MiB |   3.753 MiB
+-------------------------------------------------------
+all files:            246 B |  10.323 MiB |   3.686 MiB
+
+Index content:
+==============
+                      count |    raw size |      crypto |   encr size
+---------------------------------------------------------------------
+tree blobs:            1004 |  34.648 MiB |  31.375 KiB |  34.678 MiB
+data blobs:           91981 | 529.232 KiB |   2.807 MiB |   3.324 MiB
+---------------------------------------------------------------------
+all blobs:            92985 |  35.164 MiB |   2.838 MiB |  38.002 MiB
+
+percentage:
+                      count |    raw size |      crypto |   encr size
+---------------------------------------------------------------------
+tree blobs:           1.08% |      98.53% |       1.08% |      91.25%
+data blobs:          98.92% |       1.47% |      98.92% |       8.75%
+---------------------------------------------------------------------
+all blobs:          100.00% |     100.00% |     100.00% |     100.00%
+
+statistics - raw blobs:
+                        min |         max |         avg
+-------------------------------------------------------
+tree blobs:           362 B | 352.109 KiB |  35.337 KiB
+data blobs:             3 B |         8 B |         5 B
+-------------------------------------------------------
+all blobs:              3 B | 352.109 KiB |       396 B
+
+pack size by index:
+                 # packs |   raw blobs | pack header |      crypto |       total
+--------------------------------------------------------------------------------
+tree blobs:            9 |  34.648 MiB |  36.312 KiB |  31.656 KiB |  34.714 MiB
+data blobs:            2 | 529.232 KiB |   3.246 MiB |   2.807 MiB |   6.570 MiB
+--------------------------------------------------------------------------------
+all blobs:            11 |  35.164 MiB |   3.281 MiB |   2.838 MiB |  41.284 MiB
+
+percentage:
+                 # packs |   raw blobs | pack header |      crypto |       total
+--------------------------------------------------------------------------------
+tree blobs:              |      99.81% |       0.10% |       0.09% |     100.00%
+data blobs:              |       7.87% |      49.40% |      42.73% |     100.00%
+--------------------------------------------------------------------------------
+all blobs:               |      85.18% |       7.95% |       6.87% |     100.00%
+
+Overhead:
+=========
+index:        10.323 MiB ( 20.00%)
+snapshots:         214 B (  0.00%)
+pack header:   3.281 MiB (  6.36%)
+crypto:        2.839 MiB (  5.50%)
+total:        16.443 MiB ( 31.86%)
+
+Total:
+======
+      92985 blobs
+         14 files
+ 51.607 MiB total rpository size
+```
+
+
+Was the change discussed in an issue or in the forum before?
+------------------------------------------------------------
+
+No, but I needed some statistics while developing and thought it might be a good extension.
+There is an issue with `restic stat` because it walks all trees for all snapshots and hence is pretty slow, see #2126. This extension does not solve this issue but is able to give repository statistics very fast. 
+
+Please give me feedback if this is useful or should be complemented by something. I will then finish this PR (and add docu, etc).
+If it is not useful, feel free to close this PR.
+
+Checklist
+---------
+
+- [x] I have read the [Contribution Guidelines](https://github.com/restic/restic/blob/master/CONTRIBUTING.md#providing-patches)
+- [ ] I have added tests for all changes in this PR
+- [ ] I have added documentation for the changes (in the manual)
+- [ ] There's a new file in `changelog/unreleased/` that describes the changes for our users (template [here](https://github.com/restic/restic/blob/master/changelog/TEMPLATE))
+- [x] I have run `gofmt` on the code in all commits
+- [x] All commit messages are formatted in the same style as [the other commits in the repo](https://github.com/restic/restic/blob/master/CONTRIBUTING.md#git-commits)
+- [ ] I'm done, this Pull Request is ready for review
+
+
+<!--
+Thank you very much for contributing code or documentation to restic! Please
+fill out the following questions to make it easier for us to review your
+changes.
+
+You do not need to check all the boxes below all at once, feel free to take
+your time and add more commits. If you're done and ready for review, please
+check the last box.
+-->
+
+What is the purpose of this change? What does it change?
+--------------------------------------------------------
+Resolves Issue #2508, adding support for `diff --json`
+Note:  As discussed in #2508 this only includes summary diff statistics in the json output
+<!--
+Describe the changes here, as detailed as needed.
+-->
+
+Was the change discussed in an issue or in the forum before?
+------------------------------------------------------------
+* #2508
+<!--
+Link issues and relevant forum posts here.
+
+If this PR resolves an issue on GitHub, use "closes #1234" so that the issue is
+closed automatically when this PR is merged.
+-->
+
+Checklist
+---------
+
+- [X] I have read the [Contribution Guidelines](https://github.com/restic/restic/blob/master/CONTRIBUTING.md#providing-patches)
+- [ ] I have added tests for all changes in this PR
+- [ ] I have added documentation for the changes (in the manual)
+- [X] There's a new file in `changelog/unreleased/` that describes the changes for our users (template [here](https://github.com/restic/restic/blob/master/changelog/TEMPLATE))
+- [X] I have run `gofmt` on the code in all commits
+- [X] All commit messages are formatted in the same style as [the other commits in the repo](https://github.com/restic/restic/blob/master/CONTRIBUTING.md#git-commits)
+- [X] I'm done, this Pull Request is ready for review
+
+
+<!--
+Thank you very much for contributing code or documentation to restic! Please
+fill out the following questions to make it easier for us to review your
+changes.
+
+You do not need to check all the boxes below all at once, feel free to take
+your time and add more commits. If you're done and ready for review, please
+check the last box.
+-->
+
+What is the purpose of this change? What does it change?
+--------------------------------------------------------
+Documentation improvements that:
+
+- Increase the clarity of which files restic reads during a backup
+- Mentions both the mtime/ctime attributes
+- Moves `restic check` to its own section
+
+Was the change discussed in an issue or in the forum before?
+------------------------------------------------------------
+https://github.com/restic/restic/issues/2502
+
+Checklist
+---------
+
+- [X] I have read the [Contribution Guidelines](https://github.com/restic/restic/blob/master/CONTRIBUTING.md#providing-patches)
+- [ ] I have added tests for all changes in this PR
+- [X] I have added documentation for the changes (in the manual)
+- [X] There's a new file in `changelog/unreleased/` that describes the changes for our users (template [here](https://github.com/restic/restic/blob/master/changelog/TEMPLATE))
+- [ ] I have run `gofmt` on the code in all commits
+- [X] All commit messages are formatted in the same style as [the other commits in the repo](https://github.com/restic/restic/blob/master/CONTRIBUTING.md#git-commits)
+- [X] I'm done, this Pull Request is ready for review

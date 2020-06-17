@@ -1,0 +1,164 @@
+We use `from_python` mainly to convert `schema.Object.field` to `edgeql.AST.field`.  Since fields are typed anyway, we don't really need to have the dispatch in `BaseConstant`, we can just reimplement it in `AlterObjectProperty._get_ast` using the field type information.  GraphQL can do it's own thing.  We don't have constant folding other than string concatenation, so it's not an issue for that use case either.
+
+Bottom line: the proper action is to kill `BaseConstant.from_python`.
+
+_Originally posted by @elprans in https://github.com/edgedb/edgedb/pull/1131_
+This development tool allows removing all traces of EdgeDB from the 
+specified PostgreSQL cluster.  Useful for cases when debugging bootstrap 
+and setting up new clusters is expensive.
+
+There are a couple of prerequisite commits that are tagging along this
+PR as well.
+Constraints are overloaded callables, and so require that the
+arguments of a constraint are specified when doing `ALTER` or `DROP`.
+
+Issue: #1134.
+`schema::Type` now has an `expr` property that is non-empty if the
+`Type` is a type variant, i.e. produced by an alias declaration.  The
+new `is_from_alias` boolean computable is also added to simplify checks.
+
+The REPL is taught to filter out type variants produced by aliases from
+`\lt` and friends, and a new `\la` command is added to list aliases
+specifically.
+GraphQL spec defines `Int` as `int32` and `Float` as `float64` specifically. The definitions are actually very rigid and currently we don't quite adhere to these limitations when mapping EdgeDB types onto GraphQL.
+
+The solution would be to add custom scalars like `Int64`, `Bigint` and `Decimal` so that we can map EdgeDB types in the following way:
+```
+int16 -> Int
+int32 -> Int
+int64 -> Int64
+bigint -> Bigint
+float32 -> Float
+float64 -> Float
+decimal -> Decimal
+```
+The actual number representations (both in terms of input and output formats) will adhere to valid representations of `Int` and `Float` since the parsing spec and output spec don't put a limit on the digits for either one of these. So crucially, GraphQL `Decimal` and `Bigint` won't have a special suffix like their counterparts in EdgeQL do. This is not very important for `Bigint` as it's perfectly compatible with all the other integers and differs only in the range. However, for `Decimal` vs. `Float` the number `1.23` actually has a different value, so we'll have to be careful when reading these literals to infer the correct type so that the actual values passed to EdgeDB don't get unexpectedly mangled. 
+@elprans, this is the draft PR for `inheriting.py`. It's a work in progress; it's down to 10 mypy errors, but there are unclear parts for me. Some parts are totally work in progress, for example the mind-bending annotations I drafted for `injeriting.py` `delta_bases` function.
+
+1. the function InheritingObjectCommand._apply_rebase_ast seems to be never used in the tests
+2. I need help with the delta_bases function, and the three places with TODOs :blush:
+EdgeDB version: `1.0-alpha.2+dev.505.g5b68ec24`
+
+Steps to reproduce:
+```
+modbay_beta> SELECT 6[:1];                                                                                                                                                                                             
+InternalServerError: 'NoneType' object has no attribute 'context'
+```
+
+Using left index or both slice indexes causes proper error message:
+```
+modbay_beta> SELECT 6[1:1];                                                                                                                                                                                            
+QueryError: scalar type 'std::int64' cannot be sliced
+
+modbay_beta> SELECT 6[1:];                                                                                                                                                                                             
+QueryError: scalar type 'std::int64' cannot be sliced
+```
+EdgeDB version: `1.0-alpha.2+dev.505.g5b68ec24`
+
+I tried removing constraint running [an example from documentation](https://edgedb.com/docs/edgeql/ddl/constraints#id15) and got confusing error:
+```
+modbay_beta> ALTER TYPE User ALTER PROPERTY username 
+............ DROP CONSTRAINT std::regexp;                                                                                                                                                                              
+InvalidReferenceError: schema item 'default::std|regexp@@default|__|username@@default|User@da39a3ee5e6b4b0d3255bfef95601890afd80709' does not exist
+```
+Was my database corrupted somehow or that example is no longer valid in for master branch?
+
+Type information:
+```
+modbay_beta> \d+ User                                                                                                                                                                                                  
+type default::User {
+    required single link __type__ -> schema::Type {
+        readonly := true;
+    };
+    required single link global_role -> default::GlobalRole {
+        default := (SELECT
+            GlobalRole FILTER
+                (.name = "Default")
+        LIMIT
+            1
+        );
+    };
+    required single property avatar -> std::str;
+    single property bio -> std::str;
+    required single property created_at -> std::datetime {
+        default := datetime_current();
+        readonly := true;
+    };
+    single property edited_at -> std::datetime;
+    required single property email -> std::str {
+        constraint std::exclusive;
+        constraint std::regexp(r'.+@.+\..+');
+    };
+    required single property email_verified -> std::bool {
+        default := false;
+    };
+    required single property id -> std::uuid {
+        readonly := true;
+        constraint std::exclusive;
+    };
+    required single property password -> std::bytes;
+    required single property username -> std::str {
+        constraint std::exclusive;
+        constraint std::max_len_value(12) on (len(<std::str>__subject__));
+        constraint std::min_len_value(5) on (len(<std::str>__subject__));
+        constraint std::regexp(r'[a-zA-Z_.-][\w.-]{4,11}');
+    };
+};
+```
+Currently we don't distinguish between limited and unlimited
+precision/size numbers in GraphQL. Which means that by default it
+makes sense to treat `Int` as `bigint` and `Float` as `decimal`
+(especially for variables). This preserves the precision when it's
+needed and can be downcast to the specific type the expression
+requires.
+
+Since `int64` is implicitly castable into `bigint` it's possible to
+treat small `Int` literals as `int64` and large ones as `bigint`.
+
+Stop mapping `bigint` onto `Float` and use `Int` instead.
+
+This technically breaks the sprict spec for `Int` and `Float`.
+Introducing custom types would be a separate PR.
+
+Issue #1138
+EdgeDB version: `1.0-alpha.2+dev.505.g5b68ec24` (docker image)
+Python lib version: `0.7.0a9`
+Docker version: `19.03.5-ce, build 633a0ea838`
+
+I run my client on a remote host, each time I try to connect to the server, CPU usage raises from 1-2% to 100% and stays there for a few seconds.
+![image](https://user-images.githubusercontent.com/22667809/72547597-fcc4d380-389d-11ea-9260-49bd6ac0124b.png)
+
+Top processes are:
+![image](https://user-images.githubusercontent.com/22667809/72547940-bae85d00-389e-11ea-8675-1ca0dcc95e04.png)
+
+This does not happen when I connect to database using CLI tool from host machine.
+CPU usage on client machine is always low.
+
+CPU information:
+```
+~ lscpu
+Architecture:                    x86_64
+CPU op-mode(s):                  32-bit, 64-bit
+Byte Order:                      Little Endian
+Address sizes:                   40 bits physical, 48 bits virtual
+CPU(s):                          4
+On-line CPU(s) list:             0-3
+Thread(s) per core:              1
+Core(s) per socket:              4
+Socket(s):                       1
+NUMA node(s):                    1
+Vendor ID:                       GenuineIntel
+CPU family:                      6
+Model:                           62
+Model name:                      Intel(R) Xeon(R) CPU E5-2620 v2 @ 2.10GHz
+Stepping:                        4
+CPU MHz:                         2099.998
+BogoMIPS:                        4199.99
+Hypervisor vendor:               KVM
+Virtualization type:             full
+L1d cache:                       128 KiB
+L1i cache:                       128 KiB
+L2 cache:                        16 MiB
+L3 cache:                        16 MiB
+NUMA node0 CPU(s):               0-3
+```

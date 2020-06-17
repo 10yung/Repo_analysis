@@ -1,0 +1,268 @@
+This PR implements runtime kernel feature / helper detection for bpftrace. Kernel support is currently tested at compile time which makes it impossible to ship a single bpftrace build. If it is compiled on an older kernel some  of the features will be blocked, even though the kernel supports it. And when using it on an older kernel  helpers that are not supported by the kernel will be allowed by bpftrace. 
+
+- I've added a feature tester `BPFfeature` (inspired by the one @olsajiri added in #871). It tests kernel support by loading small programs into the kernel. All tests are done during object creation which on my test VM takes around 350us (for all 3). 
+- We currently rely  on the `enum bpf_func_id` shipped by the kernel to do feature detection and the one shipped with libbcc in irbuilder. This causes issues like #1014 and also limits the features we compile into bpftrace to what the system supports at that moment (e.g. `signal`). By defining this enum ourselves we avoid all those issues and make sure the symbol we need are always present. 
+This will cause some issues if the kernel people ever decide to significantly change this enum (e.g. sorting it) but that seems unlikely and will cause a lot of issues anyway (e.g. codegen).
+- An `--info` command has been added which reports what the kernel supports:
+
+```
+sudo bpftrace --info
+Kernel helpers
+  get_current_cgroup_id: yes
+  send_signal: no
+
+Kernel features
+  Loop support: no
+```
+
+Related to: #1087 
+Solves issues with: #1014 #966 
+
+Currently the features provided by the bpftrace binary are a product of the system that bpftrace is built on. If the headers available at build-time have a particular feature, then bpftrace uses them.
+
+This hurts the portability of bpftrace, as it means that it has to be built for each system that it runs on. Now that #1041 has merged to help adress #342, this is more relevant of an issue - systems that can potentially run a bpftrace that tries to use features their kernel doesn't support. This causes issues like https://github.com/iovisor/bpftrace/issues/1014 and for various headers to have to be bundled in. This issue was first raised by @danobi in https://github.com/iovisor/bpftrace/issues/342#issuecomment-569450971. 
+
+The alternative paths that a solution might take, that I've thought of so far are:
+
+1. We build bpftrace for each kernel version which adds to or modifies the BPF API, and users can distribute bpftrace per kernel
+1. We teach bpftrace to detect this at runtime, and either take fallback paths for compatibility
+1. Throw an exception / catch whatever exception arises, and warn the user that the feature is not supported, or perhaps not fully supported.
+
+I think that 1) is probably going to be a lot of work and a bit of a pain. The checks we have at build-time are still good for ensuring that bpftrace can build the superset of functionality, but I'd prefer if it were able to still work robustly if it is running against an older kernel. For this reason, i favor 2) or 3).
+
+I'm not actually sure what issues we'll run into, I'd guess that there will probably be some bugs reported against the 0.9.4 semi-static binaries that could give some insight. I know that we can at least see cases where we do #ifdef in the code now, so I'd guess that for instance someone trying to use the cgroup builtin on a system that doesn't support it could run into this problem.
+
+So, if we go the path of checking kernel compatibility, there will probably be more code complexity as we have to handle fallbacks / stubbing functionality / warning on older systems.
+
+So, the error handling path might be the best one, as it is already a runtime system for handling fallbacks. I'd guess that we can just design a new exception `KernelVersionException` or `BpfApiException` or something to that effect, and either warn or throw a fatal error depending on what is appropriate.
+
+For a lot of users, a fatal exception for a script that tries to use unhandled features isn't degrading their experience, because they couldn't run the script anyways - at least now they know why. In other cases, if functionality is missing but not critical (ie, there is a reasonable fallback), then a warning message can be printed, or the fallback to something less efficient could happen transparently.
+
+@fbs @mmarchini @danobi any thoughts on how we should tackle this?
+
+
+
+
+
+
+DRAFT to fix #1071 (ignore #1084 )
+
+May need patches to BCC due to iovisor/bcc#2324 which appears to also be affecting the ability to do USDT probes in containers.
+
+This functionality use to work in bpftrace 0.9.2 with BCC up to 0.11.0, It seems to now be broken.
+
+This also builds off of #1021
+
+To do:
+
+* [X] ~Verify there is an underlying issue in BCC and fix it, ideally before 0.13.0 is released~ https://github.com/iovisor/bcc/pull/2710 is up
+* [ ] Add runtime regression tests that use mountns_wrapper to make sure this regression doesn't creep back in
+The class has gotten too big and does way too many things now. We should break it up into smaller components.
+
+### Work items:
+- [ ] child process management
+  * `cmd_` and `pid_` are used and abused too often b/c they are public
+- [ ] logging
+Commit 854cd4bc053c53 ("Add memory watchpoint probe prototype") added
+support for memory watchpoint at absolute addresses. That was a good first
+step, but it's fairly rare that users are working with fixed memory addresses.
+
+This patchset adds support for much more powerful and dynamic memory
+watchpoints. Consider the following example:
+```
+$ cat ~/scratch/printfloop.c
+__attribute__((noinline))
+void saysomething(int *i) {
+  int x = *i;
+  // do work
+}
+
+int main() {
+  int *i = malloc(sizeof(int));
+  *i = 0;
+  while (1) {
+    saysomething(i);
+    (*i) = random();  // !!! corruption
+    sleep(1);
+  }
+}
+```
+
+We could watch for the "corruption" but executing the following bpftrace
+script:
+```
+$ sudo bpftrace -e 'watchpoint:saysomething:0:4:w { printf("saw a write\n"); }' \
+    -c ./printfloop
+Attaching 1 probe...
+saw a write!
+^C
+
+```
+where `saysomething` is the function to hook into, `0` is the argument
+(identical to `arg0`, `arg1`, etc.) we treat as the target memory address,
+`4` is the length of the memory watchpoint (4 bytes), and `w` as listen
+for writes.
+
+See individual commits for descriptions of the mechanics behind how
+this feature works.
+
+For full examples, see the attached runtime tests.
+
+### TODO
+- [ ] final clang format pass
+- [ ] documentation
+
+As @mmarchini  found in #711  there are quite a few type issues which usually work fine but break LLVM (segfault / oom) in edge cases. I bumped into these too while trying to implement while loops (segfaults in weird place) so figured I'd give them a go.
+
+These are just the first 2, there are a lot more of them but once the `*map` ones are out of the way the rest should cause a lot less codegen changes.
+
+Once everything is done adding `llvm-as` to the testing phase might useful as it spots a lot of these issues for us, e.g.:
+
+```
+llvm-as-7: bad.ll:162:27: error: constant expression type mismatch
+  %lookup_elem = call i8* inttoptr (i64 1 to i8* (i8*, i8*)*)(i64 %pseudo, i64* %"@_key")
+```
+Type::string value can be non null-terminated and/or its length can be less than `STRING_SIZE` (64).
+Fix the codes which do not take these into account.
+
+------
+
+This fixes errors like the following.
+
+- Target program
+```c
+#include <stdio.h>
+
+struct a {
+    char v[4];
+};
+
+void f(struct a* a){
+    printf("%c\n", a->v[0]);
+}
+
+int main(){
+    struct a a = { .v = {0x30, 0x31, 0x32, 0x33} };
+    f(&a);
+    return 0;
+}
+```
+
+- error 1
+```
+%sudo ./src/bpftrace -e 'struct a { char v[4]; } u:./a.out:f { $a = ((struct a*)arg0)->v; printf("%s %s\n", $a, $a); }'
+Attaching 1 probe...
+01230123 0123
+```
+
+- error 2
+
+```
+% sudo ./src/bpftrace -e 'struct a { char v[4]; } u:./a.out:f { @[((struct a*)arg0)->v] = count(); }'
+Attaching 1 uprobe...
+Running...
+^C
+
+@[0123U]: 1
+```
+
+Similar to https://github.com/iovisor/bpftrace/issues/968, as expected USDT probes in containers don't work.
+
+I'm mostly writing this issue as a reminder to myself to fix this, similarly to how it was done in #1021 
+
+I debugged this a little bit with a colleague today (@clandry94) trying to attach to USDT probes on a JVM process inside of a container.
+
+After modifying the semantic analyzer to pass a pid to `resolve_binary_path`, we still got the error:
+
+```
+ ERROR: usdt target file '/proc/3509211/root/usr/share/elasticsearch/jdk/lib/server/libjvm.so' does not exist or is not executable
+```
+
+Despite the file very much existing and being executable. It even shows up when you list the USDT probes for the process.
+
+I don't expect this to be very complicated to fix, and we confirmed that it was working in bpftrace 0.9.2 (but not master), so this is clearly a regression. A regression runtime test will need to be added to prevent this from regressing again once fixed.
+```
+> bpftrace --version
+bpftrace v0.9.3
+> sudo bpftrace -e 'tracepoint:block:block_rq_issue { @bytes[args->rwbs] = sum(args->bytes); }'
+Attaching 1 probe...
+^C
+
+@bytes[WS]: 2
+@bytes[R]: 4
+@bytes[R]: 5
+@bytes[RA]: 6
+@bytes[RA]: 9
+@bytes[R]: 16
+@bytes[RA]: 30
+@bytes[R]: 32
+```
+
+There are duplicates in the string keyed map. It seems like maybe the end of the string isn't being zeroed, and then the whole buffer gets strcmped, but that is just a guess. I'm running a patched version of Linux 4.16.
+Early PR to get feedback on the approach, there is still a lot to do but it is functional.
+
+On a fedora31 machine the following code runs:
+
+```
+i:s:10 {
+  $a = 1;
+  while($a < 100) {
+    if ($a > 50) {
+      break;
+    }
+    printf("%d\n", $a++);
+  }
+  exit();
+}
+```
+
+and compiles into:
+
+```
+   0: (bf) r6 = r1
+   1: (b7) r8 = 1
+   2: (b7) r9 = 0
+   3: (7b) *(u64 *)(r10 -16) = r9
+   4: (7b) *(u64 *)(r10 -8) = r8
+   5: (18) r7 = map[id:377]
+   7: (85) call bpf_get_smp_processor_id#94320
+   8: (bf) r4 = r10
+   9: (07) r4 += -16
+  10: (bf) r1 = r6
+  11: (bf) r2 = r7
+  12: (bf) r3 = r0
+  13: (b7) r5 = 16
+  14: (85) call bpf_perf_event_output_tp#-48704
+  15: (07) r8 += 1
+  16: (15) if r8 == 0x33 goto pc+1
+  17: (05) goto pc-15
+  18: (b7) r1 = 30000
+  19: (7b) *(u64 *)(r10 -16) = r1
+  20: (18) r7 = map[id:377]
+  22: (85) call bpf_get_smp_processor_id#94320
+  23: (bf) r4 = r10
+  24: (07) r4 += -16
+  25: (bf) r1 = r6
+  26: (bf) r2 = r7
+  27: (bf) r3 = r0
+  28: (b7) r5 = 8
+  29: (85) call bpf_perf_event_output_tp#-48704
+  30: (b7) r0 = 0
+  31: (95) exit
+```
+
+I've added a runtime feature tester (mostly stolen from @olsajiri ) that tests whether the kernel supports loops. But during testing I found that LLVM unrolls quite aggressively, replacing 50 with 25 in the above example makes the code run on a 4.18 kernel (320 instructions)
+
+LLVM seems to be quite picky about it's IR (extra branches can lead to loops or segfaults) which makes the `if` quite complex.
+
+Once this is in I can start on `for` loops, they shouldn't be too hard once we have agreement on the approach.
+
+I've added `--emit-ir` mostly for testing. The IR can be passed into LLVM tools to test some manual IR changes. Easier than going to a compile/run cycle
+
+
+TODO:
+
+- [ ] cleanup code
+- [ ] tests
+- [ ] docs
+- [ ] more tests

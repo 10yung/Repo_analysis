@@ -1,0 +1,154 @@
+cling based C++ as scripting language / hot code reload
+Why? Able to run C++ script in runtime or compile it for max speed ( as in example https://github.com/derofim/cling-cmake )
+
+> **HOT code reload**
+> possible approaches:
+> 
+> store app state
+> fix cling undo for files
+> https://root-forum.cern.ch/t/loading-unloading-class-as-interpreted-macro-in-cling-multiple-times/32976/2
+> 
+> execute cling code to change callbacks & variables
+> nested cling::Interpreter with multiple cling::MetaProcessor
+> IDK how to do it, but you can create child cling::Interpreter
+
+I see there are no versions and releases so users must use bleeding edge or a fork of Oryol *and* all dependencies.
+
+It seems to me that in order to properly support versions you must tag all dependencies then change fips.yml to point to the appropriate tags. It's somewhat of a grunt work but I think it's important to allow users work without the risks involved with always using bleeding edge.
+
+This will also allow safe tagging of stable versions which may be useful for breaking changes (for example, the one in the sokol_gfx pull request)
+
+An added benefit will be the ability to git bisect, which with luck you will never have to use. 
+
+PS But according to Murphy's law the only way to guarantee you will never use something is to invest effort in making it. So there's that :laughing: 
+I just updated Mojave and tried to built my project (which has been working great). I now get these errors: 
+![image](https://user-images.githubusercontent.com/1939589/48984240-6ea0f300-f0c7-11e8-913b-193416afc975.png)
+Any suggestions? 
+Oryol's RTTI doesn't work properly in Emscripten when using dynamic libraries.
+
+A simple test case:
+
+module.h:
+
+```
+class Module : public RefCounted {
+    OryolClassDecl(Plugin);
+    OryolBaseTypeDecl(Plugin);
+public:
+    virtual ~Module(){}
+};
+
+class ModuleOfSpecificType : public Module {
+    OryolClassDecl(ModuleOfSpecificType);
+    OryolTypeDecl(ModuleOfSpecificType, Module);
+public:
+    virtual ~ModuleOfSpecificType(){}
+    virtual void doSomething() = 0;
+};
+
+```
+
+side_module.h:
+```
+class SideModule : public ModuleOfSpecificType {
+    OryolClassDecl(SideModule);
+    OryolTypeDecl(SideModule, ModuleOfSpecificType);
+    OryolClassCreator(SideModule);
+public:
+    virtual void doSomething();
+}
+```
+
+If the class SideModule is used in, well, a side module in Emscripten and then dlopened by the main code and constructed via e.g.
+
+```
+extern "C" Ptr<Module> create(){
+    return new Module;
+}
+```
+and `dlsym(side_module, "create")` is used to instantiate it and get a Ptr<Module> named m:
+
+```
+if (m->IsA<ModuleOfSpecificType>()) {
+    // On desktop, this code is run. On Emscripten... not so much
+    m->DynamicCast<ModuleOfSpecificType>()->doSomething();
+}
+```
+
+If that's changed to use a raw pointer access and manual cast e.g.
+
+```
+((ModuleOfSpecificType*)m.p)->doSomething();
+```
+
+then it works fine.
+
+Importantly, it works on native platforms, and it works with a manual cast. The only thing that's broken is the RTTI.
+
+I suspect that Emscripten gives each module its own address space, which makes Oryol's RTTI fundamentally incompatible with Emscripten with libdl.
+
+A possible solution: once the module support is added behind a Fips option, have that option also change to a different RTTI implementation that functions differently.
+
+One idea that occurs to me: if it's possible to override specific templates which IIRC it is, the RTTI can be changed to overload for the specific class.
+I have a program that launches a group of Lua-based plugins. The plugins are instantiated in parallel; that is, there are a number of threads that set up the plugins.
+
+However, I came upon an assertion failure when using IO::Load to load in the Lua scripts, as apparently IO::Load can only be called from the thread IO::Setup was called from? Is there any way to change this so that I/O can execute on other threads?
+## Summary
+I added a `mat2` uniform to my vertex shader. I assigned it an identity matrix so I was surprised when my mesh stopped displaying. I replaced the uniform by the literal identity `mat2(vec2(1, 0), vec2(0, 1))` and the mesh displayed correctly.
+
+So I checked with Nvidia Nsight and I found the issue.
+
+My uniform declaration:
+```glsl
+uniform params {
+	mat4 viewProj;
+	mat2 model;
+};
+```
+
+My uniform data looks like this (`params[0]` on the GPU):
+```
+Address Data
+0x00000000         0.00250         0.00000         0.00000         0.00000
+0x00000010         0.00000         0.00333         0.00000         0.00000
+0x00000020         0.00000         0.00000        -0.00100         0.00000
+0x00000030         0.00000         0.00000         0.00150         1.00000
+0x00000040         1.00000         0.00000         0.00000         1.00000
+0x00000050         0.00000         0.00000         0.00000         0.00000
+```
+
+The generated vertex shader tries to initialize the `mat2` like this:
+`mat2(params[4].xy, params[5].xy)`
+
+According to the data it should be:
+`mat2(params[4].xy, params[4].zw)`
+
+## Test case
+https://github.com/Ohmnivore/battle/tree/5c88e270fef19618425dbfa82b6217bc87c7dafc
+
+Overview (the project only has two source files):
+* Shader code in `code/shaders.glsl`
+* Uniforms applied in `code/BattleApp.cc` (BattleApp::OnRunning):
+```c++
+// Update parameters
+this->mainVSParams.viewProj = viewProj;
+this->mainVSParams.model = glm::mat2();
+this->mainDrawState.FSTexture[MainShader::tex] = this->texBG3;
+
+// Render
+Gfx::ApplyDrawState(this->mainDrawState);
+Gfx::ApplyUniformBlock(this->mainVSParams);
+Gfx::Draw(0);
+```
+
+## Generated files
+* [shaders.h](https://gist.github.com/Ohmnivore/0d4a8eaf1cc850ea607867dedd5d27fb#file-shaders-h)
+* [shaders.cc](https://gist.github.com/Ohmnivore/0d4a8eaf1cc850ea607867dedd5d27fb#file-shaders-cc)
+* [Vertex shader contents](https://gist.github.com/Ohmnivore/0d4a8eaf1cc850ea607867dedd5d27fb#file-mainvs-glsl)
+If an item to be added is a reference to an item in the same container, and the container needs to grow, the item reference will be invalid and a memory corruption might happen. Detect if the container needs to grow, and create a copy of the item before growing.
+
+I read to the bottom of the pipelines doc and reached it's (rather anti-climactic!) [conclusion](https://github.com/floooh/oryol/blob/master/code/Modules/Gfx/doc/Pipelines.md#creating-pipeline-objects).
+
+I'm having a casual play with Oryol this summer and hopefully will do something more substantial with it next summer after exams. I'm not a C++ programmer, let alone a game developer, so the documentation is really useful!
+Added "Center" button to the GamepadState printout in the TestInput sample.
+Added gamepad mapping for Nintendo Wii U Pro Controller on glfw Linux.

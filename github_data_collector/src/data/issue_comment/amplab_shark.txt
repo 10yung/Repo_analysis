@@ -1,0 +1,88 @@
+clear-buffer-cache.py assumes the slaves file is located under /root/spark-ec2/slaves .  This is not consistent with the Spark setup guide for custom deployments.
+
+I added the ability to find the slaves file relative to the SPARK_HOME environmental variable, if set.  If the slaves file cannot be found in either location, an error is raised.
+
+
+- Support reload the cachedRDD upon the start
+- Support the CLI switch for Hive/Catalyst
+
+```
+$ bin/shark
+catalyst> show tables;
+Execution Mode: catalyst
+OK
+shark_test1
+shark_test1_cached
+Time taken: 0.011 seconds
+
+catalyst> explain select * from shark_test1;
+Execution Mode: catalyst
+== Logical Plan ==
+Project [key#0,val#1]
+ MetastoreRelation default, shark_test1, None
+
+== Optimized Logical Plan ==
+MetastoreRelation default, shark_test1, None
+
+== Physical Plan ==
+HiveTableScan [key#0,val#1], (MetastoreRelation default, shark_test1, None), None
+Time taken: 0.172 seconds
+
+catalyst> set shark.exec.mode=hive;
+hive> explain select * from shark_test1;
+Execution Mode: hive
+OK
+ABSTRACT SYNTAX TREE:
+  (TOK_QUERY (TOK_FROM (TOK_TABREF (TOK_TABNAME shark_test1))) (TOK_INSERT (TOK_DESTINATION (TOK_DIR TOK_TMP_FILE)) (TOK_SELECT (TOK_SELEXPR TOK_ALLCOLREF))))
+
+STAGE DEPENDENCIES:
+  Stage-0 is a root stage
+
+STAGE PLANS:
+  Stage: Stage-0
+    Fetch Operator
+      limit: -1
+      Processor Tree:
+        TableScan
+          alias: shark_test1
+          Select Operator
+            expressions:
+                  expr: key
+                  type: int
+                  expr: val
+                  type: string
+            outputColumnNames: _col0, _col1
+            ListSink
+
+
+Time taken: 0.107 seconds
+```
+
+
+This change is necessary for compatibility with Spark-1.0:
+commit 7eefc9d2b3f6ebc0ecb5562da7323f1e06afbb35 in Spark
+added ClassTags on Serializer and all dependent types.
+
+If partition schema does not match table schema, the row (formed by deserializing through partition serde) is converted to match the table schema. If conversion was performed, convertedRow will be a standard Object, but if conversion wasn't necessary, it will still be lazy.
+
+We can't have both (standard and lazy objects) across partitions, so we serialize and deserialize again to make it lazy.
+
+This extra serialize/deserialize is being performed irrespective of the fact that whether conversion was done or not.
+
+There are two effects of this serialization / deserialization:
+
+1) Extra serialization / deserilization cost for cases, where no conversion happened.
+
+2) If a table is created using ThriftDeserializer, the non-availability of serialize function in it makes it unusable in this context.
+
+The fix done is that in case conversion was not done (when partition and table serde match), then this serialization and deserialization step should be skipped, since it is not required as the object would still be lazy. This shall also allow users to be able to use ThriftDeserializer in such a case. 
+
+Tachyon supports kinds of WriteType, like CACHE_THROUGH, MUST_CACHE, TRY_CACHE, and etc. And currently Shark only supports CACHE_THROUGH. Here we make the write type of TachyonOffheapTableWriter configurable, so that the end user can choose different types by "set shark.tachyon.writetype=xxx", to avoid some WRITETHROUGH overhead somehow. 
+
+Scenario 1 :The select privilege is not working when we set metastore pression.
+Scenario 2: The yarn user will be executed when Shark submit JOB and write the scratch doc, and it will try eliminating the utilized account. However, it will report waring exception due to 
+ (Reloading the "close" to ensure ordinary operation) , That lead  Queries can't return the correct verification code.
+
+
+1. 'cache tablename' directive overwrites existing memory tables and can cause memory leaks when the cache command is used on an already cached table. caching new partition also causes a memory leak if the parition already exists.
+2. using 'cache' directive on a partitioned table causes table to be corrupt. Only the last cached partition is accessable with the rest being leaked.

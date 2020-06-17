@@ -1,0 +1,982 @@
+Hi,
+
+As stated in the README, I'm using MLeap 0.11.0 because I run Spark 2.1
+
+My pipeline is as follows (code simplified) :
+
+```
+val str = new StringIndexer()
+val ohe = new OneHotEncoder()
+val vecAssembler = new VectorAssembler()
+val rf = new RandomForestClassifier()
+new Pipeline().setStages(Array(str, ohe, vecAssembler, rf))
+```
+
+The saving works fine :
+```
+val filePrefix = "jar:file:"
+val filePath = "/tmp/model.zip"
+
+val sbc = SparkBundleContext().withDataset(model.transform(data))
+for (bf <- managed(BundleFile(s"$filePrefix$filePath"))) {
+  model.writeBundle.format(SerializationFormat.Json).save(bf)(sbc).get
+}
+```
+
+
+I checked the model I saved, here is what OneHotEncoder looks like :
+
+```
+{
+  "op": "one_hot_encoder",
+  "attributes": {
+    "size": {
+      "long": 3
+    },
+    "drop_last": {
+      "boolean": true
+    }
+  }
+```
+
+The problem happens when I'm trying to load the pipeline to use it.
+When I do :
+
+```
+import ml.combust.mleap.runtime.MleapSupport._
+import java.net.URI
+
+val bundleUri = new URI("jar:file:/tmp/model.zip")
+val model = bundleUri.loadMleapBundle().get.root
+```
+
+I get the following error **java.util.NoSuchElementException: key not found: category_sizes**
+
+This attribute comes from the new OneHotEncoder estimator from Spark 2.3, but I'm running Spark 2.1
+
+When retrieving the list of ops from the reference.conf file of mleap-runtime, we get two keys for the OneHotEncoder, here they are :
+
+  "ml.combust.mleap.bundle.ops.feature.NormalizerOp",
+  **"ml.combust.mleap.bundle.ops.feature.OneHotEncoderOp",
+  "ml.combust.mleap.bundle.ops.feature.OneHotEncoderOpV23",**
+  "ml.combust.mleap.bundle.ops.feature.PcaOp",
+
+And then, in BundleRegistry class line 40, we loop through the ops name, instantiate them, and put them in a Map with their name as the key.
+
+The thing is, OneHotEncoderOp and OneHotEncoderOpV23 have the same key and thus, OneHotEncoderOpV23 overrides OneHotEncoderOp in the Map (you can clearly see that during debug).
+
+Afterwards, when trying to load my Spark 2.1 model, MLeap sees the OneHotEncoderOpV23 has the correct transformer to load and looks for an attribute (category_sizes) that does not exist in the model I saved.
+
+Is something wrong on my end ? Maybe I'm missing some conf or something.
+
+Thanks for your help !
+This builds on top of https://github.com/combust/mleap/pull/571, so the additional commits are the point of this one.
+
+----
+
+On Travis `string_map_test > test_serialize_to_bundle` fails with this error:
+
+> java.util.NoSuchElementException: key not found: org.apache.spark.ml.mleap.feature.StringMap
+
+This is thrown when trying `opAlias("org.apache.spark.ml.mleap.feature.StringMap")` in `BundleRegistry.scala`, this line:
+
+https://github.com/combust/mleap/blob/beb4fd248e020282f10778c91d68a3518e981dcb/bundle-ml/src/main/scala/ml/combust/bundle/BundleRegistry.scala#L102
+
+So, apparently the `opAlias` map hasn't been initialized properly.
+
+Normally it's initialized here:
+
+https://github.com/combust/mleap/blob/beb4fd248e020282f10778c91d68a3518e981dcb/bundle-ml/src/main/scala/ml/combust/bundle/BundleRegistry.scala#L134
+
+Which is called by this code:
+
+https://github.com/combust/mleap/blob/beb4fd248e020282f10778c91d68a3518e981dcb/bundle-ml/src/main/scala/ml/combust/bundle/BundleRegistry.scala#L35-L45
+
+The `registryConfig.getStringList("ops")` here expects to read from this resource file:
+
+https://github.com/combust/mleap/blob/beb4fd248e020282f10778c91d68a3518e981dcb/mleap-spark-extension/src/main/resources/reference.conf#L1-L13
+
+..but if `reference.conf` is not in classpath, then nothing is read.
+
+----
+
+Locally I was able to trace this problem down to this:
+
+1. `sbt mleap-spark-extension/compile && find mleap-spark-extension/target -name reference.conf`
+   -> finds only: `mleap-spark-extension/target/scala-2.11/classes/reference.conf`
+2. `sbt +mleap-spark-extension/compile && find mleap-spark-extension/target -name reference.conf`
+   -> finds only: `mleap-spark-extension/target/scala-2.12/classes/reference.conf`
+
+With this I can also reproduce the Travis failure by trying to run `tox -c python/tox.ini -v` when the conf doesn't exist in the 2.11 classes folder!
+
+----
+
+So, somehow building sbt with `+` ie. multi-version (builds first 2.11.8, then 2.12) removes the `reference.conf` from under `scala-2.11/classes/` even though it doesn't delete the `.class` files in that folder! Does it make any sense that sbt behaves like this? I posted this as an sbt question on stack overflow: https://stackoverflow.com/questions/59730695/sbt-deletes-resources-under-classes-folder-of-other-scala-versions
+
+----
+
+Full trace of the failed test on Travis: 
+```
+======================================================================
+11822ERROR: test_serialize_to_bundle (tests.pyspark.string_map_test.StringMapTest)
+11823----------------------------------------------------------------------
+11824Traceback (most recent call last):
+11825  File "/home/travis/build/combust/mleap/python/tests/pyspark/string_map_test.py", line 61, in test_serialize_to_bundle
+11826    _serialize_to_file(pipeline_file, self.input, pipeline)
+11827  File "/home/travis/build/combust/mleap/python/tests/pyspark/string_map_test.py", line 94, in _serialize_to_file
+11828    SimpleSparkSerializer().serializeToBundle(model, _to_file_path(path), df_for_serializing)
+11829  File "/home/travis/build/combust/mleap/python/mleap/pyspark/spark_support.py", line 42, in serializeToBundle
+11830    self._java_obj.serializeToBundle(transformer._to_java(), path, dataset._jdf)
+11831  File "/home/travis/build/combust/mleap/python/.tox/py/local/lib/python2.7/site-packages/py4j/java_gateway.py", line 1257, in __call__
+11832    answer, self.gateway_client, self.target_id, self.name)
+11833  File "/home/travis/build/combust/mleap/python/.tox/py/local/lib/python2.7/site-packages/pyspark/sql/utils.py", line 63, in deco
+11834    return f(*a, **kw)
+11835  File "/home/travis/build/combust/mleap/python/.tox/py/local/lib/python2.7/site-packages/py4j/protocol.py", line 328, in get_return_value
+11836    format(target_id, ".", name), value)
+11837Py4JJavaError: An error occurred while calling o835.serializeToBundle.
+11838: java.util.NoSuchElementException: key not found: org.apache.spark.ml.mleap.feature.StringMap
+11839	at scala.collection.MapLike$class.default(MapLike.scala:228)
+11840	at scala.collection.AbstractMap.default(Map.scala:59)
+11841	at scala.collection.MapLike$class.apply(MapLike.scala:141)
+11842	at scala.collection.AbstractMap.apply(Map.scala:59)
+11843	at ml.combust.bundle.BundleRegistry.opForObj(BundleRegistry.scala:102)
+11844	at ml.combust.bundle.serializer.GraphSerializer$$anonfun$writeNode$1.apply(GraphSerializer.scala:31)
+11845	at ml.combust.bundle.serializer.GraphSerializer$$anonfun$writeNode$1.apply(GraphSerializer.scala:30)
+11846	at scala.util.Try$.apply(Try.scala:192)
+11847	at ml.combust.bundle.serializer.GraphSerializer.writeNode(GraphSerializer.scala:30)
+11848	at ml.combust.bundle.serializer.GraphSerializer$$anonfun$write$2.apply(GraphSerializer.scala:21)
+11849	at ml.combust.bundle.serializer.GraphSerializer$$anonfun$write$2.apply(GraphSerializer.scala:21)
+11850	at scala.collection.IndexedSeqOptimized$class.foldl(IndexedSeqOptimized.scala:57)
+11851	at scala.collection.IndexedSeqOptimized$class.foldLeft(IndexedSeqOptimized.scala:66)
+11852	at scala.collection.mutable.WrappedArray.foldLeft(WrappedArray.scala:35)
+11853	at ml.combust.bundle.serializer.GraphSerializer.write(GraphSerializer.scala:20)
+11854	at org.apache.spark.ml.bundle.ops.PipelineOp$$anon$1.store(PipelineOp.scala:21)
+11855	at org.apache.spark.ml.bundle.ops.PipelineOp$$anon$1.store(PipelineOp.scala:14)
+11856	at ml.combust.bundle.serializer.ModelSerializer$$anonfun$write$1.apply(ModelSerializer.scala:87)
+11857	at ml.combust.bundle.serializer.ModelSerializer$$anonfun$write$1.apply(ModelSerializer.scala:83)
+11858	at scala.util.Try$.apply(Try.scala:192)
+11859	at ml.combust.bundle.serializer.ModelSerializer.write(ModelSerializer.scala:83)
+11860	at ml.combust.bundle.serializer.NodeSerializer$$anonfun$write$1.apply(NodeSerializer.scala:85)
+11861	at ml.combust.bundle.serializer.NodeSerializer$$anonfun$write$1.apply(NodeSerializer.scala:81)
+11862	at scala.util.Try$.apply(Try.scala:192)
+11863	at ml.combust.bundle.serializer.NodeSerializer.write(NodeSerializer.scala:81)
+11864	at ml.combust.bundle.serializer.BundleSerializer$$anonfun$write$1.apply(BundleSerializer.scala:34)
+11865	at ml.combust.bundle.serializer.BundleSerializer$$anonfun$write$1.apply(BundleSerializer.scala:29)
+11866	at scala.util.Try$.apply(Try.scala:192)
+11867	at ml.combust.bundle.serializer.BundleSerializer.write(BundleSerializer.scala:29)
+11868	at ml.combust.bundle.BundleWriter.save(BundleWriter.scala:31)
+11869	at ml.combust.mleap.spark.SimpleSparkSerializer$$anonfun$serializeToBundleWithFormat$2.apply(SimpleSparkSerializer.scala:26)
+11870	at ml.combust.mleap.spark.SimpleSparkSerializer$$anonfun$serializeToBundleWithFormat$2.apply(SimpleSparkSerializer.scala:25)
+11871	at resource.AbstractManagedResource$$anonfun$5.apply(AbstractManagedResource.scala:88)
+11872	at scala.util.control.Exception$Catch$$anonfun$either$1.apply(Exception.scala:125)
+11873	at scala.util.control.Exception$Catch$$anonfun$either$1.apply(Exception.scala:125)
+11874	at scala.util.control.Exception$Catch.apply(Exception.scala:103)
+11875	at scala.util.control.Exception$Catch.either(Exception.scala:125)
+11876	at resource.AbstractManagedResource.acquireFor(AbstractManagedResource.scala:88)
+11877	at resource.ManagedResourceOperations$class.apply(ManagedResourceOperations.scala:26)
+11878	at resource.AbstractManagedResource.apply(AbstractManagedResource.scala:50)
+11879	at resource.DeferredExtractableManagedResource$$anonfun$tried$1.apply(AbstractManagedResource.scala:33)
+11880	at scala.util.Try$.apply(Try.scala:192)
+11881	at resource.DeferredExtractableManagedResource.tried(AbstractManagedResource.scala:33)
+11882	at ml.combust.mleap.spark.SimpleSparkSerializer.serializeToBundleWithFormat(SimpleSparkSerializer.scala:27)
+11883	at ml.combust.mleap.spark.SimpleSparkSerializer.serializeToBundle(SimpleSparkSerializer.scala:17)
+11884	at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+11885	at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+11886	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+11887	at java.lang.reflect.Method.invoke(Method.java:498)
+11888	at py4j.reflection.MethodInvoker.invoke(MethodInvoker.java:244)
+11889	at py4j.reflection.ReflectionEngine.invoke(ReflectionEngine.java:357)
+11890	at py4j.Gateway.invoke(Gateway.java:282)
+11891	at py4j.commands.AbstractCommand.invokeMethod(AbstractCommand.java:132)
+11892	at py4j.commands.CallCommand.execute(CallCommand.java:79)
+11893	at py4j.GatewayConnection.run(GatewayConnection.java:238)
+11894	at java.lang.Thread.run(Thread.java:748)
+11895
+11896
+11897
+```
+it seems that this bug not fixed for 0.11 version with this case: #489 
+i write two test cases, first is a spark test case which generate a mleap zip model to local; second test case is a java test case, which load the zip model and predict on sampe data from test1's dataframe, but the probability is not same, here is my code:
+
+test1:
+
+`package com.zenmen.wkread.pmmlModel.ctrModel
+
+import com.zenmen.wkread.SparkFunSuite
+import org.apache.spark.ml.classification.{LogisticRegression, LogisticRegressionModel}
+import org.apache.spark.ml.feature._
+import org.apache.spark.ml.linalg.Vector
+import org.apache.spark.ml.{Pipeline, PipelineStage}
+import org.apache.spark.sql.functions
+import org.scalatest.FunSuite
+
+import scala.collection.mutable.ArrayBuffer
+import scala.util.Try
+
+class ChapterLrManModelTest extends FunSuite with SparkFunSuite {
+
+  private val getKeys: Map[String, Double] => Seq[String] = { input: Map[String, Double] => input.keySet.toSeq }
+
+  private val getProb1 = functions.udf((v: Vector) => v.toArray(1))
+
+  val keyUdf = functions.udf(getKeys)
+
+  test("testTrainModel") {
+    val data0 = spark.createDataFrame(Seq(
+      (Array("1"), 1.0, Map("a" -> 0.1, "b" -> 0.2, "c" -> 0.3), 1),
+      (Array("2"), 10.0, Map("d" -> 0.1, "e" -> 0.2, "c" -> 0.3), 0),
+      (Array("3"), 20.0, Map("x" -> 0.1, "a" -> 0.2, "b" -> 0.3), 0),
+      (Array("4"), 15.0, Map("c" -> 0.1, "b" -> 0.2, "w" -> 0.3), 0),
+      (Array("5"), 18.0, Map("c" -> 0.1, "b" -> 0.2, "w" -> 0.3), 0),
+      (Array("6"), 25.0, Map("c" -> 0.1, "b" -> 0.2, "w" -> 0.3), 1),
+      (Array("6"), 5.0, Map("a" -> 0.1, "b" -> 0.2, "d" -> 0.3), 0),
+      (Array("7"), 30.0, Map("c" -> 0.1, "b" -> 0.2, "w" -> 0.3), 0))
+    )
+      .toDF("book_id", "pv", "myInputCol0", "label")
+
+    val data = data0.withColumn("myInputCol", keyUdf(functions.col("myInputCol0")))
+      .drop("myInputCol0")
+
+    data.show(10)
+    data.printSchema()
+
+    val pipelineStage = new ArrayBuffer[PipelineStage]()
+
+    val bookFiter = new CountVectorizer()
+      .setInputCol("book_id")
+      .setOutputCol("book_id_vec")
+      .setMinDF(1)
+      .setMinTF(1)
+      .setBinary(true)
+    pipelineStage += bookFiter
+
+    val doubleDiscretizer = new QuantileDiscretizer()
+      .setInputCol("pv")
+      .setOutputCol("pv_bucket")
+      .setNumBuckets(3)
+    pipelineStage += doubleDiscretizer
+
+    val myFiter = new CountVectorizer()
+      .setInputCol("myInputCol")
+      .setOutputCol("myInputCol1_vec")
+      .setMinDF(1)
+      .setMinTF(1)
+      .setBinary(true)
+    pipelineStage += myFiter
+
+
+    val vectorAsCols = Array("pv_bucket", "book_id_vec", "myInputCol1_vec")
+
+    val vectorAssembler = new VectorAssembler().setInputCols(vectorAsCols).setOutputCol("vectorFeature")
+    pipelineStage += vectorAssembler
+
+    val scaler = new MinMaxScaler().setInputCol("vectorFeature").setOutputCol("scaledFeatures")
+    pipelineStage += scaler
+
+    val lr: LogisticRegression = new LogisticRegression()
+      .setFitIntercept(true)
+      .setMaxIter(1) //max iteration
+      .setFeaturesCol("scaledFeatures")
+      .setLabelCol("label")
+
+    pipelineStage += lr
+
+    //    val featurePipeline = new Pipeline().setStages(Array(myFiter, labelQuant, vectorAssembler, scaler))
+    val featurePipeline = new Pipeline().setStages(pipelineStage.toArray)
+
+    val fitor = featurePipeline.fit(data)
+    val data1 = fitor.transform(data)
+
+    val lrm = fitor.stages.last.asInstanceOf[LogisticRegressionModel]
+
+    val vecModels = fitor
+      .stages
+      .map(x => Try(x.asInstanceOf[CountVectorizerModel]))
+      .filter(x => x.isSuccess)
+
+    //    val quantModels = fitor
+    //      .stages
+    //      .map(x => Try(x.asInstanceOf[Bucketizer]))
+    //      .filter(x => x.isSuccess)
+
+    val featureIndex = data1.schema.fieldIndex("vectorFeature")
+    val vecMap = data1.schema.fields(featureIndex).metadata.getMetadata("ml_attr").getMetadata("attrs")
+    val featureMapping = Array(
+      Try(vecMap.getMetadataArray("numeric")),
+      Try(vecMap.getMetadataArray("binary")),
+      Try(vecMap.getMetadataArray("nominal"))
+    )
+      .filter(x => x.isSuccess)
+      .flatMap(x => x.get)
+      .map(x => (x.getLong("idx"), x.getString("name")))
+    val featureCof = featureMapping
+      .map(x => (x._2, x._1))
+      .map(x => (x._1, lrm.coefficients(x._2.toInt)))
+      .toList
+      .sortBy(x => x._2)
+      .reverse
+      .map(x => {
+        if (x._1.contains("_vec")) {
+          val featureOrgIndex = x._1.lastIndexOf("_").toInt
+          val vecModelOutCol = x._1.substring(0, featureOrgIndex)
+          val vecIndex = x._1.substring(featureOrgIndex + 1).toInt
+          val vecModels = fitor
+            .stages
+            .map(x => Try(x.asInstanceOf[CountVectorizerModel]))
+            .filter(x => x.isSuccess && x.get.getOutputCol == vecModelOutCol)
+            .map(x => x.get)
+          val feature = vecModels.head.vocabulary(vecIndex)
+          (s"${vecModelOutCol}_${feature}", x._2)
+        } else {
+          (x._1, x._2)
+        }
+      })
+      .map(x => s"${x._1}\t${x._2}")
+      .mkString("\n")
+    val dataFinal = data1.select(
+      Seq(functions.concat_ws(",", functions.col("book_id")),
+        functions.col("pv"),
+        functions.concat_ws(",", functions.col("myInputCol")),
+        getProb1(functions.col("probability")).alias("prob1")): _*)
+    dataFinal.show()
+    println(dataFinal.schema)
+    dataFinal
+      .write
+      .mode("overwrite")
+      .csv(s"${dataOutPath}/lr_base/csv")
+
+    val mleapModel = new com.zenmen.wkread.pmmlModel.serving.mleap.serialization.ModelSerializer()
+    mleapModel.serializeModel(fitor, s"jar:file:${dataOutPath}/lr_base/model/lr.model.mleap.zip", data1)
+  }
+
+}
+
+---------------------------------------------------------split line----------------------------------
+`
+test2:
+`package com.zenmen.wkread.pmmlModel.serving.mleap.load;
+
+import com.google.common.collect.Lists;
+import ml.combust.mleap.core.types.StructField;
+import ml.combust.mleap.core.types.StructType;
+import ml.combust.mleap.runtime.frame.Row;
+import ml.combust.mleap.runtime.javadsl.LeapFrameBuilder;
+import org.junit.Test;
+
+import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * @program: wk-rec
+ * @description: 测试mleap java serving
+ * @author: Xu.Chao
+ * @create: 2020-01-07 17:04
+ **/
+
+public class JavaModelServerTest1 {
+
+    String testResourcePath = String.format("%s/src/test/resource", new File(".").getAbsolutePath());
+    String testDataInPath = String.format("%s/src/test/dataIn", new File(".").getAbsolutePath());
+    String testDataOutPath = String.format("%s/src/test/dataOut", new File(".").getAbsolutePath());
+
+    @Test
+    public void testLoadModel() {
+        LeapFrameBuilder builder = new LeapFrameBuilder();
+        List<StructField> fields = new ArrayList();
+        fields.add(builder.createField("book_id", builder.createList(builder.createBasicString())));
+        fields.add(builder.createField("pv", builder.createDouble()));
+        fields.add(builder.createField("myInputCol", builder.createList(builder.createBasicString(), true)));
+
+        StructType schema = builder.createSchema(fields);
+        JavaModelServer javaModelServer = new JavaModelServer(String.format("%s/lr_base/model/lr.model.mleap.zip", testDataOutPath), schema);
+        javaModelServer.loadModel();
+
+        List<List<String>> books = Lists.newArrayList();
+        books.add(Lists.newArrayList("1"));
+        books.add(Lists.newArrayList("2"));
+        books.add(Lists.newArrayList("3"));
+        books.add(Lists.newArrayList("4"));
+        books.add(Lists.newArrayList("5"));
+        books.add(Lists.newArrayList("6"));
+        books.add(Lists.newArrayList("6"));
+        books.add(Lists.newArrayList("7"));
+
+        List<Double> pv = Lists.newArrayList();
+        pv.add(1.0);
+        pv.add(10.0);
+        pv.add(20.0);
+        pv.add(15.0);
+        pv.add(18.0);
+        pv.add(25.0);
+        pv.add(5.0);
+        pv.add(30.0);
+
+        List<List<String>> myInputCol = Lists.newArrayList();
+        myInputCol.add(Lists.newArrayList("a", "b", "c"));
+        myInputCol.add(Lists.newArrayList("d", "e", "c"));
+        myInputCol.add(Lists.newArrayList("x", "a", "b"));
+        myInputCol.add(Lists.newArrayList("c", "b", "w"));
+        myInputCol.add(Lists.newArrayList("c", "b", "w"));
+        myInputCol.add(Lists.newArrayList("c", "b", "w"));
+        myInputCol.add(Lists.newArrayList("a", "b", "d"));
+        myInputCol.add(Lists.newArrayList("c", "b", "w"));
+
+        List<Row> rows = Lists.newArrayList();
+        // 第一个值是对的，其余都是错的, 序不对了
+        for(int i =0; i< pv.size(); i++){
+            List<Object> rowValues = Lists.newArrayList();
+            rowValues.add(books.get(i));
+            rowValues.add(pv.get(i));
+            rowValues.add(myInputCol.get(i));
+            Row features = builder.createRowFromIterable(rowValues);
+            ArrayList<Object> result = javaModelServer.forecast(features);
+            System.out.println(String.format("预测概率为: %f", (double) (result.get(1))));
+        }
+    }
+}`
+
+test1's predict is:
+
+`+---------------------+----+------------------------+-------------------+
+|concat_ws(,, book_id)|  pv|concat_ws(,, myInputCol)|              prob1|
++---------------------+----+------------------------+-------------------+
+|                    1| 1.0|                   a,b,c| 0.8919558331701626|
+|                    2|10.0|                   d,e,c|0.08783704512194512|
+|                    3|20.0|                   x,a,b|0.16700716790954087|
+|                    4|15.0|                   c,b,w| 0.3690755404084818|
+|                    5|18.0|                   c,b,w| 0.3690755404084818|
+|                    6|25.0|                   c,b,w| 0.6447347800200935|
+|                    6| 5.0|                   a,b,d|  0.434624976135266|
+|                    7|30.0|                   c,b,w|0.34559828223992617|
++---------------------+----+------------------------+-------------------+`
+
+test2's predict probability is :
+`预测概率为: 0.891956
+预测概率为: 0.096383
+预测概率为: 0.197425
+预测概率为: 0.393189
+预测概率为: 0.393189
+预测概率为: 0.690080
+预测概率为: 0.355408
+预测概率为: 0.393189`
+
+the first row probability is same, others are different, and order changed.
+Anyone else frustrated like me at the lack of mleap support ? I'm desperate enough that I'm willing to pay the creators to help get my issues resolved.
+After creating a PySpark model and serializing it to a bundle, I try to read in the MLeap transformer and make a prediction but the prediction is wrong.
+
+Upon investigation, I've found that the inputSchema of the model has been modified, so the features are in the wrong order. If you simply print out the PipelineModel, it shows the features in the correct order, but calling inputSchema gives an incorrect order.
+@abaveja313
+** Code to reproduce:
+
+Model
+```from sklearn.datasets import load_breast_cancer
+from pyspark import SparkConf, SparkContext, SQLContext
+from pyspark.sql import Row
+from pyspark.ml.feature import VectorAssembler,StringIndexer
+from pyspark.ml.classification import LogisticRegression,RandomForestClassifier
+from pyspark.ml import Pipeline
+
+data = load_breast_cancer()
+X, y = data['data'], data['target']
+cols = [str(i) for i in data['feature_names']] + ['label']
+sample = Row(*cols)
+dataframe = []
+for X_sample, y_sample in zip(X, y):
+    X_data = [float(i) for i in X_sample]
+    label = float(y_sample)
+    sample_data = X_data + [label]
+    dataframe.append(sample(*sample_data))
+df = sqlContext.createDataFrame(dataframe)
+features = df.columns
+features.remove('label')
+assembler = VectorAssembler(inputCols=features, outputCol='features')
+model = RandomForestClassifier()
+pipeline = Pipeline(stages=[assembler, model])
+train, test = df.randomSplit([0.7, 0.3])
+fittedPipeline = pipeline.fit(train)
+predictions = fittedPipeline.transform(test)
+print(predictions.select('prediction').limit(10).collect())
+```
+
+serialization and movement to HDFS:
+```fittedPipeline.serializeToBundle("jar:file:///tmp/mleap-rftest.zip", predictions)
+%%bash 
+hdfs dfs -copyFromLocal -f /tmp/mleap-rftest.zip /tmp/mleap-rftest.zip
+```
+
+Reading in the model
+```%%scala
+import java.net.URI
+
+import ml.bundle.hdfs.HadoopBundleFileSystem
+import ml.combust.mleap.runtime.MleapContext
+import ml.combust.mleap.runtime.frame.Transformer
+import ml.combust.mleap.runtime.MleapSupport._
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.FileSystem
+
+object HDFSRetriever {
+  val config = new Configuration()
+  // Create the hadoop file system
+  val fs: FileSystem = FileSystem.get(config)
+  // Create the hadoop bundle file system
+  val bundleFs = new HadoopBundleFileSystem(fs)
+  // Create an implicit custom mleap context for saving/loading
+  implicit val customMleapContext: MleapContext = MleapContext.defaultContext.copy(
+    registry = MleapContext.defaultContext.bundleRegistry.registerFileSystem(bundleFs)
+  )
+
+  /**
+   * Load a given model from HDFS using
+   * the configuration specified in the
+   * MLeapContext
+   *
+   * @param path hdfs path to load from
+   */
+  def loadBundleFromHDFS(path: String): Transformer = {
+    new URI(path).loadMleapBundle().get.root
+  }
+}
+val model = HDFSRetriever.loadBundleFromHDFS("hdfs:///tmp/mleap-rftest.zip");
+print(model)
+out>> Pipeline(PipelineModel_515b263296a1,NodeShape(Map(),Map()),
+PipelineModel(List(VectorAssembler(VectorAssembler_b62fd25850d3,NodeShape(Map(
+input0 -> Socket(input0,mean radius), 
+input1 -> Socket(input1,mean texture), 
+input2 -> Socket(input2,mean perimeter), 
+input3 -> Socket(input3,mean area),
+input4 -> Socket(input4,mean smoothness), 
+input5 -> Socket(input5,mean compactness), 
+input6 -> Socket(input6,mean concavity), 
+input7 -> Socket(input7,mean concave points), 
+input8 -> Socket(input8,mean symmetry),
+input9 -> Socket(input9,mean fractal dimension), 
+input10 -> Socket(input10,radius error), 
+input11 -> Socket(input11,texture error), 
+input12 -> Socket(input12,perimeter error), 
+input13 -> Socket(input13,area error), 
+input14 -> Socket(input14,smoothness error),
+input15 -> Socket(input15,compactness error), 
+input16 -> Socket(input16,concavity error), 
+input17 -> Socket(input17,concave points error), 
+input18 -> Socket(input18,symmetry error), 
+input19 -> Socket(input19,fractal dimension error), 
+input20 -> Socket(input20,worst radius), 
+input21 -> Socket(input21,worst texture), 
+input22 -> Socket(input22,worst perimeter), 
+input23 -> Socket(input23,worst area), 
+input24 -> Socket(input24,worst smoothness), 
+input25 -> Socket(input25,worst compactness),
+input26 -> Socket(input26,worst concavity), 
+input27 -> Socket(input27,worst concave points), 
+input28 -> Socket(input28,worst symmetry), 
+input29 -> Socket(input29,worst fractal dimension)),Map(output -> Socket(output,features))),VectorAssemblerModel(List(ScalarShape(true)
+```
+
+printing the inputSchema:
+```%%scala
+model.inputSchema.fields.zipWithIndex.foreach { case (field, idx) =>
+  println(s"$idx $field")
+}
+out>> 0 StructField(mean texture,ScalarType(double,true))
+1 StructField(concavity error,ScalarType(double,true))
+2 StructField(mean compactness,ScalarType(double,true))
+3 StructField(mean radius,ScalarType(double,true))
+4 StructField(texture error,ScalarType(double,true))
+5 StructField(mean smoothness,ScalarType(double,true))
+6 StructField(concave points error,ScalarType(double,true))
+7 StructField(worst concavity,ScalarType(double,true))
+8 StructField(mean concavity,ScalarType(double,true))
+9 StructField(compactness error,ScalarType(double,true))
+10 StructField(mean area,ScalarType(double,true))
+11 StructField(worst fractal dimension,ScalarType(double,true))
+12 StructField(worst concave points,ScalarType(double,true))
+13 StructField(worst perimeter,ScalarType(double,true))
+14 StructField(area error,ScalarType(double,true))
+15 StructField(worst compactness,ScalarType(double,true))
+16 StructField(worst texture,ScalarType(double,true))
+17 StructField(mean concave points,ScalarType(double,true))
+18 StructField(mean symmetry,ScalarType(double,true))
+19 StructField(worst area,ScalarType(double,true))
+20 StructField(symmetry error,ScalarType(double,true))
+21 StructField(fractal dimension error,ScalarType(double,true))
+22 StructField(worst radius,ScalarType(double,true))
+23 StructField(worst smoothness,ScalarType(double,true))
+24 StructField(mean fractal dimension,ScalarType(double,true))
+25 StructField(radius error,ScalarType(double,true))
+26 StructField(smoothness error,ScalarType(double,true))
+27 StructField(mean perimeter,ScalarType(double,true))
+28 StructField(worst symmetry,ScalarType(double,true))
+29 StructField(perimeter error,ScalarType(double,true))
+```
+
+As you can see, the inputSchema is wrong, causing all predictions to be wrong. I've reproduced the same with LogisticRegression models as well. I'm stuck here because without being able to generate the schema I have to specify it each time which creates non-reproducible code. 
+
+Is there something I'm doing wrong here or missing? Help would be greatly appreciated!
+
+ 
+The `Imputer` class imported here:
+
+https://github.com/combust/mleap/blob/beb4fd248e020282f10778c91d68a3518e981dcb/python/mleap/sklearn/extensions/data.py#L24
+
+Was removed in scikit-learn version 0.22 as mentioned here:
+
+https://github.com/scikit-learn/scikit-learn/blob/ee328faa3601b40944ad43e28bce71860d39f2de/sklearn/preprocessing/imputation.py#L60
+I ran into this exception and don't seem to be able to identify the root cause. Am I missing any dependencies?
+ 
+Project Structure:
+```
+.
+├── build.sbt
+├── project
+│   ├── Dependencies.scala
+│   ├── xyzProject.scala
+│   ├── build.properties
+│   ├── plugins.sbt
+├── xyz-core
+│   ├── build.sbt
+│   ├── src
+│   │   ├── main
+│   │   │   └── scala
+│   │   │       └── com
+│   │   │           └── abc
+│   │   │               └── xyz
+│   │   │                   └── core
+│   │   │                       ├── features
+│   │   │                       │   ├── Timestamp.scala
+│   │   │                       └── utils
+│   │   │                           └── DateUtil.scala
+├── xyz-examples
+│   ├── build.sbt
+│   ├── src
+│   │   ├── main
+│   │   │   └── scala
+│   │   │       └── com
+│   │   │           └── abc
+│   │   │               └── xyz
+│   │   │                   └── examples
+│   │   │                       └── TimestampFeatureExtractor.scala
+├── xyz-mleap
+│   ├── build.sbt
+│   ├── src
+│   │   ├── main
+│   │   │   ├── resources
+│   │   │   │   └── reference.conf
+│   │   │   └── scala
+│   │   │       └── com
+│   │   │           └── abc
+│   │   │               └── xyz
+│   │   │                   └── mleap
+│   │   │                       ├── ops
+│   │   │                       │   └── TimestampFeaturizerOp.scala
+│   │   │                       └── transformer
+│   │   │                           └── TimestampFeaturizer.scala
+├── xyz-spark
+│   ├── build.sbt
+│   ├── src
+│   │   ├── main
+│   │   │   ├── resources
+│   │   │   │   └── reference.conf
+│   │   │   └── scala
+│   │   │       ├── com
+│   │   │       │   └── abc
+│   │   │       │       └── xyz
+│   │   │       │           └── spark
+│   │   │       │               ├── ops
+│   │   │       │               │   └── TimestampFeaturizerOp.scala
+│   │   │       │               └── transformer
+│   │   │       │                   └── TimestampFeaturizer.scala
+└── version.sbt
+```
+
+Dependencies for `xyz-spark`
+
+```
+libraryDependencies ++= Seq(
+    "org.apache.spark" %% "spark-core" % "2.4.4",
+    "org.apache.spark" %% "spark-sql" % "2.4.4",
+    "org.apache.spark" %% "spark-mllib" % "2.4.4",
+    "ml.combust.mleap" %% "mleap-spark" % "0.15.0",
+    "ml.combust.mleap" %% "mleap-spark-extension" % "0.15.0"
+)
+```
+
+Dependencies for `xyz-mleap`
+
+```
+libraryDependencies ++= Seq(
+    "ml.combust.mleap" %% "mleap-runtime" % "0.15.0"
+)
+```
+
+Dependencies for `xyz-examples`
+
+```
+libraryDependencies ++= Seq(
+    "org.apache.spark" %% "spark-core" % "2.4.4",
+    "org.apache.spark" %% "spark-sql" % "2.4.4",
+)
+```
+
+Content for `xyz-spark/src/main/resources/reference.conf`
+```
+com.abc.xyz.spark.ops = [
+    "com.abc.xyz.spark.ops.TimestampFeaturizerOp"
+]
+
+ml.combust.mleap.spark.registry.default += com.abc.xyz.spark.ops
+```
+
+
+Content for `xyz-mleap/src/main/resources/reference.conf`
+```
+com.abc.xyz.mleap.ops = [
+    "com.abc.xyz.mleap.ops.TimestampFeaturizerOp",
+]
+
+ml.combust.mleap.registry.default.ops += "com.abc.xyz.mleap.ops"
+```
+
+Content for `xyz-examples/src/main/scala/com/abc/xyz/TimestampFeatureExtractor.scala`
+```
+package com.abc.xyz.examples
+
+import resource._
+import ml.combust.bundle.BundleFile
+import org.apache.spark.ml.mleap.SparkUtil
+import ml.combust.mleap.spark.SparkSupport._
+import org.apache.spark.ml.bundle.SparkBundleContext
+import org.apache.spark.SparkConf
+import org.apache.spark.ml.{Pipeline, Transformer}
+import org.apache.spark.sql.{DataFrame, SparkSession}
+import com.abc.xyz.spark.transformer.TimestampFeaturizer
+import ml.combust.bundle.serializer.SerializationFormat
+
+
+object TimestampFeatureExtractor {
+    def main(args: Array[String]): Unit = {
+        // initialize spark
+        val conf = new SparkConf().setAppName("DateTransformer").setMaster("local")
+        val spark = SparkSession.builder().config(conf).getOrCreate()
+        import spark.implicits._
+
+        val training = Seq(
+            ("1", "2018-01-05T09:00:00.000"),
+            ("2", "2019-03-15T09:00:00.000"),
+            ("3", "2017-05-17T09:00:00.000"),
+            ("4", "2015-06-23T09:00:00.000"),
+            ("5", "2018-04-11T09:00:00.000"),
+            ("6", "2019-11-01T09:00:00.000")).toDF("uid", "timestampColumn")
+        training.show()
+
+        val tsFeaturizer: Transformer = new TimestampFeaturizer().setTimestampCol("timestampColumn")
+        val pipeline = new Pipeline().setStages(Array(tsFeaturizer))
+        val model = pipeline.fit(training)
+
+        val test = training
+        model.transform(test).show()
+
+        val mleapPipeline = SparkUtil.createPipelineModel(uid = "pipeline", Array(model))
+        val sbc = SparkBundleContext()
+        for (bundle <- managed(BundleFile("jar:file:/Users/ketankumar/tmp/models/TimestampFeatureExtractor.zip"))) {
+            mleapPipeline.writeBundle.format(SerializationFormat.Json).save(bundle)(sbc).get
+        }
+    }
+}
+```
+
+
+```
+Exception in thread "main" java.util.NoSuchElementException: key not found: org.apache.spark.ml.PipelineModel
+	at scala.collection.MapLike$class.default(MapLike.scala:228)
+	at scala.collection.AbstractMap.default(Map.scala:59)
+	at scala.collection.MapLike$class.apply(MapLike.scala:141)
+	at scala.collection.AbstractMap.apply(Map.scala:59)
+	at ml.combust.bundle.BundleRegistry.opForObj(BundleRegistry.scala:102)
+	at ml.combust.bundle.BundleWriter$$anonfun$1.apply(BundleWriter.scala:28)
+	at ml.combust.bundle.BundleWriter$$anonfun$1.apply(BundleWriter.scala:28)
+	at scala.Option.getOrElse(Option.scala:121)
+	at ml.combust.bundle.BundleWriter.save(BundleWriter.scala:27)
+	at com.abc.xyz.examples.TimestampFeatureExtractor$$anonfun$main$2.apply(TimestampFeatureExtractor.scala:51)
+	at com.abc.xyz.examples.TimestampFeatureExtractor$$anonfun$main$2.apply(TimestampFeatureExtractor.scala:50)
+	at resource.AbstractManagedResource$$anonfun$5.apply(AbstractManagedResource.scala:88)
+	at scala.util.control.Exception$Catch$$anonfun$either$1.apply(Exception.scala:125)
+	at scala.util.control.Exception$Catch$$anonfun$either$1.apply(Exception.scala:125)
+	at scala.util.control.Exception$Catch.apply(Exception.scala:103)
+	at scala.util.control.Exception$Catch.either(Exception.scala:125)
+	at resource.AbstractManagedResource.acquireFor(AbstractManagedResource.scala:88)
+	at resource.ManagedResourceOperations$class.apply(ManagedResourceOperations.scala:26)
+	at resource.AbstractManagedResource.apply(AbstractManagedResource.scala:50)
+	at resource.ManagedResourceOperations$class.acquireAndGet(ManagedResourceOperations.scala:25)
+	at resource.AbstractManagedResource.acquireAndGet(AbstractManagedResource.scala:50)
+	at resource.ManagedResourceOperations$class.foreach(ManagedResourceOperations.scala:53)
+	at resource.AbstractManagedResource.foreach(AbstractManagedResource.scala:50)
+	at com.abc.xyz.examples.TimestampFeatureExtractor$.main(TimestampFeatureExtractor.scala:50)
+	at com.abc.xyz.examples.TimestampFeatureExtractor.main(TimestampFeatureExtractor.scala)
+```
+I am training and serializing a scikit-learn Pipeline that contains a FeatureExtractor and a LogisticRegression, and I am using Spark to deserialize it in Python. But when I tried to run predict function on the deserialized pipeline model, I encountered an error saying `java.util.NoSuchElementException: Failed to find a default value for threshold`. Below is the full error log:
+
+```
+answer = 'xro255', gateway_client = <py4j.java_gateway.GatewayClient object at 0x7efc589eb0f0>, target_id = 'o248', name = 'collectToPython'
+
+    def get_return_value(answer, gateway_client, target_id=None, name=None):
+        """Converts an answer received from the Java gateway into a Python object.
+
+        For example, string representation of integers are converted to Python
+        integer, string representation of objects are converted to JavaObject
+        instances, etc.
+
+        :param answer: the string returned by the Java gateway
+        :param gateway_client: the gateway client used to communicate with the Java
+            Gateway. Only necessary if the answer is a reference (e.g., object,
+            list, map)
+        :param target_id: the name of the object from which the answer comes from
+            (e.g., *object1* in `object1.hello()`). Optional.
+        :param name: the name of the member from which the answer comes from
+            (e.g., *hello* in `object1.hello()`). Optional.
+        """
+        if is_error(answer)[0]:
+            if len(answer) > 1:
+                type = answer[1]
+                value = OUTPUT_CONVERTER[type](answer[2:], gateway_client)
+                if answer[1] == REFERENCE_TYPE:
+                    raise Py4JJavaError(
+                        "An error occurred while calling {0}{1}{2}.\n".
+>                       format(target_id, ".", name), value)
+E                   py4j.protocol.Py4JJavaError: An error occurred while calling o248.collectToPython.
+E                   : org.apache.spark.SparkException: Job aborted due to stage failure: Task 1 in stage 1.0 failed 1 times, most recent failure: Lost task 1.0 in stage 1.0 (TID 3, localhost, executor driver): org.apache.spark.SparkException: Failed to execute user defined function($anonfun$4: (struct<type:tinyint,size:int,indices:array<int>,values:array<double>>) => double)
+E                   	at org.apache.spark.sql.catalyst.expressions.GeneratedClass$GeneratedIteratorForCodegenStage1.processNext(Unknown Source)
+E                   	at org.apache.spark.sql.execution.BufferedRowIterator.hasNext(BufferedRowIterator.java:43)
+E                   	at org.apache.spark.sql.execution.WholeStageCodegenExec$$anonfun$13$$anon$1.hasNext(WholeStageCodegenExec.scala:636)
+E                   	at org.apache.spark.sql.execution.SparkPlan$$anonfun$2.apply(SparkPlan.scala:255)
+E                   	at org.apache.spark.sql.execution.SparkPlan$$anonfun$2.apply(SparkPlan.scala:247)
+E                   	at org.apache.spark.rdd.RDD$$anonfun$mapPartitionsInternal$1$$anonfun$apply$24.apply(RDD.scala:836)
+E                   	at org.apache.spark.rdd.RDD$$anonfun$mapPartitionsInternal$1$$anonfun$apply$24.apply(RDD.scala:836)
+E                   	at org.apache.spark.rdd.MapPartitionsRDD.compute(MapPartitionsRDD.scala:52)
+E                   	at org.apache.spark.rdd.RDD.computeOrReadCheckpoint(RDD.scala:324)
+E                   	at org.apache.spark.rdd.RDD.iterator(RDD.scala:288)
+E                   	at org.apache.spark.scheduler.ResultTask.runTask(ResultTask.scala:90)
+E                   	at org.apache.spark.scheduler.Task.run(Task.scala:121)
+E                   	at org.apache.spark.executor.Executor$TaskRunner$$anonfun$10.apply(Executor.scala:408)
+E                   	at org.apache.spark.util.Utils$.tryWithSafeFinally(Utils.scala:1360)
+E                   	at org.apache.spark.executor.Executor$TaskRunner.run(Executor.scala:414)
+E                   	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)
+E                   	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)
+E                   	at java.lang.Thread.run(Thread.java:748)
+E                   Caused by: java.util.NoSuchElementException: Failed to find a default value for threshold
+E                   	at org.apache.spark.ml.param.Params$$anonfun$getOrDefault$2.apply(params.scala:780)
+E                   	at org.apache.spark.ml.param.Params$$anonfun$getOrDefault$2.apply(params.scala:780)
+E                   	at scala.Option.getOrElse(Option.scala:121)
+E                   	at org.apache.spark.ml.param.Params$class.getOrDefault(params.scala:779)
+E                   	at org.apache.spark.ml.PipelineStage.getOrDefault(Pipeline.scala:42)
+E                   	at org.apache.spark.ml.param.Params$class.$(params.scala:786)
+E                   	at org.apache.spark.ml.PipelineStage.$(Pipeline.scala:42)
+E                   	at org.apache.spark.ml.classification.LogisticRegressionParams$class.getThreshold(LogisticRegression.scala:122)
+E                   	at org.apache.spark.ml.classification.LogisticRegressionModel.getThreshold(LogisticRegression.scala:991)
+E                   	at org.apache.spark.ml.classification.LogisticRegressionModel.raw2prediction(LogisticRegression.scala:1174)
+E                   	at org.apache.spark.ml.classification.ProbabilisticClassificationModel$$anonfun$4.apply(ProbabilisticClassifier.scala:136)
+E                   	at org.apache.spark.ml.classification.ProbabilisticClassificationModel$$anonfun$4.apply(ProbabilisticClassifier.scala:136)
+E                   	... 18 more
+E
+E                   Driver stacktrace:
+E                   	at org.apache.spark.scheduler.DAGScheduler.org$apache$spark$scheduler$DAGScheduler$$failJobAndIndependentStages(DAGScheduler.scala:1889)
+E                   	at org.apache.spark.scheduler.DAGScheduler$$anonfun$abortStage$1.apply(DAGScheduler.scala:1877)
+E                   	at org.apache.spark.scheduler.DAGScheduler$$anonfun$abortStage$1.apply(DAGScheduler.scala:1876)
+E                   	at scala.collection.mutable.ResizableArray$class.foreach(ResizableArray.scala:59)
+E                   	at scala.collection.mutable.ArrayBuffer.foreach(ArrayBuffer.scala:48)
+E                   	at org.apache.spark.scheduler.DAGScheduler.abortStage(DAGScheduler.scala:1876)
+E                   	at org.apache.spark.scheduler.DAGScheduler$$anonfun$handleTaskSetFailed$1.apply(DAGScheduler.scala:926)
+E                   	at org.apache.spark.scheduler.DAGScheduler$$anonfun$handleTaskSetFailed$1.apply(DAGScheduler.scala:926)
+E                   	at scala.Option.foreach(Option.scala:257)
+E                   	at org.apache.spark.scheduler.DAGScheduler.handleTaskSetFailed(DAGScheduler.scala:926)
+E                   	at org.apache.spark.scheduler.DAGSchedulerEventProcessLoop.doOnReceive(DAGScheduler.scala:2110)
+E                   	at org.apache.spark.scheduler.DAGSchedulerEventProcessLoop.onReceive(DAGScheduler.scala:2059)
+E                   	at org.apache.spark.scheduler.DAGSchedulerEventProcessLoop.onReceive(DAGScheduler.scala:2048)
+E                   	at org.apache.spark.util.EventLoop$$anon$1.run(EventLoop.scala:49)
+E                   	at org.apache.spark.scheduler.DAGScheduler.runJob(DAGScheduler.scala:737)
+E                   	at org.apache.spark.SparkContext.runJob(SparkContext.scala:2061)
+E                   	at org.apache.spark.SparkContext.runJob(SparkContext.scala:2082)
+E                   	at org.apache.spark.SparkContext.runJob(SparkContext.scala:2101)
+E                   	at org.apache.spark.SparkContext.runJob(SparkContext.scala:2126)
+E                   	at org.apache.spark.rdd.RDD$$anonfun$collect$1.apply(RDD.scala:945)
+E                   	at org.apache.spark.rdd.RDDOperationScope$.withScope(RDDOperationScope.scala:151)
+E                   	at org.apache.spark.rdd.RDDOperationScope$.withScope(RDDOperationScope.scala:112)
+E                   	at org.apache.spark.rdd.RDD.withScope(RDD.scala:363)
+E                   	at org.apache.spark.rdd.RDD.collect(RDD.scala:944)
+E                   	at org.apache.spark.sql.execution.SparkPlan.executeCollect(SparkPlan.scala:299)
+E                   	at org.apache.spark.sql.Dataset$$anonfun$collectToPython$1.apply(Dataset.scala:3257)
+E                   	at org.apache.spark.sql.Dataset$$anonfun$collectToPython$1.apply(Dataset.scala:3254)
+E                   	at org.apache.spark.sql.Dataset$$anonfun$53.apply(Dataset.scala:3364)
+E                   	at org.apache.spark.sql.execution.SQLExecution$$anonfun$withNewExecutionId$1.apply(SQLExecution.scala:78)
+E                   	at org.apache.spark.sql.execution.SQLExecution$.withSQLConfPropagated(SQLExecution.scala:125)
+E                   	at org.apache.spark.sql.execution.SQLExecution$.withNewExecutionId(SQLExecution.scala:73)
+E                   	at org.apache.spark.sql.Dataset.withAction(Dataset.scala:3363)
+E                   	at org.apache.spark.sql.Dataset.collectToPython(Dataset.scala:3254)
+E                   	at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+E                   	at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+E                   	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+E                   	at java.lang.reflect.Method.invoke(Method.java:498)
+E                   	at py4j.reflection.MethodInvoker.invoke(MethodInvoker.java:244)
+E                   	at py4j.reflection.ReflectionEngine.invoke(ReflectionEngine.java:357)
+E                   	at py4j.Gateway.invoke(Gateway.java:282)
+E                   	at py4j.commands.AbstractCommand.invokeMethod(AbstractCommand.java:132)
+E                   	at py4j.commands.CallCommand.execute(CallCommand.java:79)
+E                   	at py4j.GatewayConnection.run(GatewayConnection.java:238)
+E                   	at java.lang.Thread.run(Thread.java:748)
+E                   Caused by: org.apache.spark.SparkException: Failed to execute user defined function($anonfun$4: (struct<type:tinyint,size:int,indices:array<int>,values:array<double>>) => double)
+E                   	at org.apache.spark.sql.catalyst.expressions.GeneratedClass$GeneratedIteratorForCodegenStage1.processNext(Unknown Source)
+E                   	at org.apache.spark.sql.execution.BufferedRowIterator.hasNext(BufferedRowIterator.java:43)
+E                   	at org.apache.spark.sql.execution.WholeStageCodegenExec$$anonfun$13$$anon$1.hasNext(WholeStageCodegenExec.scala:636)
+E                   	at org.apache.spark.sql.execution.SparkPlan$$anonfun$2.apply(SparkPlan.scala:255)
+E                   	at org.apache.spark.sql.execution.SparkPlan$$anonfun$2.apply(SparkPlan.scala:247)
+E                   	at org.apache.spark.rdd.RDD$$anonfun$mapPartitionsInternal$1$$anonfun$apply$24.apply(RDD.scala:836)
+E                   	at org.apache.spark.rdd.RDD$$anonfun$mapPartitionsInternal$1$$anonfun$apply$24.apply(RDD.scala:836)
+E                   	at org.apache.spark.rdd.MapPartitionsRDD.compute(MapPartitionsRDD.scala:52)
+E                   	at org.apache.spark.rdd.RDD.computeOrReadCheckpoint(RDD.scala:324)
+E                   	at org.apache.spark.rdd.RDD.iterator(RDD.scala:288)
+E                   	at org.apache.spark.scheduler.ResultTask.runTask(ResultTask.scala:90)
+E                   	at org.apache.spark.scheduler.Task.run(Task.scala:121)
+E                   	at org.apache.spark.executor.Executor$TaskRunner$$anonfun$10.apply(Executor.scala:408)
+E                   	at org.apache.spark.util.Utils$.tryWithSafeFinally(Utils.scala:1360)
+E                   	at org.apache.spark.executor.Executor$TaskRunner.run(Executor.scala:414)
+E                   	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)
+E                   	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)
+E                   	... 1 more
+E                   Caused by: java.util.NoSuchElementException: Failed to find a default value for threshold
+E                   	at org.apache.spark.ml.param.Params$$anonfun$getOrDefault$2.apply(params.scala:780)
+E                   	at org.apache.spark.ml.param.Params$$anonfun$getOrDefault$2.apply(params.scala:780)
+E                   	at scala.Option.getOrElse(Option.scala:121)
+E                   	at org.apache.spark.ml.param.Params$class.getOrDefault(params.scala:779)
+E                   	at org.apache.spark.ml.PipelineStage.getOrDefault(Pipeline.scala:42)
+E                   	at org.apache.spark.ml.param.Params$class.$(params.scala:786)
+E                   	at org.apache.spark.ml.PipelineStage.$(Pipeline.scala:42)
+E                   	at org.apache.spark.ml.classification.LogisticRegressionParams$class.getThreshold(LogisticRegression.scala:122)
+E                   	at org.apache.spark.ml.classification.LogisticRegressionModel.getThreshold(LogisticRegression.scala:991)
+E                   	at org.apache.spark.ml.classification.LogisticRegressionModel.raw2prediction(LogisticRegression.scala:1174)
+E                   	at org.apache.spark.ml.classification.ProbabilisticClassificationModel$$anonfun$4.apply(ProbabilisticClassifier.scala:136)
+E                   	at org.apache.spark.ml.classification.ProbabilisticClassificationModel$$anonfun$4.apply(ProbabilisticClassifier.scala:136)
+E                   	... 18 more
+
+venv/lib/python3.6/site-packages/py4j/protocol.py:328: Py4JJavaError
+```
+
+If I understand correctly, deserializing a LogisticRegressionModel with Spark is using [LogisticRegressionOp](https://github.com/combust/mleap/blob/80aefcfa0b6d298c4d703eff8ee9ebf035fc0ef0/mleap-spark/src/main/scala/org/apache/spark/ml/bundle/ops/classification/LogisticRegressionOp.scala#L56) from mleap-spark. It will try to look for `threshold` parameter first, if it is not there, nothing will be set. 
+
+Since scikit-learn LogisticRegressionModel doesn't use `threshold` to make predictions while spark LogisticRegressionModel does, this error will be thrown when we try to run prediction on a spark deserialized LogisticRegressionModel. I saw that [LogisticRegressionOp](https://github.com/combust/mleap/blob/d276c1c800277a1edcf30dda6e8559c7413b21f8/mleap-runtime/src/main/scala/ml/combust/mleap/bundle/ops/classification/LogisticRegressionOp.scala#L51-L53) from mleap-runtime does set a default value for `threshold` if it is not found, can we do the same thing in mleap-spark to set a default value for `threshold`?
+
+I'm trying to de-serialize the airbnb sample model file and getting an error:
+
+```
+scala> val bundlePath5="jar:file:/tmp/models/airbnb.model.lr.zip"
+bundlePath5: String = jar:file:/tmp/models/airbnb.model.lr.zip
+
+scala> val zipBundle5 = (for(bundle <- managed(BundleFile(bundlePath5))) yield {
+     |   bundle.loadMleapBundle().get
+     |     }).opt.get
+java.util.NoSuchElementException: None.get
+  at scala.None$.get(Option.scala:529)
+  at scala.None$.get(Option.scala:527)
+  ... 38 elided```
+
+Any pointers ?

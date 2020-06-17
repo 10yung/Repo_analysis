@@ -1,0 +1,190 @@
+
+Add some API for resolving the [type parameters](https://docs.oracle.com/en/java/javase/13/docs/api/java.base/java/lang/reflect/Method.html#getTypeParameters()) of methods, in particular when some or all of the argument types for a method invocation are known.
+
+[`TypeToken#resolveType(Type)`](https://guava.dev/releases/28.2-jre/api/docs/com/google/common/reflect/TypeToken.html#resolveType-java.lang.reflect.Type-) is useful for resolving type parameters of classes, but I don't see a way to resolve type parameters of methods.
+
+Take the method [`Lists#reverse(List)`](https://guava.dev/releases/28.2-jre/api/docs/com/google/common/collect/Lists.html#reverse-java.util.List-) for example.  Suppose I have obtained the following somehow.
+* The `java.lang.reflect.Method` object representing `Lists#reverse(List)`.  (I just have a reference to a `Method`.  I don't have static knowledge that it's the `reverse` method specifically.)
+* The actual `Type` of the argument I'd like to provide to this method, such as `ArrayList<String>`.
+* The actual `Type` of the variable in which I'd like to store the result returned from this method, such as `Collection<String>`.
+
+and I want to answer these questions.
+* Is it type safe to provide this argument to that method?  (yes)
+* Is it type safe to store the result of this method into this variable?  (yes)
+
+I don't think there is any API for answering either of those questions right now.  This code doesn't get there.
+
+```java
+Invokable<Lists, Object> method =
+    TypeToken.of(Lists.class).method(
+        Lists.class.getMethod("reverse", List.class));
+System.out.println(method);
+// public static <T> List<T> reverse(List<T> list)
+
+TypeToken<?> parameterType = method.getParameters().get(0).getType();
+System.out.println(parameterType);
+// List<T>
+
+TypeToken<?> returnType = method.getReturnType();
+System.out.println(returnType);
+// List<T>
+
+TypeToken<?> argumentType = new TypeToken<ArrayList<String>>() {};
+System.out.println(argumentType);
+// ArrayList<String>
+
+TypeToken<?> variableType = new TypeToken<Collection<String>>() {};
+System.out.println(variableType);
+// Collection<String>
+
+boolean isArgumentSafe = argumentType.isSubtypeOf(parameterType);
+System.out.println(isArgumentSafe);
+// false (but that's not right...)
+
+boolean isVariableSafe = returnType.isSubtypeOf(variableType);
+System.out.println(isVariableSafe);
+// false (also not right...)
+
+// See if using TypeToken#resolveType(Type) helps.
+
+TypeToken<?> wrongResolvedParameterType =
+    argumentType.resolveType(parameterType.getType());
+System.out.println(wrongResolvedParameterType);
+// List<T> (nope...)
+// probably because the argument's T comes from List.class,
+// whereas this T comes from the Lists.reverse method.
+
+TypeToken<?> wrongResolvedReturnType =
+    argumentType.resolveType(returnType.getType());
+System.out.println(wrongResolvedReturnType);
+// List<T> (nope...)
+```
+
+I'm not sure what such an API would look like.  Here's one idea.
+
+```java
+Invokable<Lists, Object> resolvedMethod =
+    method.withArgumentTypes(argumentType);
+//         ^ new method
+
+System.out.println(resolvedMethod.getParameters().get(0).getType());
+// List<String>
+
+System.out.println(resolvedMethod.getReturnType());
+// List<String>
+```
+I need to limit the bandwidth of the file downloading, and limit the bandwidth to 50MB/s, but the real download bandwidth can only reach 7MB/s.
+
+```java
+@RestController
+class HelloWorldController {
+    @GetMapping("/")
+    public String sayHello() {
+        return "hello world";
+    }
+
+    @GetMapping("/download")
+    public ResponseEntity<Resource> download() throws FileNotFoundException {
+        RateLimiter rateLimiter = GuavaRateLimiter.create(52428800L, 500, TimeUnit.MILLISECONDS)
+        FileInputStream in = new FileInputStream("/home/hujianxin/Downloads/officesp2010-kb2687455-fullfile-x64-en-us.exe");
+        InputStreamResource resource = new InputStreamResource(new InputStream() {
+            @Override
+            public int read() throws IOException {
+                rateLimiter.acquire();
+                return in.read();
+            }
+
+            @Override
+            public int read(byte[] b) throws IOException {
+                rateLimiter.acquire(b.length);
+                return in.read(b);
+            }
+
+            @Override
+            public int read(byte[] b, int off, int len) throws IOException {
+                rateLimiter.acquire(len);
+                return in.read(b, off, len);
+            }
+        });
+        return ResponseEntity.ok().body(resource);
+    }
+}
+```
+I doubt that anyone has ever hit this in practice. (I didn't see any bugs filed internally about it, anyway, nor any mentions of it on the web.) But I thought it was neat :)
+
+```java
+$ cat ConcatTs.java 
+import static com.google.common.collect.ObjectArrays.concat;
+
+public class ConcatTs {
+  public static void main(String[] args) {
+    String[] array = new String[0];
+    Object[] concatenated = concat(array, 0);
+  }
+}
+```
+
+```
+ $ javac -cp $HOME/.m2/repository/com/google/guava/guava/28.2-jre/guava-28.2-jre.jar ConcatTs.java && java -cp .:$HOME/.m2/repository/com/google/guava/guava/28.2-jre/guava-28.2-jre.jar ConcatTs
+Exception in thread "main" java.lang.ArrayStoreException: java.lang.Integer
+  at com.google.common.collect.ObjectArrays.concat(ObjectArrays.java:102)
+  at ConcatTs.main(ConcatTs.java:6)
+```
+
+Interestingly, we got this right in `concat(T[], T[], Class<T>)` -- which requires a `Class` to use to create the array -- back in CL 3734425. But we got it wrong in the new methods in CL 7931853.
+Fixes https://github.com/google/guava/issues/3037. Fixes https://github.com/google/guava/issues/1774
+
+As mentioned in https://github.com/google/guava/issues/3037#issuecomment-570493413, this is needed to remove `Thread.sleep` from unit tests of classes that internally use `RateLimiter` (eg https://github.com/prestosql/presto/blob/cb62e11aa72116c13bcac50ddcfb8e0f01bbb02a/presto-hive/src/test/java/io/prestosql/plugin/hive/util/TestThrottledAsyncQueue.java#L105).
+Are there collectors that create and populate graphs, that I perhaps have missed? For example, can I easily stream the entries of a `Map<K, K>` and return a (say, directed) graph that would contain the corresponding edges?
+
+If so, please document on the wiki.
+
+If not, please consider adding a set of nice collectors, similar to those available for the guava collection classes!
+Hello, 
+
+In checkstyle project we are adding a new check to detect no-arg calls to superclass constructor - `super();` https://github.com/checkstyle/checkstyle/pull/7387
+
+We run analysis on your source code and there are several violations that you can see in report - 
+https://strkkk.github.io/checkstyle/7363_2/guava/index.html#A1
+
+Is there some reason to keep this explicit calls to superclass constructor in code, in your opinion? Or it is just garbage that can be removed.
+
+I appreciate any feedback.
+There’s [`Multimaps.asMap`](https://guava.dev/releases/snapshot-jre/api/docs/com/google/common/collect/Multimaps.html#asMap-com.google.common.collect.SetMultimap-) to transform a `SetMultimap<K, V>` to a `Map<K, Set<V>>`, but there’s no `Multimaps.asMap` to transform an `ImmutableSetMultimap<K, V>` to a `Map<K, ImmutableSet<V>>`, it seems.
+
+Have you considered adding this method? Is it already available somehow?
+
+Currently I copy the content into a new `ImmutableSetMultimap`, which seems unnecessary: `Multimaps.asMap(myImmutableSetMultimap).entrySet().stream().collect(ImmutableMap.toImmutableMap((e) -> e.getKey(), (e) -> ImmutableSet.copyOf(e.getValue())))`
+The following piece of code throws an undocumented `IllegalArgumentException`:
+
+    final Set<String> products = Sets.newHashSet("coffee", "tea");
+    final List<Set<String>> productOf = Collections.nCopies(31, products);    
+    assert Sets.cartesianProduct(productOf).size() == Integer.MAX_VALUE;
+
+The fact that `Sets::cartesianProduct` will throw an `IllegalArgumentException` when there would be more than 2^31-1 elements in the resulting set is not documented as far as I can see.
+
+I would like to see one of two solutions:
+
+1. Document why this Exception is thrown (there may be an implementation detail that prevents *even defining* such large sets).
+2. Fix it, because `java.util.Set::size()` specifies that if the size would be more than `Integer.MAX_VALUE` it would simply be `Integer.MAX_VALUE`.
+
+I like to see this fixed (solution 2), because now I can't even define such a Cartesian product. Iterating over so many elements is of course a different issue, but I have a piece of code that may very quickly find an `element` in the product, because I know it is in there and due to some ordering on `element`.
+
+In order to solve issues like https://github.com/google/guava/issues/2730
+We encountered this "crazy" issue in production that when setting `warmupPeriod=0`, the ratelimiter changed the rate from 1 per second to millions (if not billions) per second.
+
+Or simply see this issue by running following code as a test:
+```
+  @Test
+  public void t() {
+    RateLimiter rateLimiter = RateLimiter.create(1, 0, TimeUnit.SECONDS);
+
+    while (true) {
+      rateLimiter.acquire();
+      System.out.println("Done");
+    }
+  }
+```
+
+When setting `warmupPeriod=0` will trigger some downstream slope calculation with some value divide 0:  https://github.com/google/guava/blob/master/guava/src/com/google/common/util/concurrent/SmoothRateLimiter.java#L229
+![image](https://user-images.githubusercontent.com/161689/69821597-6f052a00-1204-11ea-8782-fd66cd074014.png)

@@ -1,0 +1,280 @@
+Could not figure out why the importer resolves the wrong path when stylus is run inside of an asar archive but putting an absolute path fixes the issue.  https://github.com/electron/asar
+Hey maintainers, I believe I found some inconsistent behavior in the way Stylus's Renderer.render() and Renderer.deps() looks for dependency files.
+
+I'm currently working on unofficially updated forks of:
+* [electron-forge](https://github.com/LanetheGreat/electron-forge)
+* [electron-prebuilt-compile](https://github.com/LanetheGreat/electron-prebuilt-compile)
+* [electron-compile](https://github.com/LanetheGreat/electron-compile)
+* [electron-compilers](https://github.com/LanetheGreat/electron-compilers)
+
+And trying to maintain the "buildless" system that the developers at Electron-Userland abandoned and came across this bug while trying to add dependency output for [electron-compilers](https://github.com/LanetheGreat/electron-compilers) to use in unit tests for the repo. I'm using the [milligram framework](https://milligram.io/) (which conveniently built multiple packages of their framework in [LESS](https://github.com/milligram/milligram-less), [SASS](https://github.com/milligram/milligram-sass)/[SCSS](https://github.com/milligram/milligram-scss), [minified CSS](https://github.com/milligram/milligram), and [Stylus](https://github.com/milligram/milligram-stylus)) to unit test all of the CSS compilers, but when testing Stylus it'd successfully render milligram into CSS but when calling `.deps()` it would always give an error of either `null` or an object being passed to the path library.
+
+Some debugging later and I found out that milligram was using `@import _ExampleDependency` without quotes around the file names instead of `@import '_ExampleDependency'`, which Stylus is interpreting as identifier nodes (Ident) whose `.val` is a Null node internally, instead of a string node (String) whose `.val` is actually the string used in the file's syntax. So I'm not fully sure how `.render()` is interpreting the syntax correctly, but this PR fixes `.deps()` and makes it consistent with `.render()`. I've also added a unit test based off of the existing 'basic' test already under '[test/deps-resolver](https://github.com/stylus/stylus/tree/dev/test/deps-resolver)' to check for the missing behavior in `.deps()`.
+
+I've also attached an example snippet to demonstrate the inconsistency using [milligram-stylus](https://npmjs.org/package/milligram-stylus). I've tested this on v0.54.7 and the dev branch using Node 8 and 10 on both Linux and Windows.
+```javascript
+const fs = require('fs');
+const path = require('path');
+const stylus = require('.');
+const filePath = path.posix.join('node_modules', 'milligram-stylus', 'dist', 'milligram.styl')
+
+console.log(stylus(fs.readFileSync(filePath, 'utf-8')).set('filename', filePath).render())
+console.log(stylus(fs.readFileSync(filePath, 'utf-8')).set('filename', filePath).deps())
+```
+Steps to demonstrate behavior:
+* Clone stylus, and `npm install`
+* Run `npm install --no-save milligram-stylus`
+* Save the code snippet into the project's root folder as `test-deps.js`.
+* Run `node test-deps.js`
+
+It'll show milligram compiled, and then error when gathering its dependencies.
+
+
+Stylus currently resolves stylus files if they have the same name as their parent folder (with .styl extension).
+For example:
+given the following directory structure where `test.styl` is the input file and `test.css` is the output file
+```
+.
+├── a
+|   ├── a.styl
+├── test.styl
+├── test.css
+```
+and the following file contents
+
+__./test.styl__
+```stylus
+@require a
+```
+__./a/a.styl__
+```stylus
+body
+  background-color red
+```
+yields the following output
+__./test.css__
+```css
+body {
+  background-color: #f00;
+}
+
+```
+
+this seems like logical and intended behavior, but it appears to not be listed in the documentation ( or at least not in the __@import.md__ index styles section:
+>__@ import__ also supports index styles. This means when you `@import blueprint`, it will resolve 
+__either__ `blueprint.styl` or `blueprint/index.styl`. This is really useful for libraries that want to expose all their features, while still allowing feature subsets to be imported.
+
+Unless this behavior is unintended, it should probably be changed to something like:
+>__@ import__ also supports index styles. This means when you `@import blueprint`, it will resolve 
+__`blueprint.styl`, `blueprint/index.styl`, or `blueprint/blueprint.styl`__ . This is really useful for libraries that want to expose all their features, while still allowing feature subsets to be imported.
+Broken version: 0.54.7
+Working version: 0.54.5
+
+Styl code
+```stylus
+.is-spinner-button-loading:hover
+  [ang-small-spinner]
+    margin-bottom: 4px
+    margin-top: -@margin-bottom
+    margin-left: 13px
+    margin-right: -@margin-left
+```
+
+CSS
+```css
+.is-spinner-button-loading:hover [ang-small-spinner] {
+  margin-bottom: 4px;
+  margin-top: -@margin-bottom;
+  margin-left: 13px;
+  margin-right: -@margin-left;
+}
+```
+Consider the following generic .styl sheet 
+
+generic.styl
+```
+font-size()
+	color #f00
+.some-css-class 
+	font-size: 20px
+```
+
+What is happening is font-size no longer functions as a css property within the compiled sheet, instead it invokes the function call. What you end up with is:
+
+generic.css
+```
+.some-css-class {
+   color: #f00
+}
+```
+So as you can see, not only is the property declaration ignored, it is ignored and invokes the function call instead. While I admit the fallacy of declaring functions with the same name as properties, this is a really weird side effect. 
+
+This stung me because I was using flex declarations in the same sheets where I had a flex() function. 
+Just like this picture:
+
+![image](https://user-images.githubusercontent.com/8682847/69411307-a7f65800-0d47-11ea-828e-e82eab6bd38d.png)
+
+Code:
+```stylus
+@font-face
+  font-family OpenSans
+  font-weight 300
+  src url('~assets/fonts/OpenSans/Light/OpenSans-Light.eot') /* IE9*/
+  src url('~assets/fonts/OpenSans/Light/OpenSans-Light.eot#iefix') format('embedded-opentype'), /* IE6-IE8 */ url('~assets/fonts/OpenSans/Light/OpenSans-Light.woff') format('woff'), /* chrome, firefox */ url('~assets/fonts/OpenSans/Light/OpenSans-Light.ttf') format('truetype'), /* chrome, firefox, opera, Safari, Android, iOS 4.2+*/ url('~assets/fonts/OpenSans/Light/OpenSans-Light.svg') format('svg') /* iOS 4.1- */
+
+@font-face
+  font-family OpenSans
+  font-weight 400
+  src url('~assets/fonts/OpenSans/Regular/OpenSans-Regular.eot') /* IE9*/
+  src url('~assets/fonts/OpenSans/Regular/OpenSans-Regular.eot#iefix') format('embedded-opentype'), /* IE6-IE8 */ url('~assets/fonts/OpenSans/Regular/OpenSans-Regular.woff') format('woff'), /* chrome, firefox */ url('~assets/fonts/OpenSans/Regular/OpenSans-Regular.ttf') format('truetype'), /* chrome, firefox, opera, Safari, Android, iOS 4.2+*/ url('~assets/fonts/OpenSans/Regular/OpenSans-Regular.svg') format('svg') /* iOS 4.1- */
+
+@font-face
+  font-family OpenSans
+  font-weight 500
+  src url('~assets/fonts/OpenSans/Semibold/OpenSans-Semibold.eot') /* IE9*/
+  src url('~assets/fonts/OpenSans/Semibold/OpenSans-Semibold.eot#iefix') format('embedded-opentype'), /* IE6-IE8 */ url('~assets/fonts/OpenSans/Semibold/OpenSans-Semibold.woff') format('woff'), /* chrome, firefox */ url('~assets/fonts/OpenSans/Semibold/OpenSans-Semibold.ttf') format('truetype'), /* chrome, firefox, opera, Safari, Android, iOS 4.2+*/ url('~assets/fonts/OpenSans/Semibold/OpenSans-Semibold.svg') format('svg') /* iOS 4.1- */
+```
+
+I nest multiple mixin to build BEM style codes. When using block mixin without styles, partial render results get lost.
+```
+block($name) {
+  element($el) {
+    / &__{$el} {
+      {block}
+    }
+  }
+  / .{$name} {
+    {block}
+  }
+}
+
+// Normal
++block(test-a) {
+  width: 1px;
+  +element(el-a) {
+    height: 10px
+  }
+}
+
+// Render nothing.
++block(test-b) {
+  +element(el-b) {
+    height: 10px
+  }
+}
+
+// Lost the first.
++block(test-c) {
+  +element(el-c) {
+    height: 10px
+  }
+  +element(el-d) {
+    height: 10px
+  }
+}
+```
+Render as 
+```
+.test-a {
+  width: 1px;
+}
+// Expected to have .test-b__el-b
+.test-a__el-a {
+  height: 10px;
+}
+// Expected to have .test-c__el-c
+.test-c__el-d {
+  height: 10px;
+}
+```
+Stylus:
+```stylus
+H = {
+    s: ".bar"
+}
+{H.s}
+    color red
+```
+
+Expected:
+```css
+.bar
+   color red
+```
+
+Result:
+```
+ParseError: test.css:7:1
+   3|     s: ".bar"
+   4| }
+   5| {H.s}
+   6|     color red
+   7| 
+------^
+
+expected "indent", got "outdent"
+```
+
+whereas
+```stylus
+H = {
+    s: ".bar"
+}
+&{H.s}
+    color red
+``` 
+works.
+for example
+```stylus
+M()
+  "[a],[b],[c]"
+
+{M()}  
+  &{M()}
+    x y
+```
+should be generated as
+```css
+[a][a],
+[b][a],
+[c][a],
+[a][b],
+[b][b],
+[c][b],
+[a][c],
+[b][c],
+[c][c] {
+  x: y;
+}
+```
+but it is generated as
+```css
+[a][a],
+[b][a],
+[c][a],
+[a] [b],
+[b] [b],
+[c] [b],
+[a] [c],
+[b] [c],
+[c] [c] {
+  x: y;
+}
+```
+bug is 
+
+The first 3 selector right, others wrong, no spaces between them
+```css
+[a] [b],
+[b] [b],
+[c] [b],
+[a] [c],
+[b] [c],
+[c] [c] 
+```
+
+
+When `grid-template-columns` property has  value that contains something like `[some-var]`, stylus can't parse it.
+Here are is the simple expample in CodePen: https://codepen.io/vadjs_ru/pen/GRRYxwR
+
+You can switch CSS Preprocessor to Stylus and watch error.

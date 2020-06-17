@@ -1,0 +1,369 @@
+Getting issues while trying to match the following query: 
+SELECT
+v.col1,
+v.col2 as colTemp1,
+col3,
+col4 as colTemp2,
+a.col5
+FROM table1 a
+JOIN table2 m USING (s1)
+LEFT OUTER JOIN table3 v USING (s2)
+LEFT OUTER JOIN table4 d USING (s3)
+LEFT OUTER JOIN table5 t USING (s4)
+LEFT OUTER JOIN table6 p USING (s5)
+LEFT OUTER JOIN table7 USING(s6)
+LEFT OUTER JOIN table8 qc USING(s7)
+WHERE something = ?
+AND v.something1 = 1
+AND v.something2 = 1
+
+but get "was not expected, next expectation is: ExpectedQuery => expecting Query, QueryContext or QueryRow which" error. 
+
+Trying to match the query as follows: 
+
+queryReg := regexp.QuoteMeta(query)
+mock.ExpectQuery(queryReg).WithArgs("1").WillReturnRows(rs)
+
+What would be the correct query string that won't have match issues? 
+When an expectation failed, the SQL request would error suggesting the type of the actual expectation. However, it is not detailed enough to show exactly _which_ expectation failed. Consider the following simplified example.
+
+<details><summary>Example code</summary>
+
+```go
+package main
+
+import (
+	"database/sql"
+	"testing"
+
+	"github.com/DATA-DOG/go-sqlmock"
+)
+
+func InsertValues(db *sql.DB, table string, column string, values ...interface{}) (err error) {
+	var tx *sql.Tx
+	tx, err = db.Begin()
+	if err != nil {
+		return
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		} else {
+			err = tx.Commit()
+		}
+	}()
+
+	stmt := "INSERT INTO " + table + " (" + column + ") VALUES (?)"
+	for _, val := range values {
+		if _, err = tx.Exec(stmt, val); err != nil {
+			return
+		}
+	}
+	return
+}
+
+func TestInsertValues(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("cannot create sql mock: %s", err)
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectExec(`INSERT INTO tbl`).WithArgs(2).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	mock.ExpectBegin()
+	mock.ExpectExec(`INSERT INTO tbl`).WithArgs(3).WillReturnResult(sqlmock.NewResult(2, 1))
+	mock.ExpectCommit()
+
+	mock.ExpectBegin()
+	mock.ExpectExec(`INSERT INTO tbl`).WithArgs(4).WillReturnResult(sqlmock.NewResult(3, 1))
+	mock.ExpectCommit()
+
+	err = InsertValues(db, "tbl", "col", 2, 3, 4)
+	if err != nil {
+		t.Errorf("cannot insert values: %s", err)
+	}
+	err = mock.ExpectationsWereMet()
+	if err != nil {
+		t.Errorf("unfulfilled expectation: %s", err)
+	}
+}
+```
+
+</details>
+
+The code would fail like this:
+
+```
+--- FAIL: TestInsertValues (0.00s)
+    1_test.go:53: cannot insert values: call to ExecQuery 'INSERT INTO tbl (col) VALUES (?)' with args [{Name: Ordinal:1 Value:3}], was not expected, next expectation is: ExpectedCommit => expecting transaction Commit
+    1_test.go:57: unfulfilled expectation: there is a remaining expectation which was not matched: ExpectedCommit => expecting transaction Commit
+FAIL
+FAIL    command-line-arguments  0.240s
+FAIL
+```
+
+We know that the error happens because an `ExpectCommit` is not fulfilled, but it does not suggest _which of the three_ `ExpectCommit`s failed! This makes debugging test failure difficult.
+
+----
+
+I propose that 
+
+1. Every call to `ExpectXXX()` should record the stack trace, e.g. with the stack trace we would know it is the `ExpectCommit()` on line 41 causing the failure. And/or
+2. Add a `WithComment(string)`/`WithCommentf(string, ...interface{})` method to every `ExpectedXXX` type. The expectation failure would include the comment. 
+
+`WithComment` is needed to distinguish between different Expect invocations in a loop (where the stack trace would still be ambiguous) e.g.
+
+```go
+for i, val := range values {
+    comment := fmt.Sprintf("iteration #%d, value %s", i, val)
+    mock.ExpectBegin().WithComment(comment)
+    mock.ExpectExec("INSERT").WithComment(comment).WithArgs(val).WillReturnResult(sqlmock.NewResult(int64(i+1), 1))
+    mock.ExpectCommit().WithComment(comment)
+}
+```
+I have a query that I run that has a few `sql.Out` parameters. Using go-sqlmock, it doesn't appear to be possible to have values injected into the `Dest` field of a `sql.Out` parameter when the query is executed.
+
+#174  added some functionality to make some sql.Out testing possible, but it doesn't appear to be possible to fully test these types of queries.
+
+For example, here is my query I have in my code:
+```golang
+func (r mgRepo) ExecuteQuery(ctx context.Context, area model.Area, cluster string, requestCount int64) (*MyGlobalData, error) {
+	var AvailableRangeStart int64
+	var IDBlockSize int64
+	_, err := r.db.QueryContext(
+		ctx,
+		r.sProc,
+		sql.Named("TableName", area.String()),
+		sql.Named("MinBlockSize", requestCount),
+		sql.Named("AvailableRangeStart", sql.Out{Dest: &AvailableRangeStart}),
+		sql.Named("IDBlockSize", sql.Out{Dest: &IDBlockSize}),
+		sql.Named("RequestingServer", cluster),
+	)
+	if err != nil {
+		return nil, err
+	}
+	if AvailableRangeStart == 0 || IDBlockSize == 0 {
+		return nil, errors.New("failed to retrieve block")
+	}
+	return &MyGlobalData{
+		RangeStart: AvailableRangeStart,
+		RangeEnd:   AvailableRangeStart + IDBlockSize - 1,
+	}, nil
+}
+```
+
+This function validates that the `AvailableRangeStart` and `IDBlockSize` sql.Out parameters have been assigned (checks that they don't have the default value of 0), which means I can't run this function using a mock database without the `errors.New("failed to retrieve block")` error being returned.
+
+Here is my test:
+```golang
+type CustomConverter struct{}
+
+func (s CustomConverter) ConvertValue(v interface{}) (driver.Value, error) {
+	if val, ok1 := v.(driver.NamedValue); ok1 {
+		return val.Value, nil
+	}
+
+	if val, ok := v.(sql.Out); ok {
+		res := val.Dest.(*int64)
+		return *res, nil
+	}
+	return v, nil
+}
+
+func TestMgRepo_ExecuteQuery(t *testing.T) {
+	converter := sqlmock.ValueConverterOption(CustomConverter{})
+	db, mock, err := sqlmock.New(converter)
+	if err != nil {
+		t.Errorf("failed to create sql mock")
+	}
+
+	a := int64(100)
+	i := int64(10)
+	
+	mock.ExpectQuery("test").WithArgs(
+		sql.Named("TableName", "Contact_log"),
+		sql.Named("MinBlockSize", int64(10)),
+		sql.Named("AvailableRangeStart", sql.Out{Dest: &a}),
+		sql.Named("IDBlockSize", sql.Out{Dest: &i}),
+		sql.Named("RequestingServer", "test"),
+	).WillReturnRows(nil)
+	mgRepo := mgRepo{
+		db:    db,
+		sProc: "test",
+	}
+	_, err = mgRepo.ExecuteQuery(context.Background(), model.Contact_log, "test", int64(10))
+	assert.Nil(t, err)
+}
+```
+
+Here is the test execution output:
+```bash
+=== RUN   TestMgRepo_ExecuteQuery
+--- FAIL: TestMgRepo_ExecuteQuery (0.00s)
+    myGlobal_test.go:164: 
+        	Error Trace:	myGlobal_test.go:164
+        	Error:      	Expected nil, but got: &errors.errorString{s:"Query 'test', arguments do not match: argument 2 expected [int64 - 100] does not match actual [int64 - 0]"}
+        	Test:       	TestMgRepo_ExecuteQuery
+FAIL
+```
+I have a function to get the primary key columns from a table.
+How can I use go-sqlmock to create a test case for this function?
+
+Thansk in advance!
+
+`type Mvl2Json struct {
+	sync.Mutex
+	db         *sql.DB
+	schemaName string
+	tableName  string
+	mvlName    string
+	logger     *logrus.Logger
+	primaryKey []string
+	lobColunms []string
+	currentSeq int64 // 当前处理到的sequence$$
+}
+
+// primaryKey, 查询对象的主键列
+func (m *Mvl2Json) PrimaryKey() {
+
+	...
+	m.primaryKey = append(m.primaryKey, primaryKeyColunm)
+}`
+My code uses pg.Array to read a `text[]` field. Can I use this package to test this code? ... if so, how?
+
+Thanks!
+I am not clearly how it works sqlmock internal. Here is my case:
+
+A insert function:
+
+```go
+func insert() (sql.Result, error) {
+        query := `...`
+  	stmt, err := repo.Db.Prepare(query)
+	if err != nil {
+		return nil, errors.Wrap(err, "repo.Db.Prepare(query)")
+	}
+	defer stmt.Close()
+
+	result, err := stmt.Exec(values...)
+	if err != nil {
+		return nil, errors.Wrap(err, "repo.Db.Exec(query, values)")
+	}
+	return result, nil
+}
+```
+
+As you can see, the return value of this function is `sql.Result` and `error`.
+
+After I add below statements in my unit test, this test failed.
+
+```go
+if !reflect.DeepEqual(got, tt.want) {
+  t.Errorf("repo.Upsert() = %#v, want %#v", got, tt.want)
+}
+```
+
+Got error: 
+
+> repo.Upsert() = sql.driverResult{Locker:(*sql.driverConn)(0xc0000ae080), resi:(*sqlmock.result)(0xc00000c140)}, want &sqlmock.result{insertID:1, rowsAffected:1, err:error(nil)}
+
+I mock the return result using `WillReturnResult(sqlmock.NewResult(1, 1))`. And the value of `tt.want` is `sqlmock.NewResult(1, 1)` as well.
+
+The return value of `sqlmock.NewResult` is `driver.Result`, so I think that's why the error happened. 
+
+Is it necessary add `!reflect.DeepEqual(got, tt.want)` and assert it ? Or, all I need is `mock.ExpectationsWereMet()`? Thanks for explaining.
+
+
+
+I tried a nested query. Instead of letting me know the regex is not valid or pointing out differences in the string literal versus the regex pattern, it said query not expected and unable to match actual versus expected query respectively.
+
+Please clarify the regex was invalid in the panic message or a compile time warning please.
+
+Stack overflow question here:
+https://stackoverflow.com/questions/58142191/call-to-query-with-args-was-not-expected-in-go-sqlmock-for-compound-sql-quer/58160875#58160875.
+
+Example of working query:
+
+```
+sqlMock.ExpectQuery("SELECT EXISTS \\( SELECT 1 FROM information_schema\\.tables WHERE table_schema = 'public' AND table_name = 'myTable3' \\);").
+        WillReturnRows(existsRows)
+```
+
+Example of Invalid query unable to match:
+
+```
+sqlMock.ExpectQuery("SELECT EXISTS ( SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'myTable3' );").
+        WillReturnRows(existsRows)
+```
+
+Example of invalid regex query skipped in evaulation:
+
+```
+sqlMock.ExpectQuery("SELECT EXISTS \\( SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'myTable3' \\);").
+        WillReturnRows(existsRows)
+```
+I've found a case where calling `db.Close()` in different ways only sometimes satisfies `mock.ExpectClose()`. For example, if I call `sqlmock.New()` and then call `defer db.Close()` on the DB handle that is returned, `mock.ExpectClose()` is not satisfied. However if I perform a nil check on the deferred result of `db.Close()` then `mock.ExpectClose()` is satisfied.
+
+I would expect all cases of `db.Close()` to be consistent: either satisfy or don't satisfy `mock.ExpectClose()`.
+
+**My goal is to catch non-nil errors from `db.Close()` and ensure they are logged.**
+
+Test cases showing the behaviour:
+```golang
+func Test_SQLMock_DBClose_Pass(t *testing.T) {
+	db, mock, _ := sqlmock.New()
+	defer db.Close()
+	assert.Nil(t, mock.ExpectationsWereMet())
+}
+
+func Test_SQLMock_DBClose_AlsoPass(t *testing.T) {
+	db, mock, _ := sqlmock.New()
+	defer func() {
+		_ = db.Close()
+	}()
+	assert.Nil(t, mock.ExpectationsWereMet())
+}
+
+func Test_SQLMock_DBClose_Fail(t *testing.T) {
+	db, mock, _ := sqlmock.New()
+	defer func() {
+		err := db.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+	assert.Nil(t, mock.ExpectationsWereMet())
+}
+```
+
+go version go1.12.7 linux/amd64
+go-sqlmock v1.3.3
+Work done by MarcelHillmann@ to add column metadata, but that pull request hasn't seen activity in some time.
+When using`WillReturnCloseError` on an `ExpectedPrepare` but not using transactions,`Close()` is not returning the error given to `WillReturnCloseError`
+
+Expected behaviour: `stmt.Close() == wantErr` 
+Actual behaviour: `stmt.Close() == nil` 
+
+Here's a failing test function that should pass.
+```go
+func TestExpectedPreparedStatementCloseErrorDB(t *testing.T) {
+        conn, mock, err := New()
+        if err != nil {
+                t.Fatal("failed to open sqlmock database:", err)
+        }
+
+        want := errors.New("STMT ERROR")
+        mock.ExpectPrepare("SELECT").WillReturnCloseError(want)
+
+        stmt, err := conn.Prepare("SELECT")
+        if err != nil {
+                t.Fatal("unexpected error while preparing a statement:", err)
+        }
+
+        if err := stmt.Close(); err != want {
+                t.Fatalf("got = %v, want = %v", err, want)
+        }
+}
+```

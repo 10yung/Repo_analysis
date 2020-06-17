@@ -1,0 +1,162 @@
+Is it possible to automatically raise the right error (from 'Excon::Error` module) when the return status is not successful? 
+Hi,
+
+Debian Jessie has 0.33.0 version of excon and I mean to patch CVE-2019-16779 with the help of https://github.com/excon/excon/commit/ccb57d7a422f020dc74f1de4e8fb505ab46d8a29.
+
+Now, whilst doing so, I am using the following patch:
+```
+--- a/lib/excon/connection.rb
++++ b/lib/excon/connection.rb
+@@ -261,6 +261,11 @@
+ 
+       datum[:connection] = self
+ 
++      # cleanup data left behind on persistent connection after interrupt
++      if datum[:persistent] && !@persistent_socket_reusable
++        reset
++      end
++
+       datum[:stack] = datum[:middlewares].map do |middleware|
+         lambda {|stack| middleware.new(stack)}
+       end.reverse.inject(self) do |middlewares, middleware|
+@@ -269,7 +274,9 @@
+       datum = datum[:stack].request_call(datum)
+ 
+       unless datum[:pipeline]
++        @persistent_socket_reusable = false
+         datum = response(datum)
++        @persistent_socket_reusable = true
+ 
+         if datum[:persistent]
+           if key = datum[:response][:headers].keys.detect {|k| k.casecmp('Connection') == 0 }
+@@ -324,6 +331,7 @@
+       if old_socket = sockets.delete(@socket_key)
+         old_socket.close rescue nil
+       end
++      @persistent_socket_reusable = true
+     end
+ 
+     # Generate HTTP request verb methods
+--- a/tests/basic_tests.rb
++++ b/tests/basic_tests.rb
+@@ -15,6 +15,29 @@
+         response[:status]
+       end
+     end
++
++    tests("persistent connections") do
++      connection = Excon.new('http://127.0.0.1:9292', persistent: true)
++
++      response_body = connection.request(path: '/foo', method: 'get').body
++      test("successful uninterrupted request") do
++        connection.request(path: '/foo', method: 'get').body == 'foo'
++      end
++
++      begin
++        # simulate an interrupted connection which leaves data behind
++        Timeout::timeout(0.0000000001) do
++          connection.request(path: '/foo', method: 'get')
++        end
++      rescue Timeout::Error
++        nil
++      end
++
++      test("resets connection after interrupt") do
++        response = connection.request(path: '/bar', method: 'get')
++        response.body == 'bar'
++      end
++    end
+   end
+ end
+ 
+--- a/tests/rackups/basic.rb
++++ b/tests/rackups/basic.rb
+@@ -26,6 +26,14 @@
+     echo
+   end
+ 
++  get('/foo') do
++    'foo'
++  end
++
++  get('/bar') do
++    'bar'
++  end
++
+   private
+ 
+   def echo
+```
+
+Whilst building, I am getting the following build errors:
+https://gist.github.com/utkarsh2102/7fbaaed9ef57ea6bba0f36968e361ac8
+
+I am not sure how to patch these? Am I missing something?
+As I see, some of them could be fixed by using the right certificates. But I am unsure really.
+
+Could you please help with the same? :)
+Hello! 👋 I'd like to set some custom headers on proxy CONNECT requests to be able to some log info on the proxy server based on the header. Would it be possible to add an option somewhere on the request datum to add custom headers (e.g. something like Go's http clients [ProxyConnectHeader](https://tip.golang.org/pkg/net/http/#Transport.ProxyConnectHeader))?
+
+The CONNECT request is constructed over [here](https://github.com/excon/excon/blob/master/lib/excon/ssl_socket.rb#L102), but I'm not entirely sure how `@data` is actually populated at request time. My ruby is pretty limited, but happy to help in any way I can!
+While writing test for an excon middleware, I came across this warning:
+```
+[excon][WARNING] Invalid Excon connection keys: :idempotent, :instrumentor_name, :mock, :retry_errors, :retry_limit
+/Users/marco.costa/.rbenv/versions/2.5.1/lib/ruby/gems/2.5.0/gems/excon-0.66.0/lib/excon/connection.rb:425:in `validate_params'
+/Users/marco.costa/.rbenv/versions/2.5.1/lib/ruby/gems/2.5.0/gems/excon-0.66.0/lib/excon/connection.rb:71:in `initialize'
+/Users/marco.costa/.rbenv/versions/2.5.1/lib/ruby/gems/2.5.0/gems/excon-0.66.0/lib/excon.rb:142:in `new'
+/Users/marco.costa/.rbenv/versions/2.5.1/lib/ruby/gems/2.5.0/gems/excon-0.66.0/lib/excon.rb:142:in `new'
+(pry):3:in `__pry__'
+```
+
+This warning can be reproduced with the following snippet:
+```ruby
+$VERBOSE = true
+require 'excon'
+Excon.new('http://httpstat.us/200', middlewares: [Excon::Middleware::ResponseParser]).get;
+```
+
+This warning is issued because the list of middlewares I provided to excon is a subset of `Excon.defaults[:middlewares]`, and `Excon.defaults` includes `:idempotent`, `:instrumentor_name`, `:mock`, `:retry_errors`, and `:retry_limit` as default parameters. Because their respective middlewares are not registered, excon thinks these are extraneous parameters.
+
+[Here's the line responsible for this validation.](https://github.com/excon/excon/blob/master/lib/excon/connection.rb#L416)
+In the last few days I've been chasing a memory leak that was introduced as part of the fix of #640. The memory leak of the fix is actually discussed in the conversation about the fix and we've run into it.
+
+We use Excon to keep a persistent connection to an API in a web application that runs with Puma as the server. The Puma configuration allowed for a variable number of threads between a minimum and maximum (this is how Puma runs by default). With the new change the app uses all of the memory on the server and had to be killed.
+
+Before the change the sockets for each connection were cached on the thread variables, so when a Puma thread got destroyed it allowed the Excon sockets to be garbage collected. With the new version the cache is stored on the connection itself. When a thread is destroyed the cache does not clear the sockets that it holds for that thread which causes a leak of Excon sockets.
+
+I'm not sure what is the preferred fix, there are a couple of solutions that I can think of:
+
+- The first one would be removing the cache. I found it surprising and unexpected that sockets are shared between connections, something also discussed in #640. (In our case to ensure thread safety we use a connection pool of Excon connections that the Puma threads can access)
+
+- Use [ObjectSpace#define_finalizer](http://ruby-doc.org/core-2.4.2/ObjectSpace.html#method-c-define_finalizer) to cleanup the socket caches when a thread is destroyed.
+
+I prefer the first option because is simpler and leads to less confusion about how an Excon connection really works. The second solution seems a bit hackish to me.
+
+However I may be missing a use case where the cache is necessary or useful?
+
+
+There does not seem to be a way to apply an overall timeout to a request.
+
+I have looked at connect_timeout, read_timeout, and write_timeout but what I really want is an overall timeout. Timeout::timeout seemed one option but appears to have is own issues which I would prefer to avoid
+
+ It seems time to move on from shindo to rspec since active development on shindo has waned.  This issue is for a discussion on the topic. At the moment I'm trying to get feedback on using webmock/rspec in place of firing up servers wherever possible for the sake of fewer moving parts and a leaner test suite.
+
+ Note that we can still it seems we could still use all of the rackups, etc. See https://github.com/bblimke/webmock
+
+ Then again, the way it all works in the test suite is pretty simple. 
+
+- Port being added to URL can be forced by using `include_default_port` option
+- Simplifies some of the port addition code
+- Break out logic to determine if a default port into its own method
+- Tests basic cases of scheme+port combinations
+
+This is a **big change** in terms of default functionality, and I suspect it will affect the gem users enough that it is worth considering what kind of version bump it'd require.
+
+Additionally, I'd like to have deprecation warnings when the `omit_default_port` option is used with Excon, but I am not sure which method to add the detection and warning output to. Thoughts?
+
+Fixes #357. Per discussion in #357, this should only add the port to the URL when `include_default_port` is specified or the port was included in the original URL.
+
+
+/cc @jclem
+
+Not sure what all we could borrow, but allowing strings instead of regexes seems like it could be super handy.

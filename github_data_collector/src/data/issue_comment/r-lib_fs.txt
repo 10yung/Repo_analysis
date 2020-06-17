@@ -1,0 +1,362 @@
+Currently, `path()` recycles the same way base R does (and therefore also the function building upon `path()` like `+` or `/`).
+
+``` r
+fs::path(1:2, 1:3)
+#> 1/1 2/2 1/3
+```
+
+This should rather throw an informative error.
+
+<sup>Created on 2019-12-16 by the [reprex package](https://reprex.tidyverse.org) (v0.3.0)</sup>
+Often, one has an organised directory structure e.g. of the format `/<country>/<year>` and then needs to do some batch processing of files in these directories. A typical workflow would be to get info about a certain file in each of these directories and parse parts of the path to the file, e.g.
+
+``` r
+library(fs)
+library(dplyr)
+dir_info("~/Downloads/", recurse = TRUE, regexp = "(es|de|fr)/\\d{4}/population\\.xlsx") %>% 
+  transmute(
+    country = stringr::str_match(path, "(es|de|fr)/(\\d{4})/population\\.xlsx")[, 2],
+    year = stringr::str_match(path, "(es|de|fr)/(\\d{4})/population\\.xlsx")[, 3],
+    size
+  )
+#> # A tibble: 5 x 3
+#>   country year         size
+#>   <chr>   <chr> <fs::bytes>
+#> 1 de      2000        2.95M
+#> 2 de      2001        2.95M
+#> 3 de      2002        2.95M
+#> 4 fr      2000        2.95M
+#> 5 fr      2002        2.95M
+```
+
+<sup>Created on 2019-12-13 by the [reprex package](https://reprex.tidyverse.org) (v0.3.0)</sup>
+
+and then process each file passing path, country and year as a parameter to the corresponding function.
+
+Instead of the code above it would be very nice to have something like
+
+``` r
+dir_info("~/Downloads/", parts = c(country = "es|de|fr", year = "\\d{4}", "population\\.rds"))
+```
+
+i.e. specify the parts of the path and the named parts should become a column in the output.
+
+Further, it would make sense to also support this in `dir_map()` and `dir_walk()` and pass the parsed parts of the path on to fun, i.e.
+
+``` r
+dir_walk(
+  "~/Downloads/",
+  parts = c(country = "es|de|fr", year = "\\d{4}", "population\\.rds"),
+  fun = function(path, country, year) {}
+)
+```
+If the `path` argument to `dir_delete` contains nested subdirectories, `dir_delete` will delete the subdirectories, but will fail prior to deleting the top level directories:
+
+```
+test <- c("~/test/about", "~/test/tags",  "~/test/tags/blogdown")
+dir_create(test)  # Make sure there is no existing ~/test directory first.
+dir_ls("~/test", recurse = TRUE) %>% as.character()
+## [1] "/home/michael/test/about"         "/home/michael/test/tags"         
+## [3] "/home/michael/test/tags/blogdown"
+dir_delete(test)
+## Error: [ENOENT] Failed to remove '/home/michael/test/tags/blogdown': no such file or directory
+dir_ls("~/test", recurse = TRUE) %>% as.character()
+## [1] "/home/michael/test/about" "/home/michael/test/tags" 
+```
+
+This happens because `dir_delete` itself goes off and gets subdirectories to delete, and then concatenates them with the original top-level directories before deleting:
+
+```
+old <- path_expand(path)
+dirs <- dir_ls(old, type = "directory", recurse = TRUE, 
+  all = TRUE)
+# ...
+rmdir_(rev(c(old, dirs)))
+```
+
+If `path` had subdirectories in it, `c(old, dirs)` will include subdirectories twice, so it fails the second time it gets to one.
+
+A solution would be to wrap `c(old, dirs)` in `unique`:
+
+```
+rmdir_(rev(unique(c(old, dirs), fromLast = TRUE)))
+```
+
+This works in my testing. Happy to (try to) create a pull request if appropriate.
+
+Versions:
+fs 1.3.1
+R 3.6.1
+RStudio 1.2.5019
+
+In the Comparison Vignette, `path_norm()` is said to approximate `normalizePath()`. 
+
+It seems that `path_norm()` is more the equivalent of `path_abs()` though:
+
+``` r
+library(fs)
+normalizePath(".")
+#> [1] "/private/var/folders/5z/rm2h62lj45d332kfpj28c8zm0000gn/T/RtmpdjTe5h/reprex171265ac46d6f"
+path_norm(".")
+#> .
+path_abs(".")
+#> /private/var/folders/5z/rm2h62lj45d332kfpj28c8zm0000gn/T/RtmpdjTe5h/reprex171265ac46d6f
+```
+
+<sup>Created on 2019-11-27 by the [reprex package](https://reprex.tidyverse.org) (v0.3.0)</sup>
+Is there a recommended strategy for finding and gracefully handling broken symlinks? My package functions run `path_real()` on the project files to resolve any potential symlinks, and I had a user report a bug where a broken symlink broke everything. Is there a better option than always having to check with `is_link()`/`link_path()`/`file_exists()`?
+
+Here is a reprex to demonstrate the issue:
+
+``` r
+packageVersion("fs")
+#> [1] '1.3.1.9000'
+library(fs)
+d <- file_temp()
+dir_create(d)
+non_existent <- path(d, "non-existent")
+broken_link <- path(d, "broken-link")
+link_create(non_existent, broken_link)
+file_exists(non_existent)
+#> /tmp/RtmpeYDu12/file25f817354d04/non-existent 
+#>                                         FALSE
+link_exists(broken_link)
+#> /tmp/RtmpeYDu12/file25f817354d04/broken-link 
+#>                                         TRUE
+link_path(broken_link)
+#> /tmp/RtmpeYDu12/file25f817354d04/non-existent
+file_exists(link_path(broken_link))
+#> /tmp/RtmpeYDu12/file25f817354d04/non-existent 
+#>                                         FALSE
+f <- dir_ls(path = d)
+path_real(f)
+#> Error: [ENOENT] Failed to realize '/tmp/RtmpeYDu12/file25f817354d04/broken-link': no such file or directory
+# Find any broken links
+any(!file_exists(link_path(f[is_link(f)])))
+#> [1] TRUE
+```
+
+<sup>Created on 2019-10-29 by the [reprex package](https://reprex.tidyverse.org) (v0.3.0.9000)</sup>
+
+<details>
+
+<summary>Session info</summary>
+
+``` r
+sessioninfo::session_info()
+#> ─ Session info ──────────────────────────────────────────────────────────
+#>  setting  value                       
+#>  version  R version 3.6.1 (2019-07-05)
+#>  os       Ubuntu 18.04.3 LTS          
+#>  system   x86_64, linux-gnu           
+#>  ui       X11                         
+#>  language (EN)                        
+#>  collate  en_US.UTF-8                 
+#>  ctype    en_US.UTF-8                 
+#>  tz       America/New_York            
+#>  date     2019-10-29                  
+#> 
+#> ─ Packages ──────────────────────────────────────────────────────────────
+#>  package     * version    date       lib source                   
+#>  assertthat    0.2.1      2019-03-21 [3] CRAN (R 3.5.3)           
+#>  cli           1.1.0      2019-03-19 [3] CRAN (R 3.5.3)           
+#>  crayon        1.3.4      2017-09-16 [3] CRAN (R 3.5.0)           
+#>  digest        0.6.22     2019-10-21 [3] CRAN (R 3.6.1)           
+#>  evaluate      0.14       2019-05-28 [3] CRAN (R 3.6.0)           
+#>  fs          * 1.3.1.9000 2019-10-28 [1] Github (r-lib/fs@a292266)
+#>  highr         0.8        2019-03-20 [3] CRAN (R 3.5.3)           
+#>  htmltools     0.4.0      2019-10-04 [3] CRAN (R 3.6.1)           
+#>  knitr         1.25       2019-09-18 [3] CRAN (R 3.6.1)           
+#>  magrittr      1.5        2014-11-22 [3] CRAN (R 3.5.0)           
+#>  Rcpp          1.0.2      2019-07-25 [3] CRAN (R 3.6.1)           
+#>  reprex        0.3.0.9000 2019-07-19 [1] local                    
+#>  rlang         0.4.1      2019-10-24 [3] CRAN (R 3.6.1)           
+#>  rmarkdown     1.15       2019-08-21 [1] CRAN (R 3.6.1)           
+#>  sessioninfo   1.1.1      2018-11-05 [3] CRAN (R 3.5.1)           
+#>  stringi       1.4.3      2019-03-12 [3] CRAN (R 3.5.3)           
+#>  stringr       1.4.0      2019-02-10 [3] CRAN (R 3.5.2)           
+#>  withr         2.1.2      2018-03-15 [3] CRAN (R 3.5.0)           
+#>  xfun          0.10       2019-10-01 [3] CRAN (R 3.6.1)           
+#>  yaml          2.2.0      2018-07-25 [3] CRAN (R 3.5.1)           
+#> 
+#> [1] /home/jdb-work/R/x86_64-pc-linux-gnu-library/3.6
+#> [2] /usr/local/lib/R/site-library
+#> [3] /usr/lib/R/site-library
+#> [4] /usr/lib/R/library
+```
+
+</details>
+
+Is there some built-in way to filter on the files, not the full paths?
+
+``` r
+require(fs)
+#> Loading required package: fs
+file_create("test.xlsx")
+file_create("~$test.xlsx")
+
+dir_ls(regexp = "^[^~].*[.]xlsx")
+#> test.xlsx
+
+dir_ls(path = getwd(), regexp = "^[^~].*[.]xlsx")
+#> /private/var/folders/5_/l71sk6kn29z17n011g8kld5m0000gp/T/RtmpPIBVNS/reprex7ac63e7b1dfb/test.xlsx
+#> /private/var/folders/5_/l71sk6kn29z17n011g8kld5m0000gp/T/RtmpPIBVNS/reprex7ac63e7b1dfb/~$test.xlsx
+```
+
+<sup>Created on 2019-10-16 by the [reprex package](https://reprex.tidyverse.org) (v0.3.0)</sup>
+All below is for OS X.
+
+MS Office has an awful habit of creating a temporary file for any open files in the same directory, ie "myfile.xlsx" when opened creates a temporary file "~$myfile.xlsx".  Thus using a "*.xlsx" grob captures these.
+
+Unfortunately, `all = F` to not return hidden files does not seem to apply to these files. 
+
+Of course you can use `regexp` to filter these, but since the files only appear when another file is open, it's very easy to not catch that it's necessary if writing code without any files open that then pop up later if someone is looking at one of the files they are about to read in (fairly common in my experience).  In addition, the `regexp` argument wont' work along side the `grob` argument.
+
+Perhaps the `all` argument could be updated to include filtering things that start with "~$"?  Or a new arg to ignore temporary MS Office files could be added with the default set to TRUE?
+
+
+Consider:
+
+``` r
+library(fs)
+
+path1 <- file_temp()
+path2 <- file_temp()
+
+str(rlang::catch_cnd(file_copy(path1, path2)))
+#> List of 1
+#>  $ message: chr "[ENOENT] Failed to copy '/tmp/Rtmpkbe5wh/filef26a706f1216' to '/tmp/Rtmpkbe5wh/filef26ac0c9c05': no such file or directory"
+#>  - attr(*, "class")= chr [1:4] "ENOENT" "fs_error" "error" "condition"
+#>  - attr(*, "location")= chr "file.cc:321"
+```
+
+<sup>Created on 2019-10-09 by the [reprex package](https://reprex.tidyverse.org) (v0.3.0)</sup>
+
+I think `ENOENT` should be in a "error code" (or similar) field of the error object, and it would be nice to include the error path in the object
+Discovered while working on usethis.
+
+I'm working in a project on a folder shared between a Windows VM guest and the macOS host.
+
+fs can recursively add folders there, but not if the UNC path is used. It can list directory contents with such a path.
+
+``` r
+setwd("Z:/win10/frommacos")
+getwd()
+#> [1] "Z:/win10/frommacos"
+
+library(usethis)
+#> Warning: package 'usethis' was built under R version 3.6.1
+library(fs)
+
+proj_get()
+#> <U+2714> Setting active project to '//vmware-host/Shared Folders/win10/frommacos'
+#> //vmware-host/Shared Folders/win10/frommacos
+proj_sitrep()
+#> *   working_directory: 'Z:/win10/frommacos'
+#> * active_usethis_proj: '//vmware-host/Shared Folders/win10/frommacos'
+#> * active_rstudio_proj: <unset>
+#> <U+25CF> Your working directory is not the same as the active usethis project.
+#>   Set working directory to the project: `setwd(proj_get())`
+#>   Set project to working directory:     `proj_set(getwd())`
+
+dir_create("top_folder/subfolder")
+
+proj_path()
+#> //vmware-host/Shared Folders/win10/frommacos
+dir_ls(proj_path())
+#> //vmware-host/Shared Folders/win10/frommacos/R
+#> //vmware-host/Shared Folders/win10/frommacos/top_folder
+#> //vmware-host/Shared Folders/win10/frommacos/NAMESPACE
+#> //vmware-host/Shared Folders/win10/frommacos/frommacos.Rproj
+#> //vmware-host/Shared Folders/win10/frommacos/reprex.R
+#> //vmware-host/Shared Folders/win10/frommacos/DESCRIPTION
+
+proj_path("even_more/subfolder")
+#> //vmware-host/Shared Folders/win10/frommacos/even_more/subfolder
+dir_create(proj_path("even_more/subfolder"))
+#> Error: [ENOENT] Failed to make directory '//vmware-host/Shared Folders': no such file or directory
+
+dir_delete("top_folder")
+```
+
+<sup>Created on 2019-10-01 by the [reprex package](https://reprex.tidyverse.org) (v0.3.0.9000)</sup>
+
+On Windows, I get:
+
+``` r
+fs::path_real("~/R/dev")
+#> C:/Users/mikko/AppData/Local/Temp/Rtmpa8cpqi/reprex37584fd22289/Users/mikko/R/dev
+```
+
+I would expect to get:
+
+``` r
+file.path(path.expand("~"), "R", "dev")
+#> [1] "C:/Users/mikko/Documents/R/dev"
+```
+
+<sup>Created on 2019-09-28 by the [reprex package](https://reprex.tidyverse.org) (v0.3.0)</sup>
+
+I ran into this as many `usethis` functions were failing due to path errors. Maybe related to #206?
+
+<details>
+
+<summary>Session info</summary>
+
+``` r
+devtools::session_info()
+#> - Session info ----------------------------------------------------------
+#>  setting  value                       
+#>  version  R version 3.6.1 (2019-07-05)
+#>  os       Windows 10 x64              
+#>  system   x86_64, mingw32             
+#>  ui       RTerm                       
+#>  language (EN)                        
+#>  collate  English_United States.1252  
+#>  ctype    English_United States.1252  
+#>  tz       Europe/Helsinki             
+#>  date     2019-09-28                  
+#> 
+#> - Packages --------------------------------------------------------------
+#>  package     * version    date       lib source                        
+#>  assertthat    0.2.1      2019-03-21 [1] CRAN (R 3.6.0)                
+#>  backports     1.1.4      2019-04-10 [1] CRAN (R 3.6.0)                
+#>  callr         3.3.0      2019-07-04 [1] CRAN (R 3.6.1)                
+#>  cli           1.1.0      2019-03-19 [1] CRAN (R 3.6.0)                
+#>  crayon        1.3.4      2017-09-16 [1] CRAN (R 3.6.0)                
+#>  desc          1.2.0      2018-05-01 [1] CRAN (R 3.6.0)                
+#>  devtools      2.1.0      2019-07-06 [1] CRAN (R 3.6.1)                
+#>  digest        0.6.20     2019-07-04 [1] CRAN (R 3.6.1)                
+#>  evaluate      0.14       2019-05-28 [1] CRAN (R 3.6.0)                
+#>  fs            1.3.1.9000 2019-09-28 [1] Github (r-lib/fs@380685c)     
+#>  glue          1.3.1      2019-03-12 [1] CRAN (R 3.6.0)                
+#>  highr         0.8        2019-03-20 [1] CRAN (R 3.6.0)                
+#>  htmltools     0.3.6      2017-04-28 [1] CRAN (R 3.6.0)                
+#>  knitr         1.23       2019-05-18 [1] CRAN (R 3.6.0)                
+#>  magrittr      1.5        2014-11-22 [1] CRAN (R 3.6.0)                
+#>  memoise       1.1.0      2017-04-21 [1] CRAN (R 3.6.0)                
+#>  pkgbuild      1.0.3      2019-03-20 [1] CRAN (R 3.6.0)                
+#>  pkgload       1.0.2      2018-10-29 [1] CRAN (R 3.6.0)                
+#>  prettyunits   1.0.2      2015-07-13 [1] CRAN (R 3.6.0)                
+#>  processx      3.4.0      2019-07-03 [1] CRAN (R 3.6.1)                
+#>  ps            1.3.0      2018-12-21 [1] CRAN (R 3.6.0)                
+#>  R6            2.4.0      2019-02-14 [1] CRAN (R 3.6.0)                
+#>  Rcpp          1.0.2      2019-07-25 [1] CRAN (R 3.6.1)                
+#>  remotes       2.1.0      2019-06-24 [1] CRAN (R 3.6.0)                
+#>  rlang         0.4.0      2019-06-25 [1] CRAN (R 3.6.0)                
+#>  rmarkdown     1.13       2019-05-22 [1] CRAN (R 3.6.0)                
+#>  rprojroot     1.3-2      2018-01-03 [1] CRAN (R 3.6.0)                
+#>  sessioninfo   1.1.1      2018-11-05 [1] CRAN (R 3.6.0)                
+#>  stringi       1.4.3      2019-03-12 [1] CRAN (R 3.6.0)                
+#>  stringr       1.4.0      2019-02-10 [1] CRAN (R 3.6.0)                
+#>  testthat      2.1.1      2019-04-23 [1] CRAN (R 3.6.0)                
+#>  usethis       1.5.1.9000 2019-09-28 [1] Github (r-lib/usethis@a2342b8)
+#>  withr         2.1.2      2018-03-15 [1] CRAN (R 3.6.0)                
+#>  xfun          0.8        2019-06-25 [1] CRAN (R 3.6.0)                
+#>  yaml          2.2.0      2018-07-25 [1] CRAN (R 3.6.0)                
+#> 
+#> [1] C:/Users/mikko/Documents/R/win-library/3.6
+#> [2] C:/Program Files/R/R-3.6.1/library
+```
+
+</details>

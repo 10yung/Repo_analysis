@@ -1,0 +1,306 @@
+It would be beneficial to users if they were able to enable log output when debugging issues with coroutines. One of the main reason this was avoided initially was because we didn’t want to tie users to a particular logging framework. Additionally we didn’t want to introduce any overhead into the library. 
+
+Using something like googles [flogger](https://github.com/google/flogger) would provide performant logging and allow users to include whichever backend matches their current logging framework. 
+It would be nice to see an example dokka configuration that would display the auto-generated code; preferably with DSL examples.
+
+**Arrangement**:
+Project with a Spring Web MVC `@RestController` that uses a protobuf generated class as an input, and calls the same server code as the `@GrpcSpringService` (using https://github.com/yidongnan/grpc-spring-boot-starter). Kroto Plus configured to generate builders, message extensions, and coroutines for the service and messages defined in the proto files.
+
+Kroto Plus version `0.6.0-SNAPSHOT` was used
+
+```
+/*
+ * Copyright (C) 2019 Electronic Arts Inc. All rights reserved.
+ */
+
+package com.ea.poutine.roolz.rlzservice
+
+import com.ea.p.r.r.api.RController
+import org.springframework.boot.SpringApplication
+import org.springframework.boot.autoconfigure.SpringBootApplication
+import org.springframework.context.ConfigurableApplicationContext
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.ComponentScan
+import springfox.documentation.builders.PathSelectors
+import springfox.documentation.builders.RequestHandlerSelectors
+import springfox.documentation.spi.DocumentationType
+import springfox.documentation.spring.web.plugins.Docket
+import springfox.documentation.swagger2.annotations.EnableSwagger2
+
+@SpringBootApplication
+@EnableSwagger2
+// import the specific ones we want Swagger exposed for, rather than let it wander around scanning controllers in the packages
+@ComponentScan(basePackageClasses = [RController::class])
+class Swagger2SpringBoot {
+    companion object {
+        lateinit var appContext: ConfigurableApplicationContext
+
+        @JvmStatic
+        fun main(args: Array<String>) {
+            appContext = SpringApplication.run(Swagger2SpringBoot::class.java, *args)
+        }
+    }
+
+    @Bean
+    fun api(): Docket {
+        return Docket(DocumentationType.SWAGGER_2)
+            .select()
+            .apis(RequestHandlerSelectors.any())
+            .paths(PathSelectors.any())
+            .build()
+    }
+}
+```
+
+```
+@SpringBootApplication
+@ComponentScan("com.ea.p")
+@EnableDiscoveryClient
+@EnableConfigurationProperties
+class RApp {
+    companion object {
+        private val logger = KotlinLogging.logger { }
+
+        @JvmStatic
+        fun main(args: Array<String>) {
+            logger.debug { "Running RApplication with args: ${Klaxon().toJsonString(args)}" }
+            SpringApplication.run(RApp::class.java, *args)
+        }
+
+        @Bean
+        fun init() = CommandLineRunner {
+            logger.debug { "init called" }
+        }
+
+        @Bean
+        fun userProvider(): UserProvider {
+            return ThreadLocalUserProvider()
+        }
+    }
+}
+```
+
+```
+@RestController
+@RequestMapping("/v3/r")
+class RController @Autowired constructor(
+    private val service: RService,
+    fConverter: FConverter,
+    private val timers: Timers,
+    private val rResultConverter: rResultConverter,
+    private val container: KContainer
+) {
+    private val bEvaluator = BEvaluator(service, fConverter)
+    private val logger = KotlinLogging.logger { }
+
+    @PostMapping(value = ["/tenant/{tenantId}/entity/{entityId}"],
+        consumes = ["application/x-protobuf", "application/json"],
+        produces = ["application/x-protobuf", "application/json"])
+    fun ruleResultRequest(
+        @PathVariable("tenantId") tenantId: String,
+        @PathVariable("entityId") entityId: String,
+        @RequestBody eRequests: BERequest
+    ): ResponseEntity<BRResults> = runBlocking {
+        val tags = mapOf("actorKey" to PAKey(entityId, tenantId).toString())
+        withLoggingContext(tags) {
+            respond(
+                // rainbow brackets plugin for IntelliJ is useful here
+                logicFunc = {
+                    ruleResultConverter.toDto(
+                        timers.recordAsync(MetricTypes.RRequestGrpc.id, tags) {
+                            async {
+                                bEvaluator.execute(evalRequests, entityId, tenantId)
+                            }
+                        }
+                    )
+                },
+                afterFunc = { logger.info { "Finished all requests in list for $tenantId $entityId" } }
+        ) }
+    }
+
+    @DeleteMapping("/tenant/{tenantId}/entity/{entityId}")
+    fun deleteSession(
+        @PathVariable("tenantId") tenantId: String,
+        @PathVariable("entityId") entityId: String
+    ): ResponseEntity<Boolean> {
+        // this block wraps with try/catch with boilerplate logging, and is from the api-common library
+        // returns an ResponseEntity.Ok(this return value as body) when it exits the respond block
+        return respond(
+            logicFunc = { service.deleteSession(PAKey(entityId, tenantId)) },
+            afterFunc = { logger.info("Completed REST API to gRPC call for deleteSession for $tenantId $entityId") })
+    }
+
+    @GetMapping(value = ["/r"],
+            produces = ["application/json"])
+    fun getAllRNames(): ResponseEntity<List<String>> = runBlocking {
+        val rNames = container.getRNames()
+        val tags = mapOf("rNames" to rNames.toString())
+        withLoggingContext(tags) {
+            respond {
+                logger.debug { "Finished returning all the rnames" }
+                rNames
+            }
+        }
+    }
+}
+```
+
+```
+mockServices:
+  - filter:
+      includePath:
+        - com/ea/p/*
+    implementAsObject: true
+    generateServiceList: true
+    serviceListPackage: com.ea.p.r
+    serviceListName: MockRServices
+
+protoBuilders:
+  - filter:
+      excludePath:
+        - google/*
+      includePath:
+        - com/ea/p/*
+    unwrapBuilders: true
+    useDslMarkers: true
+
+grpcCoroutines: []
+
+grpcStubExts:
+  - supportCoroutines: true
+
+extendableMessages:
+  - filter:
+      includePath:
+        - com/ea/p/r/*
+```
+
+```
+syntax = "proto3";
+import "google/protobuf/any.proto";
+package com.ea.p.r;
+option java_package = "com.ea.p.r.rp";
+option java_multiple_files = true;
+service RService {
+    rpc bREvaluation (BERequest) returns (BRResults);
+    rpc deleteSession (DeleteSessionRequest) returns (DeleteSessionResponse);
+}
+
+message BERequest {
+    string tenantId = 1;
+    string entityId = 2;
+    repeated ERequestV3 eRequests = 3;
+    Service service = 4; 
+}
+
+message BRResults {
+    repeated EResponseV3 responses = 1;
+}
+
+message EResponseV3 {
+    string associatedRequestId = 1;
+    repeated RResultV3 rResults = 3;
+}
+
+message RResultV3 {
+    string rId =1;
+    bool state = 2;
+    map<string, string> results = 3;
+}
+
+message ERequestV3 {
+    string requestId = 1;
+    repeated FDto f = 3;
+    repeated string rIdFilter = 4;
+}
+
+message Service {
+    string service = 1;
+    string key = 2;
+}
+
+message FactDto {
+    string factId = 1;                  
+    google.protobuf.Any value = 2;
+}
+
+// This is a possible FDto value.
+message FJsonValue {      
+    string jsonValue = 1;               // The string with the JSON representation
+    enum FType {                     // The supported types the JSON representation can be mapped to.
+        STRING = 0;
+        INTEGER = 1;
+        BOOLEAN = 3;
+        DOUBLE = 4;
+        LIST_INTEGER = 5;
+        LIST_STRING = 6;
+        STATS_DATA = 7;
+    }
+    FType fType = 2;
+}
+
+message DeleteSessionRequest {
+    string tenantId = 1;
+    string entityId = 2;
+}
+
+message DeleteSessionResponse {
+    bool success = 1;
+}
+```
+
+**Expected**:
+Works the same as before, starts up fine with a Swagger UI.
+
+**Actual**:
+Fails to start, gets lost in the gRPC generated code. 
+
+**Workaround**:
+Remove Kroto Plus, observe that it starts up again.
+Several cases have come up where users have wanted to be able to destructure message with the familiar kotlin syntax. Although this is highly requested it doesn’t come for free. It can become massively error prone for users if they re arrange fields ids or introduce new ones. 
+
+I still think a safe implementation can be provided by allowing users to define a “deconstructor” option within their message. Similar to the common proto support of the method signature option. The trade off is that this would make the component extensions explicitly defined and managed by the proto author instead of implicitly determined by the plugin. 
+
+There’s a already a branch in progress with a working example but the majority of the effort needed for this is in writing good documentation. 
+Hello, In bidirectional streaming How I can check client connection status? I am developing multiplayer online game with your library and I want to know when one player disconnect and notify to other players? 
+How come the abstract `NameImplBase` class generates open functions rather than abstract functions? I think it would be nice to get a compile time error if a method has not been implemented, rather than a runtime error.
+Hello
+
+Can you provide an example of how to subscribe to a server stream please?
+In my case, the server sends messages to the stream every second, but when I connect to it like:
+![Screenshot at Oct 17 17-13-11](https://user-images.githubusercontent.com/29251216/67016777-6ac3f800-f101-11e9-83e6-dbde806d1212.png)
+
+I get messages every 1-2 minutes.
+Currently server implementations use server handler builder to process incoming calls using the existing stream observer api. This requires a lot of adapter code just to map coroutine behavior to the existing stream observer call back. 
+
+It should be possible to implement `ServerCallHandler` and emit its usage in the generated code. This gives us the ability to not only improve performance but map the coroutine apis closer to the call level.
+
+At the moment it is difficult to expand the kroto API. With access to the call, we could potentially allow users to pass execution parameters via a call wrapper type. This would allow the customization of the following:
+
+* Server method `CoroutineStart`
+* Initial `coroutineContext`
+* Channel buffer size for streaming APIs
+* _(Possibly?)_ Custom Exception handlers
+
+Call wrapper example:
+
+```kotlin
+abstract class ServerCallCoroutine<ReqT,RespT>(
+    delegate: ServerCall<ReqT,RespT>
+) : SimpleForwardingServerCall<ReqT,RespT>(delegate){
+
+    open val initialContext: CoroutineContext = EmptyCoroutineContext
+
+    open val coroutineStart: CoroutineStart = CoroutineStart.ATOMIC
+    
+    open val requestChannelBufferSize: Int = Channel.BUFFER
+
+}
+```
+
+The kroto implementation of `ServerCallHandler` would be able to check for this type explicitly during method invocation and use the parameters provided
+Now, in development there is not elegant form to show errors in console, we have to put in every coroutine try {} catch and print the error, and in production for example if I have EntityNotFoundException, I have to put a try catch and raise StatusException.
+
+Is there an elegant way to handle exceptions with coroutins? If we use the classic grpc form, we have the interceptors, but in the case of the coroutins, the exception is encapsulated before it can be handled by the server interceptors. I think the errors should be able to be handled like coroutin errors in the context, and if they are not handled there, the server must handle it with interceptors, and if the server don't handle it, the application should be closed(By default should exist a interceptor to catch every exception and handle it, for avoid application closing).
+
+At the moment I have solved it by modifying the library to delegate errors to a Handler from Throw.toRpcException but it is not the best.

@@ -1,0 +1,311 @@
+<!--- Provide a general summary of the issue in the Title above -->
+I met this issue when I tried to run the compress test /test/compress/compress.sh
+```
+  16:31:29       # /root/spdk/scripts/rpc.py set_compress_pmd -p 1
+request:
+{
+  "pmd": 1,
+  "method": "set_compress_pmd",
+  "req_id": 1
+}
+Got JSON-RPC error response
+response:
+{
+  "code": -32601,
+  "message": "Method not found"
+}
+  16:31:29      # trap - ERR
+  16:31:29      # print_backtrace
+  16:31:29      # [[ ehxBE =~ e ]]
+  16:31:29      # xtrace_disable
+  16:31:29      # '[' no '!=' yes ']'
+  16:31:29      # PREV_BASH_OPTS=ehxBE
+  16:31:29      # [[ ehxBE == *\x* ]]
+  16:31:29      # XTRACE_DISABLED=yes
+  16:31:29      # set +x
+```
+And then I started a spdk_tgt and tried to run `set_compress_pmd` and `bdev_compress_create`, but found out both methods are not found even in `rpc_get_methods`. I think it lacks some certain dependencies so I added `--with-reduce` to `./configure` (I think it has something to do with compress) but it remains no change. (Also tried several other parameters)
+## Expected Behavior
+<!--- Tell us what should happen -->
+./compress.sh successfully execute
+## Current Behavior
+<!--- Tell us what happens instead of the expected behavior -->
+```
+request:
+{
+  "pmd": 1,
+  "method": "set_compress_pmd",
+  "req_id": 1
+}
+Got JSON-RPC error response
+response:
+{
+  "code": -32601,
+  "message": "Method not found"
+}
+```
+## Possible Solution
+<!--- Not obligatory, but suggest a fix/reason for the bug, -->
+Add some dependencies to current environment
+## Steps to Reproduce
+<!--- Provide a link to a live example, or an unambiguous set of steps to -->
+<!--- reproduce this bug. Include code to reproduce, if relevant -->
+1. ./configure --with-reduce
+2. make
+3. ./test/compress/compress.sh
+
+## Context (Environment including OS version, SPDK version, etc.)
+<!--- Providing context helps us come up with a solution that is most useful in the real world -->
+CentOS Linux release 7.4.1708 (Core)
+Linux version 3.10.0-693.17.1.el7.x86_64
+SPDK v20.01-pre git sha1 6c27474
+When using RHEL 8.1 with official kernel from distribution (4.18.0-147.el8.x86_64) it is not possible to bind nvme devices to uio_pci_generic driver and due to that to use them within SPDK environment:
+
+> [82734.333834] genirq: Threaded irq requested with handler=NULL and !ONESHOT for irq 113
+> [82734.341761] uio_pci_generic: probe of 0000:18:00.0 failed with error -22
+
+The issue was previously reported in SPDK bugzilla [here](https://github.com/spdk/spdk/issues/399) for vanilla kernel 4.18. Unfortunately the kernel used in RHEL 8 does not contain the proper [bugfix](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?h=linux-4.18.y&id=a34e4f42055a7fe8e804fc9e71dfc1e324c657f1) backported.
+
+Even that this issue is not directly caused by spdk code, it still makes impossible to use SPDK in such a configuration, so probably should be tracked here in order to find some solution/workaround, since RHEL is rather important distribution for the enterprise.
+
+## Expected Behavior
+NVMe devices can be used within SPDK environment when using RHEL 8 as OS.
+
+## Current Behavior
+NVMe devices are not visible within SPDK environment (since they are not bind to any pcie driver).
+
+## Possible Solution
+Manually applying the missing commit into the RHEL 8 uio module source code and rebuilding it solves the issue.
+
+## Steps to Reproduce
+1. Boot into RHEL 8.1 with official kernel
+2. Run setup.sh script
+3. Try to use any of the nvme devices within SPDK environment.
+
+## Context (Environment including OS version, SPDK version, etc.)
+RHEL 8.1 with official kernel 4.18.0-147.el8.x86_64 (I didn't test RHEL 8.0 kernel, but based on changelog the issue should occur there too).
+SPDK changeset: 159703c9dc6f7ff6750c6a6a59c86a15e06b4390
+## Issue Description
+SPDK will crash when I invoke apply_firmware RPC method without a right firmware file.
+
+## Test Env
+SPDK version: SPDK v19.10-pre
+DPDK version: DPDK 19.11.0-rc0
+OS: 		        centos7.4
+vmd: 		enabled
+
+## Reproducing Scenario
+1. Start SPDK with the following commands
+```
+$ ./app/vhost/vhost -m 0x1000010 -s 2048 -S /var/run/spdk -c /usr/local/etc/spdk/vhost.conf
+```
+2. Invoke apply_firmware RPC
+```
+$ ./scripts/rpc.py apply_firmware xxxx 272869e5-3721-463e-9d5b-d7ab22f7fbf7-nvmen1
+```
+
+## Root Cause
+I checked the callstack when spdk crashed, and found that the wild pointer was in the
+spdk_json_decode_string func which had freed a char **s pointer. Actully, this pointer
+is struct rpc_apply_firmware *req in the spdk_rpc_bdev_nvme_apply_firmware, and it will be passed into spdk_json_decode_object. I don't know why spdk_json_decode_string needs
+to free this object.
+
+I add some print info in this function, and call apply_firmware and get_bdevs RPC.
+```
+int
+spdk_json_decode_string(const struct spdk_json_val *val, void *out)
+{
+        char **s = out;
+        printf("out=%p\n", *s);
+        free(*s);
+
+        *s = spdk_json_strdup(val);
+
+        if (*s) {
+                return 0;
+        } else {
+                return -1; 
+        }
+}
+```
+```
+get_bdevs
+$ ./scripts/rpc.py get_bdevs -b 272869e5-3721-463e-9d5b-d7ab22f7fbf7-nvmen1
+...
+
+spdk output
+...
+rpc.c: 122:spdk_jsonrpc_handler: *WARNING*: RPC method get_bdevs is deprecated.  Use bdev_get_bdevs instead.
+out=(nil)
+...
+
+
+apply_firmware
+$ ./scripts/rpc.py apply_firmware xxxx 272869e5-3721-463e-9d5b-d7ab22f7fbf7-nvmen1
+
+spdk output
+rpc.c: 122:spdk_jsonrpc_handler: *WARNING*: RPC method apply_nvme_firmware is deprecated.  Use bdev_nvme_apply_firmware instead.
+out=0x7f69e4d6d7c8
+```
+
+We can see void *out is NULL or a wild pointer, so I think we should not free in this func.
+
+## Bug Solution
+I think void *out is no use for spdk_json_decode_string, so it should be deleted.
+```
+int
+spdk_json_decode_string(const struct spdk_json_val *val)
+{
+	char **s;
+	
+	*s = spdk_json_strdup(val);
+
+	if (*s) {
+		return 0;
+	} else {
+		return -1;
+	}
+}
+```
+Moreover, any funcs which calls this func should be modified, too.
+
+[crash.txt](https://github.com/spdk/spdk/files/4058989/crash.txt)
+[vhost.conf](https://github.com/spdk/spdk/files/4058990/vhost.txt)
+
+Please use the issue tracker only for reporting suspected issues.
+
+See [The SPDK Community Page](http://www.spdk.io/community/) for other SPDK communications channels.
+
+<!--- Provide a general summary of the issue in the Title above -->
+
+## Expected Behavior
+No error out.
+
+## Current Behavior
+SPDK reported error:
+Device 0000:d7:05.5 is still attached at shutdown!
+
+## Possible Solution
+The Device 0000:d7:05.5 is the vmd device. so I think we need to some shutdown codes in the vmd driver.
+
+## Steps to Reproduce
+<!--- Provide a link to a live example, or an unambiguous set of steps to -->
+<!--- reproduce this bug. Include code to reproduce, if relevant -->
+1. enable vmd in the BIOS;
+2. get current vmd devices:
+$lspci|grep 201d
+d7:05.5 RAID bus controller: Intel Corporation Device 201d (rev 04)
+3. run setup.sh:
+PCI_WHITELIST="0000:d7:05.5" ./scripts/setup.sh
+4. run spdk tgt:
+$./app/spdk_tgt/spdk_tgt --wait-for-rpc 
+5. in another terminal, run rpc command to enable vmd:
+./scripts/rpc.py enable_vmd
+6. back to the original terminal, use ctrlr+c to kill the spdk target.
+
+## Context (Environment including OS version, SPDK version, etc.)
+SPDK COMMIT:241d04467dd79b5be05939e016c3de07e76f1664
+While working on adding json_config support to bdev fio plugin, it seems that some interaction between FIO and QoS causes the application to hang.
+
+## Expected Behavior
+It should be possible to add QoS limits on bdev via json_config, even in bdev fio plugin.
+
+## Current Behavior
+When a limit is defined on a bdev the fio application hangs.
+
+## Possible Solution
+
+## Steps to Reproduce
+1. Json_config load to fio is added in patch https://review.gerrithub.io/c/spdk/spdk/+/463979/
+2. An example test patch converting current configuration file to json for fio tests https://review.gerrithub.io/c/spdk/spdk/+/464647/
+3. Remove following lines to reproduce the issue
+```
+	# For some reason QoS hangs fio at the end of run, if it was enabled by json_rpc
+	# Disable it for now and will try to create minimal repro steps
+	$rpc_py bdev_set_qos_limit --rw_ios_per_sec 0 Malloc0
+	$rpc_py bdev_set_qos_limit --rw_mbytes_per_sec 0 Malloc3
+```
+
+## Context (Environment including OS version, SPDK version, etc.)
+killprocess function caused the following error on freebsd.
+
+> 01:21:38 # ps --no-headers -o comm= 21419
+> ps: illegal option -- -
+> usage: ps [-aCcdefHhjlmrSTuvwXxZ] [-O fmt | -o fmt] [-G gid[,gid...]]
+> [-J jid[,jid...]] [-M core] [-N system]
+> [-p pid[,pid...]] [-t tty[,tty...]] [-U user[,user...]]
+> ps [-L]
+> 01:21:38 # '[' '' = sudo ']'
+> 01:21:38 # echo 'killing process with pid 21419'
+> killing process with pid 21419
+> 01:21:38 # kill 21419
+> 01:21:38 # wait 21419
+> 01:21:38 # exit 1
+
+This issue was separated from https://github.com/spdk/spdk/issues/1136
+
+We will have to consider different method to remove headers of ps output on freebsd.
+https://stackoverflow.com/questions/11532188/how-to-get-rid-of-the-headers-in-a-ps-command-in-mac-os-x
+This is happening on a lot of test runs.  A VM will fail somewhere random during the test due to hitting the max amount of time.  When you look at the time stamps, you'll see that the build itself is taking 8-10 minutes.
+
+Links coming...
+Several of these seen in the test pool - will post links shortly:
+
+  18:59:01	# '[' IOPS = IOPS ']'
+   18:59:01	# echo '{' '"tick_rate":' 2494212256, '"bdevs":' '[' '{' '"name":' '"Null_0",' '"bytes_read":' 104226033664, '"num_read_ops":' 25445802, '"bytes_written":' 0, '"num_write_ops":' 0, '"bytes_unmapped":' 0, '"num_unmap_ops":' 0, '"read_latency_ticks":' 7353991675588, '"write_latency_ticks":' 0, '"unmap_latency_ticks":' 0 '}' ']' '}'
+   18:59:01	# jq -r '.bdevs[0].num_read_ops'
+  18:59:01	# io_result_after=25445802
+  18:59:01	# echo 1053360
+ 18:59:01	# qos_result=1053360
+ 18:59:01	# '[' IOPS = BANDWIDTH ']'
+  18:59:01	# echo '950000 0.9'
+  18:59:01	# awk '{printf("%i",$1*$2)}'
+ 18:59:01	# lower_limit=855000
+  18:59:01	# echo '950000 1.1'
+  18:59:01	# awk '{printf("%i",$1*$2)}'
+ 18:59:01	# upper_limit=1045000
+ 18:59:01	# '[' 1053360 -lt 855000 ']'
+ 18:59:01	# '[' 1053360 -gt 1045000 ']'
+ 18:59:01	# echo 'Failed to limit the io read rate of NULL bdev by qos'
+Failed to limit the io read rate of NULL bdev by qos
+ 18:59:01	# /var/jenkins/workspace/Other_systems/freebsd_autotest/spdk/scripts/rpc.py bdev_null_delete Null_0
+
+ Logical core: 1
+
+ Null_0              :  426887.60 IO/s    1667.53 MB/s
+
+ =====================================================
+
+ Total               :  426887.60 IO/s    1667.53 MB/s
+0
+ 18:59:01	# killprocess 70340
+ 18:59:01	# '[' -z 70340 ']'
+ 18:59:01	# kill -0 70340
+  18:59:01	# ps --no-headers -o comm= 70340
+ps: illegal option -- -
+usage: ps [-aCcdefHhjlmrSTuvwXxZ] [-O fmt | -o fmt] [-G gid[,gid...]]
+          [-J jid[,jid...]] [-M core] [-N system]
+          [-p pid[,pid...]] [-t tty[,tty...]] [-U user[,user...]]
+       ps [-L]
+ 18:59:01	# '[' '' = sudo ']'
+ 18:59:01	# echo 'killing process with pid 70340'
+killing process with pid 70340
+ 18:59:01	# kill 70340
+
+Vhost nightly tests fail on step "nightly_vhost_integrity_blk". This started between commits 80da9548 and 801e76d8. Most likely candidate that introduced it is dd7cd80c.
+
+All of the following logs occurred on fedora_phy_nightly_1.
+https://dqtibwqq6s6ux.cloudfront.net/public_build/autotest-nightly_1339.html
+https://dqtibwqq6s6ux.cloudfront.net/public_build/autotest-nightly_1340.html
+https://dqtibwqq6s6ux.cloudfront.net/public_build/autotest-nightly_1341.html
+https://dqtibwqq6s6ux.cloudfront.net/public_build/autotest-nightly_1342.html
+https://dqtibwqq6s6ux.cloudfront.net/public_build/autotest-nightly_1344.html
+Have only seen passes on fedora_phy_nightly_2.
+
+Both machines have iommu enabled. Although checking logs the failing fedora_phy_nightly_1 selects PA mode, and passing fedora_phy_nightly_2 machines selects VA.
+
+@benlwalker Do you mind taking a look ?
+https://dqtibwqq6s6ux.cloudfront.net/public_build/autotest-per-patch_54994.html
+https://dqtibwqq6s6ux.cloudfront.net/results/autotest-per-patch/builds/54994/archive/BlobFS_autotest/rocksdb/writesync_db_bench.txt
+
+

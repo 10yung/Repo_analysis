@@ -1,0 +1,112 @@
+It seems riak 3.0 limited with erlang 20, how can I use latest erlang with develop-3.0 branch? Is there a plan to support latest erlang versions?
+Does not work when trying to create a new bucket.
+
+At the same time, I also wonder if it's worthwhile considering moving away from the unfortunate need to create a json formatted props string when specifying config at the point of creation. I'm sure that this has been talked about before, there may even be open issues for it somewhere.
+
+RPC to 'riak@127.0.0.1' failed: {'EXIT', {function_clause, [{riak_kv_console,bucket_type_create, [["foo"]], [{file, "/data/jenkins-agent/workspace/riak-3.1/rel/pkg/out/BUILD /riak-3.1-2-gd8acf0a/_build/default/lib/riak_kv/src/riak_kv_console.erl"}, {line,499}]}, {rpc,'-handle_call_call/6-fun-0-',5, [{file,"rpc.erl"},{line,197}]}]}} 
+Hi,
+we are going to upgrade our riak cluster from 2.2.3 to 2.9p5, can we do it directly or some  intermediate steps required?
+
+Can we upgrade our cluster via adding additional nodes with 2.9p5 version (may be some configuration changes required?) or rolling upgrade is preferred way?
+
+UPDATE: Is there a plan to upgrade basho's docker images (https://hub.docker.com/r/basho/riak-kv) for riak? 
+
+Some riak_test tests (e.g. ensemble_remove_node - https://github.com/basho/riak_test/blob/develop-2.9/tests/ensemble_basic2.erl) require a patch that survives restart using `rt_intercept:add_and_save/2`.
+
+This add and save uses the basho_patches folder, which is required to be in the code path of the node.  However this is no longer in the code path in `develop-3.0`.
+
+The mkdir command in `rebar.config` https://github.com/basho/riak/blob/8a257eea9c5cd351aea41d0e59bf1b7149f52cd0/rebar.config#L76 has been switched to riak-patches.  However, although switching that back to basho-patches will create the path in `make devrel`, it will not add the path to the code_path (i.e. if you start a node and then call code_get_path() from `riak remote_console` it is not included).
+
+Is this a relx issue?
+
+@martincox might you be able to take a look?
+
+Can Riak 2.0.6 be upgraded directly to 2.9.0 or are intermediate steps required? 
+A race condition in AAE causes the same eleveldb iterator to be used in two different erlang processes. This can result in a kernel general protection fault, or a segfault, which terminates the erlang beam process immediately. 
+
+The condition is caused by several compounding bugs. One of the main ones is in the terminate clause of the riak_kv_vnode, which updates all hashtree's on a nodes shutdown. With a large amount of data in AAE store, this causes the vnode to take longer than 60 seconds and crash on its way down.
+
+The race condition is triggered (and has been replicated) via the following:
+1) Trigger an AAE exchange for Preflist P1 between Node 1 and Node 2
+2) Stop Node 1 (when it has fired off the riak_kv_index_hashtree:compare/5 call in the riak_kv_exchange_fsm)
+3) Trigger an AAE exchange for Preflist P1 on Node 2 and Node 3
+4) Node 2 will now have two processes using the same eleveldb iterator
+
+The race condition occurs due to riak_kv_exchange_fsm stopping on Node 1 shutdown, which causes the riak_kv_index_hashtree locks to be released on Node 1 and Node 2. However the riak_kv_index_hashtree:compre/5 call is a spawen'd off process, which is still running due to the bug mentioned above that causes the riak_kv_vnode to stay up for 60 seconds on a nodes shutdown.
+
+The comparsion on Node 1 is still active for 60 seconds, and sends to Node 2 riak_kv_index_hashtree:exchange_segment/2 calls. This call utilises the eleveldb iterator stored in the riak_kv_index_hashtree state. The new exchange between Node 2 and Node 3 causes an spawn'd of process to update the eleveldb iterator, save it to state and then update the hashtree. With an exchange_segments call coming in after this, we now have two processes using the same eleveldb iterator.
+
+Thus causing the general protection fault, or segfault. Taking down a seperate node to the node that has been requested to stop. 
+
+The number of nodes this could potentially take down is the lowest out of:
+1) the highest n_val
+2) the anti entropy concurrency limit
+
+While the edge case is extremely difficult to hit, we can mitigate the race condition by stopping exchanges while stoppping any node in the cluster.
+
+-----------------------------------------------------------------------------------------------------------------------
+To stop exchanges do the following:
+
+riak attach
+
+riak_core_util:rpc_every_member_ann(riak_kv_entropy_manager, set_mode, [manual], 10000).
+riak_core_util:rpc_every_member_ann(riak_kv_entropy_manager, cancel_exchanges, [], 10000).
+
+
+
+To start the exchanges again:
+
+riak attach
+
+riak_core_util:rpc_every_member_ann(riak_kv_entropy_manager, set_mode, [automatic], 10000).
+At the moment, AAE does not handle objects that expire. As such, even though the data has gone, the entry in the AAE hashtree remains until the hashtree is cleared and rebuilt. Should you have a lot of items that expire, this can cause AAE clearing to take a very long period of time.
+
+Quick example:
+I store user sessions in one backend and they expire after an hour. AAE runs once monthly.
+
+Assuming that AAE just completed:
+After 1 hour, I have 1 hour's worth of data and 1 hour's worth of AAE data. All good.
+After 2 hours, I have 1 hours' worth of data and 2 hours' worth of AAE data. Ok but not ideal.
+After 3 hours, I have 1 hours' worth of data and 3 hours' worth of AAE data. Ok but not ideal.
+After 24 hours, I have 1 hours' worth of data and 24 hours' worth of AAE data. Not very happy.
+After 48 hours, I have 1 hours' worth of data and 48 hours' worth of AAE data. Annoyed now.
+After 30 days, I have 1 hours' worth of data and 720 hours' worth of AAE data. Somewhat insane.
+
+Now AAE gets to clear the hashtree but during the hashtree clearing process, should more than 90 hashtree tokens be used, the node becomes locked until clearing completes i.e. incoming writes have to wait and start to time out.
+
+As hashtree clearing deletes one item at a time from the hashtree, the above hashtree bloat becomes a significant time waster. Even assuming an average of only 500 sessions per hour that is 360,000 records to be cleared where there should only be 500. Estimate 1 ms to clear each item from the hashtree and we observe 100th percentile node put fsms taking in the region of 5-6 minutes to complete in the worst cases.
+
+To address the above, I have two suggestions:
+1. Adjust expiry to be a regular delete i.e. when called, it deletes the entry from the AAE hashtree at the same time it deletes the data to be expired.
+2. Adjust the way that hashtree clearing works so that it deletes all data in one go ala `rm -rf <folder>` style rather than the current iteration over each item.
+Hi folks, 
+
+The links on the downloads page are broken and point to the wrong S3 repository (`downloads.riak.com`) instead of `downloads.basho.com`.
+https://docs.riak.com/riak/latest/downloads.1.html
+
+All but the debian link are affected:
+Here's the mac os link as it appears on the download page (doesn't work):
+http://s3.amazonaws.com/downloads.riak.com/riak/2.2/2.2.3/osx/10.8/riak-2.2.3-OSX-x86_64.tar.gz
+Correct link is:
+http://s3.amazonaws.com/downloads.basho.com/riak/2.2/2.2.3/osx/10.8/riak-2.2.3-OSX-x86_64.tar.gz
+
+In order to prevent someone spoofing the inexistent `downloads.riak.com` s3 bucket and using it to propagate malware, I've created a bucket named downloads.riak.com empty but for a single file in it. 
+
+Please correct this issue asap and I'll then delete the bucket. 
+
+Thanks
+Thomas Blanchard
+relates to https://github.com/Homebrew/homebrew-core/pull/40075
+
+```
+Compiling /private/tmp/riak-20190519-82810-z0c3fg/distdir/riak-2.9.0/deps/hyper/src/hyper_gb.erl failed:
+/private/tmp/riak-20190519-82810-z0c3fg/distdir/riak-2.9.0/deps/hyper/src/hyper_gb.erl:70: type gb_tree/0 is deprecated and will be removed in OTP 18.0; use use gb_trees:tree/0 or preferably gb_trees:tree/2
+ERROR: compile failed while processing /private/tmp/riak-20190519-82810-z0c3fg/distdir/riak-2.9.0/deps/hyper: rebar_abort
+make[4]: *** [compile] Error 1
+make[3]: *** [buildrel] Error 2
+make[2]: *** [bootstrap] Error 2
+make[1]: *** [ostype] Error 2
+make: *** [package] Error 2
+```
+
+Need some eyes on the brew upgrade process. 

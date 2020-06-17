@@ -1,0 +1,395 @@
+We are using Avro4s to build Avro schemas.
+
+After migrating the Avro version from 1.8.2 to 1.9.1 and avro4s 2.12:3.0.4 we faced an NotSerializableException: org.apache.avro.Conversions$DecimalConversion
+
+The following code reproduces the issue:
+
+```
+import java.io.{ByteArrayOutputStream, ObjectOutputStream}
+import com.sksamuel.avro4s.Encoder
+
+val oos = new ObjectOutputStream(new ByteArrayOutputStream())
+oos.writeObject(Encoder.bigDecimalEncoder)
+oos.close
+```
+
+We assume Encoders should be serializable. The problem is that avro:DecimalConverion is not serializable which is out of scope of avro4s.
+
+The following is a potential Bug-Fix for avro4s in line https://github.com/sksamuel/avro4s/blob/03556542ed8454b68cf64a9fd673d1338edb1425/avro4s-core/src/main/scala/com/sksamuel/avro4s/Encoder.scala#L245:
+@transient private lazy val converter = new Conversions.DecimalConversion
+
+Is that bugfix in line with the rest of the project? Should we open a PR or will you take it from the issue?
+In avro4s I don't find the option to generate Schemas from a Scala case class that generate this type for a field:
+
+```json
+"type": {
+  "type": "string",
+  "avro.java.string": "String"
+}
+```
+
+So if I have: 
+```scala
+case class Account(id: String)
+```
+
+it will generate (for id field):
+```json
+"fields": [{
+    "name": "id",
+    "type": "string"
+}
+```
+
+This additional "avro.java.string" : "String" is necessary since apparently is checked when comparing schemas. Am I stuck having to define JSON schemas and not using the feature of defining case classes?
+
+Cheers
+DO NOT MERGE - for discussion purposes only.
+Hello!
+
+We've been using Avro4s to build avro schemas based on case classes and it's been super helpful when reading/writing Parquet data via Scio (Spotify's Scala API for Apache Beam). I wanted to open an issue because up until this point, we've been able to use Avro4s 3.0.x alongside Scio 0.8.0-beta2, even though Scio/Beam have not migrated past Avro 1.8.2. Scio just released 0.8.0, and we're now seeing issues due to the Avro version mismatch. 
+
+I understand that Avro 1.8.x is pretty outdated, but from what I can tell, both Spark and Beam have not been able to migrate to 1.9.x yet because of the breaking datetime changes. Here's the Beam PR that trailed out late last year attempting the upgrade for some context: https://github.com/apache/beam/pull/9779
+
+I've been able to make some minimal modifications to Avro4s 3.0.5 to depend on Avro 1.8.2, and utilizing this 'avro4s-core:3.0.5_avro1.8.2' dependency resolves the issues I'm seeing with Scio 0.8.0; I'm interested in getting your input on whether maintaining an avro 1.8.2 branch in avro4s is worthwhile? Otherwise, I'll likely maintain this implementation locally for the forseeable future, as its unclear how soon Spark/Beam will be able to make the leap forward.
+
+This sketch is intended to show how schema computations and name mappings could be moved out of the critical encode / decode path. 
+
+I tried to find the most challenging parts and address them, namely:
+- how to handle sealed traits and case classes
+- how to handle annotations on fields
+- how to propagate annotations to primitive codecs.
+Not sure though these actually are the most challenging parts.
+
+For the design I decided to factor on the shape of the data that is encoded / decoded rather than to split schema generation, encoding, and decoding. I tried this since I feel the coupling is stronger this way. I see that having a SchemaFor[T] will be necessary in order to support custom encoding / decoding, and have build e.g. RecordCodec so that a SchemaFor could re-use the same code (RecordCodec.buildSchema).
+
+A key piece on how to deal with annotations-based schema customization is the method Codec.withSchema. It allows to enrich a schema that has been derived bottom-up by Magnolia with top-down information available through field annotations.
+
+I must say I'm not sure I fully understood the namespace-conversions that happen in the schema helpers encoding / decoding of sealed traits and case classes (i.e. GenericEncoder.encode and  SchemaHelper.extractTraitSubschema and the like), so while I think it could work, it still needs a test to actually prove it is working properly. On a second thought, I think TypeUnionCodec isn't working fully as before, as it doesn't propagate annotations of the sealed trait to the subtypes; this can be fixed, however.
+
+I moved the FieldMapper to an implicit of the Magnolia-based codec derivation. That has the downside that it makes an implicitNotFound annotation on the Codec really necessary, as it is virtually impossible for a newcomer to understand what's going on if there is no implicit FieldMapper in scope.
+
+Let me know what you think, and if you think it is worthwhile to proceed with this.
+I have been working with avro4s since 1,5 years and I must first say thank you for providing this very convenient library. It is really well documented all around and nice to use; thank you for the effort you put into it!
+
+Recently however, I have experienced a significant performance impact of avro4s on the overall CPU utilization of a codebase. I managed to narrow it down to the performance impact of using sealed traits with one subtype having a type parameter. 
+
+I've provided you a benchmark for encoding / decoding that shows the impact of sealed traits and type parameters, and compares as well with the performance of partially hand-rolling encoders and decoders. I will share the benchmarks as PR soon.
+
+The numbers are roughly as follows:
+```
+::Benchmark avro4s simple field decoding::                           0.003976 ms
+::Benchmark avro4s type union decoding::                             0.010974 ms
+::Benchmark avro4s type parameter decoding::                         0.003747 ms
+::Benchmark avro4s union type with type param decoding::             0.012863 ms
+::Benchmark Avro specific record union type field decoding::         0.001309 ms
+::Benchmark avro4s union type with type param hand-rolled decoding:: 0.00148  ms
+
+::Benchmark avro4s simple field encoding::                           0.003463 ms
+::Benchmark avro4s type union encoding::                             0.014125 ms
+::Benchmark avro4s type parameter encoding::                         0.004532 ms
+::Benchmark avro4s union type with type param encoding::             0.019654 ms
+::Benchmark Avro specific record union type field encoding::         0.00087  ms
+::Benchmark avro4s union type with type param hand-rolled encoding:: 0.002641 ms
+```
+
+So introducing a sealed trait (with 3 subtypes) makes encoding x 4.0 slower and decoding x 2.7 slower. Introducing a type parameter on its own has little impact, the combination however makes encoding x 5.6 slower and decoding x 3.2 slower in the benchmark.
+
+Comparing this with a partially hand-rolled encoding / decoding is also interesting: encoding is 7.4 x slower than hand-rolled, and 22.6 x slower than specific avro record, and decoding is 8.7 x slower than hand-rolled, and 9.8 x slower than specific avro record. In my real use-case, the improvement of partially hand-rolling the encoding gives a ~ x 12 speedup.
+
+I have been looking around the code (without deep knowledge of it) and pointed a profiler at it (without deep knowledge of it), and gained the impression that there is a lot of potential to move significant amount of logic from encoding / decoding paths to encoder / decoder generation.
+
+I will first now provide you the benchmarks so that you can evaluate what I have been measuring, and then we can maybe proceed with identifying areas of potential improvement. I might be possible to gain significant speedup by moving the Avro Schema parameter from the encode / decode methods to a class parameter of encoder / decoders. As far as I looked, this seems possible, but there might be corner cases that make it infeasible.
+
+fix the exception when use avro4s in Spark:(#419)
+`Caused by: java.io.NotSerializableException: com.sksamuel.avro4s.SafeFrom$$anon$9
+Serialization stack:
+	- object not serializable (class: com.sksamuel.avro4s.SafeFrom$$anon$9, value: com.sksamuel.avro4s.SafeFrom$$anon$9@59e320ea)
+	- field (class: com.sksamuel.avro4s.Decoder$$anon$18, name: safeFromS, type: class com.sksamuel.avro4s.SafeFrom)
+	- object (class com.sksamuel.avro4s.Decoder$$anon$18, com.sksamuel.avro4s.Decoder$$anon$18@2dfd2c1b)
+	- field (class: com.sksamuel.avro4s.Decoder$$anon$18, name: decoder$3, type: interface com.sksamuel.avro4s.Decoder)
+	- object (class com.sksamuel.avro4s.Decoder$$anon$18, com.sksamuel.avro4s.Decoder$$anon$18@55cad944)`
+very appreciate that the SafeFrom class(https://github.com/sksamuel/avro4s/blob/master/avro4s-core/src/main/scala/com/sksamuel/avro4s/SafeFrom.scala#L7) can extends Serializable. 
+
+Thanks.
+Error:
+```
+java.io.NotSerializableException: scala.SerialVersionUID
+at java.io.ObjectOutputStream.writeObject0(ObjectOutputStream.java:1184)
+at java.io.ObjectOutputStream.writeArray(ObjectOutputStream.java:1378)
+at java.io.ObjectOutputStream.writeObject0(ObjectOutputStream.java:1174)
+at java.io.ObjectOutputStream.defaultWriteFields(ObjectOutputStream.java:1548)
+at java.io.ObjectOutputStream.writeSerialData(ObjectOutputStream.java:1509)
+at java.io.ObjectOutputStream.writeOrdinaryObject(ObjectOutputStream.java:1432)
+at java.io.ObjectOutputStream.writeObject0(ObjectOutputStream.java:1178)
+at java.io.ObjectOutputStream.defaultWriteFields(ObjectOutputStream.java:1548)
+at java.io.ObjectOutputStream.writeSerialData(ObjectOutputStream.java:1509)
+at java.io.ObjectOutputStream.writeOrdinaryObject(ObjectOutputStream.java:1432)
+at java.io.ObjectOutputStream.writeObject0(ObjectOutputStream.java:1178)
+at java.io.ObjectOutputStream.defaultWriteFields(ObjectOutputStream.java:1548)
+at java.io.ObjectOutputStream.writeSerialData(ObjectOutputStream.java:1509)
+at java.io.ObjectOutputStream.writeOrdinaryObject(ObjectOutputStream.java:1432)
+at java.io.ObjectOutputStream.writeObject0(ObjectOutputStream.java:1178)
+at java.io.ObjectOutputStream.defaultWriteFields(ObjectOutputStream.java:1548)
+at java.io.ObjectOutputStream.writeSerialData(ObjectOutputStream.java:1509)
+at java.io.ObjectOutputStream.writeOrdinaryObject(ObjectOutputStream.java:1432)
+at java.io.ObjectOutputStream.writeObject0(ObjectOutputStream.java:1178)
+at java.io.ObjectOutputStream.defaultWriteFields(ObjectOutputStream.java:1548)
+at java.io.ObjectOutputStream.writeSerialData(ObjectOutputStream.java:1509)
+...
+```
+
+Version: `3.0.0-RC1` because I'm still on 2.11 and also transitive deps on Avro 1.8.2.
+
+Reproduction Scala worksheet:
+```
+import java.io.{FileOutputStream, ObjectOutputStream}
+import com.sksamuel.avro4s.Encoder
+
+// Namespaced
+object Rebuffers {
+  case class Metrics(count: Int)
+  case class EarlyLate(early: Metrics)
+  case class Stats(session: Option[EarlyLate])
+}
+
+case class Rebuffers(network: Option[Rebuffers.Stats])
+
+case class PlaybackSession(rebuffers: Option[Rebuffers])
+
+val fileOut = new FileOutputStream("remove_me")
+val out = new ObjectOutputStream(fileOut)
+out.writeObject(Encoder[PlaybackSession])
+
+println("Done")
+```
+
+But if I unnamespace the subclasses then it works:
+```
+import java.io.{FileOutputStream, ObjectOutputStream}
+import com.sksamuel.avro4s.Encoder
+
+// Not namespaced
+case class Metrics(count: Int)
+case class EarlyLate(early: Metrics)
+case class Stats(session: Option[EarlyLate])
+
+case class Rebuffers(network: Option[Stats])
+
+case class PlaybackSession(
+    rebuffers: Option[Rebuffers]
+)
+
+val fileOut = new FileOutputStream("remove_me")
+val out = new ObjectOutputStream(fileOut)
+out.writeObject(Encoder[PlaybackSession])
+
+println("Done")
+```
+
+Thanks
+The new schema enum default code is putting the `default` field in the wrong location in the schema.
+For example, the `EnumSchemaTest."support default scala enum"` test case generates the following schema where the `default` field is placed outside of the `enum` JSON object:
+```
+{
+  "type": "record",
+  "name": "ScalaEnumsWithDefault",
+  "namespace": "com.sksamuel.avro4s.schema",
+  "fields": [
+    {
+      "name": "colours",
+      "type": {
+        "type": "enum",
+        "name": "Colours",
+        "namespace": "com.sksamuel.avro4s.schema",
+        "symbols": [
+          "Red",
+          "Amber",
+          "Green"
+        ]
+      },
+      "default": "Red"
+    }
+  ]
+}
+```
+According to https://avro.apache.org/docs/current/spec.html#Enums, the `default` field should be at the same level as the `symbols` field:
+```
+{
+  "type": "record",
+  "name": "ScalaEnumsWithDefault",
+  "namespace": "com.sksamuel.avro4s.schema",
+  "fields": [
+    {
+      "name": "colours",
+      "type": {
+        "type": "enum",
+        "name": "Colours",
+        "namespace": "com.sksamuel.avro4s.schema",
+        "symbols": [
+          "Red",
+          "Amber",
+          "Green"
+        ],
+        "default": "Red"
+      }
+    }
+  ]
+}
+```
+Below are two tests that check the compatibility of the above schema when adding a new enum value `Orange`. The first test puts the `default` field in the same location as avro4s 3.0.4 and fails the compatibility test. The second test puts the `default` field next to the `symbols` field and succeeds:
+```import com.sksamuel.avro4s.AvroSchema
+import org.apache.avro.SchemaCompatibility
+import org.apache.avro.SchemaCompatibility.SchemaCompatibilityType
+import org.junit.jupiter.api.Assertions._
+import org.junit.jupiter.api.Test
+
+class Avro4sEnumDefaultTest {
+  object Colours extends Enumeration {
+    val Red, Amber, Green = Value
+  }
+
+  case class ScalaEnumsWithDefault(colours: Colours.Value = Colours.Red)
+
+  // This test uses the AVRO SchemaCompatibility.checkReaderWriterCompatibility method to check the compatibility of two
+  // versions of an enum schema with a default enum field in the location produced by avro4s 3.0.4.
+  // In the first version of the schema, the
+  // enum values are "Red", "Amber", and "Green". In the second version, "Orange" is added to the enum values.
+  //
+  // The test shows that the two schemas versions are not actually compatible because the "default" enum value field
+  // ("default": "Red") is output in the wrong location in the schema.
+  @Test
+  def avro4sDefaultEnumTest1: Unit = {
+    // this is the schema generated by avro4s 3.0.4
+    val schemaVersion1 = new org.apache.avro.Schema.Parser().parse(
+      """
+        |{
+        |  "type": "record",
+        |  "name": "ScalaEnumsWithDefault",
+        |  "namespace": "Avro4sEnumDefaultTest",
+        |  "fields": [
+        |    {
+        |      "name": "colours",
+        |      "type": {
+        |        "type": "enum",
+        |        "name": "Colours",
+        |        "symbols": [
+        |          "Red",
+        |          "Amber",
+        |          "Green"
+        |        ]
+        |      },
+        |      "default": "Red"
+        |    }
+        |  ]
+        |}""".stripMargin)
+
+    // just to be sure, actually generate the schema and check against the one above
+    val avro4sSchema = AvroSchema[ScalaEnumsWithDefault]
+
+    assertEquals(avro4sSchema, schemaVersion1)
+
+    // this schema adds a new enum value "Orange". It should be compatible the the prior version of the schema
+    // due to the default value, but it's not because the "default" value is in the wrong location.
+    val schemaVersion2 = new org.apache.avro.Schema.Parser().parse(
+      """
+        |{
+        |  "type": "record",
+        |  "name": "ScalaEnumsWithDefault",
+        |  "namespace": "Avro4sEnumDefaultTest",
+        |  "fields": [
+        |    {
+        |      "name": "colours",
+        |      "type": {
+        |        "type": "enum",
+        |        "name": "Colours",
+        |        "symbols": [
+        |          "Red",
+        |          "Amber",
+        |          "Green",
+        |          "Orange"
+        |        ]
+        |      },
+        |      "default": "Red"
+        |    }
+        |  ]
+        |}""".stripMargin)
+
+    val schemaPairCompatibility: SchemaCompatibility.SchemaPairCompatibility = SchemaCompatibility.checkReaderWriterCompatibility(
+      schemaVersion1,
+      schemaVersion2
+    )
+
+    // this assert fails
+    assertEquals(SchemaCompatibilityType.COMPATIBLE, schemaPairCompatibility.getType)
+  }
+
+  // This test uses the AVRO SchemaCompatibility.checkReaderWriterCompatibility method to check the compatibility of two
+  // versions of an enum schema with a default enum field placed next to the "symbols" field as specified in
+  // https://avro.apache.org/docs/current/spec.html#Enums.
+  //
+  // In the first version of the schema, the
+  // enum values are "Red", "Amber", and "Green". In the second version, "Orange" is added to the enum values.
+  //
+  // The test shows that the two schemas versions are compatible.
+  @Test
+  def avro4sDefaultEnumTest2: Unit = {
+    // this is the schema generated by avro4s 3.0.4
+    val schema1WithDefaultOutsideEnumType = new org.apache.avro.Schema.Parser().parse(
+      """
+        |{
+        |  "type": "record",
+        |  "name": "ScalaEnumsWithDefault",
+        |  "namespace": "Avro4sEnumDefaultTest",
+        |  "fields": [
+        |    {
+        |      "name": "colours",
+        |      "type": {
+        |        "type": "enum",
+        |        "name": "Colours",
+        |        "symbols": [
+        |          "Red",
+        |          "Amber",
+        |          "Green"
+        |        ],
+        |        "default": "Red"
+        |      }
+        |    }
+        |  ]
+        |}""".stripMargin)
+
+    // this schema adds a new enum value "Orange". It should be compatible the the prior version of the schema
+    // due to the default value.
+    val schema1ModifiedWithDefaultOutsideEnumType = new org.apache.avro.Schema.Parser().parse(
+      """
+        |{
+        |  "type": "record",
+        |  "name": "ScalaEnumsWithDefault",
+        |  "namespace": "Avro4sEnumDefaultTest",
+        |  "fields": [
+        |    {
+        |      "name": "colours",
+        |      "type": {
+        |        "type": "enum",
+        |        "name": "Colours",
+        |        "symbols": [
+        |          "Red",
+        |          "Amber",
+        |          "Green",
+        |          "Orange"
+        |        ],
+        |        "default": "Red"
+        |      }
+        |    }
+        |  ]
+        |}""".stripMargin)
+
+    val schemaPairCompatibility: SchemaCompatibility.SchemaPairCompatibility = SchemaCompatibility.checkReaderWriterCompatibility(
+      schema1WithDefaultOutsideEnumType,
+      schema1ModifiedWithDefaultOutsideEnumType
+    )
+
+    // succeeds
+    assertEquals(SchemaCompatibilityType.COMPATIBLE, schemaPairCompatibility.getType)
+  }
+}

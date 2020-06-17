@@ -1,0 +1,172 @@
+Repeatedly making a copy of a party df, making some changes, and deleting the object, uses an increasing amount of memory on the nodes. Shouldn't deleting the object trigger deletion of the objects in the nodes? I guess one could start a new cluster within the loop, but in my application these are extremely large objects, i would like to avoid having to re-partition.
+
+```r
+library(multidplyr)
+library(dplyr, warn.conflicts = FALSE)
+library(nycflights13)
+
+cluster <- new_cluster(2)
+flights1 <- flights %>% group_by(dest) %>% partition(cluster)
+
+print(cluster_call(cluster,sort(sapply(ls(), function(x) print(format(object.size(get(x)), unit = 'auto'))))))
+
+for(i in 1:3) {
+print(paste("i: ", i))
+remove(flights2)
+cluster_call(cluster,print(gc()))
+print(cluster_call(cluster,sort(sapply(ls(), function(x) print(format(object.size(get(x)), unit = 'auto'))))))
+flights2 <- flights1 %>% mutate(sumtime = dep_time + sched_dep_time)
+gc()
+}
+```
+
+create_cluster no longer exists in the code base.    It is in the documentation.
+
+``` r
+
+devtools::install_github("hadley/multidplyr")
+#> Skipping install of 'multidplyr' from a github remote, the SHA1 (ac69341e) has not changed since last install.
+#>   Use `force = TRUE` to force installation
+library(multidplyr)
+create_cluster(2)
+#> Error in create_cluster(2): could not find function "create_cluster"
+```
+
+I would like to wrap multidplyr code into a function, since I am applying the parallelised multidplyr code to multiple datasets. However, this significantly slows the processing speed, to a point where the parallelisation of the code is not advantageous anymore in terms of run time. 
+
+Is there a fix for this? Am I doing something incorrectly? I believe that this may have something to do with the global environment vs local environment to the user-defined function. 
+
+Below is an example to illustrate the effect of wrapping multidplyr functions into a user-defined function in terms of run time. 
+
+**Note:** I understand that for this particular example itself, it is not advantageous to use the multidplyr commands vs dplyr since the overhead will outweigh the advantage of parallelising however, the issue I want to highlight is the doubling of the run time when wrapping the identical multidplyr code into a user defined function. 
+
+```r
+
+library(tidyverse)
+library(multidplyr)
+library(stringr)
+
+df <- tibble(index = rep(1:100000, 3), 
+             to_concat = (rep(1:100000, 3)))
+
+cluster <- new_cluster(2)
+
+system.time(expr = {
+  
+  df %>% 
+    group_by(index) %>% 
+    partition(cluster) %>% 
+    summarise(concat = stringr::str_c(to_concat, collapse = "_")) %>% 
+    collect()
+    
+})
+
+rm(cluster)
+
+```
+
+`user  system elapsed 0.444   0.068   2.753`
+
+```r
+
+user_defined_func <- function(df, cluster_num){
+  
+  cluster <- new_cluster(cluster_num)
+  
+  df <- 
+    df %>% 
+    group_by(index) %>% 
+    partition(cluster) %>% 
+    summarise(concat = stringr::str_c(to_concat, collapse = "_")) %>% 
+    collect()
+  
+  rm(cluster)
+  
+  return(df)
+
+}
+
+system.time(expr = {
+  
+  user_defined_func(df, cluster_num = 2)
+
+})
+
+```
+`user  system elapsed 1.432   0.288   4.353`
+When a dataframe is partitioned by multidplyr, I would like to be able to use pivot_longer / pivot_wider on it.  My pattern is to take the data and make it long, then make it wide by a different variable (e.g. logs on two dates, where all the columns are gathered into key/value pairs for longer data, and then spread by the log date for comparison purposes).
+
+```r
+data(mtcars)
+cl <- new_cluster(5)
+mtcars %>% partition(cl) %>% pivot_longer(c(cyl,gear)) %>% collect() #fails
+#> Error in map_lgl(.x, .p, ...) : object 'cyl' not found
+mtcars %>% group_by(cyl,gear) %>% partition(cl) %>% pivot_longer(c(cyl,gear)) %>% collect() #also fails
+#> Error in map_lgl(.x, .p, ...) : object 'cyl' not found"
+```
+
+I am excited about the potential of this package. However I had some difficulties.
+
+I have a large database (256,000 rows), where each row contains a data frame. This is in tibble format and I use map iterations to make calculations.
+When using multidplyr, the time is reduced considerably ... After a long wait I get an error. I tried reducing to only 5000 rows and the error persists. However, when testing the same code with only 3000 rows (slice), the calculations are done correctly.
+
+I enclose the code and errors.
+Code:
+```
+items_temp <- items_temp %>% 
+  partition(cluster) %>% 
+  mutate(
+    alfa_psych = purrr::map(data,
+                            ~ psych::alpha(dplyr::select(., -dplyr::ends_with("Item")))),
+    alfa_coef  = purrr::map_dbl(alfa_psych,
+                                ~ purrr::pluck(.x, "total", "raw_alpha")),
+    alfa_ord_psych = purrr::map(data,
+                                ~ psych::alpha(psych::polychoric(dplyr::select(., dplyr::ends_with("Item")))$rho)),
+    alfa_ord_coef  = purrr::map_dbl(alfa_ord_psych,
+                                    ~ purrr::pluck(.x, "total", "raw_alpha"))
+  ) 
+```
+Error (row > 5000):
+```
+Error: Computation failed
+Parents:
+ ─callr subprocess failed: unable to fork, possible reason: Recurso no disponible temporalmente
+ ─unable to fork, possible reason: Recurso no disponible temporalmente
+```
+
+```
+rlang::last_error()
+<error>
+message: Computation failed
+class:   `rlang_error`
+backtrace:
+  1. multidplyr::partition(., cluster)
+ 10. dplyr::mutate(...)
+ 11. multidplyr:::shard_call(.data, "mutate", enquos(...))
+<error: parent>
+message: callr subprocess failed: unable to fork, possible reason: Recurso no disponible temporalmente
+class:   `callr_status_error`
+<error: parent>
+message: unable to fork, possible reason: Recurso no disponible temporalmente
+class:   `callr_remote_error`
+backtrace:
+  1. withCallingHandlers(...)
+ 20. .handleSimpleError(...)
+ 21. h(simpleError(msg, call))
+Call `rlang::last_trace()` to see the full backtrace
+```
+```
+rlang::last_trace()
+     █
+  1. └─`%>%`(...)
+  2.   ├─base::withVisible(eval(quote(`_fseq`(`_lhs`)), env, env))
+  3.   └─base::eval(quote(`_fseq`(`_lhs`)), env, env)
+  4.     └─base::eval(quote(`_fseq`(`_lhs`)), env, env)
+  5.       └─`_fseq`(`_lhs`)
+  6.         └─magrittr::freduce(value, `_function_list`)
+  7.           ├─base::withVisible(function_list[[k]](value))
+  8.           └─function_list[[k]](value)
+  9.             ├─dplyr::mutate(...)
+ 10.             └─multidplyr:::mutate.multidplyr_party_df(...)
+ 11.               └─multidplyr:::shard_call(.data, "mutate", enquos(...))
+```

@@ -1,0 +1,172 @@
+In recent git versions, git filter-branch prints a message to use other tools and waits for the user to press Ctrl-C. Since git-subrepo uses filter-branch sensibly and doesn't show the message to the user, there's no need for this delay. Setting FILTER_BRANCH_SQUELCH disables it.
+
+Fixes #430.
+When the history in the main repo is complex with lots of merges, I'm seeing changes being pushed to the subrepo's remote with a message from a merge commit instead of the real commit. Sometimes the merge commit is from a completely unrelated pull request.
+
+I have created a test file that demonstrates at least part of the problem (although in this case, the message is related): [push-with-merges.t](https://github.com/ingydotnet/git-subrepo/files/3978739/push-with-merges.t.txt)
+
+The problem seems to stem from git-subrepo's logic of skipping non-linear commits, i.e., this part of `subrepo:branch`:
+
+```bash
+# Only include the commit if it's a child of the previous commit
+# This way we create a single path between $subrepo_parent..HEAD
+if [[ -n "$ancestor" ]]; then
+  local is_direct_child=$(git show -s --pretty=format:"%P" $commit | grep "$ancestor")
+  o "is child: $is_direct_child"
+  if [[ -z "$is_direct_child" ]]; then
+    o "Ignore $commit, it's not in the selected path"
+    continue
+  fi
+fi
+```
+On newer git versions, the filter-branch command emits a warning message that it's a dangerous operation and you shouldn't use it. It then waits 5 seconds or more for the user to press Ctrl-C and abort. This makes any operation of git-subrepo that uses filter_branch a lot slower.
+
+Setting the environment variable FILTER_BRANCH_SQUELCH_WARNING to 1 makes this go away. With this variable set, tests run in 42 seconds on my machine. Without it, I don't have the patience to see how long it takes.
+git subrepo branch foo/bar
+git clean foo/bar
+ls .git/tmp/subrepo/ still contains foo. bar has been removed.
+
+Honestly if subrepo or tmp are empty they should be removed also.
+When pulling a subrepo, the modified `.gitrepo` contains LF instead of CRLF on Windows. The automatically generated commit message is lost since Git errors out before the commit step. The volume on which this occurs is formatted NTFS.
+
+Windows 10 Version 1803 (OS Build 17134.1130)
+From Git Bash
+```
+$ git --version
+git version 2.23.0.windows.1
+$ git subrepo pull utilities/math
+git-subrepo: Command failed: 'git add -f -- utilities/math/.gitrepo'.
+fatal: LF would be replaced by CRLF in utilities/math/.gitrepo
+```
+
+The relevant section of my `.gitconfig` on Windows.
+```
+[core]
+        whitespace = cr-at-eol,tab-in-indent
+        autocrlf = true
+        safecrlf = true
+        longpaths = true
+```
+This issue does not occur on Linux. My `.gitconfig` on Linux 
+```
+[core]
+        whitespace = cr-at-eol,tab-in-indent
+```
+
+```sh
+git clone https://github.com/ingydotnet/git-subrepo ~/git/ingydotnet\:git-subrepo
+echo "source ~/git/ingydotnet\:git-subrepo/.rc" >> ~/.bashrc
+```
+```bash
+source ~/.bashrc
+```
+Fixes #183
+
+I don't know how to comprehensively test this, but I have verified that some basic completions work correctly
+I had found that the parent pointer does not change after the pull. As a result, the next pull does re-sampling of old commits and ends up in merge conflicts in some cases. To fix the issue, i commented out the extra check in the update-gitrepo-file (# if [[ $upstream_head_commit == $output ]]; then). 
+
+This works in all my cases. It also works in all tests but "pull-merge.t".  The test did sample the parent before pull. So, i modified it to sample the parent after the pull.
+
+There was also an issue with 'push.t'. The push after pull had truncated history, because the parent pointer had been moved before the push is done. The solution for the issue was to add yet another parent pointer as 'push-parent'. So, the .gitrepo has another entry now. 
+
+On the way i had fixed a few issues:
+
+1. git 2.21 changed word casing in the 'Cc]ouldn't find remote ref' message. I fixed  the regex
+
+1. branch... tests were failing sporadically at least with git 2.22. The order of transactions reported by rev-list in presence of branches was different from test to test. looks like --topo-order fixed it.
+
+1.  error.t was failing inside a submodule, because there was a ref to '.dir'.  So, the 'cd' command failed. I fixed the test.  
+
+
+  
+
+Background:
+==========
+	Have a tree of ~270 nested subrepos of various levels
+
+                 top
+				  |
+				 subrepo0 -- top
+				      |
+					import
+				 /       |         \
+              subreop1 subreop2 .. subrepo140
+		          |
+		        import    ...
+				 /    \
+			sibreopo141 ..
+
+
+		checkout time for all files of the 'top' subrepo is about 20 min
+
+Issues found:
+============
+
+   1. 'subrepo branch' for the top of the nested subrepos creates a tree which includes nested subrepos and pushes them tot he
+   	  origin
+
+   2. 'subrepo bfanch' created nested references which just do not work in case of the multiple branches in existence.
+      e.g.: error: cannot lock ref 'refs/heads/subrepo/s1': 'refs/heads/subrepo/s1/s5/s6' exists; cannot create 'refs/heads/subrepo/s1'
+
+   3. '--tree-filter' used int the branch filtering is veeeery slow. My initial experinent of creating a branch for 'subrepo0' took
+   	  52 hours.
+
+   4. 'multiple commands are missing the --ALL' qualifier
+
+
+Bugs found:
+==========
+
+    1. Worktree was not cleaned at subrepo:branch. It was causing issues in push --ALL if some branches already existed.
+
+	2. test/branch-rev-list-one-path.t failed internittently
+
+	3. encoding did not catch single '@' correclty, causing worktree creation to fail, at least in git 2.22
+
+Features change:
+===============
+
+    1. git 2.22 message letter casing was changed from 'Couldn't find remote ref' to 'couldn't find remote ref'.
+
+
+Added changes:
+=============
+	1. Added feature to clean nested subrepo in the filter-branch
+
+	2. flattened names of nested branches by replaceing '/' with '-'
+
+	3. Added extra checking for the updates done to the nested subrepos only. It checks updated files against the nested subrepo regex
+	   -- found a code which created EMPTY commits, which looked like a leftower from debugging. It stayed in the way and I
+	      commented it out. Did not affect any test.
+	   -- it reduced number of revisions needed for subrepo0 in my initial case from 268 to 4 :-) 
+
+	4. Replaced --tree-filter with --index-filter in soc:branch. For different subrepos performance was improved 2x to 10x.
+	   -- found a git issue, probably related to the tree size. It crashed in filter-branch with `xrealloc(-1ULL)`. I did not
+	   	investigate it further. This happened to the top subrepo with 268 revisions. It worked with 4 (from above) and took onlly 7
+		min to finish (vs 52 hours initially)
+
+		-- aded the '--use_tree_filter' qualifier to allow old --tree-filter in case of git issues.
+
+    5. added the --squash_branch (-S) feature to the branch, push, pull, and fetch commands. It causes subrepo:branch to squash all commits into
+       one with combined log. This was initially done for performance reasons
+		
+	6. fixed found bugs and updated features.
+
+	   -- added --ALL to 'branch', 'clean', 'fetch', 'pull', and 'push'
+	   -- added --topo-order to 'rev-list' in subrepo:branch. This makes git reporting consistent and it looks like
+	      branch-rev-list-one-path.t  passes consistently now
+	   -- claned 'wortree' in subrepo:branch before checking for existense fo the branch
+	   -- added checking of non-prefixed branch names to the encoding. It was ok for branches but not ok for worktrees. Now
+	      worktree seems to work.
+	   -- fixed message regex to handle both, capitalized and non-capitalized veresion of the '[Cc]ouldn't'
+
+    7. added nested.t test to check both regular and squashed branches.
+
+I had rebased the commit where I performed the `git subrepo` clone and when I tried to do a `pull`after that, I received the error
+```
+git-subrepo: Command failed: 'git branch subrepo/utilities/cacherer '.
+fatal: Not a valid object name: ''.
+```
+I was able to figure out this was because of the rebase eventually, but it took some doing, so I made this MR to make the problem obvious in the future.
+
+Also replaced one raw reference to .git with an invocation of `git rev-parse --git-dir`.

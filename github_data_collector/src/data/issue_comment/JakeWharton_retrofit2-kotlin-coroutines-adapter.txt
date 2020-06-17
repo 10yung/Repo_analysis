@@ -1,0 +1,229 @@
+When an error occurs on `Deferred.await()` the thrown error stacktrace is not showing any indication of the url/method that was actually called:
+```
+Exception in thread "main" retrofit2.HttpException: HTTP 404 Not Found
+	at com.jakewharton.retrofit2.adapter.kotlin.coroutines.CoroutineCallAdapterFactory$BodyCallAdapter$adapt$2.onResponse(CoroutineCallAdapterFactory.kt:104)
+	at retrofit2.OkHttpCall$1.onResponse(OkHttpCall.java:129)
+	at okhttp3.RealCall$AsyncCall.execute(RealCall.java:206)
+	at okhttp3.internal.NamedRunnable.run(NamedRunnable.java:32)
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+	at java.lang.Thread.run(Thread.java:748)
+```
+
+The code that produces it is this:
+```kotlin
+import com.jakewharton.retrofit2.adapter.kotlin.coroutines.CoroutineCallAdapterFactory
+import kotlinx.coroutines.Deferred
+import okhttp3.OkHttpClient
+import okhttp3.ResponseBody
+import retrofit2.Retrofit
+import retrofit2.http.GET
+
+
+suspend fun main() {
+    createService("http://www.google.com/", MyService::class.java)
+        .run()
+        .await()
+}
+
+fun <T> createService(baseUrl: String, clazz: Class<T>): T {
+    val httpClient = OkHttpClient.Builder().build()
+    val retrofit = Retrofit.Builder().baseUrl(baseUrl)
+        //for coroutines deferred
+        .addCallAdapterFactory(CoroutineCallAdapterFactory())
+        .client(httpClient).build()
+    return retrofit.create(clazz)
+}
+
+interface MyService {
+
+    @GET("blabla")
+    fun run(): Deferred<ResponseBody>
+}
+```
+
+I am thinking here of a couple of alternatives:
+- attach the call as a field in `HttpException`
+- create an exception that implements `CopyableThrowable` as suggested here: https://github.com/Kotlin/kotlinx.coroutines/issues/1109
+
+Any other suggestion?
+```
+ CoroutineScope(Dispatchers.IO+job).launch {
+            request = App.redditApi?.getTop("after", "en")
+            withContext(Dispatchers.Main) {
+                try {
+                    val response = request?.await()
+                    if (response!!.isSuccessful) {
+                        val news: News? = response?.body()
+              
+                        //Do something with response e.g show to the UI.
+                    } else {
+                  
+                    }
+                } catch (e: HttpException) {
+                } catch (e: Throwable) {
+                    e.printStackTrace()
+                }
+            }
+        }
+        button.setOnClickListener { _: View? ->
+         // request?.cancel()
+            job?.cancel()
+}
+```
+
+
+I want to ask , I called the url to server side. And then called cancel.Would the work on server side be cancelled too by cancelling the job? Because thats what I want. OR should I uncomment request?.cancel() part.
+Is there a way to handle exceptions from Retrofit? We often get these ClassCastExceptions in the `await()` call.
+```
+interface Api {
+  @GET("api/config")
+  fun getConfigAsync(): Deferred<Response<String>>
+}
+```
+```
+launch { // UI
+  try {
+    val response = api.getConfigAsync().await()
+    doSomething(response)
+  } catch (e: Exception) {
+    Timber.e(e)
+  }
+}
+```
+```
+Exception: java.lang.ClassCastException: kotlin.Result$Failure cannot be cast to retrofit2.Response
+  at com.example.Setup$loadConfig$1.invokeSuspend(Setup.kt:385)
+  at kotlin.coroutines.jvm.internal.BaseContinuationImpl.resumeWith(ContinuationImpl.kt:32)
+  at kotlinx.coroutines.DispatchedTask.run(Dispatched.kt:285)
+  at kotlinx.coroutines.scheduling.CoroutineScheduler.runSafely(CoroutineScheduler.kt:594)
+  at kotlinx.coroutines.scheduling.CoroutineScheduler.access$getSchedulerName$p(CoroutineScheduler.kt:60)
+  at kotlinx.coroutines.scheduling.CoroutineScheduler$Worker.run(CoroutineScheduler.kt:742)
+```
+here is my code
+```
+class HelloRepository(api: HelloApi) {
+    suspend fun getHello() {
+        Log.e("start", "thread id = ${Thread.currentThread().id}")
+        val hello = api.getHello().await()
+        Log.e("end", "thread id = ${Thread.currentThread().id}")
+    }
+}
+
+class HelloUseCase(repository: HelloRepository) {
+    fun execute(onComplete:(Hello) -> Unit) : Job {
+        job = Job()
+        CoroutineScope(Dispatchers.Main + job).launch {
+            onComplete(repository.getHello())
+        }
+        return job
+    }
+}
+
+class ViewModel {
+    // execute on activity create
+    fun getHello() {
+        jobs += helloUseCase.execute(...)
+    }
+}
+
+// And then cancel the job on actvitiy destroy
+class Activity {
+    onDestoy() {
+        jobs.forEach {
+            it.cancelChildren()
+            it.cancel()
+        }
+    }
+}
+```
+the log App on launch 
+start thread id = 123
+end thread id = 123
+
+the log app on re-launch(press back key and click app shortcut)
+start thread id = 123
+end thread id = 126
+
+Why the Thread is different first launch and then next launch?
+
+@JakeWharton As I understand call.enqueue() dispatches request calling to retrofit internal mechanism (it works async and we get callbacks). But it is a coroutines-adapter and coroutines are an async framework itself. It looks like one async framework use another one. Can we just use call.execute() and return Deferred (but of course keep in mind to launch it in BG dispatcher)?
+
+Also there is a problem to handle errors for example occurred in Interceptors. And we cannot catch those within coroutines. It just crash the application.
+
+`2018-12-19 17:56:17.501 29846-29916/com.sample.app E/AndroidRuntime: FATAL EXCEPTION: OkHttp Dispatcher
+    Process: com.sample.app, PID: 29846
+    java.lang.Error: java.lang.Exception: Token exception
+        at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1173)
+        at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:641)
+        at java.lang.Thread.run(Thread.java:764)
+     Caused by: java.lang.Exception: Token exception
+        at com.sample.app.interceptors.TokenInterceptor.intercept(TokenInterceptor.kt:45)
+        at okhttp3.internal.http.RealInterceptorChain.proceed(RealInterceptorChain.java:147)
+        at okhttp3.internal.http.RealInterceptorChain.proceed(RealInterceptorChain.java:121)
+        at com.sample.app.interceptors.SentryInterceptor.intercept(SentryInterceptor.kt:17)
+        at okhttp3.internal.http.RealInterceptorChain.proceed(RealInterceptorChain.java:147)
+        at okhttp3.internal.http.RealInterceptorChain.proceed(RealInterceptorChain.java:121)
+        at okhttp3.RealCall.getResponseWithInterceptorChain(RealCall.java:254)
+        at okhttp3.RealCall$AsyncCall.execute(RealCall.java:200)
+        at okhttp3.internal.NamedRunnable.run(NamedRunnable.java:32)
+        at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1167)
+        at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:641) 
+        at java.lang.Thread.run(Thread.java:764) `
+The call adapter crashes with an KotlinNullPointerException when a Void response type is used
+
+```
+kotlin.KotlinNullPointerException
+	at com.jakewharton.retrofit2.adapter.kotlin.coroutines.CoroutineCallAdapterFactory$BodyCallAdapter$adapt$2.onResponse(CoroutineCallAdapterFactory.kt:102)
+	at retrofit2.OkHttpCall$1.onResponse(OkHttpCall.java:123)
+	at okhttp3.RealCall$AsyncCall.execute(RealCall.java:153)
+	at okhttp3.internal.NamedRunnable.run(NamedRunnable.java:32)
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)
+	at java.lang.Thread.run(Thread.java:745)
+```
+None
+
+I configured Retrofit like this: 
+
+```
+object RetrofitFactory {
+    fun makeRetrofitService(): RetrofitDownloadAPIService {
+        val okHttpClient = OkHttpClient().newBuilder()
+                .connectTimeout(20, TimeUnit.SECONDS)
+                .build()
+        return Retrofit.Builder()
+                .baseUrl(BASE_URL)
+                .addCallAdapterFactory(CoroutineCallAdapterFactory())
+                .client(okHttpClient)
+                .build().create(RetrofitDownloadAPIService::class.java)
+    }
+}
+```
+
+and then tried to catch SocketTimeoutException like this
+
+```
+try {
+            val request = retrofitBuildService.service.downloadPDF(codeType, uuid)
+            val response = request.await()
+            if (response.isSuccessful) {
+                if (response.headers().get("Content-Type").equals(PDF_CONTENT_TYPE)) {
+                    return writeToFile(response.body()!!)
+                } else {
+                    val responseText = response.body()!!.string()
+                    JSONParser.jsonErrorParser(responseText)
+
+                }
+            } else
+                throw ResponseException(response.code())
+        }catch (ste:SocketTimeoutException){
+            throw NetworkException(ste)
+        }
+```
+
+ but nothing happened
+May be I did something wrong, or there are not way to do timeout?
+Thank you
+None
+Without depending on a ridiculously massive library...

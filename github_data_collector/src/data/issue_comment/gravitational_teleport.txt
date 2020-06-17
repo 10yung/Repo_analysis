@@ -1,0 +1,150 @@
+**What happened**:
+During Kube interactive sessions, Teleport does not store the executed commands as structured events.
+
+**What you expected to happen**:
+Similar to Enhanced Session Recording for SSH, we would like to be able to programmatically process the commands executed in the K8 pod.
+
+**How to reproduce it (as minimally and precisely as possible)**:
+
+```
+tsh login --proxy MyTeleportProxy
+kubectl exec -it <pod> -- bash
+<do some stuff>
+exit
+```
+
+**Environment**:
+- Teleport version (use `teleport version`): 4.2.1
+- Tsh version (use `tsh version`): 4.1
+- OS (e.g. from /etc/os-release): client - macOS; server K8 cluster v1.14.9; Pod/container Ubuntu 18.04.3 LTS
+
+@benarent 
+
+This fixes a dropped error in `tool/tctl/common`.
+We use UpsertUser method to create users which results in confusing audit events being emitted as if user updated itself.
+
+Also, the "user.update" event does not capture the user who triggered an action. Instead, it stores a user name being updated.  "User X" updated "User X".
+
+
+We've had a feature request to support IBM K8s [Kubernetes Service - Overview](https://www.ibm.com/cloud/container-service/). 
+
+Reference Docs:
+- [Getting started with IBM Cloud Kubernetes Service ](https://cloud.ibm.com/docs/containers?topic=containers-getting-started)
+ - [IBM Cloud Kubernetes Service CLI](https://cloud.ibm.com/docs/containers?topic=containers-cli-plugin-kubernetes-service-cli)
+
+When inspecting the `ClusterRoleBindings`, there are the following roles created by default (in IBMs K8 service): `ibm-admin, ibm-edit, ibm-view`
+
+**Example `ibm-admin`**
+```yaml
+kubectl get clusterrolebinding ibm-admin -o yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+ annotations:
+   iam.iks.cloud.ibm.com.reserved: This role binding is automatically generated,
+     any changes will be overwritten
+ creationTimestamp: "2019-04-16T02:54:57Z"
+ name: ibm-admin
+ resourceVersion: "30530033"
+ selfLink: /apis/rbac.authorization.k8s.io/v1/clusterrolebindings/ibm-admin
+ uid: 04a72c3d-5ff3-11e9-a340-92af3c60e5c2
+roleRef:
+ apiGroup: rbac.authorization.k8s.io
+ kind: ClusterRole
+ name: cluster-admin
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+ kind: User
+ name: IAM#alice@us.ibm.com
+- apiGroup: rbac.authorization.k8s.io
+ kind: User
+ name: IAM#bob@us.ibm.com
+```
+
+Internally, IBMs K8 service uses the identity token (jwt) is used to map to these Users (e.g. `IAM#alice@us.ibm.com`)
+
+So this is partially the reason why we need to have the `identity_token` passed as part of the cluster config. There is also a `refresh_token` but I don’t think this is required
+
+
+This guide expands on a couple of 4.2 features that allows Teleport to use IBMs cloud file storage and etcd password support. 
+
+fixes: https://github.com/gravitational/teleport/issues/3269 
+This PR contains the following changes:
+
+1. Replaces SignupToken and SignupTokenData with resources `UserToken` and `UserTokenSecrets`.
+2. Implements `tctl user reset <username>` command.
+3. Adds new AudtEvent to capture UserToken creation. 
+
+Note, this PR is against alexey/webapps branch.
+Many access plugin implementations will end up needing to store small amounts of per-request information (e.g. API callbacks, tokens, timestamps, and the like).  In order to support making plugins stateless, we can allow them to store arbitrary data against individual access requests.
+
+#### Layout
+
+Because multiple plugins may be running simultaneously, its important that some form of "namespacing" exist to ensure that plugins don't accidentally overwrite one-another's data.  Some obvious potential mechanisms are:
+
+1. Use a mapping of the form `plugin-name -> blob`.  Each plugin can store an arbitrary blob with any relevant data in its assigned slot.
+    - Pros: Super simple!
+    - Cons: Plugins must rewrite all of their state to update one element.
+
+2. Use a double-layered mapping (or prefixing convention) of the form `plugin-name -> key -> blob`.  Each plugin can update keys within its mapping individually.
+    - Pros: Plugins can individually update subsets of their state.
+    - Cons: More complexity; benefit is potentially marginal.
+
+I'm leaning towards **1** right now, mostly because I think it plays better with the operations described below:
+
+#### Operations
+
+Given that most plugins will leverage some amount of parallelism, its important that plugin authors have tools to protect themselves from getting their plugins into a bad state due to concurrent writes:
+
+- API should distinguish between `create` and `upsert` operations so that authors don't accidentally overwrite unexpected state.
+
+-  API should allow authors to protect themselves from concurrent writes (e.g. via `compare-and-swap`). 
+
+
+#### Sketch
+
+This is what I'm leaning towards right now:
+
+```yaml
+metadata:
+  kind: access_request
+  # ...
+spec:
+  user: alice
+  roles: [dictator]
+  # add the `ext_data` field with a mapping of string -> string.
+  ext_data:
+    my-plugin: '{"data":[1,2,3]}'
+  # ...
+```
+
+```golang
+// example call demonstrating a plugin updating its stored state from
+// `{"data":[1,2,3]}` to `{"data":[1,2,3,4,5]}`.
+client.SetAccessRequestExtData(ExtDataSetter {
+    RequestID: "abc123",
+    Name: "my-plugin",
+    Value: `{"data":[1,2,3,4,5]}`,  // Value deletes if nil
+    Expect: `{"data":[1,2,3]}`,     // Expect states expected previous value for compare-and-swap
+    Upsert: true,                   // Upsert toggles whether this can overwrite existing data
+})
+```
+`SetAccessRequestState` could return `FailedPrecondition` code (`trace.CompareFailedError`) if the given request has been updated concurrently.
+It forces the API user to call this method in a loop: https://github.com/gravitational/teleport-plugins/blob/d20cba44b811b669dfa9b33e1b0bf9e8be9a081d/access/access.go#L160-L170
+
+Instead of this, I propose to do such loop internally in Teleport so `SetAccessRequestState` will have updated the state eventually.
+
+Not sure about implementation though. What to do if for some reason loop exits without updating? Perhaps some error should be returned but i think it must differ from `trace.CompareFailedError`. I think such error could only be used if the user explicitly states what is desired to compare.
+**What happened**:
+We've early reports from a customer than when adding a user to a group via Okta they loose other permissions. e.g. if an end user joins Okta `admin` group and `k8-admin` group, they will only have the roles with the smallest account access. 
+
+**What you expected to happen**:
+More info needed.
+
+**How to reproduce it (as minimally and precisely as possible)**:
+TBD 
+
+**Environment**:
+Multiple Teleport Cluster, Okta
+
+This picks up a dropped error in `tool/tctl/common`.

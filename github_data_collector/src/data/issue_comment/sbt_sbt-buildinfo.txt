@@ -1,0 +1,187 @@
+Looks like there is an issue when a project is using sbt protobuf generators alongside sbt-buildinfo plugin
+
+```
+registry.proto: warning: Import google/protobuf/wrappers.proto but not used.
+[info] Compiling protobuf
+[info] Protoc target directory: /builds/api/my-project/sub-project/target/scala-2.12/src_managed/main
+[info] Compiling 56 Scala sources to /builds/api/my-project/sub-project/target/scala-2.12/classes ...
+[error] IO error while decoding /builds/api/my-project/sub-project/target/scala-2.12/src_managed/main/sbt-buildinfo/BuildInfo.scala with UTF-8: /builds/api/my-project/sub-project/target/scala-2.12/src_managed/main/sbt-buildinfo/BuildInfo.scala (No such file or directory)
+[error] Please try specifying another one using the -encoding option
+[error] one error found
+[error] (Compile / compileIncremental) Compilation failed
+[error] Total time: 32 s, completed Jul 2, 2019 9:20:33 PM
+```
+```
+[error] java.io.IOException: Bad address
+[error] 	at sun.nio.ch.FileDispatcherImpl.pwrite0(Native Method)
+[error] 	at sun.nio.ch.FileDispatcherImpl.pwrite(FileDispatcherImpl.java:66)
+[error] 	at sun.nio.ch.IOUtil.writeFromNativeBuffer(IOUtil.java:89)
+[error] 	at sun.nio.ch.IOUtil.write(IOUtil.java:51)
+[error] 	at sun.nio.ch.FileChannelImpl.writeInternal(FileChannelImpl.java:778)
+[error] 	at sun.nio.ch.FileChannelImpl.write(FileChannelImpl.java:764)
+[error] 	at sun.nio.ch.FileChannelImpl.transferFromFileChannel(FileChannelImpl.java:636)
+[error] 	at sun.nio.ch.FileChannelImpl.transferFrom(FileChannelImpl.java:708)
+[error] 	at sbt.io.IO$.loop$1(IO.scala:835)
+[error] 	at sbt.io.IO$.$anonfun$copyFile$4(IO.scala:838)
+[error] 	at sbt.io.IO$.$anonfun$copyFile$4$adapted(IO.scala:829)
+[error] 	at sbt.io.Using.apply(Using.scala:22)
+[error] 	at sbt.io.IO$.$anonfun$copyFile$3(IO.scala:829)
+[error] 	at sbt.io.IO$.$anonfun$copyFile$3$adapted(IO.scala:828)
+[error] 	at sbt.io.Using.apply(Using.scala:22)
+[error] 	at sbt.io.IO$.copyFile(IO.scala:828)
+[error] 	at sbtbuildinfo.BuildInfo$BuildInfoTask.$anonfun$cachedCopyFile$1(BuildInfo.scala:100)
+[error] 	at sbtbuildinfo.BuildInfo$BuildInfoTask.$anonfun$cachedCopyFile$1$adapted(BuildInfo.scala:98)
+[error] 	at sbt.util.Tracked$.$anonfun$inputChanged$1(Tracked.scala:149)
+[error] 	at sbtbuildinfo.BuildInfo$BuildInfoTask.file(BuildInfo.scala:93)
+[error] 	at sbtbuildinfo.BuildInfo$.apply(BuildInfo.scala:11)
+[error] 	at sbtbuildinfo.BuildInfoPlugin$.$anonfun$buildInfoScopedSettings$1(BuildInfoPlugin.scala:68)
+[error] 	at scala.Function1.$anonfun$compose$1(Function1.scala:44)
+[error] 	at sbt.internal.util.$tilde$greater.$anonfun$$u2219$1(TypeFunctions.scala:40)
+[error] 	at sbt.std.Transform$$anon$4.work(System.scala:67)
+[error] 	at sbt.Execute.$anonfun$submit$2(Execute.scala:269)
+[error] 	at sbt.internal.util.ErrorHandling$.wideConvert(ErrorHandling.scala:16)
+[error] 	at sbt.Execute.work(Execute.scala:278)
+[error] 	at sbt.Execute.$anonfun$submit$1(Execute.scala:269)
+[error] 	at sbt.ConcurrentRestrictions$$anon$4.$anonfun$submitValid$1(ConcurrentRestrictions.scala:178)
+[error] 	at sbt.CompletionService$$anon$2.call(CompletionService.scala:37)
+[error] 	at java.util.concurrent.FutureTask.run(FutureTask.java:266)
+[error] 	at java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:511)
+[error] 	at java.util.concurrent.FutureTask.run(FutureTask.java:266)
+[error] 	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+[error] 	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+```
+Using scalajs, I think sbt-buildinfo is the perfect solution for incorporating compile-time environment overrides. For instance, webpack has the `DefinePlugin` which injects global `vars` as environment-specific overrides (e.g. to compile with either dev/qa/prod hostnames). But global vars is **just** starting to get support in scalajs, and I'm not totally liking the idea of global vars anyway.
+
+So to use sbt-buildinfo to fulfill this need, I just need to be able to configure compile-time env constants like:
+
+```
+buildInfoKeys in (Compile, fastOptJS) := Seq[BuildInfoKey]("contentHost" -> "localhost"),
+buildInfoKeys in (Compile, fullOptJS) := Seq[BuildInfoKey]("contentHost" -> "http://example.com"),
+```
+
+Is there an easy fix for supporting setting `buildInfoKeys` when different scalajs tasks are being run? Any potential workarounds?
+## Context
+sbt version: 1.2.1
+sbt-buildinfo version: 0.8.0
+
+We have an sbt multi-project build file with the bt-buildinfo plugin enabled on almost all projects
+
+Our Jenkins pipeline:
+
+- Stage: `sbt compile, test`
+-   Parallel Stages
+    -  `sbt projectA/test`
+    -  `sbt projectB/test`
+    -  total of 17 parallel stages, each running tests on an independent leaf project
+
+## Problem
+
+We see random failures that manifest in many different forms that appear to have a root of missing BuildInfo class files.
+
+## Preliminary diagnosis
+
+Based on the minimized buildinfo code that @dwijnand posted in https://github.com/sbt/sbt/issues/3501, it appears that each of our parallel sbt <project>/test stages is causing build-info to generate temporary files in each project's cache directory. I propose to change sbt-buildinfo to use temporary file semantics (e.g. IO.withTemporaryFile). I can submit a PR if this is acceptable.
+Hi, I have shared setting for build info like:
+```scala
+  lazy val  buildInfoSettingsNamed: String => SettingsDefinition =
+    info =>
+      Seq(
+        buildInfoPackage := "com.package.info",
+        buildInfoObject := info,
+        buildInfoOptions += BuildInfoOption.BuildTime,
+        buildInfoOptions += BuildInfoOption.Traits("com.MyTraitName"),
+        buildInfoKeys :=
+          Seq[BuildInfoKey](
+            name,
+            resolvers,
+            baseDirectory,
+            libraryDependencies
+          )
+      )
+```
+
+And 3 projects:
+```scala
+val project1 = (project in file("project1"))
+  .enablePlugins(BuildInfoPlugin)
+  .settings((name := "project1") ++ buildInfoSettingsNamed("Project1Metadata"))
+
+val project2 = (project in file("project2"))
+  .enablePlugins(BuildInfoPlugin)
+  .settings((name := "project2") ++ buildInfoSettingsNamed("Project2Metadata"))
+
+val project3 = (project in file("project3"))
+  .dependsOn(project1, project2)
+  .enablePlugins(BuildInfoPlugin)
+  .settings((name := "project3") ++ buildInfoSettingsNamed("Project3Metadata"))
+```
+
+And I get error `Could not create file project1/target/streams/$global/coursierResolutions/$global/streams/outjava.io.IOException: Too many open files` when trying to `compile` the `project3`.
+
+The example from the README works for me:
+
+```scala
+BuildInfoKey.map(name) { case (k, v) => "project" + k.capitalize -> v.capitalize }
+```
+
+but if I try e.g.:
+
+```scala
+BuildInfoKey.map(moduleID) { case (k, v) ⇒ "projectMod" -> v.name }
+```
+
+I get no errors or warnings, but there is no `projectMod` key/value in the output. 
+
+Why might this be?
+When you specify a type through inheritance without an explicit import then you get a compiler error in the `doc` task. 
+
+This is reproducible in the [Lagom Java Chirper Example.](https://github.com/lagom/lagom-java-chirper-example) Update the `project/plugins.sbt` by adding the following to the `defaultPlugins` `Seq`:
+
+```
+sbtPluginExtra("com.eed3si9n" % "sbt-buildinfo" % "0.7.0", sbtV, scalaV)
+```
+
+Then update the `build.sbt`'s `chirplmpl` to start like this:
+
+```
+lazy val chirpImpl = project("chirp-impl")
+  .enablePlugins(LagomJava, BuildInfoPlugin)
+  .settings(
+    buildInfoKeys := Seq[BuildInfoKey](name, version, scalaVersion, sbtVersion),
+    buildInfoPackage := "chirp",
+    ...
+```
+
+Now when you run `sbt doc` you get the following:
+
+> [error] /lagom-java-chirper-example-master/chirp-impl/src/main/java/sample/chirper/chirp/impl/ChirpRepositoryImpl.java:119: not found: type ReadSideHandler
+> [error]         public ReadSideHandler<ChirpTimelineEvent> buildHandler() {
+
+The current workaround is to go to `ChirpRepositoryImpl.java` and add 
+
+```
+import com.lightbend.lagom.javadsl.persistence.ReadSideProcessor.ReadSideHandler;
+```
+
+This is needed because `ReadSideHandler` is only available due to the extension of `ReadSideProcessor`, but is not working once you add `sbt-buildinfo`
+Hi,
+
+In my project, if I use `latest.release` as the version number instead of specifying a specific version e.g.
+
+```
+addSbtPlugin("com.eed3si9n" % "sbt-buildinfo" % "latest.release")
+```
+
+The build fails with the following error:
+
+```
+[warn]  ::::::::::::::::::::::::::::::::::::::::::::::
+[warn]  ::          UNRESOLVED DEPENDENCIES         ::
+[warn]  ::::::::::::::::::::::::::::::::::::::::::::::
+[warn]  :: com.eed3si9n#sbt-buildinfo;latest.release: not found
+[warn]  ::::::::::::::::::::::::::::::::::::::::::::::
+```
+
+To debug, I downloaded the source for buildinfo and built it published it locally using `publishLocal`. If I then build by project, it succeeds. Perhaps the bintray version lacks a proper ivy.xml?
+
+It'd be great if there would be a way to generate a simple Java class containing the build information.

@@ -1,0 +1,471 @@
+See https://github.com/reactor/reactor-core/issues/1251
+
+See also conversation in https://github.com/reactor/reactor-core/pull/2012
+## Expected Behavior
+`FluxSink.onDispose` should not invoke callbacks before a terminal signal or a cancellation.
+
+## Actual Behavior
+If a callback is already attached, `FluxSink.onDispose` will invoke the provided callback immediately:
+https://github.com/reactor/reactor-core/blob/2bf8b183e054280b81de9f48cbc60d5920c2f7d8/reactor-core/src/main/java/reactor/core/publisher/FluxCreate.java#L565-L576
+
+## Steps to Reproduce
+
+```java
+@Test
+public void repoCase() {
+    var cleanedUp = new AtomicBoolean();
+    Flux.create(sink -> {
+      sink.onDispose(() -> cleanedUp.set(true));
+      sink.onDispose(() -> cleanedUp.set(true));  // should not be invoked before sink is disposed
+      assertFalse(cleanedUp.get());
+      sink.complete();
+      assertTrue(cleanedUp.get());
+    }).subscribe();
+}
+```
+
+## Possible Solution
+1. support multiple disposables, or
+2. throw exception if disposable is already attached, or
+3. mention current behavior in documentation
+
+## Your Environment
+* Reactor version(s) used: 3.2.10.RELEASE
+* JVM version (`java -version`):
+```
+openjdk version "13.0.1" 2019-10-15
+OpenJDK Runtime Environment Zulu13.28+11-CA (build 13.0.1+10-MTS)
+OpenJDK 64-Bit Server VM Zulu13.28+11-CA (build 13.0.1+10-MTS, mixed mode, sharing)
+```
+* OS and version (eg `uname -a`):
+```
+Linux o948-box 4.18.0-0.bpo.1-amd64 #1 SMP Debian 4.18.6-1~bpo9+1 (2018-09-13) x86_64 GNU/Linux
+```
+
+From #1925:
+> I can't verify because the step before `bufferUntil` is `concatMapIterable` which produces a collection of allocated items and those don't seem to pass through `doOnDiscard` in case of a downstream error. Could there be an issue with `concatMapIterable`?
+
+Here is a simplified test:
+
+```java
+@Test
+void concatMapIterableDoOnDiscardTest() {
+
+	Foo foo1 = new Foo();
+	Foo foo2 = new Foo();
+	Foo foo3 = new Foo();
+
+	Flux<Foo> source = Flux.just(1)
+			.concatMapIterable(i -> Arrays.asList(foo1, foo2, foo3))
+			.doOnDiscard(Foo.class, Foo::release);
+
+	StepVerifier.create(source)
+			.consumeNextWith(foo -> {
+				foo.release();
+			})
+			.thenCancel()
+			.verify();
+
+	assertThat(foo1.getRefCount()).isEqualTo(0); // okay
+	assertThat(foo2.getRefCount()).isEqualTo(0); // fails
+	assertThat(foo3.getRefCount()).isEqualTo(0); // fails
+}
+
+static class Foo {
+
+	int refCount = 1;
+
+	public int getRefCount() {
+		return this.refCount;
+	}
+
+	public void release() {
+		this.refCount = 0;
+	}
+}
+```
+
+_Originally posted by @rstoyanchev in https://github.com/reactor/reactor-core/issues/1925#issuecomment-573630082_
+
+<!--- Provide a general summary of the issue in the Title above -->
+
+<!--- /!\ Make sure to follow the Contribution Guidelines, notably for security issues and questions:
+https://github.com/reactor/.github/blob/master/CONTRIBUTING.md
+https://pivotal.io/security
+https://github.com/reactor/.github/blob/master/CONTRIBUTING.md#question-do-you-have-a-question
+-->
+
+## Expected Behavior
+<!--- Tell us what you think should happen. -->
+According to the javadoc `onErrorContinue()` should
+
+> recover from errors by dropping the incriminating element from the sequence and continuing with subsequent elements.
+
+## Actual Behavior
+<!--- Tell us what happens instead of the expected behavior. -->
+In an (possibly) infinite `Flux`, after 256 invocations of `onErrorContinue()` the Flux stops processing elements.
+
+## Steps to Reproduce
+<!---Provide a link to a live example, or an unambiguous set of steps to
+reproduce this bug, eg. a unit test. Include code to reproduce, if relevant. -->
+
+```java
+@Test
+public void repoCase() {
+    int numberOfRequests = 500;
+    Set<Integer> sink = new HashSet<>();
+
+    Flux
+            .fromStream(IntStream.range(0, numberOfRequests).boxed())
+            .map(sink::add)
+            .flatMap(i -> Mono.error(new Exception("any")))
+            .onErrorContinue((throwable, o) -> {})
+            .subscribe();
+
+    Thread.sleep(1000);
+    Assertions.assertNotEquals(numberOfRequests, sink.size());
+    Assertions.assertEquals(256, sink.size());
+}
+```
+
+## Possible Solution
+<!--- Not obligatory, but you can suggest a fix/reason for the bug. -->
+I have no clue how to solve this. Just the fact, that it is reproducible 256, let me guess that some kind of state or metainformation like the `Context` is stored within just one bit an is just full after 256 entries.
+
+## Your Environment
+<!--- Include as many relevant details about the environment you experienced the bug in. -->
+<!--- Especially, always include the version(s) of Reactor library/libraries you used! -->
+I used a standard spring boot application created from the initializer with spring boot version 2.2.2.RELEASE. Thus the version of reactor core is 3.3.1.RELEASE.
+
+* Reactor version(s) used:
+* Other relevant libraries versions (eg. `netty`, ...):
+* JVM version (`javar -version`): 
+java version "1.8.0_231"
+Java(TM) SE Runtime Environment (build 1.8.0_231-b11)
+Java HotSpot(TM) 64-Bit Server VM (build 25.231-b11, mixed mode)
+* OS and version (eg `uname -a`):
+Windows 10 Enterprise, Version 1703
+
+I already asked the question in the community but didn't receive any answer, but comments on how to circumvent `onErrorContinue()`: https://stackoverflow.com/questions/59649584/limit-for-onerrorcontinue-in-flux 
+<!--- Provide a general summary of the issue in the Title above -->
+
+## Expected Behavior
+`windowUntil()` should complete regardless of the `prefetch` value.  According to the [documentation](https://projectreactor.io/docs/core/release/reference/#_operators_that_change_the_demand_from_downstream):
+
+> Prefetch is a way to tune the initial request made on these inner sequences.
+
+My interpretation is that `prefetch` can be used to tune performance or order of operations, but it shouldn't cause significant changes in behavior.
+
+## Actual Behavior
+`windowUntil()` doesn't complete if `prefetch` is too small.  Therefore, if `windowUntil()` needs to correctly handle arbitrary inputs, I believe `prefetch` should always be set to unbounded (`Integer.MAX_VALUE`).
+
+## Steps to Reproduce
+If `prefetch` is large enough or unbounded (`Integer.MAX_VALUE`), this code generates 4 `WindowFlux` and then completes:
+
+```java
+Flux.range(1,20)
+    .windowUntil(i -> (i % 5 == 0), false, Integer.MAX_VALUE)
+    .log()
+    .subscribe();
+```
+
+```
+onSubscribe([Fuseable] FluxWindowPredicate.WindowPredicateMain)
+request(unbounded)
+onNext(WindowFlux)
+onNext(WindowFlux)
+onNext(WindowFlux)
+onNext(WindowFlux)
+onComplete()
+```
+
+However, if `prefetch` is too small, this code will print less than 4 windows and never completes:
+
+```java
+Flux.range(1,20)
+    .windowUntil(i -> (i % 5 == 0), false, 4)
+    .log()
+    .subscribe();
+```
+
+```
+onSubscribe([Fuseable] FluxWindowPredicate.WindowPredicateMain)
+request(unbounded)
+onNext(WindowFlux)
+```
+
+## Possible Solution
+<!--- Not obligatory, but you can suggest a fix/reason for the bug. -->
+
+## Your Environment
+<!--- Include as many relevant details about the environment you experienced the bug in. -->
+<!--- Especially, always include the version(s) of Reactor library/libraries you used! -->
+
+* Reactor version(s) used: `Dysprosium-SR2`
+* Other relevant libraries versions (eg. `netty`, ...):
+* JVM version (`javar -version`): `OpenJDK Runtime Environment AdoptOpenJDK (build 11.0.5+10)`
+* OS and version (eg `uname -a`): Windows 10 Version 1909
+
+<!--- Provide a general summary of the issue in the Title above -->
+BlockHound sometimes detects blocking call on cancel timeout task. 
+
+<!--- /!\ Make sure to follow the Contribution Guidelines, notably for security issues and questions:
+https://github.com/reactor/.github/blob/master/CONTRIBUTING.md
+https://pivotal.io/security
+https://github.com/reactor/.github/blob/master/CONTRIBUTING.md#question-do-you-have-a-question
+-->
+
+## Expected Behavior
+<!--- Tell us what you think should happen. -->
+BlockHound should not detect blocking calls in reactor-core
+
+## Actual Behavior
+<!--- Tell us what happens instead of the expected behavior. -->
+BlockHound detects blocking calls in reactor-core
+
+## Steps to Reproduce
+<!---Provide a link to a live example, or an unambiguous set of steps to
+reproduce this bug, eg. a unit test. Include code to reproduce, if relevant. -->
+Here is code which could reproduce issue
+```java
+@BeforeAll
+static void setUp() {
+    BlockHound.install();
+}
+
+@Test
+void cancelTimeoutBlocks() {
+    Scheduler sc = Schedulers.newParallel("my-sc", 10, true);
+    Flux<Long> test = Flux.interval(Duration.ZERO, Duration.ofMillis(5))
+            .flatMap(it -> {
+                return Mono.just(it).hide()
+                        .timeout(Duration.ofMillis(10_000))
+                        .subscribeOn(sc);
+            }, 20)
+            .subscribeOn(Schedulers.parallel())
+            .take(Duration.ofMillis(5_000));
+    test.blockLast();
+}
+```
+Run it and check for logs 
+```
+13:36:58.222 [my-sc-12] ERROR reactor.core.scheduler.Schedulers - Scheduler worker in group main failed with an uncaught exception
+java.lang.Error: Blocking call! jdk.internal.misc.Unsafe#park
+	at reactor.blockhound.BlockHound$Builder.lambda$new$0(BlockHound.java:196)
+	at reactor.blockhound.BlockHound$Builder.lambda$install$6(BlockHound.java:318)
+	at reactor.blockhound.BlockHoundRuntime.checkBlocking(BlockHoundRuntime.java:46)
+	at java.base/jdk.internal.misc.Unsafe.park(Unsafe.java)
+	at java.base/java.util.concurrent.locks.LockSupport.park(LockSupport.java:194)
+	at java.base/java.util.concurrent.locks.AbstractQueuedSynchronizer.parkAndCheckInterrupt(AbstractQueuedSynchronizer.java:885)
+	at java.base/java.util.concurrent.locks.AbstractQueuedSynchronizer.acquireQueued(AbstractQueuedSynchronizer.java:917)
+	at java.base/java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire(AbstractQueuedSynchronizer.java:1240)
+	at java.base/java.util.concurrent.locks.ReentrantLock.lock(ReentrantLock.java:267)
+	at java.base/java.util.concurrent.ScheduledThreadPoolExecutor$DelayedWorkQueue.remove(ScheduledThreadPoolExecutor.java:1046)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.remove(ThreadPoolExecutor.java:1751)
+	at java.base/java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.cancel(ScheduledThreadPoolExecutor.java:293)
+	at reactor.core.scheduler.SchedulerTask.dispose(SchedulerTask.java:126)
+	at reactor.core.publisher.MonoDelay$MonoDelayRunnable.cancel(MonoDelay.java:135)
+	at reactor.core.publisher.Operators$MultiSubscriptionSubscriber.drainLoop(Operators.java:2051)
+	at reactor.core.publisher.Operators$MultiSubscriptionSubscriber.drain(Operators.java:2020)
+	at reactor.core.publisher.Operators$MultiSubscriptionSubscriber.cancel(Operators.java:1832)
+	at reactor.core.publisher.Operators.terminate(Operators.java:1108)
+	at reactor.core.publisher.StrictSubscriber.cancel(StrictSubscriber.java:155)
+	at reactor.core.publisher.FluxTimeout$TimeoutTimeoutSubscriber.cancel(FluxTimeout.java:409)
+	at reactor.core.publisher.FluxTimeout$TimeoutMainSubscriber.onNext(FluxTimeout.java:159)
+	at reactor.core.publisher.FluxHide$HideSubscriber.onNext(FluxHide.java:74)
+	at reactor.core.publisher.Operators$ScalarSubscription.request(Operators.java:2186)
+	at reactor.core.publisher.FluxHide$HideSubscriber.request(FluxHide.java:58)
+	at reactor.core.publisher.Operators$MultiSubscriptionSubscriber.set(Operators.java:1994)
+	at reactor.core.publisher.FluxTimeout$TimeoutMainSubscriber.onSubscribe(FluxTimeout.java:148)
+	at reactor.core.publisher.FluxHide$HideSubscriber.onSubscribe(FluxHide.java:69)
+	at reactor.core.publisher.MonoJust.subscribe(MonoJust.java:54)
+	at reactor.core.publisher.Mono.subscribe(Mono.java:4105)
+	at reactor.core.publisher.MonoSubscribeOn$SubscribeOnSubscriber.run(MonoSubscribeOn.java:124)
+	at reactor.core.scheduler.WorkerTask.call(WorkerTask.java:84)
+	at reactor.core.scheduler.WorkerTask.call(WorkerTask.java:37)
+	at java.base/java.util.concurrent.FutureTask.run(FutureTask.java:264)
+	at java.base/java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(ScheduledThreadPoolExecutor.java:304)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1128)
+	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:628)
+	at java.base/java.lang.Thread.run(Thread.java:834)
+```
+
+## Possible Solution
+<!--- Not obligatory, but you can suggest a fix/reason for the bug. -->
+Probably extend allowed blocking methods or document it
+
+## Your Environment
+<!--- Include as many relevant details about the environment you experienced the bug in. -->
+<!--- Especially, always include the version(s) of Reactor library/libraries you used! -->
+
+* Reactor version(s) used: 
+reactor-core:3.3.1.RELEASE,
+blockhound:1.0.1.RELEASE
+* Other relevant libraries versions (eg. `netty`, ...):
+* JVM version (`javar -version`): 
+openjdk version "11" 2018-09-25
+OpenJDK Runtime Environment 18.9 (build 11+28)
+OpenJDK 64-Bit Server VM 18.9 (build 11+28, mixed mode)
+* OS and version (eg `uname -a`):
+Win10
+## Motivation
+When integrating with external APIs, there is often limits like "one request per minute". With the reactor it would be extremely useful to limit the calls to such API by limiting `Flux<ApiRequest>` with according operator.
+There might be other use-cases, when it would be useful to limit quantity of processed object in period of time
+
+## Desired solution
+Code might look like this:
+
+```java
+   Flux.generate(() -> 0, (s, sink) -> {
+            sink.next(s);
+            return s++;
+        }).limitRate(5, Duration.ofMinutes(1))
+            .subscribe(o -> {
+                System.out.println("Got 5 ints per minute");
+            });
+```
+
+## Considered alternatives
+We came up with custom implementation of such operator and using it via `transformDeferred`:
+
+```java
+        Flux.generate(() -> 0, (s, sink) -> {
+            sink.next(s);
+            return s++;
+        }).transformDeferred(flux -> FluxUtil.limitRate(flux, 5, Duration.ofMinutes(1)))
+            .subscribe(o -> System.out.println("Got 5 ints per minute"));
+```
+
+# The problem
+
+Since `expand()` is an operator, the one has to have a bit of a code duplication to use it:
+```java
+Flux<Page> flux = client.fetchPage(null).expand(it -> {
+    return Mono
+        .justOrEmpty(it.nextPageId())
+        .flatMap(nextPageId -> client.fetchPage(nextPageId));
+})
+```
+
+Here, `client#fetchPage` is duplicated.
+
+# Proposal
+It would help to have a factory method with a "default" state:
+```java
+public <S, T> Flux<T> expand(
+			Supplier<S> stateSupplier,
+			Function<T, S> stateExtractor,
+			Function<S, ? extends Publisher<T>> expander
+	) 
+```
+
+And use it like this:
+```java
+flux = Flux.expand(
+    () -> Optional.of(""),
+    Page::nextPageId,
+    it -> {
+        return Mono.justOrEmpty(it)
+            .flatMap(nextPageId -> Mono.fromCompletionStage(
+                client.fetchPage(trimToNull(nextPageId))
+            ));
+    }
+)
+```
+We have a pretty complex pipeline including `Flux.switchMap`. Under high load it is trowing following NPE:
+
+```java
+java.lang.NullPointerException: null
+	at reactor.core.publisher.FluxSwitchMap$SwitchMapInner.deactivate(FluxSwitchMap.java:518) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at reactor.core.publisher.FluxSwitchMap$SwitchMapMain.onNext(FluxSwitchMap.java:208) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at reactor.core.publisher.FluxFilter$FilterSubscriber.onNext(FluxFilter.java:107) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at reactor.core.publisher.FluxConcatArray$ConcatArraySubscriber.onNext(FluxConcatArray.java:176) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at reactor.core.publisher.FluxFilter$FilterSubscriber.onNext(FluxFilter.java:107) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at reactor.core.publisher.EmitterProcessor.drain(EmitterProcessor.java:422) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at reactor.core.publisher.EmitterProcessor$EmitterInner.drainParent(EmitterProcessor.java:569) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at reactor.core.publisher.FluxPublish$PubSubInner.request(FluxPublish.java:567) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at reactor.core.publisher.FluxConcatMap$ConcatMapImmediate.drain(FluxConcatMap.java:388) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at reactor.core.publisher.FluxConcatMap$ConcatMapImmediate.innerComplete(FluxConcatMap.java:289) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at reactor.core.publisher.FluxConcatMap$ConcatMapInner.onComplete(FluxConcatMap.java:873) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at reactor.core.publisher.FluxPeek$PeekSubscriber.onComplete(FluxPeek.java:252) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at reactor.core.publisher.FluxPeek$PeekSubscriber.onComplete(FluxPeek.java:252) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at reactor.core.publisher.MonoIgnoreElements$IgnoreElementsSubscriber.onComplete(MonoIgnoreElements.java:81) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at reactor.core.publisher.FluxPeek$PeekSubscriber.onComplete(FluxPeek.java:252) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at reactor.core.publisher.FluxPeek$PeekSubscriber.onComplete(FluxPeek.java:252) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at reactor.core.publisher.MonoFlatMapMany$FlatMapManyInner.onComplete(MonoFlatMapMany.java:248) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at reactor.core.publisher.FluxPublishOn$PublishOnSubscriber.doComplete(FluxPublishOn.java:462) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at reactor.core.publisher.FluxPublishOn$PublishOnSubscriber.checkTerminated(FluxPublishOn.java:501) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at reactor.core.publisher.FluxPublishOn$PublishOnSubscriber.runAsync(FluxPublishOn.java:390) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at reactor.core.publisher.FluxPublishOn$PublishOnSubscriber.run(FluxPublishOn.java:484) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at reactor.core.scheduler.WorkerTask.call(WorkerTask.java:84) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at reactor.core.scheduler.WorkerTask.call(WorkerTask.java:37) ~[reactor-core-3.2.8.RELEASE.jar!/:3.2.8.RELEASE]
+	at java.base/java.util.concurrent.FutureTask.run(FutureTask.java:264) ~[na:na]
+	at java.base/java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(ScheduledThreadPoolExecutor.java:304) ~[na:na]
+	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1128) ~[na:na]
+	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:628) ~[na:na]
+	at java.base/java.lang.Thread.run(Thread.java:834) ~[na:na]
+
+```
+
+## Expected Behavior
+Concurrent cancel/onNext calls should be handled with proper synchronization.
+
+## Steps to Reproduce
+Issue could be reproduce with latest master. However I can reproduce issue only when running test in debug mode from IDE. Stacktrace was from actual docker container in running env.
+
+```java
+@Test
+    public void shouldProcessNextForCancelledInner() {
+        AssertSubscriber<Long> payloadSubscriber = AssertSubscriber.create();
+        AssertSubscriber<Void> concurrentSubscriber = AssertSubscriber.create();
+
+        EmitterProcessor<Long> payloadProcessor = EmitterProcessor.create(10_000, false);
+        payloadProcessor.switchMap(event -> Flux.just(10L)).subscribe(payloadSubscriber);
+        payloadProcessor.onNext(1L);
+
+        Mono.when(
+                Flux.range(0, 10_000)
+                        .map(Integer::longValue)
+                        .flatMap(event -> Mono.fromRunnable(() -> payloadProcessor.onNext(event)))
+                        .subscribeOn(Schedulers.elastic()),
+                Mono.delay(Duration.ofMillis(25))
+                        .then(Mono.fromRunnable(payloadSubscriber::cancel))
+        ).subscribe(concurrentSubscriber);
+
+        concurrentSubscriber
+                .await(Duration.ofMillis(1000L))
+                .assertComplete();
+    }
+```
+
+## Possible Solution
+FluxSwitchMap should check for cancelled inner in FluxSwitchMap#onNext(207):
+```java
+			SwitchMapInner<R> si = inner;
+			if (si != null) {
+				si.deactivate();
+				si.cancel();
+			}
+```
+```java
+			SwitchMapInner<R> si = inner;
+			if (si != null && si != CANCELLED_INNER) {
+				si.deactivate();
+				si.cancel();
+			}
+```
+
+## Your Environment
+
+* Reactor version(s) used: 
+`3.2.8`
+* JVM version (`javar -version`):
+```
+openjdk version "11.0.3" 2019-04-16
+OpenJDK Runtime Environment AdoptOpenJDK (build 11.0.3+7)
+OpenJDK 64-Bit Server VM AdoptOpenJDK (build 11.0.3+7, mixed mode)
+
+```
+* OS and version (eg `uname -a`): 
+
+`Linux legioner-work 5.3.0-24-generic #26-Ubuntu SMP Thu Nov 14 01:33:18 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux`

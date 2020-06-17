@@ -1,0 +1,70 @@
+We use Typoheus and accidentally set the timeout configuration env variables as strings. The result was timeout wasn't set correctly (was set to "101010101..." instead).
+This implements support for libcurl's "noproxy" option, as described by issue #528.
+
+I want this pull request to be merged after [typhoeus/ethon](https://github.com/typhoeus/ethon) [PR#162](https://github.com/typhoeus/ethon/pull/162) is merged
+
+So I think I just realized that the cache functionality does not really work if you are using streaming (on_body callback) because the body is never set in the response. I am wondering if there shouldn't be some sort of exception or something here to prevent people from making the same mistake I did?
+Just ran into a caching issue that I found out was only happening on production.
+
+Well, the first issue is that I think there is a bug in lib/typheous/cache/rails.rb:22
+`@cache.write(request, response, :expires_in => request.cache_ttl || @default_ttl)`
+
+It should be `request.cache_key` correct?
+
+But even after fixing that, there is a secondary issue I'd like to mention:
+
+If you have the New Relic gem installed, it automatically injects a unique `X-NewRelic-Transaction` header into all outgoing requests in order to instrument them. This effectively nukes the caching ability of Typheous since that unique value makes it's way into the `cache_key` by way of `hashable_string_for(options)`
+
+So, I'm going to have to make my own Cache class anyway which is fine, but since a lot of people are probably using the stock Typheous::Cache::Rails class, and many of them are probably using New Relic, it might be nice to have a warning somewhere in the docs if you use an APM since the issue doesn't appear in dev/test environments (New Relic is disabled there by default). That or implement a special cache_key for Typheous::Cache::Rails that doesn't include the headers and save Rails users the trouble. Thoughts?
+## Problem
+In some cases, when request fails, returned code (i.e. HTTP status code) is `0`. Since `0` isn't semantically valid return code, we should return `nil` instead. Do you accept PRs? Happy to contribute one!
+## Steps to reproduce
+
+```
+request = Typhoeus::Request.new(
+      'https://expired.badssl.com/',
+      method: :get,
+      accept_encoding: 'gzip, deflate',
+      http_version: :httpv2,
+      maxredirs: 5,
+      followlocation: true,
+      ssl_verifypeer: true,
+      ssl_verifyhost: 2,
+      timeout: 10,
+      verbose: true,
+      tcp_nodelay: true,
+)
+
+response = request.run
+```
+
+```
+puts response.code
+=> 0
+```
+Somewhat similar request to https://github.com/typhoeus/typhoeus/issues/609, but much less dangerous.
+
+Most other Ruby HTTP clients support the `SSL_CERT_FILE` environment variable out of the box as a way to specific a CA file that should be used to verify TLS certificates. From some quick testing this is currently supported by:
+
+* net::http
+* HTTParty
+* rest-client
+* excon
+* mechanize
+* `gem install`
+* probably lots more
+
+Unfortunately, it doesn't seem to be supported by Typhoeus.
+
+It'd be very useful if it was, or if there was some other clear equivalent option (i.e. an easy way to configure a CA to trust process-wide).
+There is a link in the README for available cURL options: https://www.rubydoc.info/github/typhoeus/ethon/Ethon/Easy/Options
+
+Maybe I misunderstood something, but it doesn't seem like the linked page contains any useful options (apart from `escape` and `multipart`). For instance, how do I pass the arbitrary `CURLOPT_ `option? (https://curl.haxx.se/libcurl/c/curl_easy_setopt.html)
+
+It looks like libcurl supports an idle timeout:
+
+https://curl.haxx.se/libcurl/c/CURLOPT_TCP_KEEPIDLE.html
+
+But AFAICT it's not exposed in typhoeus.
+
+We're hoping to use typhoeus as a faraday adapter for calls between microservices behind ELBs, and the ELB idle timeout is 60 seconds; so we'd prefer to set the faraday/typhoeus/libcurl idle timeout to ~45/50 seconds.

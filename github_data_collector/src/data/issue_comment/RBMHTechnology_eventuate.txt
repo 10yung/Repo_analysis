@@ -1,0 +1,52 @@
+After disaster recovery the local sequence is potentially adjusted to ensure that it is larger than the local log's time (see also [commit](https://github.com/RBMHTechnology/eventuate/pull/308/commits) for #286). If Cassandra is used as backend and the gap introduced through this adjustment covers empty partitions, replays from this event log stop prematurely as they do to proceed after the first empty partition.
+Currently we're getting `OutOfMemoryError`s in a node that's just replicating events, running with leveldb. Because the node is only replicating events we assumed that it does not need _much_ memory, therefore it's running with 1G max heap.
+
+The heap dump analysis showed that eventuate's LeveldbNumericIdentifierStore consumes ~1.3GB RAM, which is allocated by the internal idMap (with ~6.5M entries): 
+![sshot_sync001_heapdump_idstore](https://user-images.githubusercontent.com/64285/34864591-44b687b8-f775-11e7-8297-5611ffeddf67.png)
+
+AFAICS the `idMap` stores aggregate ids, right?
+
+For now we'll increase the max heap size of the java process (which we could also keep as solution, assuming that the string ids are aggregate ids).
+It might still be considered to reduce the memory requirements of the leveldb event log.
+
+Because the `LeveldbNumericIdentifierStore` stores `Int -> String` (numeric id to string id) in leveldb, it's currently not possible to resolve a string id to its numeric id via leveldb (in `def numericId(id: String): Int`). I.e. we cannot simply get rid of the `idMap`. If we don't want to also store the `String -> Int` mapping in leveldb we'd have to use a more memory efficient `Map` implementation for this use case.
+
+WDYT?
+Currently the number of events that are replicated through a single akka-message is fix (`eventuate.log.write-batch-size`) (if enough events wait for replication). If the binary representation of the resulting message exceeds the akka-remote frame size (`akka.remote.netty.tcp.maximum-frame-size`) the message is dropped at the source and the replication essentially stops as each retry results in the same error. A problem like this can only be fixed by re-configuring ether `eventuate.log.write-batch-size` or `akka.remote.netty.tcp.maximum-frame-size` and restarting the application (or at least the actor-system).
+
+To avoid a restart in these situations eventuate could either adapt the replication batch size dynamically (for example if n (n>=1) replication requests did not receive a response, the batch size is reduced incrementally by factor f1 (f < 1) until a replication response is received. After that the batch-size can be increased again either incrementally (by factor f2) or at once to its original size.
+Alternatively the batch-size is no longer measured in number of events but rather in number of bytes. 
+We want to use eventuate types in our events (currently `VectorTime`). It would be great to re-use the protobuf definitions. Therefore it would be nice to have them published via (a seperate?) artefact.
+This is a huge PR. It arose from my attempts to run the code examples in the User Guide. Along the way I realized that most of them in fact did not run, so I raised #384. As I mentioned in the #384 comments, the code examples needed to be reorganized so they could be run.
+
+This PR:
+
+- Adds material to the User Guide (should be checked for accuracy)
+- Moves code examples to the new top-level `examples` directory
+- Adjusts every reference to the moved code examples
+- Adds TODO and FIXME comments in broken code examples (remember, these examples were previously broken). 
+- All tests pass
+- Commits were squashed
+
+There is no easy way to make these changes, and I think it makes sense to do all the work in one PR instead of many repetitive and painful PRs. I suggest that the embedded FIXME and TODO comments remain, that the PR be merged, and then follow-on PRs be created to address related FIXME and TODO issues.
+The fix for #385 introduced an optional field `persistOnEventId` in `PersistOnEventRequest`. This is optional just for backwards compatibility to existing snapshots. Once 0.9 is released applications can re-create snapshots to make sure all `PersistOnEventRequest`s have this field defined. With an 0.10 release the implementation can be simplified by making this field mandatory (i.e. drop support for reading snapshots written with <0.9 releases).
+Users who are just getting started with Eventuate, like me, would find it very helpful to work through the code examples in the User Guide. Following are suggestions to make that experience better:
+
+  1. The User Guide should say that the code exists at https://github.com/RBMHTechnology/eventuate/blob/master/src/sphinx/code/UserGuideDoc.scala. 
+  2. It would be better if this code was a series of small projects, so the dependencies would be better understood, and so the reader would know that each project is independent.
+
+Following my own suggestions, I made [a GitHub repo](https://github.com/mslinn/eventuate-sourced-actors) for `UserGuideDoc.scala`:
+
+  * I refactored the User Guide code into separate Scala files for easier reading. One big file for the entire chapter is painful to figure out.
+  * Updated to Scala 2.12.1 and SBT 0.13.13.
+  * Ascribed types where they were not declared.
+  * Applied minor reformatting, while attempting to not disturb the Sphinx comments.
+  * Created `application.conf` for Akka configuration.
+
+In doing the above, I discovered that the mysterious LevelDB mentioned in the docs was actually a Scala port of the [Google LevelDB project](https://github.com/google/leveldb), originally written in C++. It would be good to tell readers early on that LevelDB is a fast key-value storage, originally developed by Google, which provides ordered mapping from `ByteArray` keys to `ByteArray` values.
+
+When the sample project is ready, it might be a good idea to move the repo over to a subproject under `RBMHTechnology/eventuate`, and replace `UserGuideDoc.scala`, so others can have a quicker start. 
+
+
+If a location loses the local event log (including backups) due to a disaster it can [recover](http://rbmhtechnology.github.io/eventuate/reference/event-log.html#disaster-recovery) events from other locations through replication connections. This will recover **all** events stored at remote locations (considering [replication filters](http://rbmhtechnology.github.io/eventuate/reference/event-log.html#replication-filters)). Depending on the number of events to be recovered this can take a significant amount of time where the location is not available. Especially in the case of locations that are using [event deletion](http://rbmhtechnology.github.io/eventuate/reference/event-log.html#deleting-events) it can make sense to recover not all but just the most recent events. So disaster recovery should allow the location to be recovered to specify a limit for the events to be recovered, for example in form of sequence numbers in the remote logs (so event recovery begins from this sequence number).
+When the `CassandraEventLog` gives up [retrying a failed write](http://rbmhtechnology.github.io/eventuate/reference/event-sourcing.html#failure-handling) it [stops itself](https://github.com/RBMHTechnology/eventuate/blob/v-0.9-M1/eventuate-log-cassandra/src/main/scala/com/rbmhtechnology/eventuate/log/cassandra/CassandraEventLog.scala#L177). As a consequence all event-sourced components connected to this log [stop themselves](https://github.com/RBMHTechnology/eventuate/blob/v-0.9-M1/eventuate-core/src/main/scala/com/rbmhtechnology/eventuate/EventsourcedView.scala#L475). The error logging could be improved in that case: the event log could add some information about the events to be written and the components could log why they are stopping. 

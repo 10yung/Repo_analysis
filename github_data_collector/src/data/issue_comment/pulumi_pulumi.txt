@@ -1,0 +1,123 @@
+When using .net and there are secrets used for values in the resources. These values are not encrypted in the state when the values is passed to a resource output
+
+This can be seen when using a self managed backend like S3
+
+example program which recreates the issue is here 
+https://gist.github.com/Jmen/27f1eaafe3660f384c34b65af6b13d4f
+
+and example of the plain text secret in the resource output of the state is here
+https://gist.github.com/Jmen/343468cfe680e12d3613bda9b8378b2b
+We should strongly consider emitting TypedDicts for all dictionaries we use for inputs and outputs: https://www.python.org/dev/peps/pep-0589/.
+
+This would provide some chance of decent tooling experiences for complex input/output shapes which are prevalent in Kubernetes.
+
+We should do the same in `tfgen` as well, though the issue is incrementally less critical there.
+There were a few type issues discovered as a part of enabling mypy in #3710 and #3758. 
+
+1. Follow up on the encoding of `Unknown` and `None` WRT `Output`: https://github.com/pulumi/pulumi/pull/3758#discussion_r367570819
+2. Label `T` in Output as covariant: https://github.com/pulumi/pulumi/pull/3758#discussion_r367579715. If I try enabling this, mypy complains about covariant parameters in `.apply`. This needs some further investigation.
+Even though the code is actually working, `pylint` by default shows an error when I code `resource.id`.
+A way to avoid the `pylint` error is to use `getattr(resource, 'id')` but it is verbose and inelegant.
+
+Is there a way to fix this linting error ?
+
+![image](https://user-images.githubusercontent.com/6024791/72570113-4a503900-38bc-11ea-9124-88abb92a18b5.png)
+
+Today we have multiple code generators - one for `tfgen`, one for our Kubernetes provider, and several providers that have had to be hand written in every language because they do not fit either of the above.
+
+Logically, these are all the same, and are tightly constrained by the need to represent the Pulumi resource model in the target language.
+
+We plan to introduce a common intermediate schema that can be shared across all of these domains, such that we can use one shared set of code generators for all resource providers.
+
+This will be used to replace existing code generators, to make it easier to build future providers, and as the foundation for significantly improved resource provider documentation.
+
+Components of this work include:
+- [ ] Define core schema model (https://github.com/pulumi/pulumi/pull/3749)
+- [ ] Add code generation for TypeScript (https://github.com/pulumi/pulumi/pull/3749)
+- [ ] Add code generation for Python(https://github.com/pulumi/pulumi/pull/3749)
+- [ ] Add code generation for .NET (https://github.com/pulumi/pulumi/pull/3749)
+- [ ] Add code generation for Go (https://github.com/pulumi/pulumi/pull/3749)
+- [ ] Replace `tfgen` with usage of this shared code generator (https://github.com/pulumi/pulumi-terraform-bridge/compare/pgavlin/schema)
+- [ ] Replace Kubernetes code generation with usage of this shared code generator (https://github.com/pulumi/pulumi-kubernetes/compare/pgavlin/schema)
+- [ ] Replace Resource documentation with language-agnostic docs derived from this schematization
+- [ ] Expand schema model to support component resources (and description of packages like `awsx` and `eks`)
+I've encountered several cases in the k8s provider where it would be useful to check only the preview step without running an update.
+
+I couldn't find an easy way to do this in test framework, so it would be nice to add this as an optional mode for ProgramTest. 
+We support `awskms`, `azurekeyvault`, `gcpkms` and `hashivault` secrets providers today.  We should ensure all of these have robust test coverage.
+We support local disk, S3, Azure Blob, and GCS backends.  We should ensure we have robust test coverage for all of these as part of GAing these backends.
+While waiting for Amazon to create an EKS cluster, the Pulumi Python language executor seems to take a full CPU (presumably busywaiting?):
+
+```
+> $ ps aurx | head -2
+USER               PID  %CPU %MEM      VSZ    RSS   TT  STAT STARTED      TIME COMMAND
+jforcier         71352  98.8  0.0  4375540   6708 s008  R     3:21PM  11:32.00 /Users/jforcier/.pyenv/versions/pulumi-eks-cpu/bin/python3 /Users/jforcier/go/bin/pulumi-language-python-exec --monitor 127.0.0.1:54673 --engine 127.0.0.1:54668 --project pulumi-eks-cpu --stack jforcier-eks-cpu --pwd /Users/jforcier/scratch/pulumi-eks-cpu --dry_run false --parallel 2147483647 .
+```
+
+Since EKS clusters take about ten minutes to create on the AWS side, this is quite a long time for one core to be busy. Pulumi is not creating any other resources during this time, and there are no further dependent resources it is waiting to create. It also does _not_ have the same behavior on deletion - deleting EKS clusters is similarly slow on the AWS side, but Pulumi doesn't exhibit the same CPU usage.
+
+Here's the simple program I used to reproduce this:
+```python
+import pulumi
+from pulumi_aws import ec2, eks, iam
+
+ASSUME_ROLE_POLICY = """{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "eks.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}"""
+
+MASTER_EGRESS_RULES = [
+    {
+        "cidr_blocks": ["0.0.0.0/0"],
+        "from_port": 0,
+        "protocol": "-1",
+        "to_port": 0
+    }
+]
+
+config = pulumi.Config()
+vpc_id = config.require("vpc_id")
+subnets = config.require_object("subnets")
+
+master_role = iam.Role("pulumi-eks-cpu-master-role", assume_role_policy=ASSUME_ROLE_POLICY)
+iam.RolePolicyAttachment("pulumi-eks-cpu-master-role-cluster-policy", role=master_role,
+                         policy_arn="arn:aws:iam::aws:policy/AmazonEKSClusterPolicy")
+iam.RolePolicyAttachment("pulumi-eks-cpu-master-role-service-policy", role=master_role,
+                         policy_arn="arn:aws:iam::aws:policy/AmazonEKSServicePolicy")
+
+security_group = ec2.SecurityGroup("pulumi-eks-cpu-sg", egress=MASTER_EGRESS_RULES, vpc_id=vpc_id)
+
+vpc_config = {
+    "endpointPrivateAccess": False,
+    "endpointPublicAccess": True,
+    "security_group_ids": [security_group],
+    "subnet_ids": subnets
+}
+
+eks_cluster = eks.Cluster("pulumi-eks-cpu", name="pulumi-eks-cpu", role_arn=master_role.arn,
+                          version="1.14", vpc_config=vpc_config, enabled_cluster_log_types=[])
+```
+You'll need to add the VPC ID/list of subnet IDs in the stack configuration:
+```
+config:
+  aws:region: us-east-1
+  pulumi-eks-cpu:vpc_id: your-vpc-id
+  pulumi-eks-cpu:subnets:
+    - some-subnet-id
+    - maybe-another-subnet-id
+```
+
+Please let me know if this issue would be better filed on the primary Pulumi repo - I filed it here simply because EKS clusters are the only resource I've observed this with.
+
+
+Related to: https://github.com/pulumi/pulumi-policy/issues/91
+
+We will be improving the UI experience to support configuration. The CLI now allows you to enable/disable Policy Packs, so the CLI will also need to be able to support configuring them.

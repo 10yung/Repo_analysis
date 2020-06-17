@@ -1,0 +1,299 @@
+I'm trying to upload data to an image that I'm also using for rendering. Ideally I shouldn't have to worry about sync since I'm only using one queue, but unless I signal a fence and wait for it after rendering and before uploading, I get an `AccessError: AlreadyInUse`. If I don't also wait for the GPU after uploading, the application seems to work as intended but the validation layer I have active complains:
+
+```
+VUID-vkQueueSubmit-pCommandBuffers-00071(ERROR / SPEC): msgNum: 0 - VkCommandBuffer 0x55df70cb2f80[] is already in use and is not marked for simultaneous use. The Vulkan spec states: If any element of the pCommandBuffers member of any element of pSubmits was not recorded with the VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT, it must not be in the pending state (https://www.khronos.org/registry/vulkan/specs/1.1-extensions/html/vkspec.html#VUID-vkQueueSubmit-pCommandBuffers-00071)
+    Objects: 1
+        [0] 0, type: 6, name: NULL
+UNASSIGNED-CoreValidation-DrawState-CommandBufferSingleSubmitViolation(ERROR / SPEC): msgNum: 0 - VkCommandBuffer 0x55df70cb2f80[] was begun w/ VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT set, but has been submitted 0x2times.
+    Objects: 1
+        [0] 0, type: 6, name: NULL
+```
+
+Here's some pieces of my code, I'll try to make a minimum working example when I have time.
+
+```rust
+        // Draw
+        let command_buffer =
+            AutoCommandBufferBuilder::primary_one_time_submit(win.device(), win.queue.family())
+                .unwrap()
+                .begin_render_pass(frame.framebuffer, false, clear_values.clone())
+                .unwrap()
+                .draw(
+                    pipeline.clone(),
+                    &win.dynamic_state,
+                    BufferlessVertices {
+                        vertices: 4,
+                        instances: 1,
+                    },
+                    desc.clone(),
+                    pc,
+                )
+                .unwrap()
+                .end_render_pass()
+                .unwrap()
+                .build()
+                .unwrap();
+        let f = future
+            .join(frame.acquire)
+            .then_execute(win.queue.clone(), command_buffer)
+            .unwrap()
+            .then_swapchain_present(win.queue.clone(), win.swapchain.clone(), frame.image_num)
+            .then_signal_fence_and_flush();
+
+        match f {
+            Ok(f) => {
+                future = Box::new(f) as Box<_>;
+            }
+            Err(vulkano::sync::FlushError::OutOfDate) => {
+                recreate_swapchain = true;
+                future = Box::new(vulkano::sync::now(win.device())) as Box<_>;
+            }
+            Err(err) => {
+                // We'll keep going, it's probably not a big deal
+                println!("{:?}", err);
+                future = Box::new(vulkano::sync::now(win.device())) as Box<_>;
+            }
+        }
+
+        // Another thread sends a list of blocks of the image to update
+        if let Ok(update) = recv.try_recv() {
+            // AccessError if I remove this
+            future
+                .then_signal_fence_and_flush()
+                .unwrap()
+                .wait(None)
+                .unwrap();
+            future = Box::new(vulkano::sync::now(win.device()));
+
+            for (loc, data) in update.blocks {
+                let b = block_buf.chunk(data).unwrap();
+                let cmd = AutoCommandBufferBuilder::primary_one_time_submit(
+                    win.device(),
+                    win.queue.family(),
+                )
+                .unwrap()
+                .copy_buffer_to_image_dimensions(
+                    b,
+                    image.clone(),
+                    loc,
+                    [16, 16, 16],
+                    0,
+                    1,
+                    0,
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+                future = Box::new(future.then_execute(win.queue.clone(), cmd).unwrap());
+            }
+
+            // Validation layer complains if I remove this
+            future
+                .then_signal_fence_and_flush()
+                .unwrap()
+                .wait(None)
+                .unwrap();
+            future = Box::new(vulkano::sync::now(win.device()));
+        }
+```
+I'm using Vulkano 0.16.0 on Arch Linux with a Radeon R9 270x with mesa's RADV.
+
+EDIT: Here's a gist with a single file demonstrating the issue: https://gist.github.com/tolziplohu/132f2695431f09bb5e4530accdf7eac2
+*   Version of vulkano: 0.16.0
+*   OS: Windows 10 x64
+*   GPU (the selected PhysicalDevice): GeForce GTX 1060 6GB
+*   GPU Driver: 1849819136 / 1.1.119
+
+# Issue
+I am trying to copy pixel data from *buffer* to an *image* using `copy_buffer_to_image_dimensions` function. This in result calls `check_copy_buffer_image` which performs validation.
+
+The format of pixel data that I am uploading is compressed and has blocks with size of 4x4 pixels where each block weights 8 bytes.
+```
+  BC1_RGBUnormBlock => FORMAT_BC1_RGB_UNORM_BLOCK [(4, 4)] [Some(8)] [compressed=texture_compression_bc] {u8},
+```
+
+That means if I upload 2048x2048 texture (that has 512x512 blocks) the buffer size should be 2097152 (512x512x8) bytes. The vulkano however reports that this is not enough bytes to fill the image buffer.
+
+```
+dims=Dim2d { width: 2048, height: 2048 }
+format=BC1_RGBUnormBlock
+block_dimensions=(4, 4)
+thread 'main' panicked at 'called `Result::unwrap()` on an `Err` value: CheckCopyBufferImageError(BufferTooSmall { required_len: 2100224, actual_len: 2097152 })'
+```
+-------
+
+The broken code seems to be in the file `src/command_buffer/validity/copy_image_buffer.rs` on the line `99`. For me it is not clear why is the size of image computed in this way
+```rust
+        let (block_width, block_height) = image.format().block_dimensions();
+        let num_blocks = (image_size[0] + block_width - 1) / block_width * (image_size[1] + block_height - 1) / block_height * image_size[2] * image_num_layers;
+        let required_len = num_blocks as usize * image.format().rate() as usize;
+        if required_len > buffer.len() {
+            return Err(CheckCopyBufferImageError::BufferTooSmall {
+                           required_len: required_len,
+                           actual_len: buffer.len(),
+                       });
+        }
+```
+
+
+When `vulkano_shaders` generates Rust data types for each uniform block in the shader, it would be useful if it could also generate an implementation of `Default` for those types. That way, they can be initialised without knowing all the values up front. And more importantly, the user can skip having to initialise "dummy" values that are only for padding and don't matter otherwise.
+* [x] Added an entry to `CHANGELOG_VULKANO.md` or `CHANGELOG_VK_SYS.md` if knowledge of this change could be valuable to users
+* [ ] Updated documentation to reflect any user-facing changes - in this repository
+* [ ] Updated documentation to reflect any user-facing changes - PR to the [guide](https://github.com/vulkano-rs/vulkano-www) that fixes existing documentation invalidated by this PR.
+
+Fixes: https://github.com/vulkano-rs/vulkano/issues/1265
+
+...ease integration with windowing api's. My current solution to integrate glfw in my project has been to create my own RawInstanceExtensions struct and transmuting it to a vulkano RawInstanceExtensions. This solution is very ugly so I added the helper function and some documentation in the code. 
+
+The function is unsafe to make it clear to the user that they need to be careful while using it. I know Vulkano is about creating a safe api but this should be unsafe since misuse could cause odd behaviour.
+# Template
+
+If you dont understand something just leave it.
+If you can provide more detailed information than the template allows for, please ignore the template and present all of your findings.
+
+*   Version of vulkano: 0.16.0
+*   OS: Fedora 31
+*   GPU (the selected PhysicalDevice): RX 5700 XT
+*   GPU Driver: radv in kernel 5.3.16
+
+´
+
+    fn main(){
+
+    init_glfw();
+
+    let monitorcount = get_monitor_count();
+
+    let window = VulkanWindow::new_windowed("Yo", 512, 512);
+
+    use glfw_native::*;
+
+
+    println!("{:?}", get_vulkano_extensions());
+
+    let inst = Instance::new(Option::None, get_vulkano_extensions(), Option::None).expect("Failed to create vulkan instance");
+
+    let surface = window.get_vulkano_surface(&inst);
+
+    let physical = PhysicalDevice::enumerate(&inst).next().expect("Oops, there is no device");
+
+    let queue_family = physical.queue_families().find(|q| q.supports_graphics()).expect("There is no queue family that support graphics");
+
+    let device_ext = vulkano::device::DeviceExtensions {
+        khr_swapchain: true,
+        ..vulkano::device::DeviceExtensions::none()
+    };
+
+    let (device, mut queues) =
+        Device::new(physical,
+                    &Features::none(),
+                    &device_ext,
+                    [(queue_family, 0.5)].iter().cloned()).expect("Could not create device.");
+
+    let queue = queues.next().unwrap();
+
+    println!("pre pre start");
+
+    let caps = surface.capabilities(physical)
+        .expect("failed to get surface capabilities");
+
+    println!("pre start");
+
+    let dimensions = caps.current_extent.unwrap_or([1280, 1024]);
+    let alpha = caps.supported_composite_alpha.iter().next().unwrap();
+    let format = caps.supported_formats[0].0;
+
+
+
+    let (swapchain, images) = Swapchain::new(device.clone(), surface.clone(),
+                                             caps.min_image_count, format, dimensions, 1, caps.supported_usage_flags, &queue,
+                                             SurfaceTransform::Identity, alpha, PresentMode::Fifo, true, Option::None)
+        .expect("failed to create swapchain");
+
+
+    while !window.should_close() {
+        unsafe {
+            glfwPollEvents();
+        }
+        println!("start!");
+
+        let (image_num, acquire_future) = vulkano::swapchain::acquire_next_image(swapchain.clone(), Option::None).unwrap();
+
+        let cmdbuf = AutoCommandBufferBuilder::new(device.clone(), queue_family).unwrap()
+            .clear_color_image(images[image_num].clone(), ClearValue::Float([0.0, 0.0, 1.0, 1.0]))
+            .unwrap();
+
+        let future = acquire_future.then_execute(queue.clone(), cmdbuf.build().unwrap()).unwrap();
+
+        let present = future.then_swapchain_present(queue.clone(), swapchain.clone(), image_num).then_signal_fence_and_flush();
+
+        println!("looop");
+
+        std::thread::sleep(Duration::new(1, 0));
+    }
+    }
+´
+
+The program outputs 
+
+´
+
+     pre pre start
+
+´
+
+Does anyone know why this could be?
+
+Ps: it's a xcb surface
+I was testing the example and saw that the Swapchain Constructor dont need a Colorspace as an Parameter only an old Swapchain so i fixed that
+
+Today I tried to subscribe for updates from vulkano in slack,  but it turned out slack needs to be installed for the repo before I can do that,  could somebosy please do that? Assuming there aren't any reasons not to? 
+The `Swapchain::new_inner` function requires a `SharingMode` value. But the function doesn't actually do anything when you provide `SharingMode::Exclusive`, the inner value just gets discarded. This matches the Vulkan spec, which determines queue ownership based on first use. Vulkano shouldn't require the user to provide a dummy value here.
+# Issue
+The `vulkano_shaders::shader!` macro as part of the vulkano-shaders rust module has trouble identifying storage buffers in the descriptor layout.
+
+I am using the compute shader example from [https://vulkano.rs/guide/compute-pipeline](https://vulkano.rs/guide/compute-pipeline):
+```glsl
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Data {
+    uint data[];
+} buf;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    buf.data[idx] *= 12;
+}
+``` 
+When using this shader, the generated descriptor for `(set = 0, binding = 0)` is seen as a **uniform**, leading the buffer being passed to `PersistantDescriptorSet::new()` being seen as a uniform buffer. This causes the validation-layer error that is printed on [line 14](https://github.com/Kneelawk/compute_error_example/blob/45b8ea99b4284443de4e03a836e5b17758473f3b/cargo_run_output.txt#L14) of the program's output.
+
+I decided to run `cargo expand compute_shader` to see what the generated descriptors for the compute shader were. Most notably, the `storage` attribute of the generated `Layout`'s `DescriptorDesc` for `(0usize, 0usize)`'s `DescriptorBufferDesc` is set to `false` on [line 627](https://github.com/Kneelawk/compute_error_example/blob/a1c80e683de4a23ae165ac24b6ea722e51f325b3/compute_shader_macro_expand.rs#L627) of the macro expansion output.
+
+# System Details
+*   Version of vulkano: 0.16.0
+*   OS: Linux Ubuntu 19.04
+*   GPU (the selected PhysicalDevice): Nvidia GTX 1060 6GB
+*   GPU Driver: NVIDIA 430.50
+*   Link to main.rs: [main.rs](https://github.com/Kneelawk/compute_error_example/blob/2f9f5936e8d826ea26105beec534d873fb78ca65/src/main.rs)
+*   Link to repository: [Kneelawk/compute_error_example](https://github.com/Kneelawk/compute_error_example)
+
+## glslangValidator Details
+*   Glslang Version: 7.11.3057
+*   ESSL Version: OpenGL ES GLSL 3.20 glslang Khronos. 11.3057
+*   GLSL Version: 4.60 glslang Khronos. 11.3057
+*   SPIR-V Version 0x00010300, Revision 6
+*   GLSL.std.450 Version 100, Revision 1
+*   Khronos Tool ID 8
+*   SPIR-V Generator Version 7
+*   GL_KHR_vulkan_glsl version 100
+*   ARB_GL_gl_spirv version 100
+
+## glslc Details
+`glslc` is not installed.
+
+# Possibly Related
+*   Compute shader shader example doesn't perform compute on mac #1127
+*   compute shader example #1273
+*   fix descriptor set codegen for SSBO after spirv update #1275

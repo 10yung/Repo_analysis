@@ -1,0 +1,86 @@
+It seems like there would be adapter libraries, or this would be one piece of a larger fuzzing system?  Where does this fit in with cargo fuzz or other existing rust fuzzing tools?
+What is the purpose is this type? It seems to always cast the variant to `Invalid` as well as just punting on mutation to the primitive value within the original variants.
+
+In the example, the mutator does not only mutate between the provided variants, it passes a `u32` to mutate and wraps the result in `UnstableEnum::Invalid(u32)`. Which isn't what I would expect from an Enum mutation except for maybe very rarely (like ignoring tags).
+I am seemingly having some issues getting fields to mutate within a defined structure. The simplest way to reproduce this is to remove the `Fixup` implementation on the example_fuzzer and comment out the connecting, and sending packets. 
+
+The mutator will also ignore any #[lain(ignore)] flags on the first field of the structure and still do a walking bit-flip pass. While this is just odd behavior, the real problem is the lack of mutation on the fields within the structure even during Havoc mode mutations. I have run this through 300 million iterations looking for a change in `length` with this setup and have yet to see one.  Additionally, `typ` does not seem to mutate after the initial run through bit flips. Looking through the code it looks like there may be an issue with duplicated unsigned fields? I am not sure how this could happen, and I am still looking around the code, but obviously `offset` is being mutated properly. Based on the trace! info, `typ` is getting into the macro generated `mutate` function, but then failing to call `mutate_from_mutation_mode`. Meanwhile the `length` field seems to be placed under what looks to be an `ignore` flag, by trying to get the 1% chance to ignore the flag. 
+
+Obviously this could be chalked up to the mutator focusing on a single field first, but that is not my understanding of how Havoc works, so I am curious if there is any other insight on this issue, or if it is reproducible for other people.
+
+```
+Sending packet: PacketData { typ: Invalid(2), offset: 17328406766963615603, length: 16032434953803588567, data: [] }
+[2019-09-04T00:26:03Z TRACE lain::mutator] generating number between 0 and 2
+[2019-09-04T00:26:03Z TRACE lain::mutator] got 0
+[2019-09-04T00:26:03Z INFO  lain::mutator] Havoc
+[2019-09-04T00:26:03Z INFO  lain::mutator] num is: 2
+[2019-09-04T00:26:03Z INFO  lain::mutator] 0, 1, 1, 543
+[2019-09-04T00:26:03Z TRACE lain::mutatable] Mutating unsigned value
+[2019-09-04T00:26:03Z INFO  lain::mutator] Havoc
+[2019-09-04T00:26:03Z INFO  lain::mutator] num is: 17328406766963615603
+[2019-09-04T00:26:03Z INFO  lain::mutator] 1, 1, 1, 543
+[2019-09-04T00:26:03Z TRACE lain::mutator] Operation selected: BitFlip
+[2019-09-04T00:26:03Z TRACE lain::mutator] xoring bit 33
+[2019-09-04T00:26:03Z TRACE lain::mutatable] Mutating unsigned value
+[2019-09-04T00:26:03Z INFO  lain::mutator] Havoc
+[2019-09-04T00:26:03Z INFO  lain::mutator] num is: 16032434953803588567
+[2019-09-04T00:26:03Z INFO  lain::mutator] 2, 1, 1, 543
+[2019-09-04T00:26:03Z TRACE lain::mutator] generating number between 0 and 100
+[2019-09-04T00:26:03Z TRACE lain::mutator] got 85.98688
+[2019-09-04T00:26:03Z TRACE lain::mutator] generating 1% chance. got 85.98688, so returning false
+[2019-09-04T00:26:04Z TRACE lain::mutator] generating number between 0 and 100
+[2019-09-04T00:26:04Z TRACE lain::mutator] got 72.75632
+[2019-09-04T00:26:04Z TRACE lain::mutator] generating 1% chance. got 72.75632, so returning false
+[2019-09-04T00:26:04Z DEBUG example_fuzzer] getting serialized size of PacketData
+[2019-09-04T00:26:04Z TRACE lain::buffer] getting serialized size for Vec
+[2019-09-04T00:26:04Z TRACE lain::buffer] returning 0 since there's no elements
+[2019-09-04T00:26:04Z DEBUG example_fuzzer] size of PacketData is 0x14
+[2019-09-04T00:26:04Z DEBUG example_fuzzer] getting serialized size of PacketData
+[2019-09-04T00:26:04Z TRACE lain::buffer] getting serialized size for Vec
+[2019-09-04T00:26:04Z TRACE lain::buffer] returning 0 since there's no elements
+[2019-09-04T00:26:04Z DEBUG example_fuzzer] size of PacketData is 0x14
+Sending packet: PacketData { typ: Invalid(2), offset: 17328406775553550195, length: 16032434953803588567, data: [] }
+```
+This fixes an issues with Vec<_> mutation where the mutator can actually try to remove more bytes than exist in the vector. This causes a panic.
+
+The fix here is pretty simple, we just take the min of the length of the vector or the randomly generated range.
+When calling `Mutatable::mutate` on an object that contains a `Vec`, the current `impl Mutatable<T> for Vec<T>` will treat itself as a slice and mutate all objects in-place. Shrinking/growing the `Vec` is desirable and should, for a baseline, require the following work:
+
+1. Fix `mutate` methods not passing down `Constraints`. 
+2. Add two new impls:
+
+```rust
+impl<T> Mutatable for Vec<T>
+where
+    T: Mutatable
+```
+
+Where only *shrinking* a `Vec` would be performed
+
+and:
+
+```rust
+impl<T> Mutatable for Vec<T>
+where
+    T: Mutatable + NewFuzzed + SerializedSize
+```
+
+Where shrinking *or* growing a `Vec` would be performed. The separation here allows us to call `NewFuzzed::new_fuzzed()` on the new elements in the vec, while also respecting the max size constraint if it's provided.
+
+Another desired feature would be to randomly mutate fields or slice elements to be the length of *any* known vectors in the data structure (including encapsulating structures), but this is a pretty large undertaking.
+Known issues to fix:
+
+1. `SerializedSize` and `NewFuzzed` are oddly coupled since the former is used when a `Constraint` with `max_size` is supplied.
+2. String mutation isn't very well-tested.
+3. ~~`NewFuzzed` is slower than it needs to be as a result of initializing fields in random order. This could be fixed with a `const fn` that checks if any of the fields (recursively) contain dynamic-size members and if not, use static initialization ordering. The randomness only matters when we have dynamic fields in order to try influencing the number of items generated for a dynamic field when working with a `max_size` constraint.~~. *Done as part of the release of lain*
+4. When things fail, they panic. This is mostly by-design to have things fail-fast, but some errors are just swallowed (e.g. serializing to a buffer that's too small).
+5. Add support for unnamed struct fields and named enum fields
+
+From an overall cleanup perspective the following changes should probably be made at some point as well:
+
+- The mutator's state machine should possibly be decoupled from the mutator itself. I'm not a huge fan of calling `mutator.begin_new_iteration()` in the harness driver or `mutator.begin_new_corpus()` when fuzzing a new item from my corpus.
+- I found myself in my corpus management checking against `MutatorMode::Havoc` to switch between items in my corpus since this is the last state in the state machine, which may be misleading or not future-proof.
+- Cleanup of API exports.
+- Work on verifying reproducible runs. This is loosely verified through tests, but isn't very elaborate.
+- Proc macros are somewhat of a mess to follow.
+- `Driver` isn't super well thought-out and is mostly for convenience.

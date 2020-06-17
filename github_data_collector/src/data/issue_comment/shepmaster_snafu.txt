@@ -1,0 +1,314 @@
+# Motivation
+
+Currently, Snafu is designed to work with enums like
+```rust
+enum MyEnum {
+    VariantA {
+        val1: Foo,
+        val2: Bar
+    },
+    VariantB {
+        val1: Baz,
+        val2: i32
+    },
+}
+```
+However, a somewhat common pattern in Rust (examples [1](https://github.com/rust-lang/rust/blob/ad808d95c4839caedc2be76d0ed059dc920ab4b6/src/librustc/hir/mod.rs#L2752), [2](https://www.reddit.com/r/rust/comments/2rdoxx/enum_variants_as_types/cnezmon/)) is to have enums like
+```rust
+struct VariantA {
+    val1: Foo,
+    val2: Bar
+}
+struct VariantB {
+    val1: Baz,
+    val2: i32
+}
+enum MyEnum {
+    VariantA(VariantA),
+    VariantB(VariantB)
+}
+```
+While it is slightly more verbose, it has a few advantages:
+
+1. Since enum variants are not types, it's not possible to accept a `MyEnum::VariantA` as a function parameter or to store it somewhere. You can only pass/store `MyEnum`. However, when you've made each variant its own type, `VariantA` *can* be passed around or stored.
+
+    ***Note:** there is [an RFC](https://github.com/rust-lang/rfcs/pull/2593) which proposes to add variant types to Rust, which would remove this advantage. However, [this comment](https://github.com/rust-lang/rfcs/pull/2593#issuecomment-486997257) doesn't give the impression that this will be implemented soon.*
+
+2. If multiple enums can have the same variant, you must repeat that variant (and all its fields) in each enum definition. With the second style, you just repeat the `VariantA(VariantA)` line.
+
+3. When matching on this kind of enum, if a variant has a lot of fields, in the first style you have to match like
+    ```rust
+    match my_enum {
+        VariantA{ val1, val2, val3, val4, val5, .. } => /* ... */
+    }
+    ```
+    whereas if you use the second style, you can match like ([example](https://github.com/rust-lang/rust/blob/c4375c9dfdd7f31de909f6e9384bac1bf37b44da/src/librustc_typeck/collect.rs#L871-L897))
+    ```rust
+    match my_enum {
+        VariantA(a) => /* use a.val1, a.val2, etc */
+    }
+    ```
+
+Snafu does not support this second style of error enum, but I think support for it can be added backwards-compatibly, since `#[derive(Snafu)]` currently isn't implemented for regular structs (it's only implemented for single-field tuples), and it also isn't implemented for enums with single-field tuple variants (only struct-like and unit variants). So this second style of enums neatly falls outside of what Snafu currently supports.
+
+The only issue is that there will be a naming collision between variant data structs and context selectors. Both are (according to the regular conventions) given the same name as the enum variant. So some bikeshedding will need to be done here, which I do below.
+
+# Bikeshedding
+
+My vote for how to color the bike shed is as follows:
+
+1. Allow `#[derive(Snafu)]` for regular Rust structs. If the struct is called `Foo`, this creates a new struct `FooContext`, which is the context selector. Any attributes that currently work on struct-like enum variants work on structs as well, and they do the same thing, essentially as if you had an enum with a single variant. `Display` and `Error` are implemented for `Foo`, `IntoError<Foo>` is implemented for `FooContext`, etc.
+
+2. Allow `#[derive(Snafu)]` for enums that have single-field tuple variants. `Display` and `Error` are implemented as usual, but for these single-field tuple variants, *no* context selector is generated (it should've been generated in step 1 above). For an enum `MyEnum` with variant `VariantA`, I think `IntoError<MyEnum>` should *not* be implemented for `VariantAContext` even though it could, but instead we should implement `From<VariantA>` for `MyEnum`. I think this should allow `.context(VariantAContext { ... })?` to work in a function returning `MyEnum` (the `?` operator does the `.into()`). Also implementing `IntoError<MyEnum>` for `VariantAContext` would probably break type inference.
+
+3. I suppose there should also be a way to specify the name of the generated context selector. This would be part of the `#[snafu(...)]` attribute, e.g. `#[snafu(context(MySelectorStructName), display(...)]` or something. This would need to be specified both on the variant-data struct and on the enum variant.
+
+Here's how the example from [the snafu docs homepage](https://docs.rs/snafu/0.6.0/snafu/index.html) would look with this style:
+
+```rust
+#[derive(Debug, Snafu)]
+#[snafu(display("Could not open config from {}: {}", filename.display(), source))]
+struct OpenConfig {
+    filename: PathBuf,
+    source: std::io::Error,
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(display("Could not save config to {}: {}", filename.display(), source))]
+struct SaveConfig {
+    filename: PathBuf,
+    source: std::io::Error,
+}
+
+#[snafu(display("The user id {} is invalid", user_id))]
+struct UserIdInvalid { user_id: i32, backtrace: Backtrace }
+
+#[derive(Debug, Snafu)]
+enum Error {
+    OpenConfig(OpenConfig),
+    SaveConfig(SaveConfig),
+    UserIdInvalid(UserIdInvalid),
+}
+
+type Result<T, E = Error> = std::result::Result<T, E>;
+
+fn log_in_user<P>(config_root: P, user_id: i32) -> Result<bool>
+where
+    P: AsRef<Path>,
+{
+    let config_root = config_root.as_ref();
+    let filename = &config_root.join("config.toml");
+
+    let config = fs::read(filename).context(OpenConfigContext { filename })?;
+    // Perform updates to config
+    fs::write(filename, config).context(SaveConfigContext { filename })?;
+
+    ensure!(user_id == 42, UserIdInvalidContext { user_id });
+
+    Ok(true)
+}
+```
+Hello,
+There are two information about the default state of the `backtrace` feature.
+ - [snafu::Backtrace page](https://docs.rs/snafu/0.6.0/snafu/struct.Backtrace.html) says it is enabled by default,
+ - [snafu::guide::feature_flags page](https://docs.rs/snafu/0.6.0/snafu/guide/feature_flags/index.html#backtraces) says it is disabled by default.
+
+As such, one of these two pages is wrong. I am no expert in how features are declared in `Cargo.toml`, but I think the default behaviour is backtrace disabled by default.
+
+If this issue is accepted, then I'll be very happy to provide you a PR to fix the documentation.
+I haven't seen any previous discussion on this, so I'm opening this ticket mostly to see what is @shepmaster's stance on this.
+
+Coming from past experiences with `error_chain` and `failure`, I got used to the `bail!()` macros they both provide (with slightly different semantics) for quickly generating+returning errors:
+ * https://github.com/rust-lang-nursery/failure/blob/0.1.5/src/macros.rs#L9-L17
+ * https://github.com/rust-lang-nursery/error-chain/blob/0653e6ab94b372ef482f8e194a85ed5ab6ab3564/src/lib.rs#L769-L777
+
+Have you maybe already considered that in the past for `snafu`? Do you have additional thoughts to share?
+First, thanks for making SNAFU, I'm really enjoying its ergonomics!
+
+I started a new project and tried to create a couple nested errors, but hit a name collision between the selectors that SNAFU was generating and one of my existing structs.
+
+My inner module looks like this:
+
+```rust
+pub struct Config {
+    // ...
+}
+
+#[derive(Debug, Snafu)]
+pub enum ConfigError {
+    // ... 
+}
+
+impl Config {
+    pub fn load() -> Result<Self, ConfigError> {
+        // ...
+    }
+}
+```
+
+My outer module imports a couple things from this struct and exports a new error type that wraps `ConfigError`:
+
+```rust
+use crate::{Config, ConfigError};
+
+#[derive(Debug, Snafu)]
+pub enum SyncError {
+    Config { // oh no, a name collision!
+        source: ConfigError,
+    }
+}
+
+pub fn sync() -> Result<(), SyncError> {
+    let config = Config::load().context(Config)?; // Collision here, too!
+
+    // ...
+}
+```
+
+The `Snafu` derive macro on `SyncError` tries to define a struct named `Config` as the context selector, which ends up colliding with the struct `Config` that I imported before!
+
+One solution for this particular case I thought of was to put my SNAFU error into its own `mod` block to scope everything the macro defines. Combined with `#[snafu(visibility)]` and re-exporting the error type, this seems to work:
+
+```rust
+use crate::Config;
+
+mod error {
+    use crate::config::ConfigError;
+    use snafu::Snafu;
+
+    #[derive(Debug, Snafu)]
+    #[snafu(visibility = "pub(super)")]
+    pub enum SyncError {
+        Config {
+            source: ConfigError,
+        },
+    }
+}
+
+pub use error::SyncError;
+
+pub fn sync() -> Result<(), SyncError> {
+    let config = Config::load().context(error::Config)?;
+
+    // ...
+}
+```
+
+Another way we could solve this is by adding a configuration option like `#[snafu(mod = "error")]` to instruct SNAFU to wrap all of its context selectors into a module with the given name.
+
+Does this feature make sense? Is there a better solution to this particular problem that I'm not seeing?
+
+Thanks!
+Copy over `iter_chain` from Rust unstable into `ErrorCompat`
+
+Related: https://github.com/shepmaster/snafu/pull/186#discussion_r333283269
+Depended by: https://github.com/shepmaster/snafu/pull/186
+A fairly common `print_error` implementation as a part of the main example.
+
+With the recent proliferation of error-handling crates, it has become clear that the situation around the lack of a `core::error::Error` is really suboptimal. In SNAFU, `no_std` support is being introduced through a whole new `Error` trait just for `no_std` - which could lead to similar problems that `failure` had by becoming incompatible with the ecosystem.
+
+Ideally, the `Error` trait would show up in core, but due to coherence concerns and std-dependent features being added to `std::error::Error`, a resolution is unlikely to happen soon.  As such, I propose making a new crate, `core-error` - exposing our own version of the `Error` trait. The goal of this crate is twofolds:
+
+- Provide a common trait for various error handling crates (Failure, SNAFU, Fehler, Anyhow, error_chain, and any other)
+- Allow no_std libraries that don't want to depend on a specific error handling crate to still expose errors that can interoperate with those libraries.
+
+Such a crate would work like this:
+
+- With the std feature, it just re-export `std::error::*`
+- With `no-default-features`, it exposes an `Error` trait similar to the one in `std` but without backtraces, and without the std/alloc-only impls.
+- Rustc version auto-detection is used to figure which errors to implement the trait on.
+- The alloc feature enables downcasting, in addition to supporting alloc errors
+- The crate would compile on all versions from 1.0.0 to the latest stable version.
+
+The trait will be compatible with std's `Error` trait, and if libcore gains an `Error` trait in the future, it should be compatible with it too.
+
+Once the crate reaches 1.0.0, I'll consider it ready for integration in the various error crates and will follow the same stability guarantee Rust does: No breaking changes ever.
+
+Work has already started in https://github.com/core-error/core-error. I'd be interested in hearing feedback on the design. 
+Assume I have an error enum like this:
+```rust
+#[derive(Debug, Snafu)]
+pub enum Error {
+    // ...
+    #[snafu(display("{}: {}", message, source)]
+    SessionError {
+        source: SomeError,
+        message: String,
+    },
+    // ...
+}
+```
+
+When I later use `.into()` on a field for some reason, like this:
+```rust
+something_with_result().context(SessionError { message: "something went wrong".into() })?
+```
+
+I will then receive a cryptic error message related to the generated struct.
+```
+error[E0282]: type annotations needed
+  --> test.rs:12:1
+   |
+12 | something_with_result().context(SessionError { message: "something went wrong".into() })?
+   |                                 ^^^^^^^^^^^^ cannot infer type for `__T0`
+```
+
+Most users will probably not know what's going on if they don't know that it could be referring to a generated type parameter.
+I haven't looked into procedural macros myself yet, but I think it would be possible to somehow make the error message more user friendly.
+New user here :)
+
+I would like to be able to report meaningful error messages across a boundary between my Rust code and my API endpoints and otherwise access the content of those error messages programatically. 
+
+To do so, I need to include a printout of the `snafu` display macro for a particular error variant.
+
+For example, given the following error struct:
+
+```rust
+pub enum MyEnum {
+    #[snafu(display("some displayed: {}", value))]
+    Variant {
+        source: <source>,
+        backtrace: <backtrace>,
+        display: String, // get this field to auto-fill from snafu display attribute
+        value: i32, 
+    }
+}
+```
+ I would like to raise the error as follows:
+
+```rust
+return Err(MyEnum::Variant { value: 42 }) // what I need to provide when raising the error
+```
+
+And get something like this back when the error occurs: 
+
+```rust
+    MyEnum::Variant{ 
+        display: "some displayed: 42", 
+        source: <source>, 
+        backtrace: <backtrace>, 
+        value: 42 
+    }
+```
+
+It seems like there may be a couple of ways to accomplish this. 
+
+One would be to add another "magic" backing field such as `snafu` has already
+done for `source` and `backtrace`. 
+
+The other would be to add macro support for `snafu` to populate a new field (`displayField` below for sake of illustration) with the `display` value which would have less risk of breaking compatibility.
+
+Something like this:
+
+```rust
+pub enum MyEnum {
+    #[snafu(display("some displayed: {}", value), displayField("msg"))]
+    Variant {
+        source: <source>,
+        backtrace: <backtrace>,
+        msg: String, // get this to auto-fill from snafu display attribute
+        value: i32, 
+    }
+}
+```
+Thank you!

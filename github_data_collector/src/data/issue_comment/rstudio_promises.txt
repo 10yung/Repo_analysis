@@ -1,0 +1,407 @@
+Since there is no way to [easily retrieve value of fulfilled promise ](https://github.com/rstudio/promises/issues/51) what is the recommended way to debug shiny promises?
+
+Let's take for example following code:
+
+```
+library(shiny)
+library(shinydashboard)
+library(glue)
+library(promises)
+
+header <- dashboardHeader(
+  title = "Example Shiny app"
+)
+
+body <- dashboardBody(
+  fluidRow(
+    column(width = 9,
+           box(width = NULL, solidHeader = TRUE,
+               shiny::dateInput("date", "Date", value = "2018-05-28")
+           )
+    )
+  )
+)
+
+ui <- dashboardPage(
+  header,
+  dashboardSidebar(disable = TRUE),
+  body
+)
+
+server <- function(input, output, session) {
+  data <- eventReactive(input$date, {
+    date <- input$date  # Example: 2018-05-28
+    year <- lubridate::year(date)  # Example: "2018"
+    
+    url <- glue("http://cran-logs.rstudio.com/{year}/{date}.csv.gz")
+    if (!dir.exists("data_cache")) dir.create("data_cache")
+    path <- file.path("data_cache", paste0(date, ".csv.gz"))
+    
+    future::future({
+      if (!file.exists(path)) {
+        download.file(url, path)
+      }
+      read_csv(path, col_types = "Dti---c-ci", progress = FALSE)
+    })
+  })
+    
+  whales <- reactive({
+    df <- data() %...>%
+      count(ip_id) %...>%
+      arrange(desc(n)) %...>%
+      head(input$count)
+    
+    browser()
+    df
+  })
+  
+  observe({
+    df <- whales()
+    
+    browser()
+  })
+}
+
+shinyApp(ui = ui, server = server)
+
+```
+
+So what do you recommend in debugging scenario where I'd like to check result of `data() %...>% count(ip_id)`? Usually (in non async app) I'd put `browser()` and execute `data() %...>% count(ip_id)`, but in this case it returns nothing:
+```
+Browse[1]> data() %...>%
++       count(ip_id)
+Browse[1]> 
+```
+
+and final output - as discussed [here](https://stackoverflow.com/a/57213477/5002478) - is not obtainable in easy and recommended way:
+
+```
+Browse[1]> df
+<Promise [pending]>
+Browse[1]>
+```
+
+I know it is always possible - for debugging needs - to rewrite it to normal `%>%` pipeline without `future`, but still case shown in example is very simple pipeline using `%...>%`. Imagine now production app where reactivity and pipelines are much more complex, they are written using `promises` and you have to debug them...
+
+
+- [x] Create a GitHub issue for release checklist
+- [x] Create branch labelled v1.1.0-rc
+- [x] Change the DESCRIPTION and NEWS on this branch to change the version number to the desired version for CRAN
+- [x] Rebuild pkgdown docs so they pick up the new version number
+- [x] Commit and push to the RC branch.
+- [x] Clean your package directory to remove any extraneous files, including ones that are git-ignored. (Warning, this will delete any unsaved buffers in RStudio! Also, be sure to close RStudio before taking this step!) `git clean -xdf .`
+- [x] Build your package. I (jcheng) personally do it from the Mac command line like this:
+PATH=$PATH:/Applications/RStudio.app/Contents/MacOS/pandoc R CMD build [pkgdir]
+- [x] Do a sanity check by installing/testing the built package.
+- [x] Run R CMD check --as-cran pkg_version.tar.gz both locally and on win-builder. You can also use https://r-hub.github.io/rhub/.
+- [x] Perform revdepcheck.
+- [x] Read every bullet point in the CRAN Policies document if this is the first release of the package. I usually print it out and check off the items one by one.
+- [x] Submit to CRAN via their online form.
+- [x] If there are R CMD check warnings that are unavoidable, make sure to explain them in the comments.
+- [ ] When accepted, tag the RC branch with a v1.1.0 tag, and push the tag to origin.
+- [ ] Merge RC into master.
+- [ ] On master, change the package version to 1.1.0.9000.
+- [ ] Tweet/blog!
+
+In some context, it would be useful to be able to block and wait for a promise to be resolved or rejected. 
+
+Typically, I want to test with `testthat` some code that acts on futures or promises, so I want to synchronously check that the resolved value is correct. The `future` API offers the `value` method but it is not implemented by `promises`.
+
+I see how you solved this with the `extract` function in `tests/testthat/common.R`. It would be useful to have access to this blocking `extract` function from the package, without confusing the end-users who shouldn't use it.
+
+How about as a non-exported function such as `promises:::extract_block` or `promises:::value`? 
+
+Or maybe it would be neater if `testthat` was promise-aware, with e.g. `expect_promise_resolved` and `expect_promise_rejected`?
+
+
+
+In `promise_map()`, if the function `.f` returns `NULL`, the value of the fulfilled promise is incorrect.
+Here is a minimal reproducible example:
+```r
+library(promises)
+
+test_promise_map <- function(first_res, second_res) {
+  f <- function(index) {
+    switch(index, first_res, second_res)
+  }
+  promise_map(1:2, f) %...>% print()
+}
+
+test_promise_map("anything", "anything_else")
+#> [[1]]
+#> [1] "anything"
+#> 
+#> [[2]]
+#> [1] "anything_else"
+
+test_promise_map(NULL, "anything_else")
+#> [[1]]
+#> NULL
+
+test_promise_map("anything", NULL)
+#> [[1]]
+#> [1] "anything"
+```  
+My guess is the problem is located here: https://github.com/rstudio/promises/blob/852e9be0cd2c91aa72105ed0f2dacfd66d97d6f6/R/utils.R#L152
+When `this_value` is `NULL` the corresponding element of the `results` list is removed.
+Here's an app that demonstrates the issue. If the observer's expression returns a promise, then Shiny blocks until that promise is resolved. If, on the other hand, it returns something else, then that promise will still run, but Shiny won't block waiting for it. This is something that both I and @aronatkins have run into, and it would be helpful if it were better documented in https://rstudio.github.io/promises/articles/shiny.html. 
+
+```R
+library(shiny)
+library(future)
+library(promises)
+
+plan("multisession")
+
+server <- function(input, output) {
+  messages <- reactiveVal()
+
+  observeEvent(input$go, {
+    messages('starting sleep in other session...')
+    p <- future({
+      Sys.sleep(3)
+    })
+    p <- then(p, function(value) {
+      messages(c(messages(), 'completed sleep'))
+    })
+    
+    if (input$return_value == "NULL") {
+      ret <- NULL
+    } else if (input$return_value == "promise") {
+      ret <- p
+    }
+
+    ret
+  })
+  
+  output$messages <- renderText(
+    paste0(messages(), collapse = "\n")
+  )
+}
+
+ui <- fluidPage(
+  p(
+    "Returning NULL causes the message to update two times: one time immediately, and one time after ",
+    "the future (and subsequent promise) is resolved. "
+  ),
+  p(
+    "Returning a promise causes the message to update only once: Shiny blocks ",
+    "until the future (and subsequent promise) is resolved."
+  ),
+  radioButtons("return_value", "Return value for observer", c("NULL", "promise")),
+  actionButton("go", "Go"),
+  tags$pre(tags$code(textOutput("messages")))
+)
+
+shinyApp(ui = ui, server = server)
+```
+This works
+
+    f <- future({
+        as.promise(future({Sys.sleep(2); 2}))
+    }) %...>% cat()
+
+and prints 2 after about 2 secs (as expected). 
+
+This does not work
+
+    f <- future({
+       future({Sys.sleep(2); 2}) %...>% { . + 1 }
+    }) %...>% cat()
+
+the returned promise is stuck in pending. I was expecting/hoping to see 3 printed after about 2 secs.
+
+I was playing around with promises and ended up with a promise which used a piped promise (more or less like the above) in its calculation, but it never resolves, making the above pattern useless. Is this intentional? I am new to this, so perhaps there are fundamental problems with promises returning promises The first example makes me think it is not so much 'promises returning promises' (which seems to be fine in the simple example), but 'promises returning pipes' which is kind of strange... 
+
+I am trying to do async for a download button my shiny app. The file download takes 8-10 seconds so i want to run it in background and make the app available for the users in that time. 
+
+I wrapped the download function with future . But it does not work as expected.
+
+script : 
+
+output$Report <- 
+    shiny::downloadHandler(
+      
+      filename = function(){
+        fileName
+      },
+      content = function(file) {
+         params = list(origin =input$Origin,
+                       destination = input$Destination)
+         # knit the document 
+         observe(print(params))
+         observe(head(flightsData))
+         
+         future({
+           downloadPpt(fileName = fileName, inputParams = params)
+           file.copy(file.path(filePath,fileName),file)
+         })
+
+      }   
+      
+    )
+The `then()` function gives an error when a non-functionable object is passed to it:
+
+```R
+promise_resolve("start") %>%
+  then("then") %>%
+  then(function(value) { message(value) })
+#> Unhandled promise error: Don't know how to convert object of class character into a promise
+```
+
+However the `$then()` method doesn't give an error. I'm not sure what it's doing:
+
+```R
+promise_resolve("start")$
+  then("then")$
+  then(function(value) { message(value) })
+#> start
+```
+
+
+For example, this documentation:
+https://github.com/rstudio/promises/blob/852e9be0cd2c91aa72105ed0f2dacfd66d97d6f6/R/then.R#L58-L66
+
+Looks like this:
+![image](https://user-images.githubusercontent.com/86978/52744931-7fb12000-2fa3-11e9-94e8-bcc933e7c7f3.png)
+
+Hi, when trying to install the promises package I gert the followign error:
+
+> devtools::install_github("rstudio/promises")
+
+Downloading GitHub repo rstudio/promises@master
+✔  checking for file ‘/tmp/Rtmps5Ik2g/remotes6f77053bb51/rstudio-promises-1d30f6e/DESCRIPTION’ ...
+─  preparing ‘promises’:
+✔  checking DESCRIPTION meta-information ...
+─  cleaning src
+─  checking for LF line-endings in source and make files and shell scripts
+─  checking for empty or unneeded directories
+─  building ‘promises_1.0.1.9000.tar.gz’
+   
+Installing package into ‘/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5’
+(as ‘lib’ is unspecified)
+* installing *source* package ‘promises’ ...
+** libs
+g++  -I"/usr/include/R/" -DNDEBUG  -I"/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/later/include" -I"/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include" -D_FORTIFY_SOURCE=2   -fpic  -march=x86-64 -mtune=generic -O2 -pipe -fstack-protector-strong -fno-plt  -c RcppExports.cpp -o RcppExports.o
+g++  -I"/usr/include/R/" -DNDEBUG  -I"/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/later/include" -I"/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include" -D_FORTIFY_SOURCE=2   -fpic  -march=x86-64 -mtune=generic -O2 -pipe -fstack-protector-strong -fno-plt  -c promise_task.cpp -o promise_task.o
+promise_task.cpp:4:28: Fehler: »later« wurde nicht deklariert
+ class PromiseTask : public later::BackgroundTask {
+                            ^~~~~
+promise_task.cpp:4:35: Fehler: expected »{« before »BackgroundTask«
+ class PromiseTask : public later::BackgroundTask {
+                                   ^~~~~~~~~~~~~~
+promise_task.cpp:5:1: Fehler: expected primary-expression before »public«
+ public:
+ ^~~~~~
+promise_task.cpp:5:1: Fehler: expected »}« before »public«
+promise_task.cpp:4:50: Anmerkung: andere Fundstelle von »{« ist hier
+ class PromiseTask : public later::BackgroundTask {
+                                                  ^
+promise_task.cpp:10:1: Fehler: expected unqualified-id before »protected«
+ protected:
+ ^~~~~~~~~
+promise_task.cpp:12:3: Fehler: »virtual« außerhalb einer Klassendeklaration
+   virtual Rcpp::RObject get_result() = 0;
+   ^~~~~~~
+promise_task.cpp:12:40: Fehler: Funktion »Rcpp::RObject get_result()« ist wie eine Variable initialisiert
+   virtual Rcpp::RObject get_result() = 0;
+                                        ^
+promise_task.cpp: In Funktion »void complete()«:
+promise_task.cpp:16:5: Fehler: »resolve« wurde in diesem Gültigkeitsbereich nicht definiert
+     resolve(result);
+     ^~~~~~~
+promise_task.cpp:16:5: Anmerkung: empfohlene Alternative: »remove«
+     resolve(result);
+     ^~~~~~~
+     remove
+promise_task.cpp: Im globalen Gültigkeitsbereich:
+promise_task.cpp:18:1: Fehler: expected unqualified-id before »private«
+ private:
+ ^~~~~~~
+promise_task.cpp:20:18: Fehler: keine passende Funktion für Aufruf von »Rcpp::Function_Impl<Rcpp::PreserveStorage>::Function_Impl()«
+   Rcpp::Function reject;
+                  ^~~~~~
+In file included from /home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp.h:48,
+                 from promise_task.cpp:1:
+/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/Function.h:72:9: Anmerkung: candidate: »Rcpp::Function_Impl<StoragePolicy>::Function_Impl(const string&, const string&) [mit StoragePolicy = Rcpp::PreserveStorage; std::__cxx11::string = std::__cxx11::basic_string<char>]«
+         Function_Impl(const std::string& name, const std::string& ns) {
+         ^~~~~~~~~~~~~
+/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/Function.h:72:9: Anmerkung:   Kandidat erwartet 2 Argumente, 0 angegeben
+/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/Function.h:65:9: Anmerkung: candidate: »Rcpp::Function_Impl<StoragePolicy>::Function_Impl(const string&, SEXP) [mit StoragePolicy = Rcpp::PreserveStorage; std::__cxx11::string = std::__cxx11::basic_string<char>; SEXP = SEXPREC*]«
+         Function_Impl(const std::string& name, const SEXP env) {
+         ^~~~~~~~~~~~~
+/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/Function.h:65:9: Anmerkung:   Kandidat erwartet 2 Argumente, 0 angegeben
+/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/Function.h:61:9: Anmerkung: candidate: »Rcpp::Function_Impl<StoragePolicy>::Function_Impl(const string&) [mit StoragePolicy = Rcpp::PreserveStorage; std::__cxx11::string = std::__cxx11::basic_string<char>]«
+         Function_Impl(const std::string& name) {
+         ^~~~~~~~~~~~~
+/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/Function.h:61:9: Anmerkung:   Kandidat erwartet 1 Argument, 0 angegeben
+/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/Function.h:39:9: Anmerkung: candidate: »Rcpp::Function_Impl<StoragePolicy>::Function_Impl(SEXP) [mit StoragePolicy = Rcpp::PreserveStorage; SEXP = SEXPREC*]«
+         Function_Impl(SEXP x){
+         ^~~~~~~~~~~~~
+/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/Function.h:39:9: Anmerkung:   Kandidat erwartet 1 Argument, 0 angegeben
+In file included from /home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/macros/macros.h:108,
+                 from /home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/r/headers.h:61,
+                 from /home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/RcppCommon.h:29,
+                 from /home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp.h:27,
+                 from promise_task.cpp:1:
+/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/Function.h:37:35: Anmerkung: candidate: »template<class Proxy> Rcpp::Function_Impl<StoragePolicy>::Function_Impl(const Rcpp::GenericProxy<Proxy>&)«
+         RCPP_GENERATE_CTOR_ASSIGN(Function_Impl)
+                                   ^~~~~~~~~~~~~
+/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/macros/interface.h:34:1: Anmerkung: in Definition des Makros »RCPP_CTOR_ASSIGN«
+ __CLASS__( const GenericProxy<Proxy>& proxy ){                                 \
+ ^~~~~~~~~
+/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/Function.h:37:9: Anmerkung: bei Substitution des Makros »RCPP_GENERATE_CTOR_ASSIGN«
+         RCPP_GENERATE_CTOR_ASSIGN(Function_Impl)
+         ^~~~~~~~~~~~~~~~~~~~~~~~~
+/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/Function.h:37:35: Anmerkung:   Herleitung/Ersetzung von Templateargument gescheitert:
+         RCPP_GENERATE_CTOR_ASSIGN(Function_Impl)
+                                   ^~~~~~~~~~~~~
+/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/macros/interface.h:34:1: Anmerkung: in Definition des Makros »RCPP_CTOR_ASSIGN«
+ __CLASS__( const GenericProxy<Proxy>& proxy ){                                 \
+ ^~~~~~~~~
+/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/Function.h:37:9: Anmerkung: bei Substitution des Makros »RCPP_GENERATE_CTOR_ASSIGN«
+         RCPP_GENERATE_CTOR_ASSIGN(Function_Impl)
+         ^~~~~~~~~~~~~~~~~~~~~~~~~
+promise_task.cpp:20:18: Anmerkung:   Kandidat erwartet 1 Argument, 0 angegeben
+   Rcpp::Function reject;
+                  ^~~~~~
+In file included from /home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/macros/macros.h:108,
+                 from /home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/r/headers.h:61,
+                 from /home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/RcppCommon.h:29,
+                 from /home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp.h:27,
+                 from promise_task.cpp:1:
+/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/Function.h:37:35: Anmerkung: candidate: »Rcpp::Function_Impl<StoragePolicy>::Function_Impl(const Rcpp::Function_Impl<StoragePolicy>&) [mit StoragePolicy = Rcpp::PreserveStorage]«
+         RCPP_GENERATE_CTOR_ASSIGN(Function_Impl)
+                                   ^~~~~~~~~~~~~
+/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/macros/interface.h:27:1: Anmerkung: in Definition des Makros »RCPP_CTOR_ASSIGN«
+ __CLASS__( const __CLASS__& other ){                                           \
+ ^~~~~~~~~
+/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/Function.h:37:9: Anmerkung: bei Substitution des Makros »RCPP_GENERATE_CTOR_ASSIGN«
+         RCPP_GENERATE_CTOR_ASSIGN(Function_Impl)
+         ^~~~~~~~~~~~~~~~~~~~~~~~~
+/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/Function.h:37:35: Anmerkung:   Kandidat erwartet 1 Argument, 0 angegeben
+         RCPP_GENERATE_CTOR_ASSIGN(Function_Impl)
+                                   ^~~~~~~~~~~~~
+/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/macros/interface.h:27:1: Anmerkung: in Definition des Makros »RCPP_CTOR_ASSIGN«
+ __CLASS__( const __CLASS__& other ){                                           \
+ ^~~~~~~~~
+/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/Rcpp/include/Rcpp/Function.h:37:9: Anmerkung: bei Substitution des Makros »RCPP_GENERATE_CTOR_ASSIGN«
+         RCPP_GENERATE_CTOR_ASSIGN(Function_Impl)
+         ^~~~~~~~~~~~~~~~~~~~~~~~~
+promise_task.cpp:21:1: Fehler: expected declaration before »}« token
+ };
+ ^
+make: *** [/usr/lib64/R/etc/Makeconf:168: promise_task.o] Fehler 1
+ERROR: compilation failed for package ‘promises’
+* removing ‘/home/mknoll/R/x86_64-pc-linux-gnu-library/3.5/promises’
+Fehler in i.p(...) : 
+  (konvertiert von Warnung) installation of package ‘/tmp/Rtmps5Ik2g/file6f773661e2a/promises_1.0.1.9000.tar.gz’ had non-zero exit status
+
+
+###############
+
+System:
+Linux archlinux 4.18.16-arch1-1-ARCH #1 SMP PREEMPT x86_64 GNU/Linux
+gcc (GCC) 8.2.1 20180831
+R version 3.5.1 (2018-07-02) -- "Feather Spray"
+

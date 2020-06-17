@@ -1,0 +1,350 @@
+Fixes #2210
+
+(I've just needed this method, so I can simply put it into upstream
+because it's probably useful for others too)
+
+If that actually works I'm proposing moving all of our ci/automation
+to this service, because of:
+
+* Integration with github seems to be vastly better
+    + No need to click n times to go to logs
+    + Rerun a failed job is easier
+    + Maybe? Inline error messages in PR's
+* Error messages are automatically extracted
+* I think they have 20 free concurrent jobs, azure has only 10 (so
+faster CI)
+
+(Most of the config is copied from wundergraph)
+## Setup
+
+### Versions
+
+- **Diesel:**  1.4.3
+
+## Problem Description
+
+[Documentation](https://docs.diesel.rs/diesel/expression_methods/trait.ExpressionMethods.html#method.eq_any) states
+
+> ```rust
+> fn eq_any<T>(self, values: T) -> In<Self, T::InExpression> 
+> ```
+> Queries using this method will not be placed in the prepared statement cache
+
+But [comments](https://github.com/diesel-rs/diesel/blob/master/diesel/src/connection/statement_cache.rs#L31) in the code say
+
+```rust
+//!     - `IN` with subselects are cached (assuming the subselect is safe to
+//!        cache)
+```
+
+
+Will queries like
+
+```rust
+some_dsl::attr.eq_any(other_table.select(other_dsl::id)))
+```
+
+be cached?  If so, the documentation mentioned fist should be updated.
+
+This commit adds a second connection implementation for postgresql,
+based on the pure rust postgres crate. This allows us to remove the
+dependency on libpq in certain cases, by providing a separate feature
+for using a the pure rust implementation for example. Maybe this also
+simplifies cross platform support for a async postgres connection?
+
+Test suite is passing for the new connection implementation if I change diesel-tests to use this one instead of the old `PgConnection` implementation.
+
+I've done a small unscientific benchmark with those two implementations. The code is [here](https://github.com/weiznich/diesel_benches). Results are [here](https://gist.github.com/weiznich/ae0b458a0b1da207c5e18195bf89a21e). (Take them with a grain of salt, just run them once without actual complicated benchmark setup). From a coarse look it seems like the pure rust implementation is minimally slower the the native libpq version, for the given benchmarks. (Or it's just noise?)
+
+Open questions:
+* Do we even want this? (That's currently just a experiment seeing where there are problems with doing this. I've found no bigger issue…)
+* How to handle testes for this? Just run diesel tests again with a different feature?
+* How to organize features in diesel itself? Currently this is behind the postgres feature, but we may want to put this behind some separate feature flag?
+
+
+**This is currently WIP and should only be seen as demo and a request for comments**
+This PR takes another try on implement aliasing support. 
+
+# Example
+As first point just a short example how the API would look like:
+
+```rust
+    let user_alias = alias!(users as user_alias);
+
+    posts::table
+        .inner_join(user_alias)
+        .inner_join(users::table)
+        .select((user_alias.field(users::name), users::name))
+        .load::<(String, String)>(&connection)
+        .unwrap();
+```
+
+# Feature
+
+The current implementation allows:
+* to define aliases
+* to access columns of a defined alias (maybe we should also implement the API proposed by sean in the other PR here?)
+* to use multiple aliases of the same/different tables to write subqueries
+* to join aliases of the same/different table using explicit and implicit joins
+
+# Implementation
+
+One of our problems with providing support for aliasing was that we were not sure how a good type safe API would look like. Sean already opened #1773 which would provide a type safe API, that requires more steps to setup an alias then we would like to have. Another idea floating around was to have an alias type in diesel itself, that would just wrap tables (and maybe later also other things), which would allow us to provide a much concrete API that wouldn't require that much steps to setup. We thought this was blocked on specialization because we would need to implement `AppearsInFromClause` for every combination and alias. In detail we need to implement that trait in such a way that the associated type `Count` is `Never` for all combination besides table and alias type are the same on both sides. It seemed impossible to solve that without having some kind of specialization. This PR does also not really solve this problem, it just takes another way to implement all combinations of `AppearsInFromClause`:
+* It reuses the `allow_tables_in_same_query!` macro by extending the generated code there to also contain cases for aliased tables. This allows to mix aliases of different tables with other tables as long as you can use the tables together. This requires the recently stabilized `re-rebalance-coherence` feature, that is currently in the rust beta channel.
+* Unfortunately it is not possible to implement `AppearsInFromClause` there in such a way that would allow to use two aliases of different tables together, because of rusts coherence rules (all types are not fundamental and not from the current crate). This is solved by the `AliasNotEqualHelper` trait which just moves this job to something (a table) for which we could implement traits there and a generic implementation of `AppearsInFormClause` for all alias alias combination that internally uses the concrete implementations of `AliasNotEqualHelper`
+* We need to provide a implementation of `AppearsInFromClause` for the alias with itself. This again uses the `AliasNotEqualHelper`, but now inside the alias macro. This prevents that a alias is used more than once in a given query.
+* As last open point we need to find some way to allow multiple aliases for the same table to be used in the same query. This requires another implementation of `AppearsInFromClause` for cases where two aliases share the same table, but are different. This impl would conflict again with already implemented ones, so I choose a hack to workaround this one. By declaring multiple aliases together in a single `alias!` macro call we are able to brute force this impls by reusing `AliasNotEqualHelper` again.
+
+Anything else in this PR is basically just implementing already existing stuff also for aliases to write some simple test cases. The tests just check if the query compiles and is successfully executed.
+
+# Open questions
+
+* Which features did I miss?
+* Did I miss an important usecase?
+* Are there any unnecessary restrictions in this API?
+* Is this API sound?
+* To we even want to have a API in this shape?
+
+# Things needed to be fixed for a final PR
+
+- [ ] Correctly implement query dsl support for aliases (it requires currently that you call `as_query()` explicitly in most cases)
+- [ ] revisit code organisation (suggestions welcome)
+- [ ] discuss naming
+- [ ] documentation
+- [ ] more and better tests
+This commit implements the proposal laid out at
+https://discourse.diesel.rs/t/proposed-change-replace-nonaggregate-with-something-less-broken-that-can-support-group-by/18.
+
+The changes made in this commit now correctly enforce semantics around
+the mixing of aggregate/non-aggregate expressions, and lays the
+foundations required for full `GROUP BY` support in the future. This
+commit does not implement `GROUP BY` as a feature in public API, though
+I have added some minimal support to prove the soundness of the change.
+
+Since this will likely be the largest breaking change in 2.0, I am going
+to include as much detail as I can about the problem, the reasoning
+behind the solution, and the likely impact of the change.
+
+Recap of the problem
+----
+
+`NonAggregate` was originally introduced in
+c66d96fa9cefaba0a418834e8cb0e78a0a87269a. The goal was to prevent the
+following error at compile time:
+
+   [local] sean@sean=# select count(*), name from users;
+   ERROR:  42803: column "users.name" must appear in the GROUP BY clause or be used in an aggregate function
+
+I didn't think about this nearly as much as I should have at the time,
+which resulted in a hilariously broken implementation that has prevented
+the addition of `group_by` support, and left bugs in the codebase for
+more than 4 years.
+
+At the time I was focused on "mixing aggregate and non-aggregate
+expressions in a select statement". Since select uses tuples to
+represent multiple values, I added a trait to represent non-aggregate
+values, added it as a bound for `impl Expression for AnyTuple`, and
+called it a day. This had a number of problems.
+
+The most obvious was that it prevented valid queries involving multiple
+aggregate expressions. At the time I figured we'd have a separate
+trait for aggregate expressions, and then `impl Expression for AnyTuple
+where AllFields: NonAggregate | AllFields: Aggregate`. This eventually
+led to [RFC #1268](https://github.com/rust-lang/rfcs/pull/1268), which
+doesn't seem likely to be stabilized soon, and even if it were we still
+have the other issues with this solution.
+
+The next issue is that you cannot say whether a given expression is
+aggregate by looking at it on its own. The answer to "Is `users`.`name`
+aggregate?" depends on whether or not that column appears in the group
+by clause. So any trait which correctly handles this must be generic
+over the group by clause, or it cannot be correctly implemented for
+columns.
+
+However, the most egregious issue with that commit is that it does not
+handle *any* composite expressions besides tuples. Even today,
+`.select((count_star(), id))` fails, but `.select(count_star() + id)`
+will compile (and either error at runtime or give non-deterministic
+results depending on your backend).
+
+User Impact
+----
+
+This change will unfortunately have more breakage than I had
+anticipated. That said, the breakage only affects *extremely* generic
+code, and I do not believe that the majority of our users will notice or
+care about this change.
+
+There are three main ways in which the breakage will affect users:
+
+- The additional bound on `SelectStatement<...>: SelectDsl` and
+  `SelectStatement<...>: Query`.
+  - This one broke our test suite in a few places, mainly where we have
+    *really* generic code to say "I can select T.eq(sql_string)". I do
+    not believe this is representative of real code.
+  - I did a GitHub-wide search of all occurances of
+    `SelectableExpression` (which is *not* the bound on the public API,
+    but is the bound on `SelectStatement`'s impl, and would point to
+    broken code). I found one repo which is relying on internals that
+    will break, and a lot of results from Wundergraph. I didnt' look at
+    those. This probably breaks Wundergraph. Sorry, Georg. It should be
+    easy to fix I promise.
+- `NonAggregate` can no longer be directly implemented
+  - I did a GitHub-wide search for `NonAggregate`. With one exception,
+    every repo implementing this trait directly was on pre-1.0. The only
+    affected repo is manually implementing `Expression` instead of using
+    `#[derive(AsExpression)]`. With that change they will be
+    future-proofed.
+- `T: NonAggregate` no longer implies `(OtherType, T): NonAggregate`
+  - This broke `infer_schema`, since it was relying on `AssocType:
+    NonAggregate` to know `(known_column, AssocType, known_column):
+    Expression`. Ironically, that's no longer important, it did still
+    break due to the first item on this list. I could not find any code
+    in the wild that fell into this category.
+
+Originally I thought that the only code which would be affected by this
+is code that wrote `impl NonAggregate`, since that code would need to
+change to `impl ValidGrouping`. However, I missed a few things when I
+made that assessment.
+
+The first is that... Well the feature exists. The whole point of this
+was to prevent `aggregate + non_aggregate` from compiling when passed to
+select, which implies a new trait bound *somewhere*. While
+`SelectStatement` and its impls are private API, it's really easy to
+couple yourself ot the bounds on those impls. It doesn't help that
+`rustc` literally recommends that folks do that when errors occur. Any
+code that is written as `Foo: SelectDsl<Selection>` will be fine, but
+any code that's gone down the rabbit hole and has copied the bounds from
+`impl SelectDsl for SelectStatement<...>` will break. I didn't find many
+cases in the wild, but I do think it's relatively common.
+
+The second thing I missed is that "is this aggregate" is not a binary
+question. Originally I expected we would have two answers to the
+question, and compound expressions would enforce that their
+sub-expressions all had the same answer. The issue is that `1` doesn't
+care. You can have `count(*) + 1`, and you can also have `non_aggregate
++ 1`. `1` is always valid, regardless of aggregation. So we need three
+answers. The problem is that this means we can't have `T: NonAggregate`
+mean everything it used to.
+
+On stable `T: NonAggregate` will mean `T: ValidGrouping<()>`, and that
+`T` can be passed to everything with a `NonAggregate` bound (`filter`,
+`order`, etc). On nightly, it also implies `T::IsAggregate:
+MixedAggregates<is_aggregate::No, Output = is_aggregate::No>`. In
+English, it implies that this is valid with no group by clause, and its
+output can appear with an expression which is not aggregate (but might
+be with a different group by clause). The outcome of this is that `T:
+NonAggregate` implies `(T, Other): NonAggregate`. However the missing
+link from both stable and unstable is `is_aggregate::No:
+MixedAggregates<T::IsAggregate>` being implied, which would mean
+`(Other, T): NonAggregate` would be implied.
+
+Ultimately this is a really long-winded way of saying that `T:
+NonAggregate` used to imply interactions with other types. That is no
+longer consistently true. It's unlikely there are many affected users,
+but any that are affected will need to directly have a `ValidGrouping`
+bound.
+
+Implementation Notes
+---
+
+Because this broke diesel_infer_schema, I had to do a version bump to
+get that crate to rely on the released 1.4.
+
+There's a note on the unsoundness of the `NonAggregate` impl of
+`Subselect`. I haven't changed the bounds on that impl, but we almost
+certainly should address it before 2.0 is released.
+
+I opted to validate the new bound in `SelectDsl`, so folks get errors on
+`.select` instead of `.load`. We can't validate this on calls to both
+`.select` *and* `.group_by`, since a select statement valid with a group
+by is often invalid without one, and a group by clause usually makes the
+default select clause invalid.
+
+While this commit does not add proper group by support, I fleshed it out
+a bit to test the type constraints. Right now a column only considers
+itself valid if there is no group by clause, or if the group by clause
+is exactly that column.
+
+I had more to say but I went on a call and lost my train of thought. I
+need to come back and finish writing this later.
+
+Notable Limitations
+---
+
+`SELECT lower(name) FROM users GROUP BY lower(name)` probably can't be
+represented.
+
+Unanswered Questions
+---
+
+`BoxableExpression` has been limited to only work when there's no
+group by clause, and only work with types which are `is_aggregate::No`.
+This is probably not what we want to do, but was the smallest change to
+start.
+Note: This includes #2247. That PR should be merged first. Look at the last commit only for a smaller diff.
+
+This updates our crate to work without `#[macro_use] extern crate
+diesel` at the crate root. I've audited all uses of `#[macro_export]`.
+If it was obvious at a glance that inner macros are local, I've added
+`local_inner_macros`. Otherwise I changed it to use `$crate::`. Most of
+the non-public macros can probably have the `__diesel_` prefix removed,
+but I've left it on to keep things reasonable for 2015 edition users and
+to minimize the diff.
+
+We actually have a surprisingly small number of non-derive macros that
+are public API. It's pretty much limited to our schema macros and
+operator generation. The schema macros are exported from the prelude,
+the operator generation macros are not as they had their prefix removed
+in 2.0 with the expectation they are always invoked with `diesel::`.
+
+I've removed all instances of `extern crate diesel` from the doctests.
+Note that this does not change anything outside the main crate. In
+particular, `diesel_cli` will still generate a `schema.rs` that assumes
+`#[macro_use] extern crate diesel;`. It will need to import the prelude
+at the top of that file. This will be addressed once that crate is moved
+to the 2018 edition.
+
+Close #1956
+I also added a command that does not require root access and updated the completions automatically with the binary.
+<!--
+If you want to report a bug, we added some points below you can fill out. If you want to request a feature, feel free to remove all the irrelevant text. In addition to this [issue tracker](https://github.com/diesel-rs/diesel/issues), you can also talk to Diesel maintainers and users on [Gitter](https://gitter.im/diesel-rs/diesel).
+-->
+
+## Setup
+
+### Versions
+
+- **Rust:** rustc 1.39.0 (4560ea788 2019-11-04)
+- **Diesel:** 1.4.0
+- **Database:** sqlite3 + postgres
+- **Operating System** linux
+
+### Feature Flags
+
+- **diesel:**  sqlite xor postgres
+
+## Problem Description
+
+The `diesel database` command ignores the migration dir supplied by `--migration-dir` and always assumes `migrations`.
+
+### What are you trying to accomplish?
+
+```
+$ diesel database --migration-dir='.migrations/sqlite' --database-url='migrate.sqlite3' reset
+Unable to find migrations directory in this directory or any parent directories.
+
+$ ls -l .migrations/
+total 8
+drwxrwxr-x. 6 ensc ensc 4096 Nov 21 12:49 sqlite
+```
+
+### Steps to reproduce
+
+1. `mkdir test && cd test`
+
+2. `mkdir sql`
+
+3. ` diesel migration --migration-dir sql generate init`
+
+4.  `diesel database --migration-dir sql setup`

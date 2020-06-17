@@ -1,0 +1,316 @@
+When running the tutorial 5 code  currently posted, I noticed that the colors aren't interpolating smoothly between the vertices as expected.
+
+EDIT 1: I made some observations.. check the bottom of the post.
+
+**To recall, here's the expected output:**
+![expected output](https://user-images.githubusercontent.com/6435200/72209992-153e8380-3483-11ea-93cf-dcacc2148e0d.png)
+
+**here's the actual output:**
+![triangle Colors](https://user-images.githubusercontent.com/6435200/72209996-22f40900-3483-11ea-9e54-c376e658890c.JPG)
+
+So far, I have attempted to add smooth attributes in the shaders and change the Enum values of smoothness in the DrawParameters.
+
+EDIT 1:
+When hardcoding the color values myself, by providing a color field in the vertex buffer format,
+I noticed some unexpected behaviours when setting some of the rgba values to negative, and some to 0.
+
+For example, see what happens when you provide these colors for vertices:
+Smooth interpolation: [0.0,0.0,0.0,1.0], [0.0,0.5,0.0,1.0], [0.5,**0.0**,0.0,1.0]
+Border: [0.0,0.0,0.0,1.0], [0.0,0.5,0.0,1.0], [0.5,**-0.25**,0.0,1.0]
+
+I believe negative values for colors should be clamped to 0, but it seems like this isn't the case when you interpolate between two non-black colors^.
+
+I have tested this both on Windows 10 and Linux.
+Could you please let me know what could be the cause of this?
+WIP as I need to figure out a solution to the `examples/support/mod.rs` build failure (see https://github.com/rust-windowing/winit/issues/1387).
+The examples are currently returning from the function if an event was received, there's no handler for. This results in the renderer braking, as long as you move your mouse.
+I have a test that draws 1 million quads. It works reasonably well on my macbook pro. Claims to get 50 fps. However as soon as resize the window it drops to 1 fps.
+
+I'm using the latest released versions. Here's my code (heavily based on the `triangle.rs` example).
+
+```
+#[macro_use]
+extern crate glium;
+
+mod support;
+
+#[allow(unused_imports)]
+use glium::{glutin, Surface};
+use glium::index::{PrimitiveType, NoIndices};
+use std::time::Instant;
+
+use rand::Rng;
+
+#[derive(Copy, Clone)]
+struct Vertex {
+    position: [f32; 2],
+    color: [f32; 3],
+}
+
+implement_vertex!(Vertex, position, color);
+
+fn main() {
+    let event_loop = glutin::event_loop::EventLoop::new();
+    let wb = glutin::window::WindowBuilder::new().with_inner_size(glutin::dpi::LogicalSize{ width: 1000.0, height: 1000.0 });
+    let cb = glutin::ContextBuilder::new();
+    let display = glium::Display::new(wb, cb, &event_loop).unwrap();
+
+    let mut rng = rand::thread_rng();
+
+    // Generate the array of squares.
+
+    let mut squares = Vec::with_capacity(10_000_000);
+    for _ in 0..1_000_000 {
+        let pos: [f32; 2] = [rng.gen_range(-1.0, 1.0), rng.gen_range(-1.0, 1.0)];
+        let col: [f32; 3] = [rng.gen_range(0.0, 1.0), rng.gen_range(0.0, 1.0), rng.gen_range(0.0, 1.0)];
+        squares.push(Vertex{
+            position: pos,
+            color: col,
+        });
+        squares.push(Vertex{
+            position: [pos[0] + 0.01, pos[1] + 0.01],
+            color: col,
+        });
+    }
+
+    // building the vertex buffer, which contains all the vertices that we will draw
+    let vertex_buffer = {
+        glium::VertexBuffer::new(&display, &squares).unwrap()
+    };
+
+    // compiling shaders and linking them together
+    let program = program!(&display,
+        140 => {
+            vertex: "
+                #version 140
+
+                uniform mat4 matrix;
+
+                in vec2 position;
+                in vec3 color;
+
+                out vec3 vColor;
+
+                void main() {
+                    gl_Position = vec4(position, 0.0, 1.0) * matrix;
+                    vColor = color;
+                }
+            ",
+
+            geometry: "
+                #version 330
+                uniform mat4 matrix;
+                layout(lines) in;
+                layout(triangle_strip, max_vertices=4) out;
+
+                in vec3 vColor[];
+                out vec3 color;
+
+                void main() {
+                    vec4 c0 = gl_in[0].gl_Position;
+                    vec4 c1 = gl_in[1].gl_Position;
+                    // Swap x coordinates.
+                    float tmp = c0.x;
+                    c0.x = c1.x;
+                    c1.x = tmp;
+
+                    gl_Position = matrix * c0;
+                    color = vColor[0];
+                    EmitVertex();
+                    gl_Position = matrix * gl_in[0].gl_Position;
+                    color = vColor[0];
+                    EmitVertex();
+                    gl_Position = matrix * gl_in[1].gl_Position;
+                    color = vColor[0];
+                    EmitVertex();
+                    gl_Position = matrix * c1;
+                    color = vColor[0];
+                    EmitVertex();
+                    EndPrimitive();
+                }
+            ",
+
+            fragment: "
+                #version 140
+                in vec3 color;
+                out vec4 fColor;
+
+                void main() {
+                    fColor = vec4(color, 1.0);
+                }
+            ",
+        },
+    ).unwrap();
+
+    let mut x = 0.0f32;
+    let mut i = 0;
+
+    let mut last_frame_time = Instant::now();
+
+    support::start_loop(event_loop, move |events| {
+        // building the uniforms
+        let uniforms = uniform! {
+            matrix: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [x, 0.0, 0.0, 1.0f32]
+            ]
+        };
+
+        x += 0.001;
+
+        // drawing a frame
+        let mut target = display.draw();
+        target.clear_color(0.0, 0.0, 0.0, 0.0);
+        target.draw(&vertex_buffer, &NoIndices(PrimitiveType::LinesList), &program, &uniforms, &Default::default()).unwrap();
+        target.finish().unwrap();
+
+        i += 1;
+        if i >= 10 {
+            i = 0;
+            let duration = last_frame_time.elapsed();
+            last_frame_time = Instant::now();
+            println!("FPS: {}", 10.0/duration.as_secs_f64());
+        }
+
+        let mut action = support::Action::Continue;
+
+        // polling and handling the events received by the window
+        for event in events {
+            match event {
+                glutin::event::Event::WindowEvent { event, .. } => match event {
+                    glutin::event::WindowEvent::CloseRequested => action = support::Action::Stop,
+                    _ => {},
+                },
+                _ => (),
+            }
+        };
+
+        action
+    });
+
+}
+```
+Maybe I'm missing something, but it seems like enabling double buffering also causes vsync to be enabled.  
+As in my frame time going from `1ms` to e.g. `16ms` solely by enabling double buffering (even if vsync is forced to being off).  
+I would have expected additional input lag caused by having to wait for one more frame, but not a drop of the frame rate to my screen's refresh rate.  
+Is this a bug or do I have to tune my configuration?
+```rust
+let context = glutin::ContextBuilder::new()
+			.with_depth_buffer(24)
+			.with_multisampling(0)
+			.with_vsync(false)
+			.with_double_buffer(Some(RENDERING_DOUBLE_BUFFER))
+			.with_hardware_acceleration(Some(true))
+			.with_gl(glutin::GlRequest::Specific(glutin::Api::OpenGl, (3, 3)));
+```
+where
+`RENDERING_DOUBLE_BUFFER = false` results in 0-1ms frame time,   
+`RENDERING_DOUBLE_BUFFER = true` results in 16ms frame time  
+using `glium 0.25.0`
+
+
+
+Using glium version 0.25.1 and the following code:
+```Rust
+extern crate glium;
+
+use glium::glutin;
+use glium::Surface;
+
+
+fn main() {
+    let mut events_loop = glutin::EventsLoop::new();
+    let window_builder = glutin::WindowBuilder::new()
+        .with_dimensions((400.0, 400.0).into())
+        .with_title("Fragula");
+    let context_builder = glutin::ContextBuilder::new();
+    let display = glium::Display::new(window_builder, context_builder, &events_loop).unwrap();
+
+    let mut closed = false;
+
+    while !closed {
+        let mut target = display.draw();
+        target.clear_color(0.122, 0.173, 0.227, 1.0);
+        target.finish().unwrap();
+
+        events_loop.poll_events(|event| {
+            match event {
+                glutin::Event::WindowEvent {event, .. } => match event {
+                    glutin::WindowEvent::CloseRequested => closed = true,
+                    _ => (),
+                },
+                _ => (),
+            }
+        });
+
+    }
+}
+```
+I receive the following window with the wrong RGB color:
+![glium](https://user-images.githubusercontent.com/10521687/66800130-0f67ef00-eee2-11e9-94bd-a7589301e5a6.png)
+
+Using C++ and libepoxy with similar code I receive the correct color as shown below:
+![opengl](https://user-images.githubusercontent.com/10521687/66800183-41795100-eee2-11e9-8663-c94f2e7e14ad.png)
+
+Here is the output of glxinfo if it helps:
+```
+name of display: :0
+display: :0  screen: 0
+direct rendering: Yes
+Extended renderer info (GLX_MESA_query_renderer):
+    Vendor: Intel Open Source Technology Center (0x8086)
+    Device: Mesa DRI Intel(R) HD Graphics 5500 (Broadwell GT2)  (0x1616)
+    Version: 18.3.6
+    Accelerated: yes
+    Video memory: 3072MB
+    Unified memory: yes
+    Preferred profile: core (0x1)
+    Max core profile version: 4.5
+    Max compat profile version: 3.0
+    Max GLES1 profile version: 1.1
+    Max GLES[23] profile version: 3.1
+OpenGL vendor string: Intel Open Source Technology Center
+OpenGL renderer string: Mesa DRI Intel(R) HD Graphics 5500 (Broadwell GT2) 
+OpenGL core profile version string: 4.5 (Core Profile) Mesa 18.3.6
+OpenGL core profile shading language version string: 4.50
+OpenGL core profile context flags: (none)
+OpenGL core profile profile mask: core profile
+
+OpenGL version string: 3.0 Mesa 18.3.6
+OpenGL shading language version string: 1.30
+OpenGL context flags: (none)
+
+OpenGL ES profile version string: OpenGL ES 3.1 Mesa 18.3.6
+OpenGL ES profile shading language version string: OpenGL ES GLSL ES 3.10
+```
+
+
+Is there any reason because Vertex trait cannot be implemented using a procedural macro? Resulting code would be more idiomatic:
+
+**Preview:**
+```rust
+#[derive(Copy, Clone, Vertex)]
+struct Vertex3 {
+    position: [f32; 3],
+    tex_coords: [f32; 2],
+}
+```
+The `gpgpu` example does show a minimum use case of compute shader, however it does not explain how to share data between other shader stage.
+
+I'm implementing an example of compute shader. In this case, I need a buffer which can be written by compute shader program as well as read by vertex buffer in ordinary pipeline.
+If I want this buffer to be written by compute shader stage, as explained in `gpgpu` example, I have to declare it as `UniformBuffer<DataType>`.
+If I want this buffer to be read by vertex buffer, I have to declare it as `VertexBuffer<VertexType>`.
+I can't figure out how to share the buffer content between them.
+
+This should be a common case of using compute shader.
+
+Glium seems to be exhibiting some strange flushing/waiting-related behavior if draw() is called more than once. Glium ends up busy-waiting on Vsync rather than allowing the drivers and application to sleep wait until the next frame. This results in high CPU usage even if very few objects are drawn on-screen.
+
+How to reproduce: Run keeshond example "doggymark" and spawn more than 8192 doggos. Notice that the average ms for "draw" jumps considerably. It should instead climb very gradually as more and more doggos are spawned.
+
+I did not have this issue on the previous OpenGL library I used (gfx pre-ll).
+In #1777 I missed that the PR actually broke the code. Only later in #1778 the problem was pointed out to me in manual review. Right now, travis CI is allowing test failures as some of our tests failed and still fail on it. We should identify those failing tests, set ignore on them, and block travis CI on the tests.
+
+I'm not sure how to ignore the tests that fail due to #1780 so I guess this issue is blocked on resolving that issue first.

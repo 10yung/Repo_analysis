@@ -1,0 +1,342 @@
+Hi there! I'm attempting to make a FFI binding for SQLite3, and I ran into a big problem that seems to stem from FFI itself.
+
+Specifically, I seem to be getting a segfault whenever a attached function, with `:varargs` as one of the arguments, receives a callback as one of the parameters.
+
+The code below is the minimal code needed to replicate this. This code, when run as is, currently produces a segfault.
+```ruby
+require 'ffi'
+
+module SQLite3
+	extend FFI::Library
+	ffi_lib 'sqlite3'
+	
+	callback :sqlite3_config_log_xFunc, [:pointer, :int, :string], :void
+	attach_function :sqlite3_config, [:int, :varargs], :int
+end
+
+def sqlog(data, op, str)
+	print 'SQLITE: '
+	p [data, op, str]
+end
+
+p SQLite3.sqlite3_config(
+	16, # SQLITE_CONFIG_LOG
+	:sqlite3_config_log_xFunc, method(:sqlog)
+)
+```
+
+To ensure this wasn't just me being stupid (or SQLite being stupid), I tried changing the parameter list for `sqlite3_config` around a bit.
+
+When the parameter list is `[:int, :sqlite3_config_log_xFunc, :varargs]` (and the function call is edited appropriately), FFI will still segfault -- and in fact, will **always** segfault even when you don't specify the callback parameter in the function call.
+
+However, when the parameter list is `[:int, :sqlite3_config_log_xFunc]` (with no `:varargs`), the function will work as intended. Even if I enter in invalid parameters to `sqlite3_config` (assuming their type matches up with what FFI expects the parameters to be), I no longer get a segfault from FFI, and SQLite receives the function call as expected. Except, now I've lost access to all the other config options that I'm meant to change via `sqlite3_config`, as the parameter list isn't compatible with any of the other configuration verbs offered for `sqlite3_config`.
+
+P.S.  I am running `ffi (1.11.3 x64-mingw32)` on Windows 10, as well as SQLite 3.30.1, in case the version numbers make any difference (they shouldn't, though).
+Is there still a mailing list?
+I tried going to the google group linked in the Wiki and google says it doesn't exist, or it's private.
+I'd like to update the wiki if it's no longer accurate or lacking details.
+
+I though about adding some loading mechanism with ABI version like this extracted from [ruby-vips](https://github.com/libvips/ruby-vips/blob/cc85f03d2252f318aa1fbc8ad7a31cfcd64324c1/lib/vips.rb#L26-L34):
+```ruby
+# Generate a library name for ffi.
+#
+# Platform notes:
+# linux:
+#   Some distros allow "libvips.so", but only if the -dev headers have been
+#   installed. To work everywhere, you must include the ABI number.
+#   Confusingly, the file extension is not at the end. ffi adds the "lib"
+#   prefix.
+# mac:
+#   As linux, but the extension is at the end and is added by ffi.
+# windows:
+#   The ABI number must be included, but with a hyphen. ffi does not add a
+#   "lib" prefix or a ".dll" suffix.
+def library_name(name, abi_number)
+  if FFI::Platform.windows?
+    "lib#{name}-#{abi_number}.dll"
+  elsif FFI::Platform.mac?
+    "#{name}.#{abi_number}"
+  else
+    "#{name}.so.#{abi_number}"
+  end
+end
+```
+
+For libvips the library file names are:
+* `libvips-42.dll` on Windows
+* `libvips.so.42` on Linux
+* `libvips.42.dylib` on Macos
+
+This file name pattern is pretty standard on Linux and other UNIXes and the corresponding Windows pattern is getting more common these days at least on MINGW/MSYS2. Not sure how library naming is done on MSVC. They change DLL loading mechanisms every some years (SxS, explicit DLL version names, API sets). Do you know how common the MacOS-pattern is (I don't know much about MacOS)?
+
+On windows, when using Ruby built with mingw64, FFI:LIBC returns msvcrt.dll. When using Ruby built with MSVC, FFI:LIBC returns vcruntime<version>.dll
+
+Neither is correct. Starting in Visual Studio 2015, the C runtime library migrated to ucrtbase.dll. See https://docs.microsoft.com/en-us/cpp/c-runtime-library/crt-library-features?view=vs-2019 for more information. Or https://devblogs.microsoft.com/cppblog/introducing-the-universal-crt/.
+
+I assume this hasn't been reported as a bug since almost no one uses a MSVC Ruby build, and attach_function for functions like malloc does actually work using msvcrt.dll - but does not with vcruntime<version>.dll
+
+This patch changes mingw64 and mswin to use ucrtbase.dll for the C library. Tested both with mswin and mingw64 Ruby builds.
+
+The one downside of this patch is that it would break for anyone running a version of Windows that hasn't been updated since Spring 2015 when Microsoft introduced this change (the dll ships with Windows 10 and was back ported to older windows versions via Windows update). So seems to me a very, very low risk.
+`(LoadError)Ruby25-x64/lib/ruby/gems/2.5.0/gems/ffi-1.11.1-x64-mingw32/lib/ffi/library.rb:145:in `block in ffi_lib': Could not open library 'sodium': The specified module could not be found.
+.
+Could not open library 'sodium.dll': The specified module could not be found.`
+
+Hello, I'm unsure what to do to solve this issue and help would be greatly appreciated. 
+
+Thank you!
+```dockerfile
+# Author: noraj
+
+# Official verified image
+FROM ruby:2.6.3-alpine3.10
+
+# hardening
+RUN chmod 773 /tmp
+
+# date
+RUN ln -fs /usr/share/zoneinfo/Europe/Paris /etc/localtime
+
+# copy files
+COPY ./website/ /usr/src/app/
+
+WORKDIR /usr/src/app
+
+## INSTALL ##
+# Print out ruby version for debugging
+RUN ruby -v
+# Bundler is not installed with the image
+RUN gem install bundler --no-document
+# install nproc (coreutils) for bundle -j
+# install git for building the gemspec
+# install make, gcc for building gem native extension (commonmarker)
+# libc-dev for musl-dev dependency (stdlib.h) needed by gcc
+# install g++ and libstdc++ for building eventmachine
+RUN apk --no-cache add coreutils git build-base libstdc++ libffi-dev
+RUN bundle install -j $(nproc) --path vendor # Install dependencies into ./vendor/ruby
+# Install node LTS and npm
+RUN apk --no-cache add nodejs npm
+# Print out node version for debugging
+RUN node --version
+# Print out npm version for debugging
+RUN npm --version
+# Install gulp
+RUN npm install -g gulp-cli
+# Install dependencies
+RUN npm install
+
+## BUILD ##
+RUN gulp build
+RUN bundle exec middleman build
+RUN mv build/* public/
+
+# drop privileges
+RUN groupadd -g 1337 appuser && \
+    useradd -r -u 1337 -g appuser appuser
+USER appuser
+
+
+EXPOSE 4567
+
+CMD bundle exec middleman server 4567
+```
+
+```
+Step 16/21 : RUN bundle exec middleman build
+ ---> Running in f56ce493f31a
+bundler: failed to load command: middleman (/usr/src/app/vendor/ruby/2.6.0/bin/middleman)
+LoadError: Error relocating /usr/src/app/vendor/ruby/2.6.0/gems/ffi-1.11.1/lib/ffi_c.so: __sprintf_chk: symbol not found - /usr/src/app/vendor/ruby/2.6.0/gems/ffi-1.11.1/lib/ffi_c.so
+  /usr/src/app/vendor/ruby/2.6.0/gems/ffi-1.11.1/lib/ffi.rb:6:in `require'
+  /usr/src/app/vendor/ruby/2.6.0/gems/ffi-1.11.1/lib/ffi.rb:6:in `rescue in <top (required)>'
+  /usr/src/app/vendor/ruby/2.6.0/gems/ffi-1.11.1/lib/ffi.rb:3:in `<top (required)>'
+  /usr/src/app/vendor/ruby/2.6.0/gems/rb-inotify-0.10.0/lib/rb-inotify/native.rb:1:in `require'
+  /usr/src/app/vendor/ruby/2.6.0/gems/rb-inotify-0.10.0/lib/rb-inotify/native.rb:1:in `<top (required)>'
+  /usr/src/app/vendor/ruby/2.6.0/gems/rb-inotify-0.10.0/lib/rb-inotify.rb:2:in `require'
+  /usr/src/app/vendor/ruby/2.6.0/gems/rb-inotify-0.10.0/lib/rb-inotify.rb:2:in `<top (required)>'
+  /usr/src/app/vendor/ruby/2.6.0/gems/listen-3.0.8/lib/listen/adapter/linux.rb:30:in `require'
+  /usr/src/app/vendor/ruby/2.6.0/gems/listen-3.0.8/lib/listen/adapter/linux.rb:30:in `_configure'
+  /usr/src/app/vendor/ruby/2.6.0/gems/listen-3.0.8/lib/listen/adapter/base.rb:45:in `block in configure'
+  /usr/src/app/vendor/ruby/2.6.0/gems/listen-3.0.8/lib/listen/adapter/base.rb:40:in `each'
+  /usr/src/app/vendor/ruby/2.6.0/gems/listen-3.0.8/lib/listen/adapter/base.rb:40:in `configure'
+  /usr/src/app/vendor/ruby/2.6.0/gems/listen-3.0.8/lib/listen/adapter/base.rb:63:in `start'
+  /usr/src/app/vendor/ruby/2.6.0/gems/listen-3.0.8/lib/listen/backend.rb:28:in `start'
+  /usr/src/app/vendor/ruby/2.6.0/gems/listen-3.0.8/lib/listen/listener.rb:67:in `block in <class:Listener>'
+  /usr/src/app/vendor/ruby/2.6.0/gems/listen-3.0.8/lib/listen/fsm.rb:120:in `instance_eval'
+  /usr/src/app/vendor/ruby/2.6.0/gems/listen-3.0.8/lib/listen/fsm.rb:120:in `call'
+  /usr/src/app/vendor/ruby/2.6.0/gems/listen-3.0.8/lib/listen/fsm.rb:91:in `transition_with_callbacks!'
+  /usr/src/app/vendor/ruby/2.6.0/gems/listen-3.0.8/lib/listen/fsm.rb:57:in `transition'
+  /usr/src/app/vendor/ruby/2.6.0/gems/listen-3.0.8/lib/listen/listener.rb:90:in `start'
+  /usr/src/app/vendor/ruby/2.6.0/gems/middleman-core-4.3.5/lib/middleman-core/sources/source_watcher.rb:182:in `listen!'
+  /usr/src/app/vendor/ruby/2.6.0/gems/contracts-0.13.0/lib/contracts/method_reference.rb:43:in `send_to'
+  /usr/src/app/vendor/ruby/2.6.0/gems/contracts-0.13.0/lib/contracts/call_with.rb:76:in `call_with'
+  /usr/src/app/vendor/ruby/2.6.0/gems/contracts-0.13.0/lib/contracts/method_handler.rb:138:in `block in redefine_method'
+  /usr/src/app/vendor/ruby/2.6.0/gems/middleman-core-4.3.5/lib/middleman-core/sources.rb:249:in `each'
+  /usr/src/app/vendor/ruby/2.6.0/gems/middleman-core-4.3.5/lib/middleman-core/sources.rb:249:in `start!'
+  /usr/src/app/vendor/ruby/2.6.0/gems/contracts-0.13.0/lib/contracts/method_reference.rb:43:in `send_to'
+  /usr/src/app/vendor/ruby/2.6.0/gems/contracts-0.13.0/lib/contracts/call_with.rb:76:in `call_with'
+  /usr/src/app/vendor/ruby/2.6.0/gems/contracts-0.13.0/lib/contracts/method_handler.rb:138:in `block in redefine_method'
+  /usr/src/app/vendor/ruby/2.6.0/gems/middleman-core-4.3.5/lib/middleman-core/core_extensions/file_watcher.rb:66:in `after_configuration'
+  /usr/src/app/vendor/ruby/2.6.0/gems/contracts-0.13.0/lib/contracts/method_reference.rb:43:in `send_to'
+  /usr/src/app/vendor/ruby/2.6.0/gems/contracts-0.13.0/lib/contracts/call_with.rb:76:in `call_with'
+  /usr/src/app/vendor/ruby/2.6.0/gems/contracts-0.13.0/lib/contracts/method_handler.rb:138:in `block in redefine_method'
+  /usr/src/app/vendor/ruby/2.6.0/gems/middleman-core-4.3.5/lib/middleman-core/extension.rb:405:in `block in bind_after_configuration'
+  /usr/src/app/vendor/ruby/2.6.0/gems/middleman-core-4.3.5/lib/middleman-core/callback_manager.rb:57:in `instance_exec'
+  /usr/src/app/vendor/ruby/2.6.0/gems/middleman-core-4.3.5/lib/middleman-core/callback_manager.rb:57:in `block in execute'
+  /usr/src/app/vendor/ruby/2.6.0/gems/hamster-3.0.0/lib/hamster/vector.rb:1316:in `each'
+  /usr/src/app/vendor/ruby/2.6.0/gems/hamster-3.0.0/lib/hamster/vector.rb:1316:in `traverse_depth_first'
+  /usr/src/app/vendor/ruby/2.6.0/gems/hamster-3.0.0/lib/hamster/vector.rb:431:in `each'
+  /usr/src/app/vendor/ruby/2.6.0/gems/middleman-core-4.3.5/lib/middleman-core/callback_manager.rb:57:in `execute'
+  /usr/src/app/vendor/ruby/2.6.0/gems/contracts-0.13.0/lib/contracts/method_reference.rb:43:in `send_to'
+  /usr/src/app/vendor/ruby/2.6.0/gems/contracts-0.13.0/lib/contracts/call_with.rb:76:in `call_with'
+  /usr/src/app/vendor/ruby/2.6.0/gems/contracts-0.13.0/lib/contracts/method_handler.rb:138:in `block in redefine_method'
+  /usr/src/app/vendor/ruby/2.6.0/gems/middleman-core-4.3.5/lib/middleman-core/callback_manager.rb:28:in `block in install_methods!'
+  /usr/src/app/vendor/ruby/2.6.0/gems/middleman-core-4.3.5/lib/middleman-core/application.rb:306:in `initialize'
+  /usr/src/app/vendor/ruby/2.6.0/gems/middleman-cli-4.3.5/bin/middleman:49:in `new'
+  /usr/src/app/vendor/ruby/2.6.0/gems/middleman-cli-4.3.5/bin/middleman:49:in `<top (required)>'
+  /usr/src/app/vendor/ruby/2.6.0/bin/middleman:23:in `load'
+  /usr/src/app/vendor/ruby/2.6.0/bin/middleman:23:in `<top (required)>'
+ERROR: Service 'cracking1' failed to build: The command '/bin/sh -c bundle exec middleman build' returned a non-zero code: 1
+```
+i get this error on startup while `require 'typhoeus'`:
+
+```bash
+/.../vendor/bundle/ruby/2.6.0/gems/ffi-1.11.1/lib/ffi/library.rb:275:in `attach': unhandled exception
+        from /.../vendor/bundle/ruby/2.6.0/gems/ffi-1.11.1/lib/ffi/library.rb:275:in `attach_function'
+        from /.../vendor/bundle/ruby/2.6.0/gems/ethon-0.12.0/lib/ethon/libc.rb:16:in `<module:Libc>'
+        from /.../vendor/bundle/ruby/2.6.0/gems/ethon-0.12.0/lib/ethon/libc.rb:6:in `<module:Ethon>'
+        from /.../vendor/bundle/ruby/2.6.0/gems/ethon-0.12.0/lib/ethon/libc.rb:1:in `<top (required)>'
+        from /.../vendor/bundle/ruby/2.6.0/gems/ethon-0.12.0/lib/ethon.rb:14:in `require'
+        from /.../vendor/bundle/ruby/2.6.0/gems/ethon-0.12.0/lib/ethon.rb:14:in `<top (required)>'
+        from /.../vendor/bundle/ruby/2.6.0/gems/typhoeus-1.3.1/lib/typhoeus.rb:2:in `require'
+        from /.../vendor/bundle/ruby/2.6.0/gems/typhoeus-1.3.1/lib/typhoeus.rb:2:in `<top (required)>'
+        from /.../app/main.rb:4:in `require'
+        from /.../app/main.rb:4:in `<top (required)>'
+        from config.ru:61:in `require'
+        from config.ru:61:in `block in <main>'
+        from /.../vendor/bundle/ruby/2.6.0/gems/rack-2.0.7/lib/rack/builder.rb:55:in `instance_eval'
+        from /.../vendor/bundle/ruby/2.6.0/gems/rack-2.0.7/lib/rack/builder.rb:55:in `initialize'
+        from config.ru:in `new'
+        from config.ru:in `<main>'
+        from /.../vendor/bundle/ruby/2.6.0/gems/rack-2.0.7/lib/rack/builder.rb:49:in `eval'
+        from /.../vendor/bundle/ruby/2.6.0/gems/rack-2.0.7/lib/rack/builder.rb:49:in `new_from_string'
+        from /.../vendor/bundle/ruby/2.6.0/gems/rack-2.0.7/lib/rack/builder.rb:40:in `parse_file'
+        from ./dispatch_fcgi.rb:21:in `<main>'
+```
+
+(replaced my folder with `...`)
+
+
+check installed version:
+
+```
+dpkg -l | grep libcurl 
+ii libcurl3-gnutls:amd64     7.58.0-2ubuntu3.8 amd64 easy-to-use client-side URL transfer library (GnuTLS flavour) 
+ii libcurl4:amd64            7.58.0-2ubuntu3.8 amd64 easy-to-use client-side URL transfer library (OpenSSL flavour) 
+ii libcurl4-gnutls-dev:amd64 7.58.0-2ubuntu3.8 amd64 development files and documentation for libcurl (GnuTLS flavour) 
+ii libwww-curl-perl          4.17-4build1      amd64 Perl bindings to libcurl 
+ii python-pycurl             7.43.0.1-0.2      amd64 Python bindings to libcurl 
+ii ruby-curb                 0.9.4-1build2     amd64 Ruby libcurl bindings 
+```
+Hi, thanks for this gem! In JRuby, it looks like the `write_int64` and `read_int64` methods are missing, but `write_array_of_int64` and `read_array_of_int64` are available. Same situation with `uint` as well.
+
+```ruby
+ptr = ::FFI::MemoryPointer.new(:int64)
+
+# both missing
+p ptr.write_int64(123)
+p ptr.read_int64
+
+# both succeed
+p ptr.write_array_of_int64([123])
+p ptr.read_array_of_int64(1)
+```
+
+FFI version: 1.11.1 (java)
+JRuby version: 9.2.7.0
+Platform: Mac 10.14
+Hi,
+
+I'm trying to install ffi on my macbook pro, but I get the following error output:
+
+current directory: /usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c
+/usr/local/opt/ruby/bin/ruby -I /usr/local/lib/ruby/site_ruby/2.6.0 -r ./siteconf20190907-74553-1tiuylv.rb extconf.rb
+checking for ffi.h... no
+checking for ffi.h in /usr/local/include,/usr/include/ffi... yes
+checking for ffi_call() in -lffi... yes
+checking for ffi_closure_alloc()... no
+checking for shlwapi.h... no
+checking for rb_thread_call_without_gvl()... yes
+checking for ruby_native_thread_p()... yes
+checking for ruby_thread_has_gvl_p()... yes
+creating extconf.h
+creating Makefile
+
+current directory: /usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c
+make "DESTDIR=" clean
+
+current directory: /usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c
+make "DESTDIR="
+Configuring libffi
+clang-4.0: error: unsupported option '-print-multi-os-directory'
+clang-4.0: error: no input files
+cd "/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi-x86_64-darwin18" && make
+make[1]: Entering directory '/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi-x86_64-darwin18'
+make 'AR_FLAGS=' 'CC_FOR_BUILD=' 'CFLAGS=-Wall -fexceptions' 'CXXFLAGS=-fno-common -O3 -ggdb3  ' 'CFLAGS_FOR_BUILD=' 'CFLAGS_FOR_TARGET=' 'INSTALL=/usr/bin/install -c' 'INSTALL_DATA=/usr/bin/install -c -m 644' 'INSTALL_PROGRAM=/usr/bin/install -c' 'INSTALL_SCRIPT=/usr/bin/install -c' 'JC1FLAGS=' 'LDFLAGS=-L/usr/local/opt/libffi/lib' 'LIBCFLAGS=' 'LIBCFLAGS_FOR_TARGET=' 'MAKE=make' 'MAKEINFO=/bin/sh /usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/missing makeinfo ' 'PICFLAG=' 'PICFLAG_FOR_TARGET=' 'RUNTESTFLAGS=' 'SHELL=/bin/sh' 'exec_prefix=/usr/local' 'infodir=/usr/local/share/info' 'libdir=/usr/local/lib' 'mandir=/usr/local/share/man' 'prefix=/usr/local' 'AR=libtool -static' 'AS=/anaconda3/bin/x86_64-apple-darwin13.4.0-as' 'CC=clang' 'CXX=clang++' 'LD=/anaconda3/bin/x86_64-apple-darwin13.4.0-ld' 'NM=/anaconda3/bin/x86_64-apple-darwin13.4.0-nm' 'RANLIB=/anaconda3/bin/x86_64-apple-darwin13.4.0-ranlib' 'DESTDIR=' all-recursive
+make[2]: Entering directory '/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi-x86_64-darwin18'
+Making all in include
+make[3]: Entering directory '/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi-x86_64-darwin18/include'
+make[3]: Nothing to be done for 'all'.
+make[3]: Leaving directory '/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi-x86_64-darwin18/include'
+Making all in testsuite
+make[3]: Entering directory '/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi-x86_64-darwin18/testsuite'
+make[3]: Nothing to be done for 'all'.
+make[3]: Leaving directory '/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi-x86_64-darwin18/testsuite'
+Making all in man
+make[3]: Entering directory '/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi-x86_64-darwin18/man'
+make[3]: Nothing to be done for 'all'.
+make[3]: Leaving directory '/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi-x86_64-darwin18/man'
+make[3]: Entering directory '/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi-x86_64-darwin18'
+/bin/sh ./libtool  --tag=CC   --mode=compile clang -DHAVE_CONFIG_H -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi  -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/include -Iinclude -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src -DRUBY_EXTCONF_H=\"extconf.h\"  -I/usr/local/opt/libyaml/include -I/usr/local/opt/openssl@1.1/include -I/usr/local/opt/readline/include -D_XOPEN_SOURCE -D_DARWIN_C_SOURCE -D_DARWIN_UNLIMITED_SELECT -D_REENTRANT    -Wall -fexceptions -c -o src/prep_cif.lo /usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src/prep_cif.c
+libtool: compile:  clang -DHAVE_CONFIG_H -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/include -Iinclude -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src -DRUBY_EXTCONF_H=\"extconf.h\" -I/usr/local/opt/libyaml/include -I/usr/local/opt/openssl@1.1/include -I/usr/local/opt/readline/include -D_XOPEN_SOURCE -D_DARWIN_C_SOURCE -D_DARWIN_UNLIMITED_SELECT -D_REENTRANT -Wall -fexceptions -c /usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src/prep_cif.c  -fno-common -DPIC -o src/.libs/prep_cif.o
+/bin/sh ./libtool  --tag=CC   --mode=compile clang -DHAVE_CONFIG_H -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi  -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/include -Iinclude -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src -DRUBY_EXTCONF_H=\"extconf.h\"  -I/usr/local/opt/libyaml/include -I/usr/local/opt/openssl@1.1/include -I/usr/local/opt/readline/include -D_XOPEN_SOURCE -D_DARWIN_C_SOURCE -D_DARWIN_UNLIMITED_SELECT -D_REENTRANT    -Wall -fexceptions -c -o src/types.lo /usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src/types.c
+libtool: compile:  clang -DHAVE_CONFIG_H -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/include -Iinclude -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src -DRUBY_EXTCONF_H=\"extconf.h\" -I/usr/local/opt/libyaml/include -I/usr/local/opt/openssl@1.1/include -I/usr/local/opt/readline/include -D_XOPEN_SOURCE -D_DARWIN_C_SOURCE -D_DARWIN_UNLIMITED_SELECT -D_REENTRANT -Wall -fexceptions -c /usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src/types.c  -fno-common -DPIC -o src/.libs/types.o
+/bin/sh ./libtool  --tag=CC   --mode=compile clang -DHAVE_CONFIG_H -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi  -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/include -Iinclude -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src -DRUBY_EXTCONF_H=\"extconf.h\"  -I/usr/local/opt/libyaml/include -I/usr/local/opt/openssl@1.1/include -I/usr/local/opt/readline/include -D_XOPEN_SOURCE -D_DARWIN_C_SOURCE -D_DARWIN_UNLIMITED_SELECT -D_REENTRANT    -Wall -fexceptions -c -o src/raw_api.lo /usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src/raw_api.c
+libtool: compile:  clang -DHAVE_CONFIG_H -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/include -Iinclude -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src -DRUBY_EXTCONF_H=\"extconf.h\" -I/usr/local/opt/libyaml/include -I/usr/local/opt/openssl@1.1/include -I/usr/local/opt/readline/include -D_XOPEN_SOURCE -D_DARWIN_C_SOURCE -D_DARWIN_UNLIMITED_SELECT -D_REENTRANT -Wall -fexceptions -c /usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src/raw_api.c  -fno-common -DPIC -o src/.libs/raw_api.o
+/bin/sh ./libtool  --tag=CC   --mode=compile clang -DHAVE_CONFIG_H -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi  -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/include -Iinclude -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src -DRUBY_EXTCONF_H=\"extconf.h\"  -I/usr/local/opt/libyaml/include -I/usr/local/opt/openssl@1.1/include -I/usr/local/opt/readline/include -D_XOPEN_SOURCE -D_DARWIN_C_SOURCE -D_DARWIN_UNLIMITED_SELECT -D_REENTRANT    -Wall -fexceptions -c -o src/java_raw_api.lo /usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src/java_raw_api.c
+libtool: compile:  clang -DHAVE_CONFIG_H -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/include -Iinclude -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src -DRUBY_EXTCONF_H=\"extconf.h\" -I/usr/local/opt/libyaml/include -I/usr/local/opt/openssl@1.1/include -I/usr/local/opt/readline/include -D_XOPEN_SOURCE -D_DARWIN_C_SOURCE -D_DARWIN_UNLIMITED_SELECT -D_REENTRANT -Wall -fexceptions -c /usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src/java_raw_api.c  -fno-common -DPIC -o src/.libs/java_raw_api.o
+/bin/sh ./libtool  --tag=CC   --mode=compile clang -DHAVE_CONFIG_H -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi  -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/include -Iinclude -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src -DRUBY_EXTCONF_H=\"extconf.h\"  -I/usr/local/opt/libyaml/include -I/usr/local/opt/openssl@1.1/include -I/usr/local/opt/readline/include -D_XOPEN_SOURCE -D_DARWIN_C_SOURCE -D_DARWIN_UNLIMITED_SELECT -D_REENTRANT    -Wall -fexceptions -c -o src/closures.lo /usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src/closures.c
+libtool: compile:  clang -DHAVE_CONFIG_H -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/include -Iinclude -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src -DRUBY_EXTCONF_H=\"extconf.h\" -I/usr/local/opt/libyaml/include -I/usr/local/opt/openssl@1.1/include -I/usr/local/opt/readline/include -D_XOPEN_SOURCE -D_DARWIN_C_SOURCE -D_DARWIN_UNLIMITED_SELECT -D_REENTRANT -Wall -fexceptions -c /usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src/closures.c  -fno-common -DPIC -o src/.libs/closures.o
+/bin/sh ./libtool  --tag=CC   --mode=compile clang -DHAVE_CONFIG_H -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi  -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/include -Iinclude -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src -DRUBY_EXTCONF_H=\"extconf.h\"  -I/usr/local/opt/libyaml/include -I/usr/local/opt/openssl@1.1/include -I/usr/local/opt/readline/include -D_XOPEN_SOURCE -D_DARWIN_C_SOURCE -D_DARWIN_UNLIMITED_SELECT -D_REENTRANT    -Wall -fexceptions -c -o src/x86/ffi64.lo /usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src/x86/ffi64.c
+libtool: compile:  clang -DHAVE_CONFIG_H -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/include -Iinclude -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src -DRUBY_EXTCONF_H=\"extconf.h\" -I/usr/local/opt/libyaml/include -I/usr/local/opt/openssl@1.1/include -I/usr/local/opt/readline/include -D_XOPEN_SOURCE -D_DARWIN_C_SOURCE -D_DARWIN_UNLIMITED_SELECT -D_REENTRANT -Wall -fexceptions -c /usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src/x86/ffi64.c  -fno-common -DPIC -o src/x86/.libs/ffi64.o
+/bin/sh ./libtool    --mode=compile clang -DHAVE_CONFIG_H -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi  -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/include -Iinclude -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src -DRUBY_EXTCONF_H=\"extconf.h\"  -I/usr/local/opt/libyaml/include -I/usr/local/opt/openssl@1.1/include -I/usr/local/opt/readline/include -D_XOPEN_SOURCE -D_DARWIN_C_SOURCE -D_DARWIN_UNLIMITED_SELECT -D_REENTRANT   -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/include -Iinclude -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src  -c -o src/x86/unix64.lo /usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src/x86/unix64.S
+libtool: compile:  clang -DHAVE_CONFIG_H -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/include -Iinclude -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src -DRUBY_EXTCONF_H=\"extconf.h\" -I/usr/local/opt/libyaml/include -I/usr/local/opt/openssl@1.1/include -I/usr/local/opt/readline/include -D_XOPEN_SOURCE -D_DARWIN_C_SOURCE -D_DARWIN_UNLIMITED_SELECT -D_REENTRANT -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/include -Iinclude -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src -c /usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src/x86/unix64.S  -fno-common -DPIC -o src/x86/.libs/unix64.o
+/bin/sh ./libtool  --tag=CC   --mode=compile clang -DHAVE_CONFIG_H -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi  -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/include -Iinclude -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src -DRUBY_EXTCONF_H=\"extconf.h\"  -I/usr/local/opt/libyaml/include -I/usr/local/opt/openssl@1.1/include -I/usr/local/opt/readline/include -D_XOPEN_SOURCE -D_DARWIN_C_SOURCE -D_DARWIN_UNLIMITED_SELECT -D_REENTRANT    -Wall -fexceptions -c -o src/x86/ffiw64.lo /usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src/x86/ffiw64.c
+libtool: compile:  clang -DHAVE_CONFIG_H -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/include -Iinclude -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src -DRUBY_EXTCONF_H=\"extconf.h\" -I/usr/local/opt/libyaml/include -I/usr/local/opt/openssl@1.1/include -I/usr/local/opt/readline/include -D_XOPEN_SOURCE -D_DARWIN_C_SOURCE -D_DARWIN_UNLIMITED_SELECT -D_REENTRANT -Wall -fexceptions -c /usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src/x86/ffiw64.c  -fno-common -DPIC -o src/x86/.libs/ffiw64.o
+/bin/sh ./libtool    --mode=compile clang -DHAVE_CONFIG_H -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi  -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/include -Iinclude -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src -DRUBY_EXTCONF_H=\"extconf.h\"  -I/usr/local/opt/libyaml/include -I/usr/local/opt/openssl@1.1/include -I/usr/local/opt/readline/include -D_XOPEN_SOURCE -D_DARWIN_C_SOURCE -D_DARWIN_UNLIMITED_SELECT -D_REENTRANT   -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/include -Iinclude -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src  -c -o src/x86/win64.lo /usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src/x86/win64.S
+libtool: compile:  clang -DHAVE_CONFIG_H -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/include -Iinclude -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src -DRUBY_EXTCONF_H=\"extconf.h\" -I/usr/local/opt/libyaml/include -I/usr/local/opt/openssl@1.1/include -I/usr/local/opt/readline/include -D_XOPEN_SOURCE -D_DARWIN_C_SOURCE -D_DARWIN_UNLIMITED_SELECT -D_REENTRANT -I. -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/include -Iinclude -I/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src -c /usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi/src/x86/win64.S  -fno-common -DPIC -o src/x86/.libs/win64.o
+/bin/sh ./libtool  --tag=CC   --mode=link clang  -Wall -fexceptions  -L/usr/local/opt/libffi/lib -o libffi_convenience.la  src/prep_cif.lo src/types.lo src/raw_api.lo src/java_raw_api.lo src/closures.lo   src/x86/ffi64.lo src/x86/unix64.lo src/x86/ffiw64.lo src/x86/win64.lo 
+libtool: link: libtool -static cru .libs/libffi_convenience.a src/.libs/prep_cif.o src/.libs/types.o src/.libs/raw_api.o src/.libs/java_raw_api.o src/.libs/closures.o src/x86/.libs/ffi64.o src/x86/.libs/unix64.o src/x86/.libs/ffiw64.o src/x86/.libs/win64.o 
+error: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/libtool: no output file specified (specify with -o output)
+Usage: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/libtool -static [-] file [...] [-filelist listfile[,dirname]] [-arch_only arch] [-sacLT] [-no_warning_for_no_symbols]
+Usage: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/libtool -dynamic [-] file [...] [-filelist listfile[,dirname]] [-arch_only arch] [-o output] [-install_name name] [-compatibility_version #] [-current_version #] [-seg1addr 0x#] [-segs_read_only_addr 0x#] [-segs_read_write_addr 0x#] [-seg_addr_table <filename>] [-seg_addr_table_filename <file_system_path>] [-all_load] [-noall_load]
+make[3]: *** [Makefile:1048: libffi_convenience.la] Error 1
+make[3]: Leaving directory '/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi-x86_64-darwin18'
+make[2]: *** [Makefile:1309: all-recursive] Error 1
+make[2]: Leaving directory '/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi-x86_64-darwin18'
+make[1]: *** [Makefile:617: all] Error 2
+make[1]: Leaving directory '/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi-x86_64-darwin18'
+make: *** [libffi.darwin.mk:33: "/usr/local/lib/ruby/gems/2.6.0/gems/ffi-1.11.1/ext/ffi_c/libffi-x86_64-darwin18"/.libs/libffi_convenience.a] Error 2
+
+make failed, exit code 2
+
+
+I tried cloning the repo and installing with rake, but I get the same error. Any ideas what might be failing??
+
+Cheers.
+I have read the wiki on library loading.  
+
+My question is, if one were to develop an FFI-based ruby gem, how would one expose to end users the ability to select a different library version to be loaded?
+
+For example, [Typhoeus](https://github.com/typhoeus/typhoeus) uses `libcurl` and loads it from the system. How would one change this [load instruction](https://github.com/typhoeus/ethon/blob/de60a72552a1ae392705617a45477d93f0f51293/lib/ethon/curls/settings.rb#L7) to allow the end user to use non-system `libcurl`?
+
+Thanks for your time.

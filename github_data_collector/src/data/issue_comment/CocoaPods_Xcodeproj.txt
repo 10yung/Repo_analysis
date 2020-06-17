@@ -1,0 +1,156 @@
+Fixes https://github.com/CocoaPods/Xcodeproj/issues/678
+Support for build phases was added with https://github.com/CocoaPods/Xcodeproj/pull/705.
+
+It should be nice to have this for "Build Rules" as well.
+
+<img width="1138" alt="Screen Shot 2019-11-04 at 3 37 12 PM" src="https://user-images.githubusercontent.com/2126835/68156073-08e4fa00-ff19-11e9-8edb-e8224b8427fc.png">
+
+
+
+It suggests that I use the `--project` option, and then says that option is unknown
+
+```plain
+% xcodeproj config-dump
+[!] No Xcode project document found in the current working directory. Please specify which to use with the `--project` option.
+
+✘ % xcodeproj config-dump --project Foobar.xcodeproj 
+[!] Unknown option: `--project`
+Did you mean: --verbose?
+```
+# TESTS TO BE ADDED
+Sample project: [RNCAsyncStorage](https://github.com/react-native-community/async-storage/tree/7042363674fd22aa9b4cb12672d6ed6f06b3b13e/ios)
+Opening it with Xcodeproj and saving it without any changes results to an error:
+```
+RuntimeError: [Xcodeproj] Consistency issue: no parent for object `RNCAsyncStorage.h`: `HeadersBuildPhase`, `CopyFilesBuildPhase`
+	from gems/xcodeproj-1.9.0/lib/xcodeproj/project/object/helpers/groupable_helper.rb:18:in `parent'
+	from gems/xcodeproj-1.9.0/lib/xcodeproj/project/object/build_file.rb:63:in `ascii_plist_annotation'
+	from gems/xcodeproj-1.9.0/lib/xcodeproj/project.rb:296:in `block in to_ascii_plist'
+	from gems/xcodeproj-1.9.0/lib/xcodeproj/project.rb:295:in `each'
+	from gems/xcodeproj-1.9.0/lib/xcodeproj/project.rb:295:in `to_ascii_plist'
+	from gems/xcodeproj-1.9.0/lib/xcodeproj/project.rb:364:in `block in save'
+	from gems/atomos-0.1.3/lib/atomos.rb:21:in `block in atomic_write'
+	from lib/ruby/2.4.0/tempfile.rb:295:in `open'
+	from gems/atomos-0.1.3/lib/atomos.rb:17:in `atomic_write'
+	from gems/xcodeproj-1.9.0/lib/xcodeproj/project.rb:363:in `save'
+```
+
+Still, the project itself is a valid Xcode project that works fine.
+Looks like the problem is related to sources that aren't added to any PBXGroup. Maybe we can add some fallback to `ascii_plist_annotation` since this annotation is just a comment? Having no parent group doesn't seem to be illegal from Xcode's point of view.
+
+We run into a race condition/UUID conflict that seems to be related to changes made in https://github.com/CocoaPods/Xcodeproj/pull/627
+
+Our sizeable project uses Cocoapods, and when testing with 1.7.0.beta.2 we run into an issue where a specific number of files included in the Pods project resulted in an apparent UUID conflict, which results in a corrupted Pods.xcodeproj generated.
+
+The issue seems to reproduce only when:
+* Pods project getting constructed in the memory has a specific number of files (meaning adding or removing a file fixes the issue)
+* Before saving the Pods project, we add a new file ref in post-install hook:
+`common_ref = project.new_file("Some.common.xcconfig")`
+
+After the project has been saved, the newly added file reference gets assigned a already existing UUID (46EB2E00000000) and replaces `rootObject`. With this, the project gets corrupted as root object no longer points to an expected data type (`PBXFileReference` instead of `PBXProject`).
+
+```
+% xcodeproj show Pods/Pods.xcodeproj
+Traceback (most recent call last):
+    7: from /Users/jsuliga/.rvm/gems/ruby-2.6.1/bin/xcodeproj:23:in `<main>'
+    6: from /Users/jsuliga/.rvm/gems/ruby-2.6.1/bin/xcodeproj:23:in `load'
+    5: from /Users/jsuliga/.rvm/gems/ruby-2.6.1/gems/xcodeproj-1.8.2/bin/xcodeproj:10:in `<top (required)>'
+    4: from /Users/jsuliga/.rvm/gems/ruby-2.6.1/gems/claide-1.0.2/lib/claide/command.rb:334:in `run'
+    3: from /Users/jsuliga/.rvm/gems/ruby-2.6.1/gems/xcodeproj-1.8.2/lib/xcodeproj/command/show.rb:46:in `run'
+    2: from /Users/jsuliga/.rvm/gems/ruby-2.6.1/gems/xcodeproj-1.8.2/lib/xcodeproj/command.rb:60:in `xcodeproj'
+    1: from /Users/jsuliga/.rvm/gems/ruby-2.6.1/gems/xcodeproj-1.8.2/lib/xcodeproj/project.rb:112:in `open'
+/Users/jsuliga/.rvm/gems/ruby-2.6.1/gems/xcodeproj-1.8.2/lib/xcodeproj/project.rb:231:in `initialize_from_file': undefined method `product_ref_group' for #<Xcodeproj::Project::Object::PBXFileReference:0x00007fb77bee82e0> (NoMethodError)
+
+```
+I'm still trying to find a self-contained project that reproduces the issue, but it's been quite challenging. Saving the project before adding the new reference seems to work around the issue, but causes us to double-save the project which is wasteful.
+Hi!
+
+~I've discovered that getting schemes for modern projects fails if scheme name differs from project name due to wrong paths. E.g. I have a `.xcscheme` file located at `./Pods.xcodeproj/xcuserdata/USERNAME.xcuserdatad/xcschemes/Firebase.xcscheme`, where `USERNAME` is a username of my user. However, current `Xcodeproj` looks for `.xcscheme` files only at `project_path/xcshareddata/xcschemes/*.xcscheme`.~
+
+~To fix that I've added `**` there. This change should support both old and new paths.~
+
+I've discovered that getting schemes for a project doesn't consider non-shared schemes.
+
+To fix that I've added `**` there. This change should support both shared and non-shared schemes.
+Hi,
+
+So I worked on a script to automatically generate a subproject and add it to an existing project and set up target dependency, link binary, and embedded frameworks. However, I noticed after running the script, the Xcode crashes when adding a new file to the project. When I tried to reproduce it in a simpler situation, I noticed that it's now crashing by adding any new phase under "Build phase". Following is the code sample for reproducing it and I have attached a zip file that has the script and sample code in it. For ease of use, I added the lines to clear and re-copy sample project.
+
+By spending some time, I found the root cause of it is [this](https://github.com/CocoaPods/Xcodeproj/blob/master/lib/xcodeproj/project/object/helpers/file_references_factory.rb#L181) line that's using the same product group as the main project instead of creating a new one, which seems to be what Xcode does. I tried the new theory with `add_subproject_reference` method and that fixes the issue with Xcode crash.
+
+I was wondering if there's any specific reason the subproject is getting added to main project's product list instead of creating a new one? Or it might be something I'm doing wrong in code below for adding a subproject.
+
+Thanks!
+
+```
+require("Xcodeproj")
+require("pathname")
+
+# def add_subproject_reference(main_project, subproject)
+#   # We call into the private function `FileReferencesFactory.new_file_reference` instead of `FileReferencesFactory.new_reference`
+#   # because it delegates into `FileReferencesFactory.new_subproject` which has the extra behavior of opening the Project which
+#   # is an expensive operation for large projects.
+#   #
+#   ref = Xcodeproj::Project::FileReferencesFactory.send(:new_file_reference, main_project.main_group, subproject.path, :built_products)
+
+#   basename = Pathname(subproject.path).basename
+#   subproject_name = File.basename(basename, ".*")
+#   ref.name = basename.to_s
+#   ref.include_in_index = nil
+
+#   product_group_ref = main_project.new(Xcodeproj::Project::PBXGroup)
+#   product_group_ref.name = "Products"
+
+#   subproject.products_group.files.each do |product_reference|
+#     container_proxy = main_project.new(Xcodeproj::Project::PBXContainerItemProxy)
+#     container_proxy.container_portal = ref.uuid
+#     container_proxy.proxy_type = Xcodeproj::Constants::PROXY_TYPES[:reference]
+#     container_proxy.remote_global_id_string = product_reference.uuid
+#     container_proxy.remote_info = subproject_name.to_s
+
+#     reference_proxy = main_project.new(Xcodeproj::Project::PBXReferenceProxy)
+#     extension = File.extname(product_reference.path)[1..-1]
+#     reference_proxy.file_type = Xcodeproj::Constants::FILE_TYPES_BY_EXTENSION[extension]
+#     reference_proxy.path = product_reference.path
+#     reference_proxy.remote_ref = container_proxy
+#     reference_proxy.source_tree = "BUILT_PRODUCTS_DIR"
+
+#     product_group_ref << reference_proxy
+#   end
+#
+#   attribute = Xcodeproj::Project::PBXProject.references_by_keys_attributes.find { |attrb| attrb.name == :project_references }
+#   project_reference = Xcodeproj::Project::ObjectDictionary.new(attribute, product_group_ref)
+#   project_reference[:project_ref] = ref
+#   project_reference[:product_group] = product_group_ref
+#   main_project.root_object.project_references << project_reference
+
+#   ref
+# end
+
+require("fileutils")
+FileUtils.rm_rf("./Subproj")
+FileUtils.cp_r("./Mainproj copy/.", ".")
+subproj_target_name = "Subproj"
+worksace_path = "./Mainproj.xcworkspace"
+workspace = Xcodeproj::Workspace.new_from_xcworkspace(worksace_path)
+
+mainproj = Xcodeproj::Project.open("./Mainproj/Mainproj.xcodeproj")
+
+subproj = Xcodeproj::Project.new("./#{subproj_target_name}/#{subproj_target_name}.xcodeproj")
+subproj.new_target(:framework, subproj_target_name, :ios, "11.0", nil, :swift)
+subproj.main_group.new_group(subproj_target_name)
+
+workspace_ref_subproj = Xcodeproj::Workspace::FileReference.new("./Subproj/Subproj.xcodeproj")
+workspace << workspace_ref_subproj
+workspace.save_as(worksace_path)
+subproj.save
+# mainproj_ref_subproj = add_subproject_reference(mainproj, subproj) 
+mainproj_ref_subproj = Xcodeproj::Project::FileReferencesFactory.new_reference(mainproj.main_group, subproj.path, :built_products)
+mainproj.targets[0].add_dependency(subproj.targets[0])
+mainproj.targets[0].frameworks_build_phase.add_file_reference(
+  mainproj_ref_subproj.file_reference_proxies.first,
+  true
+)
+mainproj.save
+```
+[Archive.zip](https://github.com/CocoaPods/Xcodeproj/files/3125414/Archive.zip)
+I'm not fully familiar with Ruby (apart from a Podfile/Podspec), so advices are welcome.

@@ -1,0 +1,460 @@
+## Filing a Linkerd issue ##
+
+Issue Type:
+- Bug report
+
+**What happened**:
+Request had been retrying for 5 hours whilst request budget (totalTimeoutMs) was set on amount 5s 
+**What you expected to happen**:
+Request is failed when budget is exceeded
+**How to reproduce it (as minimally and precisely as possible)**:
+Sorry. I can't provide steps to reproduce. But I provide config causing the issue and config eliminating it.
+**Environment**:
+- linkerd version 1.6.3
+- Linux node123 4.15.0-47-generic #50-Ubuntu SMP Wed Mar 13 10:44:52 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux:
+
+**_Config causing issue_**
+```
+admin:
+  ip: 0.0.0.0
+  port: 9990
+
+usage:
+  enabled: false
+
+telemetry:
+- kind: io.l5d.prometheus
+  prefix: cms_
+
+namers:
+- kind: io.l5d.consul
+  host: 127.0.0.1
+  port: 8500
+  includeTag: true
+  useHealthCheck: true
+  token: {{ linkerd_token }}
+  setHost: true
+  consistencyMode: stale
+  preferServiceAddress: true
+
+routers:
+  - protocol: http
+    label: /cms-to-api
+    identifier:
+      kind: io.l5d.static
+      path: /japi
+    dtab: |
+          /svc/japi => /#/io.l5d.consul/qa/japi/java-api;
+
+    service:
+      totalTimeoutMs: 5000
+      responseClassifier:
+        kind: io.l5d.http.retryableRead5XX
+      retries:
+        budget:
+          minRetriesPerSec: 1
+          percentCanRetry: 0.01
+          ttlSecs: 10
+        backoff:
+          kind: jittered
+          minMs: 1000
+          maxMs: 10000
+
+    servers:
+    - port: 8180
+      ip: 127.0.0.1
+      addForwardedHeader:
+         by: {kind: "ip:port"}
+         for: {kind: ip}
+    client:
+      failureAccrual:
+        kind: io.l5d.successRate
+        successRate: 0.9
+        requests: 1000
+        backoff:
+          kind: jittered
+          minMs: 5000
+          maxMs: 30000
+      loadBalancer:
+        kind: ewma
+    httpAccessLog: access.log
+    httpAccessLogRollPolicy: daily
+    httpAccessLogAppend: true
+    httpAccessLogRotateCount: 7
+    tracePropagator:
+      kind: io.l5d.zipkin
+```
+**_Config fixing issue_** (only 2 parameters differ)
+```
+... // on service level
+        backoff:
+          kind: jittered
+          minMs: 1000
+          maxMs: 10000
+... // on client level
+      requeueBudget:
+        percentCanRetry: 0.01
+```
+
+When maxMs (set on 10000) was reached request was retrying again and again for 5 hours each 10 seconds causing an exception in linkerd (trace is below). On the same time application 10.20.93.22:6002 successfully responded to linkerd, but linkerd continued retrying request.
+It was happening up to 20 times per day whilst application send 100k rpm to linkerd meaning that it's not critical but unpleasant thing to experience.
+```
+D 1217 06:25:59.595 UTC THREAD38 TraceId:0a3ac39af46a109b: Failed mid-stream. Terminating stream, closing connection
+com.twitter.finagle.ChannelClosedException: ChannelException at remote address: /10.20.93.22:6002. Remote Info: Not Available
+	at com.twitter.finagle.netty4.transport.ChannelTransport$$anon$2.channelInactive(ChannelTransport.scala:175)
+	at io.netty.channel.AbstractChannelHandlerContext.invokeChannelInactive(AbstractChannelHandlerContext.java:245)
+	at io.netty.channel.AbstractChannelHandlerContext.invokeChannelInactive(AbstractChannelHandlerContext.java:231)
+	at io.netty.channel.AbstractChannelHandlerContext.fireChannelInactive(AbstractChannelHandlerContext.java:224)
+	at io.netty.channel.ChannelInboundHandlerAdapter.channelInactive(ChannelInboundHandlerAdapter.java:75)
+	at io.netty.channel.AbstractChannelHandlerContext.invokeChannelInactive(AbstractChannelHandlerContext.java:245)
+	at io.netty.channel.AbstractChannelHandlerContext.invokeChannelInactive(AbstractChannelHandlerContext.java:231)
+	at io.netty.channel.AbstractChannelHandlerContext.fireChannelInactive(AbstractChannelHandlerContext.java:224)
+	at io.netty.channel.ChannelInboundHandlerAdapter.channelInactive(ChannelInboundHandlerAdapter.java:75)
+```
+
+Is it an expected behavior if jittered backoff maxMs has higher value than request budget?
+I believe it shouldn't be a such case. Please correct me if I wrong.
+
+Many thanks 
+
+Linkerd follows the [CNCF Code of Conduct](https://github.com/cncf/foundation/blob/master/code-of-conduct.md).
+
+Signed-off-by: Nguyen Hai Truong <truongnh@fujitsu.com>
+Issue Type:
+
+- [ ] Bug report
+- [x] Feature request
+
+**What happened**:
+Current gRPC runtime implementation by Buoyant doesn't validate `content-type` header in incoming requests.
+
+A generic http2/gRPC client making a request to any gRPC endpoints exposed by linkerd/namerd will fail to interpret the response and the error will not tell, what's wrong.
+
+To avoid such issues gRPC over HTTP2 spec suggests setting (on client) and validating (on server) following headers
+* Service-Name → ?( {proto package name} "." ) {service name}
+* Message-Type → {fully qualified proto message name}
+* Content-Type → "application/grpc+proto"
+
+Content-Type validation is the most desirable one (and it's also the easiest to implement).
+
+**What you expected to happen**:
+
+Server should return corresponding status codes if values of the headers do not match expected values.
+
+**How to reproduce it (as minimally and precisely as possible)**:
+Assuming a gRPC endpoint (for example mesh interface) is exposed on port 4101:
+
+```
+[~]$ curl -v --http2-prior-knowledge localhost:4101                                                                                                                         
+
+*   Trying ::1:4101...
+* TCP_NODELAY set
+* Connected to localhost (::1) port 4101 (#0)
+* Using HTTP2, server supports multi-use
+* Connection state changed (HTTP/2 confirmed)
+* Copying HTTP/2 data in stream buffer to connection buffer after upgrade: len=0
+* Using Stream ID: 1 (easy handle 0x5650af9c2f30)
+> GET / HTTP/2
+> Host: localhost:4101
+> User-Agent: curl/7.65.3
+> Accept: */*
+> 
+* Connection state changed (MAX_CONCURRENT_STREAMS == 1000)!
+* REFUSED_STREAM, retrying a fresh connect
+* Connection died, retrying a fresh connect
+* Closing connection 0
+* Issue another request to this URL: 'http://localhost:4101/localhost:4101'
+* Hostname localhost was found in DNS cache
+*   Trying ::1:4101...
+* TCP_NODELAY set
+* Connected to localhost (::1) port 4101 (#1)
+* Using HTTP2, server supports multi-use
+* Connection state changed (HTTP/2 confirmed)
+* Copying HTTP/2 data in stream buffer to connection buffer after upgrade: len=0
+* Using Stream ID: 1 (easy handle 0x5650af9c2f30)
+> GET /localhost:4101 HTTP/2
+> Host: localhost:4101
+> User-Agent: curl/7.65.3
+> Accept: */*
+> 
+* Connection state changed (MAX_CONCURRENT_STREAMS == 1000)!
+< HTTP/2 400 
+< te: trailers
+< via: h2 linkerd
+< 
+
+* Connection #1 to host localhost left intact
+```
+
+**Environment**:
+- linkerd/namerd version: 1.7.0
+
+This is related to https://github.com/linkerd/linkerd/pull/2324
+# Thanks for your help improving the project! #
+
+## Getting Help ##
+
+Github issues are for bug reports and feature requests. For questions about
+Linkerd, how to use it, or debugging assistance, start by
+[asking a question in the forums](https://discourse.linkerd.io/) or join us on
+[Slack](https://slack.linkerd.io/).
+
+Full details at [CONTRIBUTING.md](https://github.com/linkerd/linkerd/blob/master/CONTRIBUTING.md).
+
+## Filing a Linkerd issue ##
+
+Issue Type:
+
+- [x] Bug report
+- [ ] Feature request
+
+**What happened**:
+After some time linkerd stops routing traffic to external DNS names with 
+
+"E 0812 09:45:11.218 UTC THREAD11 TraceId:b86af61cbd38ae05: service failure: com.twitter.finagle.naming.buoyant.DynBoundTimeoutException: Exceeded 30.seconds binding timeout while resolving name: /svc/google.com"
+
+and
+
+"I 0812 09:45:34.190 UTC THREAD11: Reaping /svc/google.com"
+
+Routing to internal services works fine.
+
+Additional symptom:
+
+Delegator webpage starts to load without DTAB form and with message
+
+"The request to namerd has timed out. Please ensure your config is correct and try again."
+
+
+
+Restart of linkerd restores functioning of routing to external services and Delegator webpage
+
+**What you expected to happen**:
+linkerd shouldn't require restart to route traffic to external services
+
+
+**How to reproduce it (as minimally and precisely as possible)**:
+
+**Anything else we need to know?**:
+linkerd and affected services are deployed in k8s cluster
+router configuration:
+
+```
+    - protocol: http
+      label: http-outgoing
+      maxRequestKB: 20480
+      maxResponseKB: 20480
+      httpAccessLog: /var/log/linkerd/l5d-http-outgoing-access.log
+      client:
+        failureAccrual:
+          kind: none
+      interpreter:
+        kind: io.l5d.k8s.configMap
+        experimental: true
+        name: l5d-dtabs-config
+        filename: http-outgoing
+        namespace: servicemesh
+      servers:
+      - port: 4140
+        ip: 0.0.0.0
+      bindingTimeoutMs: 30000
+      bindingCache:
+        paths: 100
+        trees: 100
+        bounds: 100
+        clients: 10
+        idleTtlSecs: 5
+```
+
+DTAB used:
+
+```
+  http-outgoing: |-
+        /ph        => /$/io.buoyant.rinet ;                     # /ph/80/google.com -> /$/io.buoyant.rinet/80/google.com
+        /svc       => /ph/80 ;                                  # /svc/google.com -> /ph/80/google.com
+        /svc       => /$/io.buoyant.porthostPfx/ph ;            # /svc/google.com:80 -> /ph/80/google.com
+        /k8s       => /#/io.l5d.k8s ;                           # /k8s/default/http/foo -> /#/io.l5d.k8s.http/default/http/foo
+        /portNsSvc => /#/portNsSvcToK8s ;                       # /portNsSvc/http/default/foo -> /k8s/default/http/foo
+        /host      => /portNsSvc/http/default ;                 # /host/foo -> /portNsSvc/http/default/foo
+        /host      => /portNsSvc/http ;                         # /host/default/foo -> /portNsSvc/http/default/foo
+        /svc       => /$/io.buoyant.http.domainToPathPfx/host ; # /svc/foo.default -> /host/default/foo	
+```
+
+**Environment**:
+- linkerd/namerd version, config files: linkerd 1.6.4; namerd is not used
+- Platform, version, and config files (Kubernetes, DC/OS, etc): Kops created k8s cluster in AWS (1.11.9, 1.12.7)
+- Cloud provider or hardware configuration: AWS
+
+Linkerd's H2 protocol uses the SingletonPool for connection pooling.  This means that all requests for an address multiplex on the same connection.  This works great until maxStreamsPerConnection is reached, at which point, additional requests will fail until an existing stream completes.
+
+While this backpressure behavior is desirable, it can also be limiting, especially when talking to a server with a low value for maxStreamConnection.
+
+We should create a connection pooling module that allows additional connections to be established and pooled when the number of concurrent requests exceeds the maximum number of streams a single connection can support.
+
+Related to #2251
+# Thanks for your help improving the project! #
+
+## Filing a Linkerd issue ##
+
+Issue Type:
+
+- [X] Bug report
+- [ ] Feature request
+
+**What happened**:
+We had an incident where 70 (out of 140) linkerds were affected - they didn’t get watch update for the affected service from namerd. We inspected following things during the incident:
+
+1.  All of linkerds were on http2 mesh and the underlying connection was healthy as well - to make sure this bug is different from when underlying http2 connection goes stale because of the missing [http2 ping feat](https://github.com/linkerd/linkerd/issues/2219)
+2. We also verified that all namerds were up to date
+3. We validated that linkerds were routing traffic to the service, but to wrong destination.
+4. We did a rolling restarts of namerd hoping linkerds will connect back again and will get up to date w/ namerds. But linkerds didn’t recover. 
+
+Few other things we observed during the incident
+1. 7-8 linkerds that were running v1.3.5 + thriftmux interpreter didn't have this problem, but that could just be a coincidence too. 
+2. After we restart namerds, some linkerd watches for other services did get up to date - lastUpdated in mesh interpreter state (from inspect endpoint) had the same time when the namerd restart occurred. 
+
+All of the above leads us to the hypothesis that there is a bug in http2 mesh interpreter client. 
+
+**What you expected to happen**:
+Linkerds should route traffic to expected destinations
+
+**How to reproduce it (as minimally and precisely as possible)**:
+Unfortunately, we don't know the exact steps yet
+
+**Anything else we need to know?**:
+Please ask for the gist (because i'm too lazy to redact it) that contains namerds bind snapshots (to validate all namerds were up to date), and linkerd mesh interpreter snapshots before and after namerd restarts (to validate some watches did up date)
+
+**Environment**:
+- linkerd/namerd version, config files: linkerd and namerd v1.5.2, interpreter http2 mesh
+- Platform, version, and config files (Kubernetes, DC/OS, etc): k8s 1.10.5
+- Cloud provider or hardware configuration: GCP
+# Thanks for your help improving the project! #
+
+## Getting Help ##
+
+Github issues are for bug reports and feature requests. For questions about
+Linkerd, how to use it, or debugging assistance, start by
+[asking a question in the forums](https://discourse.linkerd.io/) or join us on
+[Slack](https://slack.linkerd.io/).
+
+Full details at [CONTRIBUTING.md](https://github.com/linkerd/linkerd/blob/master/CONTRIBUTING.md).
+
+## Filing a Linkerd issue ##
+
+Issue Type:
+
+- [ ] Bug report
+- [X] Feature request
+
+**What happened**:
+We are seeing numerous cases where 1) namerd state diverge from k8s apiserver - dtabs and endpoint 2) linkerd state diverge from namerd e.g. linkerd thinks only 4 pods are available, but namerd sees 10. We suspect events are getting dropped in namerd and linkerd. To figure out where things are going wrong, linkerd and namerd should trace all inbound and outbound watch (or relevant) events.
+
+**What you expected to happen**:
+Namerd and linkerd should log all inbound and outbound events. E.g.
+1. Namerd: received X event from apiserver
+2. Namerd: making X API call to apiserver
+3. Namerd: sending event X to linkerd Y along with success/failure
+4. Namerd: received an open stream from Linkerd X
+4. Linkerd: making X api call to namerd
+6. Linkerd: received X api call to namerd
+
+If we can also log on namerd that linkerd with "hostname" is connected to namerd, that would be really helpful too. IPs are NATed. So we lose the observability what linkerd is connected to what namerd.
+ 
+**How to reproduce it (as minimally and precisely as possible)**:
+N/A
+
+**Anything else we need to know?**:
+Let me know if you know more information
+
+**Environment**:
+- linkerd/namerd version, config files: linkerd 1.5.2, namerd 1.5.2, http2 mesh, thriftmux
+- Platform, version, and config files (Kubernetes, DC/OS, etc): 1.10.5
+- Cloud provider or hardware configuration: not relevant
+
+Issue Type:
+
+- [ ] Bug report
+- [X] Feature request
+
+This is motivated by the same use case describedin #2201. I'll copy/paste that use case here:
+
+## Use case
+We are trying to use Linkerd's dtab feature to build very large, dynamic routing tables. The goal to use Linkerd (instead of, e.g. Consul) to control which versions of which applications get routed to when a a request for a particular service is received.
+
+This requires us to dynamically build most of our dtab, and requires that the dtab have an explicit dentry for every service in our eco system. E.g.:
+
+...
+/svc/cool-thing => /tagged/ver-1.3/cool-thing;
+/svc/lame-thing => 0.1 * /tagged/ver-2.0/lame-thing & 0.9 * /tagged/ver-1.8/lame-thing;
+...
+
+This means that our dtab will get very large! The example I'm working with at the moment is 1811 lines long, and 143kb.
+
+## Problem
+We're using Consul as the KV store. Consul enforces a 512kb limit on the base64-encoded values. While my example dtab at 143kb is close to what our current "worst case" would be, we're concerned that this will not scale with time.
+
+## Proposed solution
+We'd like to have the ability to read/write gzipped (or otherwise compressed) dtabs from Consul (or any other datastore). The dynamic dtabs compress extremely well -- my current example is only 16k. The compression gains are only slightly lost with base64 encoding that Consul demands -- my final encoded, gzipped dtab was 21k.
+Issue Type:
+
+- [ ] Bug report
+- [X] Feature request
+
+# Problem
+We are trying to use Linkerd's dtab feature to build very large, dynamic routing tables. The goal to use Linkerd (instead of, e.g. Consul) to control which versions of which applications get routed to when a a request for a particular service is received.
+
+This requires us to dynamically build most of our dtab, and requires that the dtab have an explicit dentry for every service in our eco system. E.g.:
+
+```
+...
+/svc/cool-thing => /tagged/ver-1.3/cool-thing;
+/svc/lame-thing => 0.1 * /tagged/ver-2.0/lame-thing & 0.9 * /tagged/ver-1.8/lame-thing;
+...
+```
+
+This means that our dtab will get *very* large! The example I'm working with at the moment is 1811 lines long, and 143kb.
+
+When linkerd errors in some way (say when a requested service is not found), it currently 502s and sends back an error message that contains, among other things, the entire dtab in both the body and a response header.
+
+Fortunately, Linkerd appears to truncate the response header field instead of blowing up. But I think it would be useful to be able to suppress this verbose response by default, exposing it only if the client provided a debug header.
+
+# Possible solution
+
+Provide a configuration option to suppress verbose error responses by default.
+Add support for a debug header that results in the verbose error response.
+
+
+
+# Thanks for your help improving the project! #
+
+## Getting Help ##
+
+Github issues are for bug reports and feature requests. For questions about
+Linkerd, how to use it, or debugging assistance, start by
+[asking a question in the forums](https://discourse.linkerd.io/) or join us on
+[Slack](https://slack.linkerd.io/).
+
+Full details at [CONTRIBUTING.md](https://github.com/linkerd/linkerd/blob/master/CONTRIBUTING.md).
+
+## Filing a Linkerd issue ##
+
+Issue Type:
+
+- [x ] Bug report
+- [ ] Feature request
+
+**What happened**:
+GRPC calls made from the browser are preceeded with a preflight request. These requests are made via http/1.1 which causes the h2 protocol to fail. 
+
+**What you expected to happen**:
+Preflight check to be accepted by the h2 protocol and the request being normally routed. 
+
+**How to reproduce it (as minimally and precisely as possible)**:
+Make calls from a web browser using https://github.com/improbable-eng/grpc-web
+
+**Anything else we need to know?**:
+
+**Environment**:
+- linkerd/namerd version, config files: v1.5.0
+- Platform, version, and config files (Kubernetes, DC/OS, etc): windows server 2012
+- Cloud provider or hardware configuration:

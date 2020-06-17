@@ -1,0 +1,76 @@
+Someone posted an issue in the repo for pg_partman about not being able to read data from the parent table when used in combination with pg_shard. Haven't been able to reproduce this at this time, but wondered if anyone here might be able to help them or if there are any known issues when using table inheritance with sharding
+
+https://github.com/keithf4/pg_partman/issues/70
+
+Now that we've [addressed this in CitusDB](https://www.citusdata.com/blog/20-sumedh/250-announcing-citusdb-41), we want to get it into `pg_shard` as well. We know how to do prepared statements for queries, but `pg_shard` must support modifications as well. Adding this support will remove a _ton_ of friction from database adapters (such as Psycopg in Python, `pg` in Ruby, or the JDBC adapters in Java).
+
+I'm sure some bugs could shake out of #137, but for now all the tests are passing and `pg_shard` appears usable under PostgreSQL 9.5alpha2. With this in mind, can we figure out how to get the new "UPSERT"-style feature of 9.5 working in `pg_shard`? Many uses of this feature will be idempotent (and commutable? Can we detect?) which is huge from a distributed systems standpoint.
+
+Making a query against a table that has been marked as "distributed" (either by `CREATE TABLE ... DISTRIBUTE BY ...` or using `master_create_distributed_table`) which does not yet have any shards (created using either `\stage` or `master_create_worker_shards`) results in different behavior depending upon whether the active planner is CitusDB's or `pg_shard`'s:
+- Under CitusDB, the query returns zero rows
+- `pg_shard` raises an error directing the user to call `master_create_worker_shards`
+
+The latter is obviously helpful under `pg_shard` (especially for users who have missed this step), but is confusing under CitusDB. Now that integration is tighter, we need to figure out what the best approach is.
+
+`pg_shard` keeps a cache of shard interval metadata within each session which is _never_ refreshed. Within `pg_shard` this is fine, since all shards are created up front: caching forever isn't wrong. But now that Citus integration is more full-fledged, we're noticing that things like appending new shards or rebalancing existing ones results in `pg_shard` operating using stale metadata.
+
+We need to come up with some sort of contract to let other pieces of software tell `pg_shard` about changes in the shard intervals of a distributed table. We may be able to reuse some existing pieces of invalidation logic within PostgreSQL, but that requires some reading to determine.
+
+Any query using the `RETURNING` clause produces the following error:
+
+```
+NotSupportedError: cannot perform distributed planning for the given query
+DETAIL:  RETURNING clauses are not supported in distributed queries.
+```
+
+Can you add support for `RETURNING` clauses?
+
+Could `master_create_worker_shards()` be extended in order to optionally create `UNLOGGED` shard placements?
+
+It seems to work when I change them manually but this is tedious. :smile: But it makes a big difference in write speed. Since there are replicas, the risk of `UNLOGGED` seems to be lower than in a single node database.
+
+I'm experimenting with using HyperLogLog (HLL) data types in some columns. One problem with these is that they take up quite a lot more space than a BIGINT. pg_shard potentially allays a lot of those issues. The extension that provides the HLL datatype is [this one](https://github.com/aggregateknowledge/postgresql-hll) by aggregateknowledge. These two extensions seem complimentary for warehousing purposes.
+
+Surprisingly, these data types work with sharded tables for most types of reads, but not for writes (see below). When I attempt an update like so:
+
+``` sql
+update test_hll_shard set users = users||hll_hash_text('foobar') where date = date('2015-01-08');
+```
+
+I get: 
+
+```
+ERROR:  cannot plan sharded modification containing values which are not constants or constant expressions
+```
+
+ I can sort of work around this by setting the literal bytes in this field. Which works fine -- but adding HLL values requires a read and a write. Since pg_shard (understandably) doesn't allow for more than a single statement transaction, this leaves my use-case vulnerable to race conditions in multi-writer environments.
+
+Since this function is available on the workers, and is deterministic based on the value of the existing row and the new HLL value to be added, there shouldn't be any issue with dispatching this expression through to the workers. 
+
+Is there a _hard limitation_ preventing pg_shard from dispatching modifications for non-constant expressions?
+
+The bug happens when pg_shard fails to INSERT to shard placement and postgres is shut down or psql connection is closed before shard placement status is updated.
+
+This is not easy to reproduce bug. But, if a _sleep()_ function call is added to this [line](https://github.com/citusdata/pg_shard/blob/develop/pg_shard.c#L1786), reproducing becomes easy. 
+
+Assuming that _sleep()_ is added, the bug can be reproduced with following steps:
+1. Create a cluster with 1 master, 2 workers
+2. Distribute table and create worker shards with replication factor 2
+3. Stop one of the worker nodes
+4. Connect to psql, and get its pid, _select pg_backend_pid();_
+5. Issue an `INSERT` on that psql session. During the `INSERT` (since we added a sleep, it takes at least _the sleep seconds_), execute shell command "_kill -9 pid_of_psql_"
+6. Restart both master and the stopped worker node.
+7. Connect to worker nodes and observe that one of the shards is divergent
+8. But shard placements on metadata has all `STATE_FINALIZED` status
+
+The main problem here is that we do not execute remote commands and state status changes in an atomic way.
+
+A possible Solution that we can try is to check whether _HOLD_INTERRUPTS()_/_RESUME_INTERRUPTS()_ works. Also, check if these function call pair has any drawbacks.
+
+I've got a [rubygem call Apartment](https://github.com/influitive/apartment) that does database multi-tenancy for ActiveRecord using postgresql `schemas`. Effectively, our whole table structure is mirrored on a per-schema basis for each customer that we add to the system.
+
+It'd be nice if we could shard based on the postgresql schema, such that the app itself wouldn't need to know about physical shards under the hood and queries containing a particular schema in the search path would automatically be routed to the correct physical machine.
+
+The basic setup is that public schema stores `excluded models` which are _non_ tenanted models. Then, for each tenant, we create a new schema and create all the tables etc in that schema. I guess this would involve triggers on things like `CREATE SCHEMA x` to actually create it on the correct shard, and then of course on queries themselves to route to that schema.
+
+As discussed at PgConf, I'm not well versed on the internals of pg_shard itself but I'm quite happy to get the discussion going around the Apartment design and using schemas from a sharding concern.

@@ -1,0 +1,119 @@
+Starting issue 196. I'm new to all this! xD
+As ASP.NET Core and OWIN work directly with `Task`, it seems worthwhile to try to leverage the `TaskBuilder.fs`, at least for the sake of some benchmarks to determine whether this provides a possible simplification to the codebase. A first pass is likely to make things harder, but I would hope to move in the direction of [Giraffe](https://github.com/giraffe-fsharp/Giraffe) with respect to supporting `Task`-only were we to find that it performed better than async and equivalent to Hopac. This would also help with #200, should we choose to go that route.
+**Steps to reproduce:**
+
+1. Install `Freya.Template` using `dotnet new -i Freya.Template` 
+2. Generate a new Freya project using Kestrel and Hopac, e.g. `mkdir test && cd test && dotnet new freya -n Test -o src/Test -f kestrel -c hopac`
+3. Run `dotnet build src/Test && dotnet src/Test/bin/Debug/netcoreapp2.1/Test.dll` to verify the project builds and runs by navigating to http://localhost:5000/hello in a browser
+4. Download `paket.bootstrapper.exe` and rename to `paket.exe` in the `.paket` folder
+5. Run `mono ./.paket/paket.exe convert-from-nuget`
+6. Run `dotnet build src/Test && dotnet src/Test/bin/Debug/netcoreapp2.1/Test.dll` to verify the project builds and runs but fails to return results by navigating to http://localhost:5000/hello in a browser 
+
+**Actual:**
+Web app appears to run but returns no response.
+
+**Expected:**
+Following the same steps above without specifying the `-c` option uses `async`, and that converts to using paket successfully.
+
+**Known workarounds:**
+Don't use paket.
+Essentially doing this: https://blog.mavnn.co.uk/logging-freya/
+and finding that adding the composition affects every request - it takes a significant CPU hit (response time going from ~20ms to ~300ms). Tests indicate that it's something in the composition itself, as injecting the value into the freya state takes no time at all.
+
+Sample code:
+```fsharp
+let owin : OwinMidFunc = 
+        OwinMidFunc.ofFreya (Polyfill.kestrel
+                                    >?= withLogger "log"
+                                    >?= apiPipeline)
+app.UseOwin(fun p -> p.Invoke owin)
+```
+
+Wondering if I'm doing it wrong, or maybe there's a way to optimize that away.
+[Json-home](https://tools.ietf.org/html/draft-nottingham-json-home-03) is a format for exposing available resources under an entry point domain. This could be a useful utility to expose for type generators or REST clients. It would need resource metadata from any machines. I don’t know whether this would be useful outside use of router/machines.
+Should we drop OWIN in favor of the ASP.NET types so that we could potentially improve performance and pick up more interop possibilities? I don’t have any specific things in mind and would love to know what others think.
+When you browse code on GitHub to have a look how it works knowing custom operators is crucial to understand anything.
+Could you describe them in ReadMe so that code can be understand.
+How Swagger generation and versioning can be implemented in Freya as well as with [Swashbuckle](https://github.com/domaindrivendev/Swashbuckle.AspNetCore) and [ASP.NET API Versioning](https://github.com/Microsoft/aspnet-api-versioning) which use MVC ApiExplorer in ASP.NET Core?
+As I previously mentioned in #182 I've had some issues getting to grips being inside / outside Freya computations. Particularly with regards to passing around partially applied functions that requires arguments from inside a Freya computation, (and thus themselves get wrapped in a Freya computation after..)
+
+I ended up creating the some custom operators (again). 
+
+(Btw, I really wish F# would support named operators, rather than just symbolic ones, would help readability a lot..)
+
+I do have a lot of holes in my functional vocabulary, so I have no idea what to actually call these but here they are:
+
+``` f#
+let (<!^>) f v = 
+    freya {
+        let! f = f 
+        return f v
+    } 
+
+let (<^!>) f v = 
+    freya {
+        let! v = v
+        return! f v
+    }
+```
+
+The first operator will take a function wrapped in a Freya computation, "dereference" it(?) and apply the given argument, returning the result wrapped in a Freya computation.
+
+Example:
+
+``` f#
+open Freya.Core.Operators
+
+let myFunction with' some args = 
+    (...)
+
+let myValueInAFreya = 
+    freya {
+        return "some stuff"
+    }
+
+let myValueNotInAFreya = 
+    "some stuff"
+let myPartiallyAppliedOne = myFunction <!> myValueInAFreya
+// Above is now Freya<'a->'b->'c>
+// I want to add another arg partially applied
+
+let myPartiallyAppliedTwo = myPartiallyAppliedOne <!^> myValueNotInAFreya
+// Above is now Freya<'a->'b>
+```
+
+It is possible I have misunderstood something, but adding the new operator helped me quite a bit..
+
+The scenario for the other operator is a bit more weird. I ended up creating it because using the standard `<!>` map(?) operator ended up giving med nested Freyas (`Freya<Freya<'t>>`) which I was not what I was looking for.
+
+Example:
+
+``` f#
+let myFunctionNotInAFreya some arg = 
+    (...)
+
+let myFunctionReturningAFreyaWrappedFun () = 
+    freya {
+        return (fun x -> x.ToString())
+    }
+
+//this gives me nested Freyas:
+
+let normalMap = myFunctionNotInAFreya <!> (myFunctionReturningAFreyaWrappedFun ())
+// above gives `Freya<Freya<'a->'b>>`
+
+// using my operator:
+let asExpected = myFunctionNotInAFreya <^!> (myFunctionReturningAFreyaWrappedFun ())
+//above gives `Freya<'a->'b>`as expected.
+```
+
+This may or may not be something to include as part of the core operators..
+
+I find myself combining different `Freya<bool>` computation quite frequently and I have made the following custom operators for myself:
+
+``` f#
+let (<&>) = Freya.map2 (&&)
+let (<||>) = Freya.map2 (||)
+```
+
+Might be useful to include as part of the standard operators?

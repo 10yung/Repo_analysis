@@ -1,0 +1,121 @@
+```
+OS: macOS Catalina 10.15.2
+Docker: Docker version 19.03.5, build 633a0ea
+Buildctl: github.com/moby/buildkit 0.6.3
+Buildkitd: v0.6.3
+```
+
+Hi,
+
+I'm creating a PoC for a new buildkit frontend for Maven (which download the code and execute the tests).
+
+It seems that the `--export-cache` option in the `buildctl` command is crashing the `buildkitd` container.
+
+After command enters into the export cache phase, it returns the following message
+
+```
+#18 exporting cache
+#18 preparing build cache for export
+error: failed to receive status: rpc error: code = Unavailable desc = transport is closing
+```
+Killing the `buildkitd` container.
+
+Command to reproduce:
+```
+buildctl --addr=docker-container://buildkitd build \
+--frontend=gateway.v0 \
+--opt source=codescope/mavenfile-test \
+--opt context=https://github.com/drodriguezhdez/hello-world.git \
+--export-cache type=local,dest=cache \
+--output type=local,dest=output
+```
+
+Using `export-cache type=registry` or `inline`, it is obtaining the same error.
+
+Is it needed something specific in the frontend code to support this option `--export-cache`? 
+
+Thank you so much.
+see https://github.com/moby/buildkit/pull/1316
+
+A quick fix was done but it would be good to have a secondary fix so leakage wouldn't appear in component level as well.
+
+Only happens with containerd worker
+backport of https://github.com/moby/buildkit/pull/1323 for the v0.6.x release
+
+full diff: https://github.com/containerd/continuity/compare/75bee3e2ccb6402e3a986ab8bd3b17003fc0fdec...26c1120b8d4107d2471b93ad78ef7ce1fc84c4c4
+
+- containerd/continuity#109 Add OpenBSD support for fs subpackage
+- containerd/continuity#144 Support Go Modules
+- containerd/continuity#147 xattr lost when copying directory
+- containerd/continuity#148 fs: don't convert syscall.Timespec to unix.Timespec directly (doesn't work with gccgo)
+
+Signed-off-by: Sebastiaan van Stijn <github@gone.nl>
+(cherry picked from commit e0ac63481a290d0f023e9b7ea15f312e4e14cc72)
+Signed-off-by: Sebastiaan van Stijn <github@gone.nl>
+Currently, there is no way to test that old daemons continue to work with new releases of the gateway frontend (eg. external dockerfile frontends). We have had issues at least 2 times and manual testing is not enough.
+
+I suggest making a new test script that can take 2 commits. Build integration-tests stage for the first and external dockerfile frontend(+experimental) for the other. Merge them together https://github.com/moby/buildkit/blob/master/hack/test#L110-L112 and run the dockerfile integration tests. This allows running the old tests with old daemons. I don't think there is a way to run new tests as it is hard to detect new features that will not work by design.
+
+Then there can be additional script that takes some hardcoded positions in the git tree (eg. stable release tags vs master) and runs the first script. As old commits might not remain stable for a long time there might be a need to add patches or mark tests that are ignored. We could run this script with cron in CI and make sure it is clean before making releases.
+
+@hinshun 
+Opened as requested by @thaJeztah in https://github.com/moby/moby/issues/39003#issuecomment-574615437_
+
+When attempting to `docker build` with `--cache-from` the cache for COPY (and presumably ADD) commands is ignored if the two systems do not both use SELinux.
+
+For example, if you were to build an image on Ubuntu (No SELinux) and use the image as a cache in CentOS (SELinux enabled by default), the cache is ignored for COPY commands. The same is true vice-versa.
+
+**To reproduce**
+
+I have done the following on Ubuntu 18.04 with Docker 19.03.5
+```
+FROM debian:stretch-slim
+RUN ls -l
+COPY ./this-is-a-file ./
+RUN ls -l
+```
+And then
+```
+echo "this is a file" > this-is-a-file
+DOCKER_BUILDKIT=1 docker build --build-arg BUILDKIT_INLINE_CACHE=1 --tag invalid-cache:ubuntu -f Dockerfile .
+```
+
+Push this image to a docker repository somewhere.
+
+Then on a CentOS machine (Or anything with SELinux), create the same Dockerfile and run:
+
+```
+echo "this is a file" > this-is-a-file
+docker pull debian:stretch-slim
+docker pull invalid-cache:ubuntu
+DOCKER_BUILDKIT=1 docker build --build-arg BUILDKIT_INLINE_CACHE=1 --cache-from invalid-cache:ubuntu--tag invalid-cache:centos -f Dockerfile .
+```
+
+You'll see that the cache isn't used for the COPY command. I have assumed this is due to the SELinux permissions, if you build the same image on the same machine with SELinux where `this-is-a-file` has different security context you'll notice the same issue.
+CNI mode should be available even for rootless mode, when rootlesskit was launched with `--net=(slirp4netns|vpnkit|lxc-user-nic)`.
+
+containerd worker hadn't been implemented for rootless mode simply because nobody seemed using containerd worker.
+
+https://github.com/ibuildthecloud/k3c uses containerd worker and plans to support rootless mode.
+
+Supporting rootless is easy, but containerd and buildkitd need to be executed inside same RootlessKit instance
+I am experiencing deadlocks related to preparing cache mounts.
+
+Here is a stack trace from one of my build agents:
+https://gist.github.com/cpuguy83/0e79cd121c780df71eb1cbbcbcc8f1e1
+
+This has wedged most of my build agents (when they try to lookup a particular cache mount) and seems to happen rather easily.
+
+I have setup my builds to generate stack dumps any time we end up cancelling (e.g. due to timeout) the build so I can get more of these pretty easily.
+write the metadata in resp.ExporterResponse to a json file which is defined in export metadata-file;
+
+buildctl build --frontend dockerfile.v0 --opt filename=Dockerfile -local context=. --local dockerfile=. --output type=image,name=test:1,metadata-file=index.json
+
+Related: #1158
+
+Signed-off-by: genglu <genglu.gl@antfin.com>
+A bunch of small changes that fix blocking issue for supporting Buildkit on Windows against containerd.
+
+This doesn't result in working Windows support, but the remaining areas of support are harder-to-solve, relating (so far) to either container spec generation, various aspects of network namespace handling, or various LLB commands that refuse to work if they cannot do user id mapping.
+
+This is to advance #616, but does not complete it.

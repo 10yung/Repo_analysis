@@ -1,0 +1,73 @@
+To test all code paths of apps that use cpu_features to select between different implementations of an algorithm, it would be useful to be able to mock having a CPU with fewer features than actually supported.
+
+While this can be done in wrapper layer which uses cpu_features to query the real feature set, little prevents direct use of cpu_features functions that would break the purpose of the wrapper. Hence I think it would be useful if this was a core feature of cpu_features itself.
+
+One complication is that for tests to be able to run concurrently this would have to be thread-local (assuming the tests are single-threaded). For multi-threaded tests a global mutex could be used to prevent concurrent execution from the point where cpu_features is provided with override options, to the point where they're removed.
+
+Multiple users of cpu_features have to deal with this themselves currently, so having it as a core feature instead avoids duplicate effort and incompatible solutions which might have subtle bugs that are best fixed centrally.
+There was already a debate in https://github.com/google/cpu_features/issues/4 if cpus that do not set the XCR0 properly related to the xmm os support should be supported or not.
+I stumpled across a CherryTail Atom that explicitly has this issue: XCR0 bit for xmm not set, but providing SSE* register set.
+
+Now, on the one hand the debate above depicted "won't fix" as there won't be that many cpus with this issue. This is odd, because on the front page of https://github.com/google/cpu_features it is clearly depicted that a dev needs to take care about poor hardware implementations (example with SNB and AVX) in his/her own code. But in this case cpu_features tries to take control in case the bit in XCR0 for xmm os support is (not) set. I'd suggest to make the XCR0 xmm os support bit explicit to the dev so he/she can decide as well?
+Hence, this patch removes so far the burden of not properly indicating SSE* on cpus that didn't set the XCR0 register properly, but still support SSE*.
+Just an idea, adding cpu_features would be a great addition to to https://github.com/microsoft/vcpkg
+
+> Thread safe, no memory allocation, and raises no exceptions. cpu_features is suitable for implementing fundamental libc functions like malloc, memcpy, and memcmp.
+
+The README claims the above. But while grepping through the code, `memcpy` and `memcmp` are at least used already in the code from the libc library. Hence when implementing such based on `cpu_features` one would create a loop of dependencies. I assume that `cpu_features` requires a re-work to not utilize libc functions internally.
+i.e. https://gcc.gnu.org/onlinedocs/gcc-6.1.0/gcc/PowerPC-Built-in-Functions.html#PowerPC-Built-in-Functions
+
+this should be a tiny bit faster than getauxval() when it is supported.
+Thanks for the `cpu_features` library.
+
+It looks like the library is missing a define for ARMv7. ARMv7 is important for some hand tuned algorithms. For example, one might bundle [Andy Polyakov's Cryptogams](https://www.openssl.org/~appro/cryptogams/) [AES](https://wiki.openssl.org/index.php/Cryptogams_AES) and [SHA](https://wiki.openssl.org/index.php/Cryptogams_SHA) algorithms, and make the baseline ARMv7 with `-march=armv7-a`. 
+
+There are several reasons to make ARMv7 the baseline. ARMv7 is mostly the *de facto* standard nowadays, so using ARMv7 addresses the common case out of the box. ARMv7 ISA also enjoys a performance boost over older ISAs, and provides additional loads and stores not available in ARMv6 and below. However, ARMv5 and ARMv6 will show up on occasion, like old dev-boards and iPads, so a fallback is needed on occasion.
+
+At runtime, user code may do something like the following:
+
+```
+if (HasARMv7())
+{
+    CRYPTOGAMS_aes_encrypt(data, blocks, subkeys);
+}
+else
+{
+    CXX_aes_encrypt(data, blocks, subkeys);
+}
+```
+
+We can't really use `ARM_NEON` as a proxy for ARMv7 because some ARMv6 devices have NEON. And some ARMv7 dev-boards lack NEON.
+
+-----
+
+It looks like Mozilla synthesises it from `/proc/cpuinfo` on Linux; see [Changeset 522951ff7046](https://hg.mozilla.org/releases/mozilla-aurora/rev/522951ff7046fd2bdf3916c973fbfde27be0af31). Crypto++ library utilizes a [`SIGILL` probe using `movw` and `movt`](https://github.com/weidai11/cryptopp/blob/master/neon_simd.cpp#L88) because `getauxval` does not provide a define (`movw` and `movt` are part of ARMv7 ISA):
+
+```
+int a;
+asm volatile("movw %0,%1 \n"
+             "movt %0,%1 \n"
+             : "=r"(a) : "i"(0x1234));
+
+hasARMv7 = (a == 0x12341234);
+```
+
+Unfortunately, `SIGILL` probes have several of shortcomings. First, they are expensive when compared to `getauxval` and friends. Second, they only work with the GNU Assembler (GAS) or compatible assemblers. Third, they trash a program on Apple platforms. Apple does not restore the context properly when a `longjmp` is taken, so they can't be used on iPhones and iPads.
+
+So setting features true (= 1) does not comply with standards. (They can either be -1 or 0)
+However getting them is not a problem since -1 is true. (-1 is true but true might not always be -1)
+
+Some proposed changes are in this pull request: #42 
+There are demo snippets in the README showing how to use the library at the source level, and there is a building with cmake part about building it, but it would be nice to have a section that explains how to actually to add the library to your build: e.g., do you need to link against any binary? or just include the header?
+
+You cover how a project using cmake should consume this, but a large number of projects aren't using cmake, so even though they'll build cpu_features itself with cmake, they should be able to then integrate the output into their own build system. 
+
+I guess one or two lines about that scenario would suffice.
+ART on Android works around quirks/bugs in /proc/cpuinfo and aux vector, has support for cross compilation, detection of features via C preprocessor, CPUID instructions, undefined instruction exceptions, supports MIPS, ARM, Intel 32 and 64, etc.:
+https://android.googlesource.com/platform/art/+/master/runtime/arch/instruction_set_features.h#36
+Android NDK has something simple:
+https://developer.android.com/ndk/guides/cpu-features.html
+V8 CPU feature detection:
+https://github.com/v8/v8/blob/master/src/base/cpu.h#L32
+
+As there are OS/CPU bugs that cause issues standardizing on 1 library makes sense. As an author of the ART code I'm have a bias :-)

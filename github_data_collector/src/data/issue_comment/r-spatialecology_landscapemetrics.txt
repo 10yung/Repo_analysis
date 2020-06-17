@@ -1,0 +1,135 @@
+Running revdeps from sp (sp (my github fork) with development rgdal from R-Forge):
+
+```
+> library(testthat)
+> library(landscapemetrics)
+> library(raster)
+Loading required package: sp
+> 
+> test_check("landscapemetrics")
+── 1. Failure: spatialize_lsm returns CRS (@test-spatialize-lsm.R#40)  ─────────
+raster::crs(result[[1]][[1]]) not equal to raster::crs(podlasie_ccilc).
+Attributes: < Names: 1 string mismatch >
+Attributes: < Length mismatch: comparison on first 2 components >
+Attributes: < Component 2: 1 string mismatch >
+```
+See:
+
+http://rgdal.r-forge.r-project.org/articles/PROJ6_GDAL3.html
+r-spatial/sf#1231
+r-spatial/sf#1187
+r-spatial/sf#1146
+r-spatial/discuss#28
+
+for background. See:
+
+r-spatial/discuss#28 (comment)
+
+for a way of testing fixes in a docker container contributed by Jakub Nowosad.
+Not sure how complicated this will be (if even possible), but maybe we can somehow store results for e.g. the patch area and other values we need for several metrics during the calculation of `calculate_lsm()` so we don't need to calculate them n times.
+This way we could use matrices as inputs. What do you think @mhesselbarth ?
+
+Example: https://github.com/r-spatialecology/landscapemetrics/commit/8630067278f6f8d4a43ba6483ad15ad218fc733e
+
+It's nice that all functions are type stable and basically always return a list. However, maybe it makes sense to add a `simplify` argument in cases only one RasterLayer is provided and return not a list in this case.
+Hi all,
+I am now working on a different package that in its c++ functions uses some c++ code from landscapemetrics (e.g. rcpp_get_coocurrence_matrix). Right now, for the development purposes, I just copied the .cpp files to the new package, but probably the better way is to expose the landscapemetrics cpp headers in inst/include.
+
+What do you think about that?
+Of course, there are two possibilities here:
+1. Just expose the landscapemetrics cpp headers in inst/include, or:
+2. Create a new package (landscapeengine) with cpp code and exposed headers.
+Does a FAQ vignette makes sense?
+
+Collect common themes from previous issues here and highlight hidden functionality (like `to_disk`)
+@marcosci and I just discussed it might be nice to only return a `tibble` if the package is installed and if not to return a `data.frame`. This would allow to get rid of the tibble dependency.
+Related to #86: 
+
+Maybe an idea is to split this package into `landscapemetrics` and e.g. `landscapemetrics.engine`. 
+
+We could move all "core" functions (i.e. calculating metrics) to the core package and importing it in `landscapemetrics`. This would give exactly the same functionality as now for `landscapemetrics` and users would experience no difference (including all plotting/sampling etc. functions). Thereby, we still have this really nice tool for everything related to landscape metrics. 
+
+However, if somebody just wants to calculate some metrics straightforward as possible with less dependencies (e.g. on a HPC), it would be sufficient to only load `landscapemetrics.engine`
+
+As example, `spatstat` does something similar and the package actually loads e.g. `spatstat.utils` and `spatstat.data`
+hey yall,
+
+just had a quick look on how to parallelize the rcpp stuff and discussed it with Sebastian.
+
+I think the only thing we would have to change is a single line in the Rcpp code of most of the functions and maybe provide another argument to the function (the number of cores to be used, could be defaulted to 1).
+
+Have a look at `rcpp_get_coocurrence_matrix` and tell me what you think (the only change is the `#pragma ...` line):
+
+```r
+#include "rcpp_get_coocurrence_matrix.h"
+#include "rcpp_create_neighborhood.h"
+#include "rcpp_get_unique_values.h"
+#include "get_class_index_map.h"
+#include <omp.h>
+
+// [[Rcpp::export]]
+IntegerMatrix rcpp_get_coocurrence_matrix(const IntegerMatrix x,
+                                          const arma::imat directions
+                                          const int num_cores) {
+ 
+    const int na = NA_INTEGER;
+    const unsigned ncols = x.ncol();
+    const unsigned nrows = x.nrow();
+
+    std::vector<int> classes = rcpp_get_unique_values(x);
+    std::map<int, unsigned> class_index = get_class_index_map(classes);
+
+    unsigned n_classes = class_index.size();
+    std::vector<std::vector<unsigned> > cooc_mat(n_classes,
+                                                 std::vector<unsigned>(n_classes));
+
+    // create neighbors coordinates
+    IntegerMatrix tmp = rcpp_create_neighborhood(directions);
+    int neigh_len = tmp.nrow();
+    std::vector<std::vector<int> > neig_coords;
+    for (int row = 0; row < neigh_len; row++) {
+        IntegerVector a = tmp.row(row);
+        std::vector<int> b(a.begin(), a.end());
+        neig_coords.push_back(b);
+    }
+
+    // NAs need an index, otherwise they are counted as neighbors of class[0]
+    class_index.insert(std::make_pair(na, n_classes));
+
+    #pragma omp parallel for num_threads(num_cores)
+    for (unsigned col = 0; col < ncols; col++) {
+        for (unsigned row = 0; row < nrows; row++) {
+            const int tmp = x[col * nrows + row];
+            if (tmp == na)
+                continue;
+            unsigned focal_class = class_index[tmp];
+            for (int h = 0; h < neigh_len; h++) {
+                int neig_col = neig_coords[h][0] + col;
+                int neig_row = neig_coords[h][1] + row;
+                if (neig_col >= 0 &&
+                        neig_row >= 0 &&
+                        neig_col < ncols &&
+                        neig_row < nrows) {
+                    const int tmp = x[neig_col * nrows + neig_row];
+                    if (tmp == na)
+                        continue;
+                    unsigned neig_class = class_index[tmp];
+                    cooc_mat[focal_class][neig_class]++;
+                }
+            }
+        }
+    }
+
+    IntegerMatrix result(n_classes, n_classes);
+    for (unsigned col = 0; col < cooc_mat.size(); col++) {
+        for (unsigned row = 0; row < cooc_mat[col].size(); row++) {
+            result(col, row) = cooc_mat[col][row];
+        }
+    }
+
+    // add names
+    List u_names = List::create(classes, classes);
+    result.attr("dimnames") = u_names;
+    return result;
+}
+```

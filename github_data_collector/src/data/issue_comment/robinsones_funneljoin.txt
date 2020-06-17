@@ -1,0 +1,223 @@
+Hi Emily, thanks for creating the package!
+
+What if the funnel join only matched events within groups? The reason I ask is because in my domain, I'm more interested in funnels with deadlines, rather than funnels with gaps: https://timmastny.rbind.io/blog/funnel-charts-funneljoin-gaps-deadlines/
+
+Let me give you an example. Let's say I only want to count the `firstafter` event if it occurs in the same calendar week.
+
+``` r
+library(dplyr)
+#> 
+#> Attaching package: 'dplyr'
+#> The following objects are masked from 'package:stats':
+#> 
+#>     filter, lag
+#> The following objects are masked from 'package:base':
+#> 
+#>     intersect, setdiff, setequal, union
+library(tidyr)
+library(purrr)
+library(lubridate)
+#> 
+#> Attaching package: 'lubridate'
+#> The following object is masked from 'package:base':
+#> 
+#>     date
+library(funneljoin)
+#> 
+#> Attaching package: 'funneljoin'
+#> The following object is masked from 'package:stats':
+#> 
+#>     filter
+
+logs <- tribble(
+  ~date, ~event,
+  "2020-01-06", "upload",
+  "2020-01-08", "print",
+  "2020-01-13", "upload",
+  "2020-01-20", "print",
+  "2020-01-21", "upload"
+) %>%
+  mutate(date = as.Date(date)) %>%
+  mutate(user = 1)
+```
+Following the business constraint about the same week deadline, the `"2020-01-13" "upload"` should not convert to a `"print"` because there is no `firstafter` within the same calendar week. 
+
+
+I hoped this might work:
+
+```r
+logs %>%
+  mutate(deadline = floor_date(date, "week")) %>%
+  group_by(deadline) %>%
+  funnel_start(
+    moment_type = "upload",
+    moment = "event",
+    tstamp = "date",
+    user = "user"
+  ) %>%
+  funnel_step(
+    moment_type = "print",
+    type = "any-firstafter"
+  )
+#> Adding missing grouping variables: `deadline_upload`
+#> # A tibble: 12 x 6
+#> # Groups:   deadline_upload.x [3]
+#>    date_upload  user deadline_upload… deadline_upload… date_print
+#>    <date>      <dbl> <date>           <date>           <date>    
+#>  1 2020-01-06      1 2020-01-05       2020-01-05       2020-01-08
+#>  2 2020-01-06      1 2020-01-05       2020-01-05       2020-01-20
+#>  3 2020-01-06      1 2020-01-05       2020-01-12       2020-01-08
+#>  4 2020-01-06      1 2020-01-05       2020-01-12       2020-01-20
+#>  5 2020-01-13      1 2020-01-12       2020-01-05       2020-01-08
+#>  6 2020-01-13      1 2020-01-12       2020-01-05       2020-01-20
+#>  7 2020-01-13      1 2020-01-12       2020-01-12       2020-01-08
+#>  8 2020-01-13      1 2020-01-12       2020-01-12       2020-01-20
+#>  9 2020-01-21      1 2020-01-19       2020-01-05       2020-01-08
+#> 10 2020-01-21      1 2020-01-19       2020-01-05       2020-01-20
+#> 11 2020-01-21      1 2020-01-19       2020-01-12       2020-01-08
+#> 12 2020-01-21      1 2020-01-19       2020-01-12       2020-01-20
+#> # … with 1 more variable: deadline_print <date>
+```
+
+My thought was that since I did `group_by(deadline)`, it would only join on the `firstafter` events within the same deadline value. Unfortunately that's not the case because `date_upload == "2020-01-06"` is being joined to `date_print == "2020-01-20"`. 
+
+In fact, I'm not sure what's it is doing 😬. Maybe it's useful in some other way.
+
+Here's my work-around:
+
+```r
+logs %>%
+  mutate(deadline = floor_date(date, "week")) %>%
+  nest(events = -deadline) %>%
+  mutate(conversions = map(
+    events, 
+    ~funnel_start(
+      .,
+      moment_type = "upload",
+      moment = "event",
+      tstamp = "date",
+      user = "user"
+    ) %>%
+      funnel_step(
+        moment_type = "print",
+        type = "any-firstafter"
+      ) %>%
+        summarize_conversions(date_print)
+  )) %>%
+  unnest(conversions) %>%
+  select(-events)
+#> # A tibble: 3 x 4
+#>   deadline   nb_users nb_conversions pct_converted
+#>   <date>        <int>          <int>         <dbl>
+#> 1 2020-01-05        1              1             1
+#> 2 2020-01-12        1              0             0
+#> 3 2020-01-19        1              0             0
+```
+
+<sup>Created on 2019-11-09 by the [reprex package](https://reprex.tidyverse.org) (v0.2.1)</sup>
+
+It's not bad, but a little messy.
+
+What are your thoughts with `funnel_start` and `funnel_step[s]` only matching events within the group? Is it even possible? Does it match how you think it should work?
+
+
+Current example has outdated arguments
+For example, you have a course_id and want to link notification to course page view to course start. 
+@robinsones First off, great package! It makes creating and analyzing funnels clean and easy. Based on my navigation of the package's API, I had some suggestions:
+
+You might want to make `landed` and `registered` datasets in the package so users can get started with the examples without having to define them. This can be extended to define out-of-memory versions of the data by taking advantage of `dbplyr::src_dbi`.
+
+The notion of a join `type` is great and factors in the multiple scenarios that one might run into. However, I had trouble visualizing the execution and how each `type` results in a different output compared to the pure version of the `join` function. So I put together a helper function that allows one to visualize the differences. Based on this, here is my understanding of the working of `after_join`:
+
+1.  Join the tables using the regular version of `{mode}_join`
+2. Filter out all records where `event_x` occurs before `event_y`
+3. For each `user_id` only retain versions of events specified by `type`
+    - `any-any` will retain all records in Step (2)
+    -  `first-first`, `first-firstafter`, and `lastbefore-firstafter` will retain only _ONE_ record per user.
+
+Is my understanding correct? It might be useful to add something like this to the documentation so it is really clear to users how these `after_joins` work.
+
+<details>
+
+<summary>after_join_all</summary>
+
+```r
+after_join_all <- function(x, y, by, mode = 'inner', ...){
+  types <- c(
+    'first-first', 'first-firstafter', 'lastbefore-firstafter',
+    'any-firstafter', 'any-any'
+  )
+  by_type <- function(type){
+    after_join(x, y, ..., mode = mode, type = type) %>% 
+      mutate(!!type := 'Y') 
+  }
+  join_fun <- match.fun(paste0(mode, '_join'))
+  all_types <- types %>% 
+    purrr::map(by_type)
+  join_fun(x, y, by = by) %>% 
+    Reduce(left_join, all_types, init = .)
+}
+```
+
+</details>
+
+| user_id|timestamp.x |timestamp.y |first-first        |first-firstafter   |lastbefore-firstafter |any-firstafter     |any-any            |
+|-------:|:-----------|:-----------|:------------------|:------------------|:---------------------|:------------------|:------------------|
+|       1|2018-07-01  |2018-07-02  |:white_check_mark: |:white_check_mark: |:white_check_mark:    |:white_check_mark: |:white_check_mark: |
+|       3|2018-07-02  |2018-07-02  |:white_check_mark: |:white_check_mark: |:white_check_mark:    |:white_check_mark: |:white_check_mark: |
+|       4|2018-07-01  |2018-06-10  |NA                 |NA                 |NA                    |NA                 |NA                 |
+|       4|2018-07-01  |2018-07-02  |NA                 |:white_check_mark: |:white_check_mark:    |:white_check_mark: |:white_check_mark: |
+|       4|2018-07-04  |2018-06-10  |NA                 |NA                 |NA                    |NA                 |NA                 |
+|       4|2018-07-04  |2018-07-02  |NA                 |NA                 |NA                    |NA                 |NA                 |
+|       5|2018-07-10  |2018-07-11  |:white_check_mark: |:white_check_mark: |:white_check_mark:    |:white_check_mark: |:white_check_mark: |
+|       5|2018-07-12  |2018-07-11  |NA                 |NA                 |NA                    |NA                 |NA                 |
+|       6|2018-07-07  |2018-07-10  |:white_check_mark: |:white_check_mark: |NA                    |:white_check_mark: |:white_check_mark: |
+|       6|2018-07-07  |2018-07-11  |NA                 |NA                 |NA                    |NA                 |:white_check_mark: |
+|       6|2018-07-08  |2018-07-10  |NA                 |NA                 |:white_check_mark:    |:white_check_mark: |:white_check_mark: |
+|       6|2018-07-08  |2018-07-11  |NA                 |NA                 |NA                    |NA                 |:white_check_mark: |
+
+
+
+
+Sorry to open an issue for this but I just wanted to highlight a project with similar goals in [traildb](http://traildb.io/) & [trck](https://github.com/traildb/trck) from AdRoll. Both are written in C but have mature python bindings so it would be possible to write an R interface with reticulate. Traildb is neat because it allows for complex queries against timestamped events in a highly compressed data format (and being written in C it's pretty fast). 
+We'll need to take out datacampr tests before submitting to CRAN
+
+The remote table join returns 0 rows, while when collected it returns more than 0.
+
+```
+library(tidyverse)
+library(datacampr)
+library(funneljoin)
+
+regs <- tbl_views_snowplow_experiment_starts() %>%
+  after_inner_join(tbl_views_snowplow_registration_events(),
+                   by_user = "domain_userid", 
+                   by_time = c("root_tstamp" = "registered_at"),
+                   type = "withingap", 
+                   dt = as.difftime(30, units = "days")) %>%
+  filter(root_tstamp > "2018-07-15")
+
+
+regs %>%
+  collect() %>%
+  mutate(user_id = as.integer(user_id)) %>%
+  after_join(tbl_main_user_exercises()  %>% 
+               filter(completed_at > "2018-08-01") %>%
+               mutate(user_id = as.integer(user_id)) %>%
+               collect(), 
+             by_user = "user_id",
+             by_time = c("root_tstamp" = "completed_at"),
+             type = "any-firstafter",
+             mode = "inner") %>% 
+  count()  
+
+regs %>%
+  after_join(tbl_main_user_exercises()  %>% 
+               filter(completed_at > "2018-08-01"), 
+             by_user = "user_id",
+             by_time = c("root_tstamp" = "completed_at"),
+             type = "any-firstafter",
+             mode = "inner") %>% 
+  count()  
+```
+Another pattern I do is "filter for users who saw the homepage and then completed at least three exercises." Does it make sense to build support for making a minimum number of event 2s happening? We could default to just one. 

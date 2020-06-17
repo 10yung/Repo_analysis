@@ -1,0 +1,75 @@
+**Description**
+
+When using `androidx.preference.PreferenceFragmentCompat` ViewPump doesn't intercept inflating underlying elements. Even `PreferenceFragmentCompat` uses a different inflation process than `android.app.Fragment` by loading the elements from the XML resource, it still uses regular widgets at the base. 
+
+**How to reproduce**
+
+- Add a preference activity with fragment to the sample app guided by [this example](https://developer.android.com/reference/androidx/preference/PreferenceFragmentCompat)
+- Don't forget to wrap the base context
+- Observe the interceptors are not called and the `TextView` is not replaced with `CustomTextView`
+My app gets sometimes an ANR from that line
+`ViewPump.init(ViewPump.builder()`
+
+looking like this:
+
+> "main" prio=5 tid=1 Runnable
+>   | group="main" sCount=0 dsCount=0 flags=0 obj=0x72b266f0 self=0x7c85cc3a00
+>   | sysTid=25641 nice=0 cgrp=default sched=0/0 handle=0x7c8a49c9b0
+>   | state=R schedstat=( 1753354711 262386751 2208 ) utm=30 stm=145 core=0 HZ=100
+>   | stack=0x7ff109e000-0x7ff10a0000 stackSize=8MB
+>   | held mutexes= "mutator lock"(shared held)
+
+
+Not sure it's actually the framworks fault but maybe anyone knows what this means
+When calling getLayoutInflater from two threads early in the application lifecycle, it's possible to hit a KotlinNullPointerException when evaluating this `lazy(NONE)`: https://github.com/InflationX/ViewPump/blob/master/viewpump/src/main/java/io/github/inflationx/viewpump/ViewPumpContextWrapper.kt#L24
+
+While it is probably not advisable to get a LayoutInflater off of the main thread (and we've already fixed our callsite that was triggering this), it does appear to be a regression. We should be able to replace `lazy(NONE)` with `lazy(PUBLICATION)` to correct this crash and avoid any impact to runtime performance. 
+I try this 
+`public InflateResult intercept(@NotNull Chain chain) {
+        InflateRequest request = chain.request();
+        InflateResult result = chain.proceed(request);
+        if (applicationTheme != null) {
+            View view = result.view();
+            if (view != null) {
+                AttributeSet attrs = request.attrs();
+            if (view instanceof TextView || view instanceof Toolbar && !(view instanceof BottomAppBar))
+                setFont(view, applicationTheme.getFontName());
+        }
+        return result;
+    }
+
+   private void setFont(View view, String fontName) {
+
+        if (fontName != null) {
+            String formattedName = fontName.replaceAll("^\"|\"$", "").trim();
+            typeface = getTypeface(formattedName, context);
+        }
+        if (typeface == null)
+            typeface = ResourcesCompat.getFont(context, R.font.montserrat_medium);
+
+
+        if (view instanceof TextView) {
+            view.setTypeface(typeface);
+        }
+    }`
+
+This code don't change font for EditText (if inputtype="password") and for TabLayout. How i can intercept it?
+
+
+If the same context is passed in, then just return the same LayoutInflater
+From what I gathered from the doc and source code, currently we call only call `ViewPump.init` once, and have only one configuration
+
+If we want to add some new interceptors later, we have to call `init` again after getting currently installed interceptors, and add them in the new config
+
+It also means that having an activity specific configuration while maintaining an app wide configuration is possible but complicated
+
+In my case, I have an app-wide configuration, and for one activity, I have to override a specific widget with my own version
+
+- One solution could be to add a `ViewPump` parameter to the `ViewPumpContextWrapper#wrap` method, and then inject the `ViewPump` instance into `ViewPumpLayoutInflater`, and by default make it use `ViewPump.get()`
+- This change would also mean that the resolution would be eager, and thus after creating the wrapped context, changes to `ViewPump` wouldn't affect it anymore. An easy solution would be to inject null in the `ViewPumpLayoutInflater`, and when creating a view, if the instance is null, fallback to `ViewPump.get()` as before. This would prevent any behavior changes
+This will provide better safety for PRs when the sample app is not run manually
+In order to make it easier to debug inflation exceptions in large apps, we should consider adding an API  that provides the layout resource id that was trying to be inflated and possibly any other information that the app would like to tag the inflation request with.
+- Log all views that are inflated and their inflation times
+- Potentially highlight views in the UI that take too long
+Example:
+Printing the name of the view to be inflated results in duplicate lines getting printed since multiple `InflationRequest`s could be issued from successive attempts using different methods for inflating a view

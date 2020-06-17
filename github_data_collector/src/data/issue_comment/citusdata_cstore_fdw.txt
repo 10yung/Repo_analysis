@@ -1,0 +1,138 @@
+Hello
+Is there any way to install cstore_fdw on Windows 10 ? including (protobuf-c) ?
+Thanks
+cstore_fdw crash when I'm tryng using cstore_fwd foreing table as a partition to normal table
+
+Steps to reproduce -
+postgres=# create table pp(a int, b int) partition by range(a);
+CREATE TABLE
+postgres=# create foreign table c1 partition of pp for values from (1) to (20) server cstore_server;
+CREATE FOREIGN TABLE
+postgres=# insert into pp values (1,1);
+server closed the connection unexpectedly
+        This probably means the server terminated abnormally
+        before or while processing the request.
+The connection to the server was lost. Attempting reset: Failed.
+!> 
+
+journalctl logs:
+kernel: postmaster[4031]: segfault at 50 ip 00007f21a39943e4 sp 00007ffd6c1f3790 error 4 in cstore_fdw.so[7f21a398b000+10000]
+
+cat /var/lib/pgsql/11/data/log/postgresql-Tue.log:
+2019-10-29 12:22:30.743 UTC [3912] LOG:  server process (PID 4073) was terminated by signal 11: Segmentation fault
+2019-10-29 12:22:30.743 UTC [3912] DETAIL:  Failed process was running: insert into pp values (1,1);
+2019-10-29 12:22:30.743 UTC [3912] LOG:  terminating any other active server processes
+2019-10-29 12:22:30.744 UTC [4039] WARNING:  terminating connection because of crash of another server process
+2019-10-29 12:22:30.744 UTC [4039] DETAIL:  The postmaster has commanded this server process to roll back the current transaction and exit, because another server process exited abnormally and possibly corrupted shared memory.
+
+
+@ptribble ever see this one before?
+
+```
+[root@tommy-dd378711 ~/cstore_fdw]# make
+gcc -Wall -Wmissing-prototypes -Wpointer-arith -Wdeclaration-after-statement -Wendif-labels -Wmissing-format-attribute -Wformat-security -fno-strict-aliasing -fwrapv -fexcess-precision=standard -g -m64 -fPIC --std=c99 -I. -I./ -I/opt/postgresql/11.1/include/server -I/opt/postgresql/11.1/include/internal    -c -o cstore_fdw.o cstore_fdw.c
+In file included from /opt/postgresql/11.1/include/server/postgres.h:47:0,
+                 from cstore_fdw.c:18:
+/opt/postgresql/11.1/include/server/utils/elog.h:318:20: error: unknown type name 'sigjmp_buf'
+ extern PGDLLIMPORT sigjmp_buf *PG_exception_stack;
+                    ^
+<builtin>: recipe for target 'cstore_fdw.o' failed
+make: *** [cstore_fdw.o] Error 1
+                                                                                        
+```
+## Problem
+
+When creating a foreign table and dropping one of its columns, certain select statements using the table alias will yield an `ERROR:  cache lookup failed for type 0`.
+
+## Steps to reproduce
+
+```sql
+create foreign table t1 (id int, id2 int) server cstore_server options (compression 'pglz');
+insert into t1 select 1, 2;
+alter table t1 drop column id2;
+select count(t1.*) from t1;
+```
+
+ * The statement `select count(*) from t1;` works flawlessly.
+ * The statement `select count(t1.*) from t1;` works if no columns are dropped.
+
+## Environment
+
+ * `PostgreSQL 9.6.9 on x86_64-pc-linux-gnu (Debian 9.6.9-2.pgdg90+1), compiled by gcc (Debian 6.3.0-18+deb9u1) 6.3.0 20170516, 64-bit`
+ * `cstore_fdw` 1.6
+
+I prepared a Gist with a Dockerfile that installs these versions and can reproduce the issue:
+ * https://gist.github.com/moertel/08cc6a72b913990853f131bb4739f35c
+ * 
+    ```
+    $ docker build --tag cstore-bug .
+    $ docker run -p 5432:5432 -it cstore-bug
+    $ psql -h 127.0.0.1 -p 5432 --user postgres postgres
+    ```
+
+Hello, I have ran into issue with dropping cstore table and then rollbacking the transaction.
+Rollback leaves the table in an inconsistent state as the table definition still exists (which is correct), but cstore data files are deleted and not rolled back with the rest of the transaction.
+Steps to reproduce:
+```sql
+-- create empty cstore table
+create foreign table cstore_drop_test()
+    server cstore_server;
+
+-- query without errors
+select * from cstore_drop_test;
+
+-- drop cstore table and then rollback
+DO language plpgsql
+$$
+    DECLARE
+    BEGIN
+        drop foreign table cstore_drop_test;
+        rollback;
+    END
+$$;
+
+-- query fails on 'could not open file "xxx.footer" for reading'
+select * from cstore_drop_test;
+```
+
+I am trying to load data into 4 different _foreign_ tables. Each `COPY` runs as expected, but whenever I try to parallelize the operation, i.e. run 4 different `COPY` instructions at the same time, the server crashes with the following message:
+
+```
+FATAL:  terminating connection due to administrator command
+server closed the connection unexpectedly
+        This probably means the server terminated abnormally
+        before or while processing the request.
+The connection to the server was lost. Attempting reset: Failed. 
+```
+
+Upon restarting the connection, every time I try to execute a _single_ `COPY` statement, Postgres throws the same error, rendering the tables useless. Only way to have them populated is to drop them, create them again and execute `COPY` on each table, _individually_.
+
+Is there a way to do this process in parallel? Each table has a populating process of their own, there are no concurrent writes to the same table.
+
+The command I run to populate the tables is:
+
+`COPY <table> FROM '<path>' WITH CSV;`
+Trying to build cstore_fdw with 12beta1:
+```
+15:29:44 make[1]: Entering directory '/<<PKGBUILDDIR>>'
+15:29:44 Makefile:45: *** PostgreSQL 9.3 or 9.4 or 9.5 or 9.6 or 10 or 11 is required to compile this extension.  Stop.
+15:29:44 make[1]: Leaving directory '/<<PKGBUILDDIR>>'
+```
+
+IMHO it would be better to just ditch that check. If it doesn't compile, it doesn't compile, but if it compiles and passes the tests with the new version, I could just update the Debian package now, without having to poke upstream.
+If we rename public schema then hardcoded function calls won't work, so cstore tables can't be dropped. I think this is not the intended behaviour either. See #125 for reference.
+
+```
+dev=# drop foreign table public.gen_releases;
+ERROR:  function public.cstore_clean_table_resources(oid) does not exist
+LINE 1: SELECT public.cstore_clean_table_resources(v_obj.objid)
+               ^
+HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
+QUERY:  SELECT public.cstore_clean_table_resources(v_obj.objid)
+CONTEXT:  PL/pgSQL function public_20190402_18.cstore_drop_trigger() line 10 at PERFORM
+```
+
+I tried to create a new cstore_server with different name but that didn't create the functions in public. Looks like I'd have to create these functions in public or move them back to public manually for all the functions.
+This would make sense if a text column contains values from a set of strings. We could cache those strings in a dictionary and store only references.
+
+This approach requires some re-design on data storage and querying. I am noting here to keep in mind for future work.

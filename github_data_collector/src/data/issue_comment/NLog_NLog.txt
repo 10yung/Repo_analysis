@@ -1,0 +1,246 @@
+Ex. For when-filters:
+
+`SimpleLayout l = @"${when:when=level<=LogLevel.Info:inner=Good:else=Bad}";`
+Resolves #3765 
+**NLog version**: 4.6.8
+
+**Platform**: .Net 4.5 / .NET Core 3.1
+
+**Current NLog config**
+
+```xml
+<nlog xmlns="http://www.nlog-project.org/schemas/NLog.xsd"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+
+  <targets>
+    <target name="logconsole" xsi:type="Console" />
+    
+    <target
+      xsi:type="file"
+      name="logfile"
+      deleteOldFileOnStartup="true"
+      fileName="struct_logs.json">
+      <layout xsi:type="JsonLayout">
+        <attribute name="time" layout="${longdate}" />
+        <attribute name="level" layout="${level:upperCase=true}"/>
+        <attribute name="message" layout="${message}" />
+        <attribute name="eventProperties" encode="false" >
+          <layout type='JsonLayout' includeAllProperties="true"  maxRecursionLimit="2" renderEmptyObject="false"/>
+        </attribute>
+        <attribute name="scope" encode="false" >
+          <layout type='JsonLayout' includeMdlc="true"  maxRecursionLimit="2" renderEmptyObject="false"/>
+        </attribute>
+      </layout>
+    </target>
+
+    <target name="asynclogfile" xsi:type="AsyncWrapper" queueLimit="5000" overflowAction="Discard">
+      <target
+        xsi:type="file"
+        deleteOldFileOnStartup="true"
+        fileName="async_struct_logs.json">
+        <layout xsi:type="JsonLayout">
+          <attribute name="time" layout="${longdate}" />
+          <attribute name="level" layout="${level:upperCase=true}"/>
+          <attribute name="message" layout="${message}" />
+          <attribute name="eventProperties" encode="false" >
+            <layout type='JsonLayout' includeAllProperties="true"  maxRecursionLimit="2" renderEmptyObject="false"/>
+          </attribute>
+          <attribute name="scope" encode="false" >
+            <layout type='JsonLayout' includeMdlc="true"  maxRecursionLimit="2" renderEmptyObject="false"/>
+          </attribute>
+          <!-- Uncomment this line to 'fix' includeMdlc -->
+          <!--<attribute name="ExplicitScopeKey" layout="${mdlc:ScopeKey}" />-->
+        </layout>
+      </target>
+    </target>
+  </targets>
+
+  <rules>
+      <logger name="*" minlevel="Debug" writeTo="logfile" />
+      <logger name="*" minlevel="Debug" writeTo="asynclogfile" />
+      <logger name="*" minlevel="Debug" writeTo="logconsole" />
+  </rules>
+</nlog>
+```
+
+**Code for testing**
+```c#
+using NLog;
+
+namespace TestLogScope
+{
+    class Program
+    {
+        static void Main(string[] args)
+        {
+            var logger = LogManager.GetCurrentClassLogger();
+
+            logger.Info("Log before scope");
+
+            using (MappedDiagnosticsLogicalContext.SetScoped("ScopeKey", 52))
+            {
+                logger.Info("Log inside Mdlc scope {Param}", 79);
+            }
+        }
+    }
+}
+```
+In the `logfile` target the layout `<layout type='JsonLayout' includeMdlc="true"  maxRecursionLimit="2" renderEmptyObject="false"/>` output correctly the scoped MDLC:
+```
+{ "time": "2020-01-17 13:32:44.7498", "level": "INFO", "message": "Log before scope" }
+{ "time": "2020-01-17 13:32:44.7840", "level": "INFO", "message": "Log inside Mdlc scope 79", "eventProperties": { "Param": 79 }, "scope": { "ScopeKey": 52 } }
+```
+But the scope data is not output in the `asynclogfile` target even if the config is identical:
+```
+{ "time": "2020-01-17 13:32:44.7498", "level": "INFO", "message": "Log before scope" }
+{ "time": "2020-01-17 13:32:44.7840", "level": "INFO", "message": "Log inside Mdlc scope 79", "eventProperties": { "Param": 79 } }
+```
+If you explicitly use the `${mdlc}` layout renderer by uncommenting the line `<attribute name="ExplicitScopeKey" layout="${mdlc:ScopeKey}" />` in the config then it *fix* the `JsonLayout` with `includeMdlc` in addition to output the `ExplicitScopeKey` attribute:
+```
+{ "time": "2020-01-17 13:50:00.4026", "level": "INFO", "message": "Log before scope" }
+{ "time": "2020-01-17 13:50:00.4397", "level": "INFO", "message": "Log inside Mdlc scope 79", "eventProperties": { "Param": 79 }, "scope": { "ScopeKey": 52 }, "ExplicitScopeKey": "52" }
+
+```
+
+Alternative version of #3150
+
+Improve performance with help from transactions. DbCommands will not be committed individually but will be committed as a single transaction-chunk. This will reduce the number of requests sent to the database-instance, so less network-latency overhead.
+
+There is one downside. When a single LogEvent in a batch has problems, then it will also cause all other LogEvents in the same batch to fail..
+
+``` 
+NestedDiagnosticsLogicalContext.Push("foo");
+NestedDiagnosticsLogicalContext.Push("bar");
+```
+rendered with the NdlcLayoutRenderer leads to `foo bar`.
+rendered with the Log4JXmlEventLayoutRenderer leads to `bar foo`.
+
+I have the setting below:
+
+ ```
+<target name="asyncFile" xsi:type="AsyncWrapper" queueLimit="10000" overflowAction="Block">
+      <target xsi:type="File"
+                fileName="/storage/sdcard0/com.my.app/Logs/${shortdate}.log"
+                archiveFileName="/storage/sdcard0/com.my.app/Logs/archived.{#}.log"
+                maxArchiveFiles="5"
+                archiveDateFormat="yyyy-MM-dd"
+                archiveAboveSize="1048576"
+                archiveEvery="Day"
+                archiveNumbering="DateAndSequence"
+                concurrentWrites="true"
+                keepFileOpen="false">
+        <layout xsi:type="JsonLayout" includeAllProperties="true" excludeProperties="Comma-separated list (string)">
+          <attribute name="time" layout="${longdate}" />
+          <attribute name="level" layout="${level:upperCase=true}"/>
+          <attribute name="message" layout="${message}" />
+          <attribute name="exception" layout="${exception}" />
+          <attribute name="threadid" layout="${threadid}" />
+        </layout>
+      </target>
+    </target>
+
+```
+Expected behaviours:
+No more than 5 archived files are generated, and each has a maximum size of 1MB.
+```
+archived.1.log
+archived.2.log
+archived.3.log
+archived.4.log
+archived.5.log
+```
+
+Actual behaviours:
+One archived file has more 40 MB
+
+Any idea?
+With that feature it's possible to archive the old file on startup when a certain size threshold is reached.
+
+By enabling this you can ensure that the current application session is always in the same file but still have some kind of size based archival. Could also be comined with other archival options.
+We have successfully integrated our Xamarin Forms application with Azure Application Insights using Microsoft.ApplicationInsights.NLogTarget. It's working perfect in online scenarios. Our app has an offline capability, so how can we enable offline scenarios also with Microsoft.ApplicationInsights.NLogTarget? Is there any samples for the same?
+Hi 
+
+I'm getting a stack overflow exception which is killing my application when multiple processes are writing to the same log file.
+
+It specifically happens when I hook up to log out first chance exceptions:
+
+`AppDomain.CurrentDomain.FirstChanceException += CurrentDomainOnFirstChanceException; `
+
+Here is a program which repros this issue:
+
+```
+static class Program
+    {
+        private static readonly ILogger Logger = LogManager.GetCurrentClassLogger();
+        static void Main(string[] args)
+        {
+
+            AppDomain.CurrentDomain.FirstChanceException += CurrentDomainOnFirstChanceException;
+
+            string processName;
+            if (args.Length == 0)
+            {
+                processName = "0";
+                for (int i = 1; i < 2; ++i)
+                {
+                    Process.Start(Assembly.GetEntryAssembly().Location, i.ToString());
+                }
+            }
+            else
+            {
+                processName = args[0];
+            }
+
+            bool running = true;
+            Console.CancelKeyPress += (sender, eventArgs) => running = false; // shutdown on Control-C
+            int j = 0;
+            while (running)
+            {
+                Logger.Info("{0} - Happily Running Still {1}", processName, j);
+                j++;
+                Thread.Sleep(10);
+            }
+        }
+
+
+        public static void CurrentDomainOnFirstChanceException(object sender, FirstChanceExceptionEventArgs e)
+        {
+            Logger.Error(e.Exception, "Current Domain On First Chance Exception");
+        }
+    }
+```
+
+```
+<nlog xmlns="http://www.nlog-project.org/schemas/NLog.xsd" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" internalLogFile="C:\logs\log.txt" internalLogLevel="Trace">
+  <targets>
+    <target name="file"
+            xsi:type="File"
+            layout="${longdate} (${threadid}) ${level} [${logger}] ${message}"
+            fileName="c:\logPath\logfile.log"
+            archiveFileName="c:\logPath\logfile{##}.log"
+            archiveAboveSize="12000"
+            maxArchiveFiles="300"
+            concurrentWrites="true"
+            keepFileOpen="true"
+            encoding="iso-8859-2" />
+    <target name="Console" type="console" />
+  </targets>
+  <rules>
+    <logger name="*" minlevel="Debug" writeTo="file" />
+  </rules>
+</nlog>
+```
+
+
+package version:
+
+```
+<?xml version="1.0" encoding="utf-8"?>
+<packages>
+  <package id="NLog" version="4.6.8" targetFramework="net461" />
+</packages>
+```
+
+
+
+

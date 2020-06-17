@@ -1,0 +1,704 @@
+Fixes #2450 
+
+This is a DRAFT pull request for deprecating the Value methods and moving them to the right locations.
+Related to #2346
+
+
+Further investigation of #2551 shows that CompletableFutures behave differently in a Spring application.
+
+The following code using CompletableFutures stops before the `thenRun` method is executed:
+```java
+CompletableFuture<Void> f = CompletableFuture.runAsync(() -> {
+    for (int i = 0; i < 10; i++) {
+        try {
+            System.out.println(i);
+            Thread.sleep(200);
+        } catch (InterruptedException e) {
+        }
+    }
+}).thenRun(() -> {
+    for (int i = 0; i < 10; i++) {
+        try {
+            System.out.println(i);
+            Thread.sleep(200);
+        } catch (InterruptedException e) {
+        }
+    }
+});
+Thread.sleep(500);
+
+f.cancel(true);
+try{
+    f.get();
+}
+catch(CancellationException | ExecutionException e){
+    System.out.println("future cancelled");
+}
+System.out.println("end");
+```
+
+Output:
+```
+1
+2
+future cancelled
+end
+3
+4
+5
+6
+7
+8
+9
+```
+
+
+However, when using the vavr future implementation, the second part is executed as well:
+```java
+Future<Void> f = Future.run(() -> {
+    int i = 1;
+    while(i < 10){
+        try {
+            Thread.sleep(200);
+        } catch (InterruptedException e) {
+        }
+        System.out.println(i++);
+    }
+}).andThen(v -> {
+    int i = 1;
+    while(i < 10){
+        try {
+            Thread.sleep(200);
+        } catch (InterruptedException e) {
+        }
+        System.out.println(i++);
+    }
+});
+Thread.sleep(500);
+f.cancel();
+try{
+    f.get();
+}
+catch(CancellationException e){
+    System.out.println("future cancelled");
+}
+
+System.out.println("end");
+```
+
+Output:
+```
+1
+2
+future cancelled
+end
+3
+4
+5
+6
+7
+8
+9
+1
+2
+3
+4
+5
+6
+7
+8
+9
+```
+The following code snippet is executed in both a plain Java application and in a Controller class of a Spring application on Tomcat:
+
+```java
+Future<Void> f = Future.of(() -> {
+    int i = 1;
+    while(i < 10){
+        try {
+            Thread.sleep(200);
+        } catch (InterruptedException e) {
+        }
+        System.out.println(i++);
+    }
+    return Future.successful(null);
+});
+Thread.sleep(500);
+f.cancel();
+try{
+    f.get();
+}
+catch(CancellationException e){
+    System.out.println("future cancelled");
+}
+
+System.out.println("end");
+```
+
+The output for the plain Java application is as follows:
+```
+1
+2
+3
+future cancelled
+end
+```
+Thus, the thread is interrupted and the future is cancelled after the first three executions of the loop.
+
+However, the output of the Spring application is as follows:
+```
+1
+2
+3
+future cancelled
+end
+4
+5
+6
+7
+8
+9
+```
+Thus, the future's executor thread continues after the future is cancelled.
+
+Debugging the example shows that the `thread` attribute is `null` when the cancel method on the future is called:
+```java
+if (mayInterruptIfRunning && this.thread != null) {
+  this.thread.interrupt();
+}
+```
+Custom tasks like `generateSources` should execute in a `doLast { ... }` instead of within the configuration phase.
+![unzip](https://user-images.githubusercontent.com/743833/64494138-56324b80-d289-11e9-9a23-afc292d22f2a.jpeg)
+
+
+* [x] ~~Mark Value methods as `@Deprecated`~~ Value will not be deprecated. My initial plan was to introduce io.vavr.Iterable instead but that is not a good idea. The name would be ambiguous because there exists java.lang.Iterable. Instead we will just deprecate and move the Value methods mentioned below.
+* [ ] Document deprecations using `@deprecated`
+* [ ] Place 'undeprecated' copies in appropriate locations, e.g.
+  * Iterator, Traversable: exists, forAll, collect, contains, corresponds, isAsync, isLazy, isEmpty, stringPrefix + some to* conversion methods
+  * io.vavr.control.*: get, getOr*, stringPrefix + some to* conversion methods
+* [ ] Mark methods 'to be removed': isSingleValued, out, stderr, stdout
+The transformation involves
+
+* [x] deprecating `io.vavr.Value`
+* [x] adding `io.vavr.Iterable` at the top of the type hierarchy
+* [ ] Either: deprecating outdated API, adding new API
+
+    <details>
+
+    ```diff
+    -[io.vavr.Value] collect(java.util.function.Supplier, java.util.function.BiConsumer, java.util.function.BiConsumer): java.lang.Object
+    -[io.vavr.Value] collect(java.util.stream.Collector): java.lang.Object
+    -[io.vavr.Value] contains(java.lang.Object): boolean
+    -[io.vavr.Value] corresponds(java.lang.Iterable, java.util.function.BiPredicate): boolean
+    -[io.vavr.Value] eq(java.lang.Object): boolean
+    -[io.vavr.Value] exists(java.util.function.Predicate): boolean
+    -[io.vavr.Value] forAll(java.util.function.Predicate): boolean
+    -[io.vavr.Value] forEach(java.util.function.Consumer): void
+    -[io.vavr.Value] getOrElse(java.lang.Object): java.lang.Object
+    -[io.vavr.Value] getOrElse(java.util.function.Supplier): java.lang.Object
+    -[io.vavr.Value] getOrElseThrow(java.util.function.Supplier): java.lang.Object
+    -[io.vavr.Value] getOrElseTry(io.vavr.CheckedFunction0): java.lang.Object
+    -[io.vavr.Value] getOrNull(): java.lang.Object
+    -[io.vavr.Value] out(java.io.PrintStream): void
+    -[io.vavr.Value] out(java.io.PrintWriter): void
+    -[io.vavr.Value] spliterator(): java.util.Spliterator
+    -[io.vavr.Value] stderr(): void
+    -[io.vavr.Value] stdout(): void
+    -[io.vavr.Value] stringPrefix(): java.lang.String
+    -[io.vavr.Value] toArray(): io.vavr.collection.Array
+    -[io.vavr.Value] toCharSeq(): io.vavr.collection.CharSeq
+    -[io.vavr.Value] toCompletableFuture(): java.util.concurrent.CompletableFuture
+    -[io.vavr.Value] toEither(java.lang.Object): io.vavr.control.Either
+    -[io.vavr.Value] toEither(java.util.function.Supplier): io.vavr.control.Either
+    -[io.vavr.Value] toInvalid(java.lang.Object): io.vavr.control.Validation
+    -[io.vavr.Value] toInvalid(java.util.function.Supplier): io.vavr.control.Validation
+    -[io.vavr.Value] toJavaArray(): [Ljava.lang.Object;
+    -[io.vavr.Value] toJavaArray(java.lang.Class): [Ljava.lang.Object;
+    -[io.vavr.Value] toJavaArray(java.util.function.IntFunction): [Ljava.lang.Object;
+    -[io.vavr.Value] toJavaCollection(java.util.function.Function): java.util.Collection
+    -[io.vavr.Value] toJavaList(): java.util.List
+    -[io.vavr.Value] toJavaList(java.util.function.Function): java.util.List
+    -[io.vavr.Value] toJavaMap(java.util.function.Function): java.util.Map
+    -[io.vavr.Value] toJavaMap(java.util.function.Supplier, java.util.function.Function): java.util.Map
+    -[io.vavr.Value] toJavaMap(java.util.function.Supplier, java.util.function.Function, java.util.function.Function): java.util.Map
+    -[io.vavr.Value] toJavaOptional(): java.util.Optional
+    -[io.vavr.Value] toJavaParallelStream(): java.util.stream.Stream
+    -[io.vavr.Value] toJavaSet(): java.util.Set
+    -[io.vavr.Value] toJavaSet(java.util.function.Function): java.util.Set
+    -[io.vavr.Value] toJavaStream(): java.util.stream.Stream
+    -[io.vavr.Value] toLeft(java.lang.Object): io.vavr.control.Either
+    -[io.vavr.Value] toLeft(java.util.function.Supplier): io.vavr.control.Either
+    -[io.vavr.Value] toLinkedMap(java.util.function.Function): io.vavr.collection.Map
+    -[io.vavr.Value] toLinkedMap(java.util.function.Function, java.util.function.Function): io.vavr.collection.Map
+    -[io.vavr.Value] toLinkedSet(): io.vavr.collection.Set
+    -[io.vavr.Value] toList(): io.vavr.collection.List
+    -[io.vavr.Value] toMap(java.util.function.Function): io.vavr.collection.Map
+    -[io.vavr.Value] toMap(java.util.function.Function, java.util.function.Function): io.vavr.collection.Map
+    -[io.vavr.Value] toOption(): io.vavr.control.Option
+    -[io.vavr.Value] toPriorityQueue(): io.vavr.collection.PriorityQueue
+    -[io.vavr.Value] toPriorityQueue(java.util.Comparator): io.vavr.collection.PriorityQueue
+    -[io.vavr.Value] toQueue(): io.vavr.collection.Queue
+    -[io.vavr.Value] toRight(java.lang.Object): io.vavr.control.Either
+    -[io.vavr.Value] toRight(java.util.function.Supplier): io.vavr.control.Either
+    -[io.vavr.Value] toSet(): io.vavr.collection.Set
+    -[io.vavr.Value] toSortedMap(java.util.Comparator, java.util.function.Function): io.vavr.collection.SortedMap
+    -[io.vavr.Value] toSortedMap(java.util.Comparator, java.util.function.Function, java.util.function.Function): io.vavr.collection.SortedMap
+    -[io.vavr.Value] toSortedMap(java.util.function.Function): io.vavr.collection.SortedMap
+    -[io.vavr.Value] toSortedMap(java.util.function.Function, java.util.function.Function): io.vavr.collection.SortedMap
+    -[io.vavr.Value] toSortedSet(): io.vavr.collection.SortedSet
+    -[io.vavr.Value] toSortedSet(java.util.Comparator): io.vavr.collection.SortedSet
+    -[io.vavr.Value] toStream(): io.vavr.collection.Stream
+    -[io.vavr.Value] toTree(): io.vavr.collection.Tree
+    -[io.vavr.Value] toTree(java.util.function.Function, java.util.function.Function): io.vavr.collection.List
+    -[io.vavr.Value] toTry(): io.vavr.control.Try
+    -[io.vavr.Value] toTry(java.util.function.Supplier): io.vavr.control.Try
+    -[io.vavr.Value] toValid(java.lang.Object): io.vavr.control.Validation
+    -[io.vavr.Value] toValid(java.util.function.Supplier): io.vavr.control.Validation
+    -[io.vavr.Value] toValidation(java.lang.Object): io.vavr.control.Validation
+    -[io.vavr.Value] toValidation(java.util.function.Supplier): io.vavr.control.Validation
+    -[io.vavr.Value] toVector(): io.vavr.collection.Vector
+    -[io.vavr.control.Either] bimap(java.util.function.Function, java.util.function.Function): io.vavr.control.Either
+    +[io.vavr.Iterable] to(java.util.function.Function): java.lang.Object
+    +[io.vavr.control.Either] collect(java.util.stream.Collector): java.lang.Object
+    +[io.vavr.control.Either] cond(boolean, java.util.function.Supplier, java.util.function.Supplier): io.vavr.control.Either
+    [io.vavr.control.Either] equals(java.lang.Object): boolean
+    -[io.vavr.control.Either] filter(java.util.function.Predicate): io.vavr.control.Option
+    -[io.vavr.control.Either] filterNot(java.util.function.Predicate): io.vavr.control.Option
+    [io.vavr.control.Either] filterOrElse(java.util.function.Predicate, java.util.function.Function): io.vavr.control.Either
+    [io.vavr.control.Either] flatMap(java.util.function.Function): io.vavr.control.Either
+    [io.vavr.control.Either] fold(java.util.function.Function, java.util.function.Function): java.lang.Object
+    [io.vavr.control.Either] get(): java.lang.Object
+    [io.vavr.control.Either] getLeft(): java.lang.Object
+    +[io.vavr.control.Either] getOrElse(java.lang.Object): java.lang.Object
+    [io.vavr.control.Either] getOrElseGet(java.util.function.Function): java.lang.Object
+    [io.vavr.control.Either] getOrElseThrow(java.util.function.Function): java.lang.Object
+    [io.vavr.control.Either] hashCode(): int
+    -[io.vavr.control.Either] isAsync(): boolean
+    -[io.vavr.control.Either] isEmpty(): boolean
+    -[io.vavr.control.Either] isLazy(): boolean
+    [io.vavr.control.Either] isLeft(): boolean
+    [io.vavr.control.Either] isRight(): boolean
+    -[io.vavr.control.Either] isSingleValued(): boolean
+    [io.vavr.control.Either] iterator(): io.vavr.collection.Iterator
+    [io.vavr.control.Either] iterator(): java.util.Iterator
+    -[io.vavr.control.Either] left(): io.vavr.control.Either$LeftProjection
+    [io.vavr.control.Either] left(java.lang.Object): io.vavr.control.Either
+    -[io.vavr.control.Either] map(java.util.function.Function): io.vavr.Value
+    [io.vavr.control.Either] map(java.util.function.Function): io.vavr.control.Either
+    [io.vavr.control.Either] mapLeft(java.util.function.Function): io.vavr.control.Either
+    -[io.vavr.control.Either] narrow(io.vavr.control.Either): io.vavr.control.Either
+    -[io.vavr.control.Either] orElse(io.vavr.control.Either): io.vavr.control.Either
+    +[io.vavr.control.Either] onLeft(java.util.function.Consumer): io.vavr.control.Either
+    +[io.vavr.control.Either] onRight(java.util.function.Consumer): io.vavr.control.Either
+    [io.vavr.control.Either] orElse(java.util.function.Supplier): io.vavr.control.Either
+    -[io.vavr.control.Either] orElseRun(java.util.function.Consumer): void
+    -[io.vavr.control.Either] peek(java.util.function.Consumer): io.vavr.Value
+    -[io.vavr.control.Either] peek(java.util.function.Consumer): io.vavr.control.Either
+    -[io.vavr.control.Either] peekLeft(java.util.function.Consumer): io.vavr.control.Either
+    -[io.vavr.control.Either] right(): io.vavr.control.Either$RightProjection
+    [io.vavr.control.Either] right(java.lang.Object): io.vavr.control.Either
+    -[io.vavr.control.Either] sequence(java.lang.Iterable): io.vavr.control.Either
+    -[io.vavr.control.Either] sequenceRight(java.lang.Iterable): io.vavr.control.Either
+    +[io.vavr.control.Either] stream(): java.util.stream.Stream
+    [io.vavr.control.Either] swap(): io.vavr.control.Either
+    +[io.vavr.control.Either] toOption(): io.vavr.control.Option
+    +[io.vavr.control.Either] toOptional(): java.util.Optional
+    [io.vavr.control.Either] toString(): java.lang.String
+    -[io.vavr.control.Either] toValidation(): io.vavr.control.Validation
+    -[io.vavr.control.Either] traverse(java.lang.Iterable, java.util.function.Function): io.vavr.control.Either
+    -[io.vavr.control.Either] traverseRight(java.lang.Iterable, java.util.function.Function): io.vavr.control.Either
+    +[io.vavr.control.Either] toTry(java.util.function.Function): io.vavr.control.Try
+    +[io.vavr.control.Either] transform(java.util.function.Function, java.util.function.Function): io.vavr.control.Either
+    +[java.lang.Iterable] forEach(java.util.function.Consumer): void
+    +[java.lang.Iterable] spliterator(): java.util.Spliterator
+    +[java.lang.Object] getClass(): java.lang.Class
+    +[java.lang.Object] notify(): void
+    +[java.lang.Object] notifyAll(): void
+    +[java.lang.Object] wait(): void
+    +[java.lang.Object] wait(long): void
+    +[java.lang.Object] wait(long, int): void
+    ```
+
+    </details>
+
+* [ ] Option: deprecating outdated API, adding new API
+
+    <details>
+
+    ```diff
+    -[io.vavr.Value] collect(java.util.function.Supplier, java.util.function.BiConsumer, java.util.function.BiConsumer): java.lang.Object
+    -[io.vavr.Value] collect(java.util.stream.Collector): java.lang.Object
+    -[io.vavr.Value] contains(java.lang.Object): boolean
+    -[io.vavr.Value] corresponds(java.lang.Iterable, java.util.function.BiPredicate): boolean
+    -[io.vavr.Value] eq(java.lang.Object): boolean
+    -[io.vavr.Value] exists(java.util.function.Predicate): boolean
+    -[io.vavr.Value] forAll(java.util.function.Predicate): boolean
+    -[io.vavr.Value] forEach(java.util.function.Consumer): void
+    -[io.vavr.Value] getOrElseTry(io.vavr.CheckedFunction0): java.lang.Object
+    -[io.vavr.Value] getOrNull(): java.lang.Object
+    -[io.vavr.Value] out(java.io.PrintStream): void
+    -[io.vavr.Value] out(java.io.PrintWriter): void
+    -[io.vavr.Value] spliterator(): java.util.Spliterator
+    -[io.vavr.Value] stderr(): void
+    -[io.vavr.Value] stdout(): void
+    -[io.vavr.Value] stringPrefix(): java.lang.String
+    -[io.vavr.Value] toArray(): io.vavr.collection.Array
+    -[io.vavr.Value] toCharSeq(): io.vavr.collection.CharSeq
+    -[io.vavr.Value] toCompletableFuture(): java.util.concurrent.CompletableFuture
+    -[io.vavr.Value] toEither(java.lang.Object): io.vavr.control.Either
+    -[io.vavr.Value] toEither(java.util.function.Supplier): io.vavr.control.Either
+    -[io.vavr.Value] toInvalid(java.lang.Object): io.vavr.control.Validation
+    -[io.vavr.Value] toInvalid(java.util.function.Supplier): io.vavr.control.Validation
+    -[io.vavr.Value] toJavaArray(): [Ljava.lang.Object;
+    -[io.vavr.Value] toJavaArray(java.lang.Class): [Ljava.lang.Object;
+    -[io.vavr.Value] toJavaArray(java.util.function.IntFunction): [Ljava.lang.Object;
+    -[io.vavr.Value] toJavaCollection(java.util.function.Function): java.util.Collection
+    -[io.vavr.Value] toJavaList(): java.util.List
+    -[io.vavr.Value] toJavaList(java.util.function.Function): java.util.List
+    -[io.vavr.Value] toJavaMap(java.util.function.Function): java.util.Map
+    -[io.vavr.Value] toJavaMap(java.util.function.Supplier, java.util.function.Function): java.util.Map
+    -[io.vavr.Value] toJavaMap(java.util.function.Supplier, java.util.function.Function, java.util.function.Function): java.util.Map
+    -[io.vavr.Value] toJavaOptional(): java.util.Optional
+    -[io.vavr.Value] toJavaParallelStream(): java.util.stream.Stream
+    -[io.vavr.Value] toJavaSet(): java.util.Set
+    -[io.vavr.Value] toJavaSet(java.util.function.Function): java.util.Set
+    -[io.vavr.Value] toJavaStream(): java.util.stream.Stream
+    -[io.vavr.Value] toLeft(java.lang.Object): io.vavr.control.Either
+    -[io.vavr.Value] toLeft(java.util.function.Supplier): io.vavr.control.Either
+    -[io.vavr.Value] toLinkedMap(java.util.function.Function): io.vavr.collection.Map
+    -[io.vavr.Value] toLinkedMap(java.util.function.Function, java.util.function.Function): io.vavr.collection.Map
+    -[io.vavr.Value] toLinkedSet(): io.vavr.collection.Set
+    -[io.vavr.Value] toList(): io.vavr.collection.List
+    -[io.vavr.Value] toMap(java.util.function.Function): io.vavr.collection.Map
+    -[io.vavr.Value] toMap(java.util.function.Function, java.util.function.Function): io.vavr.collection.Map
+    -[io.vavr.Value] toOption(): io.vavr.control.Option
+    -[io.vavr.Value] toPriorityQueue(): io.vavr.collection.PriorityQueue
+    -[io.vavr.Value] toPriorityQueue(java.util.Comparator): io.vavr.collection.PriorityQueue
+    -[io.vavr.Value] toQueue(): io.vavr.collection.Queue
+    -[io.vavr.Value] toRight(java.lang.Object): io.vavr.control.Either
+    -[io.vavr.Value] toRight(java.util.function.Supplier): io.vavr.control.Either
+    -[io.vavr.Value] toSet(): io.vavr.collection.Set
+    -[io.vavr.Value] toSortedMap(java.util.Comparator, java.util.function.Function): io.vavr.collection.SortedMap
+    -[io.vavr.Value] toSortedMap(java.util.Comparator, java.util.function.Function, java.util.function.Function): io.vavr.collection.SortedMap
+    -[io.vavr.Value] toSortedMap(java.util.function.Function): io.vavr.collection.SortedMap
+    -[io.vavr.Value] toSortedMap(java.util.function.Function, java.util.function.Function): io.vavr.collection.SortedMap
+    -[io.vavr.Value] toSortedSet(): io.vavr.collection.SortedSet
+    -[io.vavr.Value] toSortedSet(java.util.Comparator): io.vavr.collection.SortedSet
+    -[io.vavr.Value] toStream(): io.vavr.collection.Stream
+    -[io.vavr.Value] toTree(): io.vavr.collection.Tree
+    -[io.vavr.Value] toTree(java.util.function.Function, java.util.function.Function): io.vavr.collection.List
+    -[io.vavr.Value] toTry(): io.vavr.control.Try
+    -[io.vavr.Value] toTry(java.util.function.Supplier): io.vavr.control.Try
+    -[io.vavr.Value] toValid(java.lang.Object): io.vavr.control.Validation
+    -[io.vavr.Value] toValid(java.util.function.Supplier): io.vavr.control.Validation
+    -[io.vavr.Value] toValidation(java.lang.Object): io.vavr.control.Validation
+    -[io.vavr.Value] toValidation(java.util.function.Supplier): io.vavr.control.Validation
+    -[io.vavr.Value] toVector(): io.vavr.collection.Vector
+    -[io.vavr.control.Option] collect(io.vavr.PartialFunction): io.vavr.control.Option
+    +[io.vavr.Iterable] to(java.util.function.Function): java.lang.Object
+    +[io.vavr.control.Option] collect(java.util.stream.Collector): java.lang.Object
+    [io.vavr.control.Option] equals(java.lang.Object): boolean
+    [io.vavr.control.Option] filter(java.util.function.Predicate): io.vavr.control.Option
+    -[io.vavr.control.Option] filterNot(java.util.function.Predicate): io.vavr.control.Option
+    [io.vavr.control.Option] flatMap(java.util.function.Function): io.vavr.control.Option
+    [io.vavr.control.Option] fold(java.util.function.Supplier, java.util.function.Function): java.lang.Object
+    [io.vavr.control.Option] get(): java.lang.Object
+    [io.vavr.control.Option] getOrElse(java.lang.Object): java.lang.Object
+    -[io.vavr.control.Option] getOrElse(java.util.function.Supplier): java.lang.Object
+    +[io.vavr.control.Option] getOrElseGet(java.util.function.Supplier): java.lang.Object
+    [io.vavr.control.Option] getOrElseThrow(java.util.function.Supplier): java.lang.Object
+    [io.vavr.control.Option] hashCode(): int
+    -[io.vavr.control.Option] isAsync(): boolean
+    [io.vavr.control.Option] isDefined(): boolean
+    [io.vavr.control.Option] isEmpty(): boolean
+    -[io.vavr.control.Option] isLazy(): boolean
+    -[io.vavr.control.Option] isSingleValued(): boolean
+    [io.vavr.control.Option] iterator(): io.vavr.collection.Iterator
+    [io.vavr.control.Option] iterator(): java.util.Iterator
+    -[io.vavr.control.Option] map(java.util.function.Function): io.vavr.Value
+    [io.vavr.control.Option] map(java.util.function.Function): io.vavr.control.Option
+    -[io.vavr.control.Option] narrow(io.vavr.control.Option): io.vavr.control.Option
+    [io.vavr.control.Option] none(): io.vavr.control.Option
+    [io.vavr.control.Option] of(java.lang.Object): io.vavr.control.Option
+    [io.vavr.control.Option] ofOptional(java.util.Optional): io.vavr.control.Option
+    +[io.vavr.control.Option] onDefined(java.util.function.Consumer): io.vavr.control.Option
+    [io.vavr.control.Option] onEmpty(java.lang.Runnable): io.vavr.control.Option
+    -[io.vavr.control.Option] orElse(io.vavr.control.Option): io.vavr.control.Option
+    [io.vavr.control.Option] orElse(java.util.function.Supplier): io.vavr.control.Option
+    -[io.vavr.control.Option] peek(java.util.function.Consumer): io.vavr.Value
+    -[io.vavr.control.Option] peek(java.util.function.Consumer): io.vavr.control.Option
+    -[io.vavr.control.Option] sequence(java.lang.Iterable): io.vavr.control.Option
+    [io.vavr.control.Option] some(java.lang.Object): io.vavr.control.Option
+    +[io.vavr.control.Option] stream(): java.util.stream.Stream
+    +[io.vavr.control.Option] toEither(java.util.function.Supplier): io.vavr.control.Either
+    +[io.vavr.control.Option] toOptional(): java.util.Optional
+    [io.vavr.control.Option] toString(): java.lang.String
+    -[io.vavr.control.Option] transform(java.util.function.Function): java.lang.Object
+    -[io.vavr.control.Option] traverse(java.lang.Iterable, java.util.function.Function): io.vavr.control.Option
+    -[io.vavr.control.Option] when(boolean, java.lang.Object): io.vavr.control.Option
+    -[io.vavr.control.Option] when(boolean, java.util.function.Supplier): io.vavr.control.Option
+    +[io.vavr.control.Option] toTry(java.util.function.Supplier): io.vavr.control.Try
+    +[io.vavr.control.Option] transform(java.util.function.Supplier, java.util.function.Function): io.vavr.control.Option
+    +[io.vavr.control.Option] unless(boolean, java.util.function.Supplier): io.vavr.control.Option
+    +[io.vavr.control.Option] when(boolean, java.util.function.Supplier): io.vavr.control.Option
+    +[java.lang.Iterable] forEach(java.util.function.Consumer): void
+    +[java.lang.Iterable] spliterator(): java.util.Spliterator
+    +[java.lang.Object] getClass(): java.lang.Class
+    +[java.lang.Object] notify(): void
+    +[java.lang.Object] notifyAll(): void
+    +[java.lang.Object] wait(): void
+    +[java.lang.Object] wait(long): void
+    +[java.lang.Object] wait(long, int): void
+    ```
+
+    </details>
+
+* [ ] Try: deprecating outdated API, adding new API
+
+    <details>
+
+    ```diff
+    -[io.vavr.Value] collect(java.util.function.Supplier, java.util.function.BiConsumer, java.util.function.BiConsumer): java.lang.Object
+    -[io.vavr.Value] collect(java.util.stream.Collector): java.lang.Object
+    -[io.vavr.Value] contains(java.lang.Object): boolean
+    -[io.vavr.Value] corresponds(java.lang.Iterable, java.util.function.BiPredicate): boolean
+    -[io.vavr.Value] eq(java.lang.Object): boolean
+    -[io.vavr.Value] exists(java.util.function.Predicate): boolean
+    -[io.vavr.Value] forAll(java.util.function.Predicate): boolean
+    -[io.vavr.Value] forEach(java.util.function.Consumer): void
+    -[io.vavr.Value] getOrElse(java.lang.Object): java.lang.Object
+    -[io.vavr.Value] getOrElse(java.util.function.Supplier): java.lang.Object
+    -[io.vavr.Value] getOrElseThrow(java.util.function.Supplier): java.lang.Object
+    -[io.vavr.Value] getOrElseTry(io.vavr.CheckedFunction0): java.lang.Object
+    -[io.vavr.Value] getOrNull(): java.lang.Object
+    -[io.vavr.Value] out(java.io.PrintStream): void
+    -[io.vavr.Value] out(java.io.PrintWriter): void
+    -[io.vavr.Value] spliterator(): java.util.Spliterator
+    -[io.vavr.Value] stderr(): void
+    -[io.vavr.Value] stdout(): void
+    -[io.vavr.Value] stringPrefix(): java.lang.String
+    -[io.vavr.Value] toArray(): io.vavr.collection.Array
+    -[io.vavr.Value] toCharSeq(): io.vavr.collection.CharSeq
+    -[io.vavr.Value] toCompletableFuture(): java.util.concurrent.CompletableFuture
+    -[io.vavr.Value] toEither(java.lang.Object): io.vavr.control.Either
+    -[io.vavr.Value] toEither(java.util.function.Supplier): io.vavr.control.Either
+    -[io.vavr.Value] toInvalid(java.lang.Object): io.vavr.control.Validation
+    -[io.vavr.Value] toInvalid(java.util.function.Supplier): io.vavr.control.Validation
+    -[io.vavr.Value] toJavaArray(): [Ljava.lang.Object;
+    -[io.vavr.Value] toJavaArray(java.lang.Class): [Ljava.lang.Object;
+    -[io.vavr.Value] toJavaArray(java.util.function.IntFunction): [Ljava.lang.Object;
+    -[io.vavr.Value] toJavaCollection(java.util.function.Function): java.util.Collection
+    -[io.vavr.Value] toJavaList(): java.util.List
+    -[io.vavr.Value] toJavaList(java.util.function.Function): java.util.List
+    -[io.vavr.Value] toJavaMap(java.util.function.Function): java.util.Map
+    -[io.vavr.Value] toJavaMap(java.util.function.Supplier, java.util.function.Function): java.util.Map
+    -[io.vavr.Value] toJavaMap(java.util.function.Supplier, java.util.function.Function, java.util.function.Function): java.util.Map
+    -[io.vavr.Value] toJavaOptional(): java.util.Optional
+    -[io.vavr.Value] toJavaParallelStream(): java.util.stream.Stream
+    -[io.vavr.Value] toJavaSet(): java.util.Set
+    -[io.vavr.Value] toJavaSet(java.util.function.Function): java.util.Set
+    -[io.vavr.Value] toJavaStream(): java.util.stream.Stream
+    -[io.vavr.Value] toLeft(java.lang.Object): io.vavr.control.Either
+    -[io.vavr.Value] toLeft(java.util.function.Supplier): io.vavr.control.Either
+    -[io.vavr.Value] toLinkedMap(java.util.function.Function): io.vavr.collection.Map
+    -[io.vavr.Value] toLinkedMap(java.util.function.Function, java.util.function.Function): io.vavr.collection.Map
+    -[io.vavr.Value] toLinkedSet(): io.vavr.collection.Set
+    -[io.vavr.Value] toList(): io.vavr.collection.List
+    -[io.vavr.Value] toMap(java.util.function.Function): io.vavr.collection.Map
+    -[io.vavr.Value] toMap(java.util.function.Function, java.util.function.Function): io.vavr.collection.Map
+    -[io.vavr.Value] toOption(): io.vavr.control.Option
+    -[io.vavr.Value] toPriorityQueue(): io.vavr.collection.PriorityQueue
+    -[io.vavr.Value] toPriorityQueue(java.util.Comparator): io.vavr.collection.PriorityQueue
+    -[io.vavr.Value] toQueue(): io.vavr.collection.Queue
+    -[io.vavr.Value] toRight(java.lang.Object): io.vavr.control.Either
+    -[io.vavr.Value] toRight(java.util.function.Supplier): io.vavr.control.Either
+    -[io.vavr.Value] toSet(): io.vavr.collection.Set
+    -[io.vavr.Value] toSortedMap(java.util.Comparator, java.util.function.Function): io.vavr.collection.SortedMap
+    -[io.vavr.Value] toSortedMap(java.util.Comparator, java.util.function.Function, java.util.function.Function): io.vavr.collection.SortedMap
+    -[io.vavr.Value] toSortedMap(java.util.function.Function): io.vavr.collection.SortedMap
+    -[io.vavr.Value] toSortedMap(java.util.function.Function, java.util.function.Function): io.vavr.collection.SortedMap
+    -[io.vavr.Value] toSortedSet(): io.vavr.collection.SortedSet
+    -[io.vavr.Value] toSortedSet(java.util.Comparator): io.vavr.collection.SortedSet
+    -[io.vavr.Value] toStream(): io.vavr.collection.Stream
+    -[io.vavr.Value] toTree(): io.vavr.collection.Tree
+    -[io.vavr.Value] toTree(java.util.function.Function, java.util.function.Function): io.vavr.collection.List
+    -[io.vavr.Value] toTry(): io.vavr.control.Try
+    -[io.vavr.Value] toTry(java.util.function.Supplier): io.vavr.control.Try
+    -[io.vavr.Value] toValid(java.lang.Object): io.vavr.control.Validation
+    -[io.vavr.Value] toValid(java.util.function.Supplier): io.vavr.control.Validation
+    -[io.vavr.Value] toValidation(java.lang.Object): io.vavr.control.Validation
+    -[io.vavr.Value] toValidation(java.util.function.Supplier): io.vavr.control.Validation
+    -[io.vavr.Value] toVector(): io.vavr.collection.Vector
+    -[io.vavr.control.Try] andFinally(java.lang.Runnable): io.vavr.control.Try
+    -[io.vavr.control.Try] andFinallyTry(io.vavr.CheckedRunnable): io.vavr.control.Try
+    -[io.vavr.control.Try] andThen(java.lang.Runnable): io.vavr.control.Try
+    -[io.vavr.control.Try] andThen(java.util.function.Consumer): io.vavr.control.Try
+    -[io.vavr.control.Try] andThenTry(io.vavr.CheckedConsumer): io.vavr.control.Try
+    -[io.vavr.control.Try] andThenTry(io.vavr.CheckedRunnable): io.vavr.control.Try
+    -[io.vavr.control.Try] collect(io.vavr.PartialFunction): io.vavr.control.Try
+    +[io.vavr.Iterable] to(java.util.function.Function): java.lang.Object
+    +[io.vavr.control.Try] collect(java.util.stream.Collector): java.lang.Object
+    [io.vavr.control.Try] equals(java.lang.Object): boolean
+    [io.vavr.control.Try] failed(): io.vavr.control.Try
+    [io.vavr.control.Try] failure(java.lang.Throwable): io.vavr.control.Try
+    -[io.vavr.control.Try] filter(java.util.function.Predicate): io.vavr.control.Try
+    -[io.vavr.control.Try] filter(java.util.function.Predicate, java.util.function.Function): io.vavr.control.Try
+    -[io.vavr.control.Try] filter(java.util.function.Predicate, java.util.function.Supplier): io.vavr.control.Try
+    -[io.vavr.control.Try] filterNot(java.util.function.Predicate): io.vavr.control.Try
+    -[io.vavr.control.Try] filterNot(java.util.function.Predicate, java.util.function.Function): io.vavr.control.Try
+    -[io.vavr.control.Try] filterNot(java.util.function.Predicate, java.util.function.Supplier): io.vavr.control.Try
+    -[io.vavr.control.Try] filterTry(io.vavr.CheckedPredicate): io.vavr.control.Try
+    -[io.vavr.control.Try] filterTry(io.vavr.CheckedPredicate, io.vavr.CheckedFunction1): io.vavr.control.Try
+    -[io.vavr.control.Try] filterTry(io.vavr.CheckedPredicate, java.util.function.Supplier): io.vavr.control.Try
+    -[io.vavr.control.Try] flatMap(java.util.function.Function): io.vavr.control.Try
+    -[io.vavr.control.Try] flatMapTry(io.vavr.CheckedFunction1): io.vavr.control.Try
+    +[io.vavr.control.Try] filter(io.vavr.control.CheckedPredicate): io.vavr.control.Try
+    +[io.vavr.control.Try] flatMap(io.vavr.control.CheckedFunction): io.vavr.control.Try
+    [io.vavr.control.Try] fold(java.util.function.Function, java.util.function.Function): java.lang.Object
+    [io.vavr.control.Try] get(): java.lang.Object
+    [io.vavr.control.Try] getCause(): java.lang.Throwable
+    -[io.vavr.control.Try] getOrElseGet(java.util.function.Function): java.lang.Object
+    +[io.vavr.control.Try] getOrElse(java.lang.Object): java.lang.Object
+    +[io.vavr.control.Try] getOrElseGet(java.util.function.Supplier): java.lang.Object
+    [io.vavr.control.Try] getOrElseThrow(java.util.function.Function): java.lang.Object
+    [io.vavr.control.Try] hashCode(): int
+    -[io.vavr.control.Try] isAsync(): boolean
+    -[io.vavr.control.Try] isEmpty(): boolean
+    [io.vavr.control.Try] isFailure(): boolean
+    -[io.vavr.control.Try] isLazy(): boolean
+    -[io.vavr.control.Try] isSingleValued(): boolean
+    [io.vavr.control.Try] isSuccess(): boolean
+    [io.vavr.control.Try] iterator(): io.vavr.collection.Iterator
+    [io.vavr.control.Try] iterator(): java.util.Iterator
+    -[io.vavr.control.Try] map(java.util.function.Function): io.vavr.Value
+    -[io.vavr.control.Try] map(java.util.function.Function): io.vavr.control.Try
+    -[io.vavr.control.Try] mapFailure([Lio.vavr.API$Match$Case;): io.vavr.control.Try
+    -[io.vavr.control.Try] mapTry(io.vavr.CheckedFunction1): io.vavr.control.Try
+    -[io.vavr.control.Try] narrow(io.vavr.control.Try): io.vavr.control.Try
+    -[io.vavr.control.Try] of(io.vavr.CheckedFunction0): io.vavr.control.Try
+    -[io.vavr.control.Try] ofCallable(java.util.concurrent.Callable): io.vavr.control.Try
+    -[io.vavr.control.Try] ofSupplier(java.util.function.Supplier): io.vavr.control.Try
+    +[io.vavr.control.Try] map(io.vavr.control.CheckedFunction): io.vavr.control.Try
+    +[io.vavr.control.Try] mapFailure(io.vavr.control.CheckedFunction): io.vavr.control.Try
+    +[io.vavr.control.Try] of(io.vavr.control.CheckedSupplier): io.vavr.control.Try
+    [io.vavr.control.Try] onFailure(java.lang.Class, java.util.function.Consumer): io.vavr.control.Try
+    [io.vavr.control.Try] onFailure(java.util.function.Consumer): io.vavr.control.Try
+    [io.vavr.control.Try] onSuccess(java.util.function.Consumer): io.vavr.control.Try
+    -[io.vavr.control.Try] orElse(io.vavr.control.Try): io.vavr.control.Try
+    -[io.vavr.control.Try] orElse(java.util.function.Supplier): io.vavr.control.Try
+    -[io.vavr.control.Try] orElseRun(java.util.function.Consumer): void
+    -[io.vavr.control.Try] peek(java.util.function.Consumer): io.vavr.Value
+    -[io.vavr.control.Try] peek(java.util.function.Consumer): io.vavr.control.Try
+    -[io.vavr.control.Try] recover(java.lang.Class, java.lang.Object): io.vavr.control.Try
+    -[io.vavr.control.Try] recover(java.lang.Class, java.util.function.Function): io.vavr.control.Try
+    -[io.vavr.control.Try] recover(java.util.function.Function): io.vavr.control.Try
+    -[io.vavr.control.Try] recoverWith(java.lang.Class, io.vavr.control.Try): io.vavr.control.Try
+    -[io.vavr.control.Try] recoverWith(java.lang.Class, java.util.function.Function): io.vavr.control.Try
+    -[io.vavr.control.Try] recoverWith(java.util.function.Function): io.vavr.control.Try
+    -[io.vavr.control.Try] run(io.vavr.CheckedRunnable): io.vavr.control.Try
+    -[io.vavr.control.Try] runRunnable(java.lang.Runnable): io.vavr.control.Try
+    -[io.vavr.control.Try] sequence(java.lang.Iterable): io.vavr.control.Try
+    +[io.vavr.control.Try] orElse(io.vavr.control.CheckedSupplier): io.vavr.control.Try
+    +[io.vavr.control.Try] recover(java.lang.Class, io.vavr.control.CheckedFunction): io.vavr.control.Try
+    +[io.vavr.control.Try] recoverWith(java.lang.Class, io.vavr.control.CheckedFunction): io.vavr.control.Try
+    +[io.vavr.control.Try] rethrow(java.lang.Class): io.vavr.control.Try
+    +[io.vavr.control.Try] run(io.vavr.control.CheckedRunnable): io.vavr.control.Try
+    +[io.vavr.control.Try] stream(): java.util.stream.Stream
+    [io.vavr.control.Try] success(java.lang.Object): io.vavr.control.Try
+    -[io.vavr.control.Try] toEither(): io.vavr.control.Either
+    +[io.vavr.control.Try] toEither(java.util.function.Function): io.vavr.control.Either
+    +[io.vavr.control.Try] toOption(): io.vavr.control.Option
+    +[io.vavr.control.Try] toOptional(): java.util.Optional
+    [io.vavr.control.Try] toString(): java.lang.String
+    -[io.vavr.control.Try] toValidation(): io.vavr.control.Validation
+    -[io.vavr.control.Try] toValidation(java.util.function.Function): io.vavr.control.Validation
+    -[io.vavr.control.Try] transform(java.util.function.Function): java.lang.Object
+    -[io.vavr.control.Try] traverse(java.lang.Iterable, java.util.function.Function): io.vavr.control.Try
+    -[io.vavr.control.Try] withResources(io.vavr.CheckedFunction0): io.vavr.control.Try$WithResources1
+    -[io.vavr.control.Try] withResources(io.vavr.CheckedFunction0, io.vavr.CheckedFunction0): io.vavr.control.Try$WithResources2
+    -[io.vavr.control.Try] withResources(io.vavr.CheckedFunction0, io.vavr.CheckedFunction0, io.vavr.CheckedFunction0): io.vavr.control.Try$WithResources3
+    -[io.vavr.control.Try] withResources(io.vavr.CheckedFunction0, io.vavr.CheckedFunction0, io.vavr.CheckedFunction0, io.vavr.CheckedFunction0): io.vavr.control.Try$WithResources4
+    -[io.vavr.control.Try] withResources(io.vavr.CheckedFunction0, io.vavr.CheckedFunction0, io.vavr.CheckedFunction0, io.vavr.CheckedFunction0, io.vavr.CheckedFunction0): io.vavr.control.Try$WithResources5
+    -[io.vavr.control.Try] withResources(io.vavr.CheckedFunction0, io.vavr.CheckedFunction0, io.vavr.CheckedFunction0, io.vavr.CheckedFunction0, io.vavr.CheckedFunction0, io.vavr.CheckedFunction0): io.vavr.control.Try$WithResources6
+    -[io.vavr.control.Try] withResources(io.vavr.CheckedFunction0, io.vavr.CheckedFunction0, io.vavr.CheckedFunction0, io.vavr.CheckedFunction0, io.vavr.CheckedFunction0, io.vavr.CheckedFunction0, io.vavr.CheckedFunction0): io.vavr.control.Try$WithResources7
+    -[io.vavr.control.Try] withResources(io.vavr.CheckedFunction0, io.vavr.CheckedFunction0, io.vavr.CheckedFunction0, io.vavr.CheckedFunction0, io.vavr.CheckedFunction0, io.vavr.CheckedFunction0, io.vavr.CheckedFunction0, io.vavr.CheckedFunction0): io.vavr.control.Try$WithResources8
+    +[io.vavr.control.Try] transform(io.vavr.control.CheckedFunction, io.vavr.control.CheckedFunction): io.vavr.control.Try
+    +[java.lang.Iterable] forEach(java.util.function.Consumer): void
+    +[java.lang.Iterable] spliterator(): java.util.Spliterator
+    +[java.lang.Object] getClass(): java.lang.Class
+    +[java.lang.Object] notify(): void
+    +[java.lang.Object] notifyAll(): void
+    +[java.lang.Object] wait(): void
+    +[java.lang.Object] wait(long): void
+    +[java.lang.Object] wait(long, int): void
+    ```
+
+    </details>
+
+---
+
+In the case of conflicting methods (old/new), we just deprecate the old ones with a hint that a new one will introduced as replacement in the next major version (2.0).
+
+---
+
+**Note:** I used the following snippet to create a diffable text representation of a VAVR type.
+
+* we create diffable files for specific classes
+* we compare method names, arguments and return types
+* generic type arguments aren't important in this case
+* two diffable files of different VAVR versions are compared using `git diff`
+
+```java
+package io.vavr;
+
+import io.vavr.control.Try;
+
+import java.lang.reflect.Method;
+import java.lang.reflect.Parameter;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.stream.Stream;
+
+import static java.util.stream.Collectors.joining;
+
+public final class Reflector {
+
+    public static void main(String... args) {
+        new Reflector("vavr-2-0-0") // 'vavr-<version>'
+                .out(io.vavr.control.Either.class)
+                .out(io.vavr.control.Option.class)
+                .out(io.vavr.control.Try.class);
+    }
+
+    private final String lib;
+
+    private Reflector(String lib) {
+        this.lib = lib;
+    }
+
+    private Reflector out(Class<?> c) {
+        Try.run(() -> Files.write(Paths.get(c.getName() + "." + lib), reflect(c).getBytes()));
+        return this;
+    }
+
+    private String reflect(Class<?> c) {
+        return Stream.of(c.getMethods()).map(this::reflect).sorted().collect(joining("\n"));
+    }
+
+    private String reflect(Method m) {
+        return "[" + m.getDeclaringClass().getName() + "] " + m.getName() + "(" + Stream.of(m.getParameters()).map(this::reflect).collect(joining(", ")) + "): " + m.getReturnType().getName();
+    }
+
+    private String reflect(Parameter p) {
+        return p.getType().getName();
+    }
+
+}
+```
+Currently, I use ammonite with scala 2.12. However, this issue has to be solved in order to be able to upgrade ammonite in a not too distant future.
+
+Fixable problems are type inference bugs regarding if-expressions. For example, Scala 2.13 infers Any instead for String in some specific cases regarding our code generator.
+
+Other fixable problems are that methods arguments of type Any* are now collection.Seq[Any] instead of Seq[Any].
+
+But one persistent problem is that StringContext contains a method s and a companion object s. I can't access the method s anymore in a specific case...

@@ -1,0 +1,93 @@
+```ruby
+class User < ActiveRecord::Base
+  acts_as_paranoid
+  has_many :user_permissions, -> { order_by_program_name }, dependent: :destroy
+end
+
+class Permission < ActiveRecord::Base
+  acts_as_paranoid
+  has_many   :user_permissions, dependent: :destroy
+end
+
+class UserPermission < ActiveRecord::Base
+  acts_as_paranoid
+
+  belongs_to :user
+  belongs_to :permission
+end
+
+@user = User.find(1)
+@user.destroy_fully!
+
+ActiveRecord::InvalidForeignKey (PG::ForeignKeyViolation: ERROR:  update or delete on table "users" violates foreign key constraint "fk_rails_11302c83e2" on table "user_permissions"
+DETAIL:  Key (id)=(44) is still referenced from table "user_permissions".
+: DELETE FROM "users" WHERE "users"."id" = $1):
+  app/controllers/users_controller.rb:70:in `destroy'
+```
+Is there anythinng wrong here? Thanks
+We're having a lively discussion on the merits of adding an index to the `deleted_at` column on a very large table in MySQL, which is undergoing a migration to add acts_as_paranoid.
+
+This table is going to have very few records ever deleted, thus the advice at https://stackoverflow.com/questions/26525068/does-laravels-soft-delete-need-index-on-mysql/26530488#26530488 seems to indicate that this is not a good candidate for having such as index. Given a table that has > 20% deleted, it sounds like an index MIGHT be a good idea?
+
+I'd be interested in the advice of more experienced data engineers on this question. Ever more helpful to future users would be a note in the README discussing when this column should be indexed, and when to avoid doing so.
+I find this issue vexing, as it's at direct odds with the documentation.
+
+This library is mutating the default scope to include `WHERE deleted_as IS NULL`, so a uniqueness check will use this default scoping to check for unique.
+
+So, contrary to what the docs say [here](https://github.com/ActsAsParanoid/acts_as_paranoid#validation), this library handles uniqueness checks among non-deleted records out of the box and needs some wrangling to handle uniqueness _including_ deleted records.
+
+I was able to solve it with the `conditions` option for the uniqueness validator.
+
+I believe the documentation needs to be updated to include the option of passing conditions to control exact scoping for uniqueness. The current validator (`validates_uniqueness_of_without_deleted`) should probably be removed as I can't see how the code would work that way.
+
+I'm happy to open a PR with the changes, assuming I'm not missing. The below change is how I was able to get the proper rails validations to trigger on deleted records:
+
+```
+  validates  :value,
+                  uniqueness: {
+                    scope: :customer_id,
+                    case_sensitive: false,
+                    message: 'value must be unique to a customer',
+                    conditions: -> { with_deleted },
+                }
+```
+Can I set a future date to soft delete an object?
+
+```ruby
+object.deleted_at = DateTime.tomorrow
+```
+
+So the gem would check if `deleted_at != nil` and `DateTime.today < deleted_at`
+Using `destroy` on an `acts_as_paranoid` model triggers `after_commit` callbacks. However, while most changes in `after_commit` are found in the `previous_changes` hash, changes to the `deleted_at` field after destroy are found in the `changes` hash.
+```ruby
+class User < ApplicationRecord
+  ...
+  acts_as_paranoid
+
+  has_one :data, dependent: :destroy, class_name: 'Users::Data', as: :holder
+  ...
+end
+
+module Users
+  class Data
+    ...
+    acts_as_paranoid
+
+    belongs_to :holder, polymorphic: true, touch: true, optional: true, with_deleted: true
+    ...
+  end
+end
+```
+
+I have this interesting case where the user has a unique username, but after he gets soft-deleted the username is freed up. This means that trying to recover a soft-deleted user may fail, because his previous username may now be taken, which means the `#recover` should fail and return `false` and it does.
+
+The problem is that I call `deleted_user.recover`, it fails, and then if I check the `deleted_user.data` record, it has been recovered even though the parent object has not been recovered. I tried `deleted_user.data.reload` to see if maybe the `deleted_at: nil` that I am seeing for the data is only an unsaved value, but no, the data has really been recovered even after a reload or a direct database check.
+Look's like `destroy_fully!` doesn't work in Rails 6.
+It raises `Can't modify frozen hash`
+The `dependent` option for `has_many` creates a callback that is executed on soft-deletion. However, it may make more sense to execute it on hard-deletion, because otherwise the deletion cannot be undone (unless the action is destroy and the relation is also paranoid).
+
+Options:
+* Move some of these callbacks to the hard-delete stage
+* Warn about these callbacks (i.e., make people not use them)
+This PR offers a new version of the gem that is limited to Rails 5.2+ only.  This greatly simplified the code in places and removed all the inner classes from `UniquenessWithoutDeletedValidator`.
+How can I just query normally without all the act_as_paranoid magic? For example, `Blog.unscoped.preload(:comments)` will pull only non-deleted comments.

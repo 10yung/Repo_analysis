@@ -1,0 +1,99 @@
+multiconnect test requires:
+The client is expected to establish a separate connection for each of the files requested in the $REQUESTS parameter. The connections may be established serially or in parallel. 
+
+This is exactly how we are doing right now, so adding test name will be good enough.
+
+- Update build.rs to support recent NDK (19 or later) build instruction.
+- You can still get previous NDK style support using `--features ndk-old-gcc`.
+- build_android_ndk19.sh is an example script to build using NDK >= 19.
+- travis: android build will try both way.
+- Update README
+
+This PR will fix #300 and #325 
+This is needed for libp2p, among other uses.
+Currently we only test build with old (gcc) based NDK. However recent NDK switched to clang, so need to test and fix the necessary part.
+not sure if we want to do this but...
+
+rust 1.40 adds `non_exhaustive`, which seems to align well to making the quiche crate more extensible because it forces downstream crates to code for the possibility of new fields in structs or new enums variants.
+
+I've focused on just quiche's public enums here, the small pact can be seen in the rust example client and server. There's probably also some other things like the integration tests or C examples that CI will catch - once it's uplifted to 1.40+.
+Simple lost detection: when the recovery episode ends
+and the duration of current recovery episode is
+short than a given threshold, currently defined by
+2 x min_rtt. This means there was a small loss
+recovered very quickly, indicating this has a
+low probability of congestion but a simple packet lost.
+In this case we restore previous cwnd/ssthresh
+to resume faster after recovery.
+
+This gives a good performance improvement in case of high
+random loss, not by congestion. Test result shows that
+it can improve more than 40% in case of 1% random loss.
+
+Note that it can be used other than Reno (cubic etc) too. (not BBR)
+
+p.s. This PR assumes #299.
+IsAppLimited() can be defined by bytes_in_flght < cwnd.
+
+Let's consider the following scenario.
+
+* initcwnd=3000
+
+Send pkt #0 size  500 -> bytes_in_flight =  500 cwnd=3000
+Recv ack #0           -> bytes_in_flight =    0 cwnd=3000
+Send pkt #1 size 1000 -> bytes_in_flight = 1000 cwnd=3000
+Send pkt #2 size 1000 -> bytes_in_flight = 2000 cwnd=3000
+Send pkt #3 size 1000 -> bytes_in_flight = 3000 cwnd=3000
+Recv ack #1           -> bytes_in_flight = 2000 cwnd=4000 (slow start)
+Send pkt #4 size 1000 -> bytes_in_flight = 3000 cwnd=4000
+Send pkt #5 size 1000 -> bytes_in_flight = 4000 cwnd=4000
+
+Currently is_app_limited() returns always false,
+We are actually doing like this:
+
+Send pkt #0 size  500 -> bytes_in_flight =  500 cwnd=3000
+Recv ack #0           -> bytes_in_flight =    0 cwnd=3500 (slow start)
+Send pkt #1 size 1000 -> bytes_in_flight = 1000 cwnd=3500
+Send pkt #2 size 1000 -> bytes_in_flight = 2000 cwnd=3500
+Send pkt #3 size 1000 -> bytes_in_flight = 3000 cwnd=3500
+Recv ack #1           -> bytes_in_flight = 2000 cwnd=4500 (slow start)
+Send pkt #4 size 1000 -> bytes_in_flight = 3000 cwnd=4500
+Send pkt #5 size 1000 -> bytes_in_flight = 4000 cwnd=4500
+
+It means cwnd may be bloated by acks delivered before
+bytes_in_flight reached cwnd. This happens because in the
+beginning of QUIC connection has Initial and Handshake which
+exchanges data before Application starts.
+
+To solve this, is_app_limited() need to be defined.
+
+However we can't define is_app_limited() as
+bytes_in_flight < cwnd. This is because in on_packet_acked_cc(),
+we decrease bytes_in_flight first, so when we call
+self.is_app_limited() later, it always return true because
+at this point bytes_in_flight < cwnd. This has an adverse impact
+because now is_app_limited() returns true all the time, cwnd
+will not grow.
+
+To prevent this, now app_limited is a field in Reno. We update
+this value in on_packet_sent_cc() only. When bytes_in_flight
+is same or higher than cwnd, app_limited will be false.
+
+Then, when on_packet_acked_cc() is called and when bytes_in
+_flight is same to cwnd or higher, we use app_limited updated
+last time when on_packet_sent_cc() is called. So when
+bytes_in_flight == cwnd, on_packet_sent_cc() will decrease
+bytes_in_flight but still see app_limited == false, so
+cwnd will be updated.
+
+Note that same technique can be used for cubic and other similar CCs.
+
+p.s. This PR assumes #299.
+Not a part of spec, but many implementations use a windowed min_rtt. e.g. https://cs.chromium.org/chromium/src/net/third_party/quiche/src/quic/core/congestion_control/windowed_filter.h?g=0
+Related to #299 and fixes #303 
+
+The idea is to have a `cclog!()` macro basically same to other logging macro but basically it's not enabled without QUICHE_CC_LOG=1, so only we need logging from CC we can set this environment variable.
+
+I used CC_LOG static mut variable, but it only changed in the call_once() and not changed, so using it under unsafe is fine (or I can't find not to use unsafe in the scenario).
+
+p.s. This PR assumes #299.

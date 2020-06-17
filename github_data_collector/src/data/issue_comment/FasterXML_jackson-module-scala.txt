@@ -1,0 +1,428 @@
+Hi,
+
+I am using _"com.fasterxml.jackson.module" %% "jackson-module-scala" % "2.10.0"_
+
+I am using a deserializer to read json message post into kafka.
+At a time we faced a **java.lang.ClassCastException: java.lang.Integer cannot be cast to java.lang.Long**.
+I dig into this issue and found the related issues in github and the FAQ https://github.com/FasterXML/jackson-module-scala/wiki/FAQ that indicate to annotate offending field with **@JsonDeserialize**.
+I tried this with no success.
+My case class look like this (adapt like the one in the test case https://github.com/FasterXML/jackson-module-scala/blob/master/src/test/scala/com/fasterxml/jackson/module/scala/deser/PrimitiveContainerTest.scala)
+```
+case class AnnotatedOptionLongWithDash(@JsonDeserialize(contentAs = classOf[java.lang.Long]) `value-long`: Option[Long])
+```
+
+I try to understand why the test in scala module works but not our code and found that this is because the property contain a dash and we kept the dash in the scala props (Disgusting!).
+I finally try to add @JsonProperty annotation to remove the dash and it's working.
+
+I am not sure this issue is related to jackson deserialization and can be fix or it's scala/java that do something when a property have a dash in it.
+At least it can help to add a note about this in the workarounds of the FAQ.
+
+Here some tests case to reproduce the issue.
+```
+import com.fasterxml.jackson.annotation.JsonProperty
+import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize
+import com.fasterxml.jackson.module.scala.{DefaultScalaModule, ScalaObjectMapper}
+import org.scalatest.{Matchers, WordSpec}
+
+case class AnnotatedOptionLong(@JsonDeserialize(contentAs = classOf[java.lang.Long]) valueLong: Option[Long])
+
+case class AnnotatedOptionLongWithDash(@JsonDeserialize(contentAs = classOf[java.lang.Long]) `value-long`: Option[Long])
+
+case class AnnotatedOptionLongWithDashButChangeToCamelCase(@JsonProperty("value-long") @JsonDeserialize(contentAs = classOf[java.lang.Long]) valueLong: Option[Long])
+
+class JacksonSerializationIssueTest extends WordSpec with Matchers {
+
+  val objectMapper = new ObjectMapper() with ScalaObjectMapper
+  objectMapper.registerModule(new DefaultScalaModule)
+
+  def deserialize[T](data: Array[Byte])(implicit m: Manifest[T]): T = {
+    try {
+      objectMapper.readValue(data)
+    } catch {
+      case e: Throwable =>
+        throw new RuntimeException("Error deserializing JSON message", e)
+    }
+  }
+
+  def serialize[T](data: T): Array[Byte] = {
+    try {
+      objectMapper.writeValueAsBytes(data)
+    } catch {
+      case e: Throwable =>
+        throw new RuntimeException("Error serializing JSON message", e)
+    }
+  }
+
+  def useOptionLong(v: Option[Long]): Long = v.map(_ * 2).getOrElse(0)
+
+  "same as in test source of jackon library" in {
+    // check deserialization
+    val v1 = deserialize[AnnotatedOptionLong]("""{"valueLong":151}""".getBytes)
+    v1 shouldBe AnnotatedOptionLong(Some(151L))
+    v1.valueLong.get shouldBe 151L
+
+    // serialize from case class then deserialize and then apply the method that will fail
+    val v2 = JacksonMapper.deserialize[AnnotatedOptionLong](JacksonMapper.serialize(AnnotatedOptionLong(Some(152))))
+    v2 shouldBe AnnotatedOptionLong(Some(152L))
+    v2.valueLong.get shouldBe 152L
+    useOptionLong(v2.valueLong) shouldBe 304
+  }
+
+  "failing test because of backtick prop name either if we apply the annotation @JsonDeserialize(contentAs = classOf[java.lang.Long]) " in {
+    // check deserialization
+    val v1 = deserialize[AnnotatedOptionLongWithDash]("""{"value-long":251}""".getBytes)
+    v1 shouldBe AnnotatedOptionLongWithDash(Some(251L))
+    v1.`value-long`.get shouldBe 251L
+
+    // serialize from case class then deserialize and then apply the method that will fail
+    val v2 = JacksonMapper.deserialize[AnnotatedOptionLongWithDash](JacksonMapper.serialize(AnnotatedOptionLongWithDash(Some(252))))
+    v2 shouldBe AnnotatedOptionLongWithDash(Some(252L))
+    v2.`value-long`.get shouldBe 252L
+    useOptionLong(v2.`value-long`) shouldBe 504
+  }
+
+  "working solution because we rename the prop with a dash to a camel case prop" in {
+    // check deserialization
+    val v1 = deserialize[AnnotatedOptionLongWithDashButChangeToCamelCase]("""{"value-long":351}""".getBytes)
+    v1 shouldBe AnnotatedOptionLongWithDashButChangeToCamelCase(Some(351L))
+    v1.valueLong.get shouldBe 351L
+
+    // serialize from case class then deserialize and then apply the method that will fail
+    val v2 = JacksonMapper.deserialize[AnnotatedOptionLongWithDashButChangeToCamelCase](JacksonMapper.serialize(AnnotatedOptionLongWithDashButChangeToCamelCase(Some(352))))
+    v2 shouldBe AnnotatedOptionLongWithDashButChangeToCamelCase(Some(352L))
+    v2.valueLong.get shouldBe 352L
+    useOptionLong(v2.valueLong) shouldBe 704
+  }
+
+}
+```
+
+Initial question from google groups https://groups.google.com/forum/?utm_medium=email&utm_source=footer#!msg/jackson-user/NKSx88srl-g/X4Ea2PgfAwAJ
+
+I'm trying to serialize and deserialize an abstract class that has a type parameter, but the deserialization isn't working. Instead of deserializing the JSON into an object of the type parameter's class, Jackson deserializes it into a `Map`, so I'm unable to read the object's properties.
+
+Here is the code:
+```scala
+import com.fasterxml.jackson.annotation.{JsonSubTypes, JsonTypeInfo}
+import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.module.scala.DefaultScalaModule
+
+object GithubExample {
+
+  @JsonTypeInfo(
+    use = JsonTypeInfo.Id.NAME,
+    include = JsonTypeInfo.As.PROPERTY,
+    property = "@type")
+  @JsonSubTypes(Array(
+    new JsonSubTypes.Type(value = classOf[ResultWrapperSuccess[_]]),
+    new JsonSubTypes.Type(value = classOf[ResultWrapperFailure[_]])
+  ))
+  trait ResultWrapperInterface[T] {
+    protected def obj: T
+  }
+
+  case class ResultWrapperSuccess[T](result: T) extends ResultWrapperInterface[T] {
+    override protected def obj: T = result
+  }
+
+  case class ResultWrapperFailure[F](failure: F) extends ResultWrapperInterface[F] {
+    override protected def obj: F = failure
+  }
+
+  case class User(name: String, age: Option[Int])
+
+  def main(args: Array[String]): Unit = {
+
+    val mapper = new ObjectMapper()
+    mapper.registerModule(DefaultScalaModule)
+
+    val user = User("John Smith", Some(39))
+    val serializedUser = mapper.writeValueAsString(user)
+    println(s"(1)        serializedUser: $serializedUser")
+
+    val deserializedUser = mapper.readValue(serializedUser, classOf[User])
+    println(s"(2)      deserializedUser: $deserializedUser")
+    println(s"(3) deserializedUser.name: ${deserializedUser.name}")
+
+
+    val wrapperSuccess = ResultWrapperSuccess[User](user)
+    val serializedSuccess = mapper.writeValueAsString(wrapperSuccess)
+    println(s"(4)     serializedSuccess: $serializedSuccess")
+
+    val deserializedSuccess = mapper.readValue(serializedSuccess, classOf[ResultWrapperInterface[User]])
+    deserializedSuccess match {
+      case _: ResultWrapperFailure[_] =>
+      case success: ResultWrapperSuccess[User] =>
+        println(s"(5)               success: $success")
+        println(s"(6)        success.result: ${success.result}")
+        println(s"(7)   success.result.name: ${success.result.name}")
+    }
+
+  }
+
+}
+```
+
+The first part when we serialize and deserialize the `User` object works just fine. The code breaks on (7) when it tries to access `success.result.name` because `success.result` is somehow a `Map` instead of a `User`.
+
+Here is the output:
+
+```scala
+(1)        serializedUser: {"name":"John Smith","age":39}
+(2)      deserializedUser: User(John Smith,Some(39))
+(3) deserializedUser.name: John Smith
+(4)     serializedSuccess: {"@type":"GithubExample$ResultWrapperSuccess","result":{"name":"John Smith","age":39}}
+(5)               success: ResultWrapperSuccess(Map(name -> John Smith, age -> 39))
+(6)        success.result: Map(name -> John Smith, age -> 39)
+Exception in thread "main" java.lang.ClassCastException: scala.collection.immutable.Map$Map2 cannot be cast to GithubExample$User
+    at GithubExample$.main(GithubExample.scala:55)
+    at GithubExample.main(GithubExample.scala)
+```
+
+As evidenced by the logs, the serialization seems to be working just fine. Is there something I need to change to get the deserialization working?
+I get this exception:
+
+`Can not construct instance of scala.util.Try, problem: abstract types either need to be mapped to concrete types, have custom deserializer`
+Compilation fails due to major changes in jackson-databind
+
+https://travis-ci.org/FasterXML/jackson-module-scala/jobs/588055923
+(NOTE: moved from `jackson-databind` on 11-Sep-2019 by @cowtowncoder )
+
+Version: Jackson 2.8.11, probably also 2.9.7
+
+We have an API server that receives requests then makes ElasticSearch requests using the elastic4s library. The JSON parsing is done using Jackson under the hood. We’ve noticed a lot of threads blocked on the synchronized blocks in the `LRUMap` data structure, which seems to be contributing to slow performance on our API server.
+
+Several threads are blocked on puts to the map, for example:
+
+```
+   java.lang.Thread.State: BLOCKED (on object monitor)
+	at com.fasterxml.jackson.databind.util.LRUMap.putIfAbsent(LRUMap.java:58)
+	- waiting to lock <0x0000000629be2270> (a com.fasterxml.jackson.databind.util.LRUMap)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromClass(TypeFactory.java:1287)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromParamType(TypeFactory.java:1400)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromAny(TypeFactory.java:1165)
+	at com.fasterxml.jackson.databind.type.TypeFactory._resolveSuperInterfaces(TypeFactory.java:1311)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromClass(TypeFactory.java:1254)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromParamType(TypeFactory.java:1400)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromAny(TypeFactory.java:1165)
+	at com.fasterxml.jackson.databind.type.TypeFactory._resolveSuperInterfaces(TypeFactory.java:1311)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromClass(TypeFactory.java:1254)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromParamType(TypeFactory.java:1400)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromAny(TypeFactory.java:1165)
+	at com.fasterxml.jackson.databind.type.TypeFactory._resolveSuperInterfaces(TypeFactory.java:1311)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromClass(TypeFactory.java:1254)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromParamType(TypeFactory.java:1400)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromAny(TypeFactory.java:1165)
+	at com.fasterxml.jackson.databind.type.TypeFactory._resolveSuperInterfaces(TypeFactory.java:1311)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromClass(TypeFactory.java:1254)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromParamType(TypeFactory.java:1400)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromAny(TypeFactory.java:1165)
+	at com.fasterxml.jackson.databind.type.TypeFactory._resolveSuperInterfaces(TypeFactory.java:1311)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromClass(TypeFactory.java:1254)
+	at com.fasterxml.jackson.databind.type.TypeFactory.constructMapLikeType(TypeFactory.java:807)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper.constructType(ScalaObjectMapper.scala:68)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper.constructType$(ScalaObjectMapper.scala:56)
+	at com.sksamuel.elastic4s.json.JacksonSupport$$anon$1.constructType(JacksonSupport.scala:11)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper.$anonfun$constructType$1(ScalaObjectMapper.scala:64)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper$$Lambda$2573/1098099028.apply(Unknown Source)
+	at scala.collection.immutable.List.map(List.scala:286)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper.constructType(ScalaObjectMapper.scala:64)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper.constructType$(ScalaObjectMapper.scala:56)
+	at com.sksamuel.elastic4s.json.JacksonSupport$$anon$1.constructType(JacksonSupport.scala:11)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper.$anonfun$constructType$1(ScalaObjectMapper.scala:64)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper$$Lambda$2573/1098099028.apply(Unknown Source)
+	at scala.collection.immutable.List.map(List.scala:286)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper.constructType(ScalaObjectMapper.scala:64)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper.constructType$(ScalaObjectMapper.scala:56)
+	at com.sksamuel.elastic4s.json.JacksonSupport$$anon$1.constructType(JacksonSupport.scala:11)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper.$anonfun$constructType$1(ScalaObjectMapper.scala:64)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper$$Lambda$2573/1098099028.apply(Unknown Source)
+	at scala.collection.immutable.List.map(List.scala:286)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper.constructType(ScalaObjectMapper.scala:64)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper.constructType$(ScalaObjectMapper.scala:56)
+	at com.sksamuel.elastic4s.json.JacksonSupport$$anon$1.constructType(JacksonSupport.scala:11)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper.readValue(ScalaObjectMapper.scala:190)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper.readValue$(ScalaObjectMapper.scala:189)
+	at com.sksamuel.elastic4s.json.JacksonSupport$$anon$1.readValue(JacksonSupport.scala:11)
+	at com.sksamuel.elastic4s.http.ResponseHandler$.fromEntity(ResponseHandler.scala:34)
+	at models.es.ESHttpClientBackend$GetMappingHttpExecutable$$anon$1.handle(ESHttpClientBackend.scala:575)
+	at com.sksamuel.elastic4s.http.HttpClient.$anonfun$execute$1(HttpClient.scala:62)
+	at com.sksamuel.elastic4s.http.HttpClient$$Lambda$2539/1265612311.apply(Unknown Source)
+	at scala.util.Success.$anonfun$map$1(Try.scala:251)
+	at scala.util.Success.map(Try.scala:209)
+	at scala.concurrent.Future.$anonfun$map$1(Future.scala:288)
+	at scala.concurrent.Future$$Lambda$1146/1816269091.apply(Unknown Source)
+	at scala.concurrent.impl.Promise.liftedTree1$1(Promise.scala:29)
+	at scala.concurrent.impl.Promise.$anonfun$transform$1(Promise.scala:29)
+	at scala.concurrent.impl.Promise$$Lambda$609/1310865036.apply(Unknown Source)
+	at scala.concurrent.impl.CallbackRunnable.run(Promise.scala:60)
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+	at java.lang.Thread.run(Thread.java:748)
+```
+
+and another thread blocked on `clear()`:
+
+```
+   java.lang.Thread.State: BLOCKED (on object monitor)
+	at java.util.concurrent.ConcurrentHashMap.clear(ConcurrentHashMap.java:1193)
+	- locked <0x0000000625710000> (a java.util.concurrent.ConcurrentHashMap$TreeBin)
+	at com.fasterxml.jackson.databind.util.LRUMap.clear(LRUMap.java:70)
+	at com.fasterxml.jackson.databind.util.LRUMap.putIfAbsent(LRUMap.java:60)
+	- locked <0x0000000629be2270> (a com.fasterxml.jackson.databind.util.LRUMap)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromClass(TypeFactory.java:1287)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromParamType(TypeFactory.java:1400)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromAny(TypeFactory.java:1165)
+	at com.fasterxml.jackson.databind.type.TypeFactory._resolveSuperInterfaces(TypeFactory.java:1311)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromClass(TypeFactory.java:1254)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromParamType(TypeFactory.java:1400)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromAny(TypeFactory.java:1165)
+	at com.fasterxml.jackson.databind.type.TypeFactory._resolveSuperInterfaces(TypeFactory.java:1311)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromClass(TypeFactory.java:1254)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromParamType(TypeFactory.java:1400)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromAny(TypeFactory.java:1165)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromParamType(TypeFactory.java:1396)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromAny(TypeFactory.java:1165)
+	at com.fasterxml.jackson.databind.type.TypeFactory._resolveSuperInterfaces(TypeFactory.java:1311)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromClass(TypeFactory.java:1254)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromParamType(TypeFactory.java:1400)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromAny(TypeFactory.java:1165)
+	at com.fasterxml.jackson.databind.type.TypeFactory._resolveSuperInterfaces(TypeFactory.java:1311)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromClass(TypeFactory.java:1254)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromParamType(TypeFactory.java:1400)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromAny(TypeFactory.java:1165)
+	at com.fasterxml.jackson.databind.type.TypeFactory._resolveSuperInterfaces(TypeFactory.java:1311)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromClass(TypeFactory.java:1254)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromParamType(TypeFactory.java:1400)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromAny(TypeFactory.java:1165)
+	at com.fasterxml.jackson.databind.type.TypeFactory._resolveSuperInterfaces(TypeFactory.java:1311)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromClass(TypeFactory.java:1254)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromParamType(TypeFactory.java:1400)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromAny(TypeFactory.java:1165)
+	at com.fasterxml.jackson.databind.type.TypeFactory._resolveSuperInterfaces(TypeFactory.java:1311)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromClass(TypeFactory.java:1254)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromParamType(TypeFactory.java:1400)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromAny(TypeFactory.java:1165)
+	at com.fasterxml.jackson.databind.type.TypeFactory._resolveSuperInterfaces(TypeFactory.java:1311)
+	at com.fasterxml.jackson.databind.type.TypeFactory._fromClass(TypeFactory.java:1254)
+	at com.fasterxml.jackson.databind.type.TypeFactory.constructMapLikeType(TypeFactory.java:807)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper.constructType(ScalaObjectMapper.scala:68)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper.constructType$(ScalaObjectMapper.scala:56)
+	at com.sksamuel.elastic4s.json.JacksonSupport$$anon$1.constructType(JacksonSupport.scala:11)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper.$anonfun$constructType$1(ScalaObjectMapper.scala:64)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper$$Lambda$2573/1098099028.apply(Unknown Source)
+	at scala.collection.immutable.List.map(List.scala:286)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper.constructType(ScalaObjectMapper.scala:64)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper.constructType$(ScalaObjectMapper.scala:56)
+	at com.sksamuel.elastic4s.json.JacksonSupport$$anon$1.constructType(JacksonSupport.scala:11)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper.readValue(ScalaObjectMapper.scala:190)
+	at com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper.readValue$(ScalaObjectMapper.scala:189)
+	at com.sksamuel.elastic4s.json.JacksonSupport$$anon$1.readValue(JacksonSupport.scala:11)
+	at com.sksamuel.elastic4s.http.ResponseHandler$.fromEntity(ResponseHandler.scala:34)
+	at models.es.ESHttpClientBackend$GetMappingHttpExecutable$$anon$1.handle(ESHttpClientBackend.scala:575)
+	at com.sksamuel.elastic4s.http.HttpClient.$anonfun$execute$1(HttpClient.scala:62)
+	at com.sksamuel.elastic4s.http.HttpClient$$Lambda$2539/1265612311.apply(Unknown Source)
+	at scala.util.Success.$anonfun$map$1(Try.scala:251)
+	at scala.util.Success.map(Try.scala:209)
+	at scala.concurrent.Future.$anonfun$map$1(Future.scala:288)
+	at scala.concurrent.Future$$Lambda$1146/1816269091.apply(Unknown Source)
+	at scala.concurrent.impl.Promise.liftedTree1$1(Promise.scala:29)
+	at scala.concurrent.impl.Promise.$anonfun$transform$1(Promise.scala:29)
+	at scala.concurrent.impl.Promise$$Lambda$609/1310865036.apply(Unknown Source)
+	at scala.concurrent.impl.CallbackRunnable.run(Promise.scala:60)
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+	at java.lang.Thread.run(Thread.java:748)
+```
+
+Based on heap dumps, we see that the `_typeCache` map in `TypeFactory` is getting filled up quickly with type information for the JSON objects we’re parsing, then the map is getting cleared, then the process is repeated quickly. Since the `clear()` operation is relatively expensive and inside a synchronized block, it blocks all other threads from making progress, and this can happen repeatedly in a short period of time.
+
+We could replace the `ConcurrentHashMap` with a synchronized `LinkedHashMap` with an LRU eviction policy, and/or increase the size of the cache. Either way, clearing the cache seems like an inefficient solution, especially when many threads are trying to use the cache.
+This is the part of FasterXML/jackson-databind#2434 that relates to changes to the jackson-module-scala project.
+Adding power support.
+Here is my scala code:
+```scala
+case class A(b: B)
+
+class B(id: Int) {
+  @JsonIgnore
+  def x = id
+}
+
+object MyApp {
+  def main(args: Array[String]): Unit = {
+    val objectMapper = new ObjectMapper()
+    objectMapper.registerModule(DefaultScalaModule)
+
+    val a = objectMapper.readValue("""{"b": 1}""", classOf[A])
+  }
+}
+```
+
+I get the following exception when I run this code:
+```
+Exception in thread "main" com.fasterxml.jackson.databind.exc.MismatchedInputException: Cannot construct instance of `B` (although at least one Creator exists): no int/Int-argument constructor/factory method to deserialize from Number value (1)
+ at [Source: (String)"{"b": 1}"; line: 1, column: 7] (through reference chain: A["b"])
+	at com.fasterxml.jackson.databind.exc.MismatchedInputException.from(MismatchedInputException.java:63)
+	at com.fasterxml.jackson.databind.DeserializationContext.reportInputMismatch(DeserializationContext.java:1343)
+	at com.fasterxml.jackson.databind.DeserializationContext.handleMissingInstantiator(DeserializationContext.java:1032)
+	at com.fasterxml.jackson.databind.deser.ValueInstantiator.createFromInt(ValueInstantiator.java:262)
+	at com.fasterxml.jackson.databind.deser.std.StdValueInstantiator.createFromInt(StdValueInstantiator.java:356)
+	at com.fasterxml.jackson.databind.deser.BeanDeserializerBase.deserializeFromNumber(BeanDeserializerBase.java:1324)
+	at com.fasterxml.jackson.databind.deser.BeanDeserializer._deserializeOther(BeanDeserializer.java:173)
+	at com.fasterxml.jackson.databind.deser.BeanDeserializer.deserialize(BeanDeserializer.java:161)
+	at com.fasterxml.jackson.databind.deser.SettableBeanProperty.deserialize(SettableBeanProperty.java:530)
+	at com.fasterxml.jackson.databind.deser.BeanDeserializer._deserializeWithErrorWrapping(BeanDeserializer.java:528)
+	at com.fasterxml.jackson.databind.deser.BeanDeserializer._deserializeUsingPropertyBased(BeanDeserializer.java:417)
+	at com.fasterxml.jackson.databind.deser.BeanDeserializerBase.deserializeFromObjectUsingNonDefault(BeanDeserializerBase.java:1287)
+	at com.fasterxml.jackson.databind.deser.BeanDeserializer.deserializeFromObject(BeanDeserializer.java:326)
+	at com.fasterxml.jackson.databind.deser.BeanDeserializer.deserialize(BeanDeserializer.java:159)
+	at com.fasterxml.jackson.databind.ObjectMapper._readMapAndClose(ObjectMapper.java:4013)
+	at com.fasterxml.jackson.databind.ObjectMapper.readValue(ObjectMapper.java:3004)
+	at MyApp$.main(MapperTest.scala:17)
+	at MyApp.main(MapperTest.scala)
+```
+
+However, when `B.x` is defined as `def x = 0` the deserialization works fine.  How is that possible?  Is this a bug in jackson or in jackson-module-scala or did I miss something?
+[CWE-829: Inclusion of Functionality from Untrusted Control Sphere](https://cwe.mitre.org/data/definitions/829.html)
+[CWE-494: Download of Code Without Integrity Check](https://cwe.mitre.org/data/definitions/494.html)
+
+The build files indicate that this project is resolving dependencies over HTTP instead of HTTPS. Any of these artifacts could have been MITM to maliciously compromise them and infect the build artifacts that were produced. Additionally, if any of these JARs or other dependencies were compromised, any developers using these could continue to be infected past updating to fix this.
+
+This vulnerability has a CVSS v3.0 Base Score of 8.1/10
+https://nvd.nist.gov/vuln-metrics/cvss/v3-calculator?vector=AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H
+
+### This isn't just theoretical
+POC code has existed since 2014 to maliciously compromise a JAR file inflight.
+See:
+* https://max.computer/blog/how-to-take-over-the-computer-of-any-java-or-clojure-or-scala-developer/
+* https://github.com/mveytsman/dilettante
+
+### MITM Attacks Increasingly Common
+See:
+* https://serverfault.com/a/153065
+* https://security.stackexchange.com/a/12050
+* [Comcast continues to inject its own code into websites you visit](https://thenextweb.com/insights/2017/12/11/comcast-continues-to-inject-its-own-code-into-websites-you-visit/#) (over HTTP)
+
+### Source Locations
+
+https://github.com/FasterXML/jackson-module-scala/blob/485b29b9c5b9b038c3eafb04464585f4e2c96730/project/plugins.sbt#L16
+
+### Public Disclosure
+
+#### Option 1: File for a CVE
+
+A project maintainer for this project should probably file for a CVE number to inform the public about this vulnerability in the build for this project. The goal is to inform the public that there was a potential for published build artifacts to have been maliciously compromised in earlier releases.
+
+If a maintainer on this project works for or is associated with a CNA, please have them file it with them:
+[cve.mitre.org/cve/request_id.html](https://cve.mitre.org/cve/request_id.html)
+
+Otherwise, an open source CVE should be filed for here:
+[iwantacve.org](https://iwantacve.org/)
+
+#### Option 2: Manually validate the release artifacts
+
+If this project's build is [fully reproducible](https://en.wikipedia.org/wiki/Reproducible_builds). An alternative to filing for a CVE is to go back and build the earlier releases (with the HTTPS patch applied) to confirm the artifacts were not tampered when they were built. This can be done by comparing the hashes of the artifacts built locally with the ones published. If the hashes of all previous artifacts match those that are published, you can safely assume that the releases were not tampered with.
+
+Again, this assumes that the build if fully reproducible and will require significantly more work.

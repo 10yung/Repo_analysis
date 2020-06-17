@@ -1,0 +1,120 @@
+In Gentoo Linux we compress all documentation. Since ck already does the compression, it would lead to double compression. Would it be possible to pass an argument  to ./configure whether we want documentation compression?
+
+Thank you
+Could someone look into adding support for riscv32 and riscv64? There are Fedora, Debian, OpenSUSE, Gentoo, etc. distributions available for QEMU virt machine or/and SiFive Unleashed dev board.
+```/usr/bin/cc -D_XOPEN_SOURCE=600 -D_BSD_SOURCE -D_DEFAULT_SOURCE -std=gnu99 -pedantic -Wall -W -Wundef -Wendif-labels -Wshadow -Wpointer-arith -Wcast-align -Wcast-qual -Wwrite-strings -Wstrict-prototypes -Wmissing-prototypes -Wnested-externs -Winline -Wdisabled-optimization -fstrict-aliasing -O2 -pipe -Wno-parentheses  -DCK_CC_BUILTINS -fPIC -I/home/sbahra/ck/include -I/home/sbahra/ck/include -c -o /home/sbahra/ck/src/ck_ec.o /home/sbahra/ck/src/ck_ec.c
+In file included from /home/sbahra/ck/src/ck_ec.c:1:0:
+/home/sbahra/ck/include/ck_ec.h:686:29: warning: no previous prototype for ‘ck_ec32_add_epilogue’ [-Wmissing-prototypes]
+/home/sbahra/ck/include/ck_ec.h:835:29: warning: no previous prototype for ‘ck_ec_add64_epilogue’ [-Wmissing-prototypes]
+```
+Old infrastructure is not as actively maintained.
+Comments from @pkhuong and @cota:
+
+```
+[Monday, 30 July 2018] [10:04:33 MST] <pkhuong> cota: I think ck_bytelock's design is known to be broken
+[Monday, 30 July 2018] [10:24:17 MST] <cota> pkhuong: thx, won't report it then :-)
+[Monday, 30 July 2018] [10:27:27 MST] <pkhuong> actual breakage is good to know. maybe we should just get rid of it
+[Monday, 30 July 2018] [10:27:55 MST] <pkhuong> IIUC, at the time, the design was broken according to the memory model, but seemed to work fine in practice
+```
+
+on amd64:
+```
+[Monday, 30 July 2018] [09:49:30 MST] <cota> Waiting for threads to finish correctness regression...ERROR [RD:113]: 3 != 0
+```
+
+On ppc64:
+```
+make[2]: Entering directory '/home/kev009/ck/regressions/ck_bytelock/validate'
+./validate 176 1
+Creating threads (mutual exclusion)...done
+Waiting for threads to finish correctness regression...ERROR [RD:113]: 1 != 0
+ERROR [WR:76]: 1 != 0
+ERROR [WR:76]: 1 != 0
+```
+https://github.com/pramalhe/ConcurrencyFreaks/blob/master/papers/multilist-2017.pdf
+This is something a few users have expressed interest in when using per-CPU structures or amortizing across a large number of threads.
+@cognet - I can take this on, pending remote access to MIPS64 box.
+
+Requires test coverage and re-testing on target platforms. Section-ful invocation needs to make sure that no section-less invocations exist.
+
+Taking epoch reclamation principles, SPSC use-case can be made efficient. @pkhuong dumped the following, which is a good starting point for the facility. This is a "concept" below from Paul.
+
+```
+#include <assert.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <ck_pr.h>
+
+struct buffer_index {
+    uint8_t byte;
+};
+
+/* We can obv. offset everything for 0 init, but let's keep things clear. */
+#define BUFFER_INDEX_INIT = { 1 }
+
+/* Not clear on the fencing; check ck_epoch... */
+static inline size_t
+buffer_index_read_index(const struct buffer_index *index)
+{
+    uint8_t byte = ck_pr_load_8(&index->byte);
+
+    return byte >> 4;
+}
+
+static inline void
+buffer_index_read_done(struct buffer_index *index)
+{
+    size_t next_read_index, read_index, write_index;
+    uint8_t byte = ck_pr_load_8(&index->byte);
+
+    read_index = byte >> 4;
+    write_index = byte & 0xF;
+
+    next_read_index = read_index + 1;
+    if (next_read_index == 3) {
+        next_read_index = 0;
+    }
+
+    if (next_read_index != write_index) {
+        size_t prev_write_index = (write_index + 2) % 3;
+        assert(prev_write_index == next_read_index);
+
+        ck_pr_fence_load_store();
+        ck_pr_store_8(&index->byte, (next_read_index << 4) | write_index);
+    }
+
+    return;
+}
+
+static inline size_t
+buffer_index_write_index(const struct buffer_index *index)
+{
+    uint8_t byte = ck_pr_load_8(&index->byte);
+
+    return byte & 0xF;
+}
+
+static inline size_t
+buffer_index_write_start(struct buffer_index *index)
+{
+    size_t next_write_index, read_index, write_index;
+    uint8_t byte = ck_pr_load_8(&index->byte);
+
+    read_index = byte >> 4;
+    write_index = byte & 0xF;
+
+    next_write_index = write_index + 1;
+    if (next_write_index == 3) {
+        next_write_index = 0;
+    }
+
+    if (next_write_index == read_index) {
+        return write_index;
+    }
+
+    assert(((read_index + 2) % 3) == next_write_index);
+    ck_pr_store_8(&index->byte, (read_index << 4) | next_write_index);
+    ck_pr_fence_store();
+    return next_write_index;
+}
+```

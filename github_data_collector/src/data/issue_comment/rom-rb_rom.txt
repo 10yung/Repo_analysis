@@ -1,0 +1,401 @@
+When using auto_struct and a module definition, ROM is not respecting the configured types for an association.
+
+```ruby
+schema(:articles, infer: true) do
+  associations do
+    belongs_to :profiles, as: :author, foreign_key: :author_id
+  end
+end
+
+class Entities::Article < Entity      # entity itself inherits from ROM::Struct
+  attribute :author,   ::Entities::Profile
+end
+
+ArticleRepository.new(rom).first.author.class
+# => Entities::Author ... expect an Entities::Profile
+```
+
+reproduction script:  https://gist.github.com/cflipse/947447e4c656b35d351ffb518df38d65
+
+Directly mapping to the class via `map_to` will coerce the author field correctly.
+The intention of this PR is to limit runtime deps matrix only to the latest MRI version, because it should be enough to verify that things work with crucial deps from master vs latest released versions.
+
+Unfortunately I don't know HOW to do it yet 😆 
+This sets up our CI to run against TruffleRuby.
+
+### TODO
+
+- [ ] fix broken specs
+- [ ] figure out why bundling takes so long
+
+Refs #549 
+**Describe the bug**
+
+Auto registration error "uninitialized constant Lib (NameError)"
+
+Traceback:
+
+```
+Traceback (most recent call last):
+        7: from app.rb:4:in `<main>'
+        6: from /Users/man/.rbenv/versions/2.6.3/lib/ruby/2.6.0/forwardable.rb:230:in `auto_registration'
+        5: from /Users/man/.rbenv/versions/2.6.3/lib/ruby/gems/2.6.0/gems/rom-core-5.1.2/lib/rom/setup.rb:51:in `auto_registration'
+        4: from /Users/man/.rbenv/versions/2.6.3/lib/ruby/gems/2.6.0/gems/rom-core-5.1.2/lib/rom/setup/auto_registration.rb:58:in `relations'
+        3: from /Users/man/.rbenv/versions/2.6.3/lib/ruby/gems/2.6.0/gems/rom-core-5.1.2/lib/rom/setup/auto_registration.rb:81:in `load_entities'
+        2: from /Users/man/.rbenv/versions/2.6.3/lib/ruby/gems/2.6.0/gems/rom-core-5.1.2/lib/rom/setup/auto_registration.rb:81:in `map'
+        1: from /Users/man/.rbenv/versions/2.6.3/lib/ruby/gems/2.6.0/gems/rom-core-5.1.2/lib/rom/setup/auto_registration.rb:99:in `block in load_entities'
+/Users/man/.rbenv/versions/2.6.3/lib/ruby/gems/2.6.0/gems/dry-inflector-0.2.0/lib/dry/inflector.rb:90:in `constantize': uninitialized constant Lib (NameError)
+```
+
+**To Reproduce**
+
+1. Create file `app.rb`
+
+``` ruby
+require 'rom'
+  
+configuration = ROM::Configuration.new(:memory)
+configuration.auto_registration(File.expand_path('.') + '/lib')
+container = ROM.container(configuration)
+```
+
+2. Create file `lib/relations/users.rb`
+
+``` ruby
+module Relations
+  class Users < ROM::Relation[:memory]
+    schema(infer: true)
+  end
+end
+```
+
+Source: https://rom-rb.org/5.0/learn/advanced/explicit-setup/#namespaces-inferred-from-directory-structure
+
+3. Run `ruby app.rb`
+
+**Expected behavior**
+
+Auto class registration `Relations::Users`
+
+**Your environment**
+
+- Affects my production application: **NO**
+- Ruby version: ruby 2.6.3p62 (2019-04-16 revision 67580) [x86_64-darwin18]
+- OS: macOS
+
+**Describe the bug**
+
+When using a nested combine and views we get an error thrown in the transproc gem. 
+
+```
+/Users/shipmana/.rbenv/versions/2.6.2/lib/ruby/gems/2.6.0/gems/transproc-1.1.0/lib/transproc/array/combine.rb:51:in `block in group_candidates_by_keys': no implicit conversion of Symbol into Integer (TypeError)
+```
+
+Without using the nested combine, the data structure is retrieved correctly (although obviously without the child data)
+
+As far as I can tell, the data is pulled from the data source correctly. We end up with a hash of data that fails the `group_by` call in transproc.
+
+**To Reproduce**
+
+```ruby
+#!/usr/bin/env ruby
+require 'bundler/inline'
+
+gemfile do
+  source 'https://rubygems.org'
+  gem 'rom'
+  gem 'rom-sql'
+  gem 'rom-repository'
+  gem 'dry-types'
+  gem 'sqlite3'
+end
+
+module Types
+  include Dry::Types(default: :nominal)
+end
+
+rom = ROM.container(:sql, 'sqlite::memory') do |c|
+  c.gateways[:default].create_table :product_groups do
+    primary_key :id
+    String :name
+  end
+
+  c.gateways[:default].create_table :products do
+    primary_key :id
+    String :reference
+    String :name
+  end
+
+  c.gateways[:default].create_table :grouped_products do
+    primary_key :id
+    Integer :product_group_id
+    Integer :product_id
+  end
+
+  c.gateways[:default].create_table :allocations do
+    primary_key :id
+    Integer :product_config_id
+    String :name
+  end
+
+  c.gateways[:default].create_table :product_configs do
+    primary_key :id
+    Integer :product_group_id
+  end
+
+  c.gateways[:default].use_logger(Logger.new($stdout))
+
+  c.relation(:product_groups) do
+    schema(:product_groups, infer: false) do
+      attribute :id, Types::Integer, primary_key: true
+      attribute :name, Types::String
+
+      associations do
+        has_many :products, view: :for_product_groups, override: true, combine_keys: { id: :product_group_id }
+      end
+    end
+
+    def for_allocations(_assoc, loaded)
+      product_groups
+        .join(:product_configs, { product_group_id: :id })
+        .where(product_configs[:id] => loaded.pluck(:product_config_id).uniq)
+        .select_append(product_configs[:id].as(:product_config_id))
+    end
+  end
+
+  c.relation(:grouped_products) do
+    schema(:grouped_products, infer: false) do
+      attribute :id, Types::Integer.meta(primary_key: true)
+      attribute :product_group_id, Types::Integer
+      attribute :product_id, Types::String
+    end
+  end
+
+  c.relation(:products) do
+    schema(:products, infer: false) do
+      attribute :id, Types::Integer.meta(primary_key: true)
+      attribute :reference, Types::String
+      attribute :name, Types::String
+    end
+
+    def for_product_groups(_assoc, loaded)
+      products
+        .join(:grouped_products, { grouped_products[:product_id] => products[:reference] })
+        .where(grouped_products[:product_group_id] => loaded.pluck(:id).uniq)
+        .select_append(grouped_products[:product_group_id])
+    end
+  end
+
+  c.relation(:allocations) do
+    schema(:allocations, infer: false) do
+      attribute :id, Types::Integer.meta(primary_key: true)
+      attribute :product_config_id, Types::Integer
+      attribute :name, Types::String
+
+      associations do
+        has_one :product_group, view: :for_allocations, override: true,
+          combine_keys: { product_config_id: :product_config_id }
+      end
+    end
+  end
+
+  c.relation(:product_configs) do
+    schema(:product_configs, infer: false) do
+      attribute :id, Types::Integer.meta(primary_key: true)
+      attribute :product_group_id, Types::Integer
+    end
+  end
+end
+
+rom.relations[:products].insert id: 1001, reference: "ABC", name: "TV"
+rom.relations[:product_groups].insert id: 2002, name: "Broadcasters"
+rom.relations[:grouped_products].insert id: 3003, product_group_id: 2002, product_id: "ABC"
+rom.relations[:product_configs].insert id: 4004, product_group_id: 2002
+rom.relations[:allocations].insert id: 5005, product_config_id: 4004
+
+class AllocationRepo < ROM::Repository[:allocations]
+  def boom
+    allocations.combine(product_group: :products).to_a
+  end
+
+  def ok
+    allocations.combine(:product_group).to_a
+  end
+end
+
+repo = AllocationRepo.new(rom)
+
+# puts repo.ok.inspect
+puts repo.boom.inspect # => transproc-1.1.0/lib/transproc/array/combine.rb:51:in `block in group_candidates_by_keys': no implicit conversion of Symbol into Integer (TypeError)
+
+```
+
+**Expected behavior**
+
+No error thrown and a correctly combined dataset.
+
+**Your environment**
+
+- Affects my production application: **NO**
+- Ruby version: ruby 2.6.2p47 (2019-03-13 revision 67232) [x86_64-darwin18]
+- OS: MacOS
+
+**Describe the bug**
+
+After following the repository quick start guide, specifically the [create sub-section](https://rom-rb.org/5.0/learn/repositories/quick-start/#create), I attempted to pass an array of hashes to the exposed `create` method on the repository. All array elements were saved to the datasource, but only the first saved element was returned.
+
+**To Reproduce**
+
+1. Create a new class that inherits from `ROM::Repository`
+2. Add the `commands :create` macro to this class
+3. Attempt to save an array of hashes that represent the relation which the `ROM::Repository` defined in step 1 handles.
+4. Inspect the underlying datasource and return value of `create`
+
+**Expected behavior**
+
+Providing that no elements in the input array violate the underlying datasources constraints, all input array elements should be saved in the underlying datasource, and the return value of `create` should be an array whose size is equal to the input array, and contain representations of each tuple saved in the underlying datasource
+
+**Your environment**
+
+- Affects my production application: NO
+- Ruby version: 2.6.3
+- OS: Ubuntu 16.04/18.04
+- Gemfile:
+
+```
+source "https://rubygems.org"
+
+gem "rake"
+
+# Web framework
+gem "dry-system", "~> 0.9"
+gem "dry-web", "~> 0.7"
+gem "dry-web-roda", "~> 0.11"
+gem "puma"
+gem "rack_csrf"
+
+gem "rack", ">= 2.0"
+
+# Database persistence
+gem "pg"
+gem "rom", "~> 5.1"
+gem "rom-sql", "~> 3.0.1"
+
+# Application dependencies
+gem "dry-matcher", "~> 0.8"
+gem "dry-monads", "~> 1.3.0"
+gem "dry-struct", "~> 1.0"
+gem "dry-transaction", "~> 0.13"
+gem "dry-types", "~> 1"
+gem "dry-validation", "~> 1.2.1"
+gem "dry-view", "~> 0.7"
+gem "slim"
+
+group :development, :test do
+  gem "pry-byebug", platform: :mri
+end
+
+group :development do
+  gem "rerun"
+end
+
+group :test do
+  gem "capybara"
+  gem "capybara-screenshot"
+  gem "database_cleaner"
+  gem "poltergeist"
+  gem "rspec"
+  gem "rom-factory", "~> 0.5"
+end
+```
+The example described here https://rom-rb.org/5.0/learn/repositories/writing-aggregates/
+Creating a record along with associated records raises
+```
+     ROM::Struct::MissingAttribute:
+       undefined method `[]=' for #<ROM::Struct::ProCompany:0x00007ffed0791040>
+       Did you mean?  [] (attribute not loaded?)
+     # /Users/username/.rbenv/versions/2.6.3/lib/ruby/gems/2.6.0/gems/rom-core-5.0.2/lib/rom/struct.rb:105:in `rescue in method_missing'
+     # /Users/username/.rbenv/versions/2.6.3/lib/ruby/gems/2.6.0/gems/rom-core-5.0.2/lib/rom/struct.rb:102:in `method_missing'
+     # /Users/username/.rbenv/versions/2.6.3/lib/ruby/gems/2.6.0/gems/transproc-1.1.0/lib/transproc/array/combine.rb:26:in `block in add_groups_to_element'
+```
+It tries to use `#[]=` operator on ROM::Struct while its not defined on it
+
+**To Reproduce**
+
+```ruby
+module MyModule
+
+  class Companies < ROM::Relation[:sql]
+    gateway :gateway_1
+
+    auto_struct true
+
+    schema(:companies, infer: true, as: :pro_companies) do
+      associations do
+        has_many :pro_role_groups, as: :role_groups
+      end
+    end
+
+  end
+end
+
+module MyModule
+
+  class RoleGroups < ROM::Relation[:sql]
+    gateway :gateway_1
+
+    auto_struct true
+
+    schema(:role_groups, infer: true, as: :pro_role_groups) do
+
+      associations do
+        belongs_to :pro_company, as: :company
+      end
+
+    end
+
+  end
+end
+
+module MyModule
+  class CompanyRepository < ::ROM::Repository[:pro_companies]
+
+    def create_with_default_role_groups(_company)
+      company = _company.dup
+      company.fetch(:role_groups, []).each do |rg|
+        rg[:created_at] = Time.now
+        rg[:updated_at] = Time.now
+      end
+
+      create_company = pro_companies.combine(:role_groups).command(:create) 
+      create_company.call(company) # OOPS! 
+    end
+
+  end
+end
+
+```
+
+**Expected behavior**
+
+It should not raise error
+
+**Environment**
+
+- Affects my production application: **NO**
+- Ruby version: 2.6.3
+- OS: MacOS Mojave
+
+Support sharding for SQL databases
+
+## Examples
+
+TBD
+
+## Resources
+
+Sequel supports sharding: https://github.com/jeremyevans/sequel/blob/master/doc/sharding.rdoc
+Fixes #529
+This makes sense in case of adapters where key coercion is not required, but when it is, we ALWAYS need to use an output_schema because it will handle key coercion even when there are no read types defined.
+
+This already caused issues in `rom-elasticsearch` and `rom-http`, both currently override `output_schema` Relation option as a workaround.

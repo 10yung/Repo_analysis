@@ -1,0 +1,452 @@
+In my environment:
+GREETINGS='Good Morning,Good Afternoon,Good Evening'
+
+After unmarshalling  (this is what I expected)
+c.Greetings = 
+[0]: "Good Morning"
+[1]: "Good Afternoon"
+[2]: "Good Evening"
+
+However, viper.GetStringSlice('greetings') returns:
+[0]: "Good"
+[1]: "Morning,Good"
+[2]: "Afternoon,Good"
+[3]: "Evening"
+
+Seems these should be the same. :)
+I realize there are other issues related to configs with no extension, but I didn't see this one
+
+When writing a config with no extension I get this error:
+`filename: /Users/kjayne/.test/config requires valid extension` 
+It seems to find the config file just fine...
+unless I'm missing something
+
+## Sample Code `main.go`
+```gonalg
+package main
+
+import (
+	"fmt"
+
+	"github.com/mitchellh/go-homedir"
+	"github.com/spf13/viper"
+)
+
+func main() {
+
+	// Find home directory.
+	homeDir, err := homedir.Dir()
+	if err != nil {
+		fmt.Println("Error Getting Home Directory", err)
+		return
+	}
+
+	configName := "config"
+	configDir := homeDir + "/.test"
+	configFile := configDir + "/" + configName
+
+	viper.SetConfigType("json")
+	viper.AddConfigPath(configDir)
+	viper.SetConfigName(configName)
+
+	fmt.Println("config name:", configName)
+	fmt.Println("config dir:", configDir)
+	fmt.Println("config file:", configFile)
+
+	fmt.Println("read config error:", viper.ReadInConfig())
+	fmt.Println("write config error:", viper.WriteConfig())
+	fmt.Println("write config error:", viper.WriteConfigAs(configFile))
+
+}
+```
+
+## Console Output `go run main.go`
+```gonalg
+config name: config
+config dir: /Users/kjayne/.test
+config file: /Users/kjayne/.test/config
+read config error: <nil>
+write config error: filename: /Users/kjayne/.test/config requires valid extension
+write config error: filename: /Users/kjayne/.test/config requires valid extension
+```
+
+I'm trying to figure out how i'd log the source of a setting for troubleshooting:
+X is set to Y in the config file
+A is set to V in an environment variable
+
+Thanks!
+I'm currently running viper `1.6.1`.
+
+Consider the following yaml config, `config.yaml`:
+
+```yaml
+---
+entries:
+  a:
+    foo: bar
+  b: ~
+```
+
+My intention is to unmarshal this into a Config struct of the form:
+
+```go
+type Entry struct {
+    Foo string
+}
+
+type Config struct {
+    Entries map[string]*Entry
+}
+```
+
+Where the expected output when printing would look like: `map[a:<pointer> b:<nil>]`. However, it appears keys with nil values are lost during the unmarshalling process.
+
+The following POC demonstrates loading the `config.yaml` file above using viper and yaml.v2. The yaml.v2 is what I would expect.
+
+```go
+package main
+
+import (
+    "fmt"
+    "io/ioutil"
+    "log"
+
+    "github.com/spf13/viper"
+    "gopkg.in/yaml.v2"
+)
+
+type Entry struct {
+    Foo string
+}
+
+type Config struct {
+    Entries map[string]*Entry
+}
+
+func main() {
+    viper.AddConfigPath(".")
+    viper.SetConfigName("config")
+
+    if err := viper.ReadInConfig(); err != nil {
+        log.Fatal(err)
+    }
+
+    viperConfig := Config{}
+    if err := viper.Unmarshal(&viperConfig); err != nil {
+        log.Fatal(err)
+    }
+
+    data, err := ioutil.ReadFile("config.yaml")
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    yamlConfig := Config{}
+    if err := yaml.Unmarshal(data, &yamlConfig); err != nil {
+        log.Fatal(err)
+    }
+
+    fmt.Println("AllKeys():", viper.AllKeys())
+    fmt.Println("AllSettings():", viper.AllSettings())
+    fmt.Println("viper config:", viperConfig)
+    fmt.Println("yaml.v2 config:", yamlConfig)
+}
+```
+
+When running the output is:
+
+```
+AllKeys(): [entries.a.foo entries.b]
+AllSettings(): map[entries:map[a:map[foo:bar]]]
+viper config: {map[a:0xc00009f430]}
+yaml.v2 config: {map[a:0xc00009f550 b:<nil>]}
+```
+
+So viper is clearly aware the "b" key exists given the `AllKeys()` output, but it looks to be lost during the call to `AllSettings()`.
+
+When examining the source, this looks to be intended behaviour: https://github.com/spf13/viper/blob/master/viper.go#L1894-L1898 (although the comment is misleading as `AllKeys()` clearly returns keys without a value as shown in the POC above). If I comment those lines out, then after unmarshalling, viper and yaml.v2 give the same output (and all viper's tests continue to pass).
+
+Therefore my questions are:
+* Is this still the intended behaviour, i.e. should keys with nil values be ignored during a call to `AllSettings()`?
+* If this is intended behaviour, could we consider adding a configuration option to allow this behaviour to be ignored. In the config presented above, the "b" key is still of importance in the application I'm developing despite not having any values associated with it.
+
+Thanks for a brilliant library,
+Hayden
+A short example to briefly illustrate the problem:
+
+```golang
+package main
+
+import (
+	"bytes"
+	"fmt"
+
+	"github.com/spf13/viper"
+)
+
+func main() {
+	dotenvExample := []byte(`DATABASE_PORT=5432`)
+
+	viper.SetConfigType("env")
+	viper.ReadConfig(bytes.NewBuffer(dotenvExample))
+	viper.BindEnv("database.port", "DATABASE_PORT")
+
+	// I would expect 5432, but got <nil>
+	fmt.Println(viper.Get("database.port"))
+}
+```
+
+A cursory look at the source suggests that the `v.env` variable stores the mapping of `key => ENV_VAR` (i.e. `database.port => DATABASE_PORT`). A fast way to resolve this would be to search through the `v.env` variable when marshaling `dotenv` config file, and assign the `v.env`'s key if the value matches.
+
+However, doing this way introduce an ordering constraint: `viper.BindEnv` must happen before `viper.ReadConfig`, otherwise the `v.env` would not be populated correctly then.
+
+Any suggestions on what's the best way to move forward on this?
+The suppport introduced for files with no file extension is only partial as trying to save the config file would fail with `<file name> equires valid extensio`
+This adds support to saving such files
+I'm trying to write a tool for which I would let user set defaults or custom CLI arguments through a configuration file or env vars. What I've done so far is something like: 
+
+```go
+package main
+
+import (
+	"errors"
+	"log"
+	"strings"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+	"github.com/spf13/viper"
+)
+
+func bindPFlagsHierarchy(cmd *cobra.Command) error {
+	for _, c := range cmd.Commands() {
+		if err := bindPFlags(c); err != nil {
+			return err
+		}
+
+		if err := bindPFlagsHierarchy(c); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func bindPFlags(cmd *cobra.Command) error {
+	prefix := cmd.Name()
+
+	for current := cmd.Parent(); current != nil; current = current.Parent() {
+		name := current.Name()
+		name = strings.ReplaceAll(name, "_", "-")
+		name = strings.ReplaceAll(name, ".", "-")
+		prefix = name + "." + prefix
+	}
+
+	cmd.Flags().VisitAll(func(flag *pflag.Flag) {
+		name := flag.Name
+		name = strings.ReplaceAll(name, "_", "-")
+		name = strings.ReplaceAll(name, ".", "-")
+
+		if err := viper.BindPFlag(prefix+"."+name, flag); err != nil {
+			log.Fatalf("error binding flag %s with prefix %s to viper", flag.Name, prefix)
+		}
+	})
+
+	return nil
+}
+
+type MainOptions struct {
+}
+
+type SubOptions struct {
+	Info string `mapstructure:"info"`
+}
+
+func main() {
+	mopt := MainOptions{}
+	sopt := SubOptions{}
+
+	viper.AutomaticEnv()
+	viper.SetEnvKeyReplacer(strings.NewReplacer("_", ".", "-", "."))
+
+	mainCmd := &cobra.Command{
+		Use:   "main",
+		PreRunE: func(cmd *cobra.Command, args []string) error {
+			if err := viper.UnmarshalKey("main", &mopt); err != nil {
+				return nil
+			}
+
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			log.Printf("mopt: %+v", mopt)
+			return nil
+		},
+	}
+
+	subCmd1 := &cobra.Command{
+		Use:   "sub1",
+		PreRunE: func(cmd *cobra.Command, args []string) error {
+			v := viper.Sub("main.sub1")
+			if v == nil {
+				return errors.New("no main.sub1")
+			}
+
+			if err := v.Unmarshal(&sopt); err != nil {
+				return nil
+			}
+
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			log.Printf("sopt: %+v", sopt)
+			return nil
+		},
+	}
+
+	subCmd1.Flags().StringP("info", "i", "", "shows info")
+	mainCmd.AddCommand(subCmd1)
+
+	bindPFlagsHierarchy(mainCmd)
+
+	mainCmd.Execute()
+}
+```
+
+What the code does it to walk the command hierarchy and bind pflags to viper so as example the command
+    
+    main sub1 --info=something
+
+should be equivalent to
+
+    MAIN_SUB1_INFO=something main sub1
+
+
+The problem I'm facing is that either `viper.UnmarshalKey("main.sub1, &sopt)` and ` viper.Sub("main.sub1").Unmarshal(&sopt)` fail (note that the `Sub` variant panics as `Sub` returns `nil`)
+Hey there,
+
+I didn't see any similar question anywhere, so I'll ask right here. The documentation doesn't help in this case, maybe it's possible to patch it up with an answer afterwards, so other people know as well.
+
+I've got a config looking like:
+
+```yaml
+stuff:
+ - type: A
+    aProp1: 1
+    aProp2: "other"
+  - type: B
+    bProp1: "nothing"
+```
+
+So a simple list of stuff, that has only its type in common. Based on the type I'm using it to initialize a corresponding struct or system. Other keys apart from type can match, but that's not necessary.
+
+So make this simple, I want to parse this config to a list of vipers, so I can pass the vipers to each initializer, so in pseudo code:
+
+```go
+stuff := viper.SubSlice("stuff")
+for _, v := range stuff {
+  initStuff(v) // where v is of type *viper.Viper
+}
+```
+
+Is there some undocumented way to do this? If yes it would be great to add it to the docs. If no this is a feature request for something like `SubSlice`.
+See the example below
+
+```golang
+package main
+
+import (
+	"bytes"
+	"github.com/spf13/viper"
+	"log"
+	"os"
+	"strings"
+)
+
+type Config struct {
+	AppId           string `mapstructure:"app_id"`
+	AppSecret   string `mapstructure:"app_secret"`
+}
+
+func main()  {
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	viper.AutomaticEnv()
+	os.Setenv("PARENT_APP_ID", "the correct value from env variable")
+
+	viper.SetConfigType("yaml")
+
+	var exampleYmal = []byte(`
+parent:
+  app_id: "wrong value, it should be override by env variable"
+  app_secret: "abcdef"
+`)
+	viper.ReadConfig(bytes.NewBuffer(exampleYmal))
+
+	var config Config
+	viper.UnmarshalKey("parent", &config)
+
+	log.Printf("%#v\n", config)
+	log.Printf("%#v\n", viper.Get("parent"))
+	log.Printf("%#v\n", viper.Get("parent.app_id"))
+}
+```
+
+The nesting value is not loaded from env variable when using `viper.UnmarshalKey` or `viper.Get` with parent key.
+
+**I am using the viper package to read the hcl file to test the terrartest function and need to use GetStringMapString() to read the map values form the file**
+
+Can Someone please help asap?
+
+I am using the code-
+func TestTerraformDataBricks(t *testing.T) {
+CheckForTags(t)
+}
+
+func CheckForTags(t *testing.T){
+	v1, _ := readConfig("values", "/Users/manya.singhal/go/src/DataBricks/ref.cloud.azure.golden.databricks")
+	result := v1.GetStringMapString("environment")
+	fmt.Println(result)
+}
+
+func readConfig(filename string, path string) (*viper.Viper, error) {
+	v := viper.New()	
+	v.SetConfigName(filename)
+	v.AddConfigPath(path)
+	v.SetConfigType("hcl")
+	err := v.ReadInConfig()
+	return v, err
+}
+
+
+**values.hcl file to to pass the values.**
+
+
+resource-group-name         = "shared_ea_eca-central-rg"
+location                    = "centralus"
+
+
+databricks-name             = "test-databricks-sbx-0010"
+sku                         = "premium"
+
+retention-days                                          = 90
+diagnostic-settings-storageAccount                      = "eadatalakegen21"
+diagnostic-settings-storageAccount-resourceGroupName    = "shared_ea_eca-central-rg"
+
+tags = {
+    "environment" = "testing"
+    "created-by"  = "manya"
+}
+
+**The actual output** 
+=== RUN   TestTerraformDataBricks
+map[]
+--- PASS: TestTerraformDataBricks (0.01s)
+PASS
+ok      command-line-arguments  2.869s
+
+**The Expected output**
+=== RUN   TestTerraformDataBricks
+Testing
+--- PASS: TestTerraformDataBricks (0.01s)
+PASS
+ok      command-line-arguments  2.869s

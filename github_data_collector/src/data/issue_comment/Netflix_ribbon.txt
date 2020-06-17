@@ -1,0 +1,127 @@
+30s too long, i want Manual refresh  ServerList
+(1)request->server->run serviceMethod->response=responseTime?
+(2)ping=responseTime?
+
+which right?? thank you very much!
+I have two services, one is normal, one is  abnormal, I set the maximum number of attempts is 10 times, MaxAutoRetriesNextServer is five times, MaxAutoRetries is 0 times, single thread can get normal response, multi-threaded does not return a normal response. Isn't the polling of the ribbon not supported for multithreading?
+My env:
+SpringBoot 2.1.3, SpringCloud Greenwich.SR2, jdk1.8.
+
+My configuration:
+```
+ribbon.restclient.enabled=true 
+#开启重试机制 spring.cloud.loadbalancer.retry.enabled=true 
+#请求连接的超时时间 spider-source.ribbon.ConnectTimeout=250 hystrix.command.default.execution.isolation.thread.timeoutinMilliseconds=8000 
+#请求处理的超时时间 spider-source.ribbon.ReadTimeout=3000 
+#对所有操作请求都进行重试，默认false，只有get请求会重试 
+spider-source.ribbon.OkToRetryOnAllOperations=true 
+#指定请求重试开关，该属性未被使用，疑似bug #spider-source.ribbon.RequestSpecificRetryOn=true 
+#对当前实例的重试次数 
+#spider-source.ribbon.MaxAutoRetries=3 
+#切换实例的重试次数 spider-source.ribbon.MaxAutoRetriesNextServer=1
+```
+
+Get request can be retried. Post can't be retried.
+Please help.
+Whether Separating from eureka alone using Ribbon, or using in SpringCloud's zuul, get request can be retried and post can't be retried.
+
+ThreadStack:
+```
+"PollingServerListUpdater-1" Id=157 WAITING on java.util.concurrent.locks.ReentrantReadWriteLock$NonfairSync@3adcda2
+    at java.base@11.0.4/jdk.internal.misc.Unsafe.park(Native Method)
+    -  waiting on java.util.concurrent.locks.ReentrantReadWriteLock$NonfairSync@3adcda2
+    at java.base@11.0.4/java.util.concurrent.locks.LockSupport.park(LockSupport.java:194)
+    at java.base@11.0.4/java.util.concurrent.locks.AbstractQueuedSynchronizer.parkAndCheckInterrupt(AbstractQueuedSynchronizer.java:885)
+    at java.base@11.0.4/java.util.concurrent.locks.AbstractQueuedSynchronizer.acquireQueued(AbstractQueuedSynchronizer.java:917)
+    at java.base@11.0.4/java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire(AbstractQueuedSynchronizer.java:1240)
+    at java.base@11.0.4/java.util.concurrent.locks.ReentrantReadWriteLock$WriteLock.lock(ReentrantReadWriteLock.java:959)
+    at com.netflix.loadbalancer.BaseLoadBalancer.setServersList(BaseLoadBalancer.java:475)
+    at com.netflix.loadbalancer.DynamicServerListLoadBalancer.setServersList(DynamicServerListLoadBalancer.java:156)
+    at com.netflix.loadbalancer.DynamicServerListLoadBalancer.updateAllServerList(DynamicServerListLoadBalancer.java:267)
+    at com.netflix.loadbalancer.DynamicServerListLoadBalancer.updateListOfServers(DynamicServerListLoadBalancer.java:250)
+    at com.netflix.loadbalancer.DynamicServerListLoadBalancer$1.doUpdate(DynamicServerListLoadBalancer.java:62)
+    at com.netflix.loadbalancer.PollingServerListUpdater$1.run(PollingServerListUpdater.java:116)
+    at java.base@11.0.4/java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:515)
+    at java.base@11.0.4/java.util.concurrent.FutureTask.runAndReset(FutureTask.java:305)
+    at java.base@11.0.4/java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(ScheduledThreadPoolExecutor.java:305)
+    at java.base@11.0.4/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1128)
+    at java.base@11.0.4/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:628)
+    at java.base@11.0.4/java.lang.Thread.run(Thread.java:834)
+
+    Number of locked synchronizers = 1
+    - java.util.concurrent.ThreadPoolExecutor$Worker@6ab1c5f9
+```
+
+allServerLock is an Reentrant Lock and the read lock is acquired while read server list and ping each server. However, the code of reading server list has risk that not release lock while OOM:
+
+`BaseLoadBalancer.java`
+
+```
+                allLock = allServerLock.readLock();
+                allLock.lock();
+                allServers = allServerList.toArray(new Server[allServerList.size()]);
+                allLock.unlock();
+```
+```
+2019-09-02 10:19:00.369  WARN 16504 --- [erListUpdater-0] c.n.l.PollingServerListUpdater           : Failed one update cycle
+
+java.util.ConcurrentModificationException: null
+	at java.util.ArrayList$Itr.checkForComodification(ArrayList.java:909)
+	at java.util.ArrayList$Itr.next(ArrayList.java:859)
+	at org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.predictBeanType(AbstractAutowireCapableBeanFactory.java:614)
+	at org.springframework.beans.factory.support.AbstractBeanFactory.isTypeMatch(AbstractBeanFactory.java:555)
+	at org.springframework.beans.factory.support.DefaultListableBeanFactory.doGetBeanNamesForType(DefaultListableBeanFactory.java:436)
+	at org.springframework.beans.factory.support.DefaultListableBeanFactory.getBeanNamesForType(DefaultListableBeanFactory.java:395)
+	at org.springframework.beans.factory.BeanFactoryUtils.beanNamesForTypeIncludingAncestors(BeanFactoryUtils.java:206)
+	at org.springframework.beans.factory.BeanFactoryUtils.beanNamesForTypeIncludingAncestors(BeanFactoryUtils.java:210)
+	at org.springframework.beans.factory.support.DefaultListableBeanFactory.findAutowireCandidates(DefaultListableBeanFactory.java:1267)
+	at org.springframework.beans.factory.support.DefaultListableBeanFactory.doResolveDependency(DefaultListableBeanFactory.java:1101)
+	at org.springframework.beans.factory.support.DefaultListableBeanFactory$DependencyObjectProvider.getObject(DefaultListableBeanFactory.java:1630)
+	at org.springframework.beans.factory.support.DefaultListableBeanFactory$Jsr330DependencyProvider.get(DefaultListableBeanFactory.java:1699)
+	at com.netflix.niws.loadbalancer.DiscoveryEnabledNIWSServerList.obtainServersViaDiscovery(DiscoveryEnabledNIWSServerList.java:158)
+	at com.netflix.niws.loadbalancer.DiscoveryEnabledNIWSServerList.getUpdatedListOfServers(DiscoveryEnabledNIWSServerList.java:152)
+	at org.springframework.cloud.netflix.ribbon.eureka.DomainExtractingServerList.getUpdatedListOfServers(DomainExtractingServerList.java:57)
+	at com.netflix.loadbalancer.DynamicServerListLoadBalancer.updateListOfServers(DynamicServerListLoadBalancer.java:240)
+	at com.netflix.loadbalancer.DynamicServerListLoadBalancer$1.doUpdate(DynamicServerListLoadBalancer.java:62)
+	at com.netflix.loadbalancer.PollingServerListUpdater$1.run(PollingServerListUpdater.java:116)
+	at java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:511)
+	at java.util.concurrent.FutureTask.runAndReset(FutureTask.java:308)
+	at java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.access$301(ScheduledThreadPoolExecutor.java:180)
+	at java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(ScheduledThreadPoolExecutor.java:294)
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+```
+
+
+
+
+
+
+
+- Use a more specific artifact search
+  - For just com.netflix.ribbon:ribbon we can use https://search.maven.org/search?q=g:com.netflix.ribbon%20AND%20a:ribbon
+  - For all artifacts under com.netflix.ribbon we can use https://search.maven.org/search?q=g:com.netflix.ribbon
+- Use the lastest (2.7.17) com.netflix.ribbon:ribbon version in the decalred dependency example
+`
+
+    public void setMaxTotalPingTime(int maxTotalPingTimeSeconds) {
+        if (maxTotalPingTimeSeconds < 1) {
+            return;
+        }
+        this.maxTotalPingTimeSeconds = maxTotalPingTimeSeconds;
+        logger.debug("LoadBalancer [{}]: maxTotalPingTime set to {}", name, this.maxTotalPingTimeSeconds);
+
+    }
+
+    public int getMaxTotalPingTime() {
+        return maxTotalPingTimeSeconds;
+    }
+`
+
+
+is the variable maxTotalPingTimeSeconds  used？
+
+com.netflix.loadbalancer.BaseLoadBalancer
+
+
+When running a ping( by PingUrl) to a server that is killed, the flag in Server class  is set to false. However, the thread com.netflix.loadbalancer.DynamicServerListLoadBalancer.updateAllServerList will set it back to true even it should be false.

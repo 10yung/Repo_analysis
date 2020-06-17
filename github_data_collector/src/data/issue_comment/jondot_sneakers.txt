@@ -1,0 +1,124 @@
+Hello all, @jondot 
+I am trying to implement Sneakers in an existing web application and I am trying to reuse an existing amqp connection. I've passed it in the connection as a configuration option:
+
+```
+Sneakers.configure(
+  connection: InstantiateAMQPConnection,
+  heartbeat: 30,
+...
+```
+
+I'm getting a timeout and i think it's related to the forking for Sneakers:
+```
+Unexpected error Timeout::Error
+  .../gems/bunny-2.14.3/lib/bunny/concurrent/continuation_queue.rb:39:in `block in poll'
+  .../gems/bunny-2.14.3/lib/bunny/concurrent/continuation_queue.rb:30:in `synchronize'
+  .../gems/bunny-2.14.3/lib/bunny/concurrent/continuation_queue.rb:30:in `poll'
+  .../gems/bunny-2.14.3/lib/bunny/session.rb:1372:in `wait_on_continuations'
+  .../gems/bunny-2.14.3/lib/bunny/session.rb:535:in `block in open_channel'
+  /home/vagrant/.rvm/rubies/ruby-2.3.8/lib/ruby/2.3.0/monitor.rb:214:in `mon_synchronize'
+  .../gems/bunny-2.14.3/lib/bunny/session.rb:528:in `open_channel'
+  .../gems/bunny-2.14.3/lib/bunny/channel.rb:234:in `open'
+  .../gems/bunny-2.14.3/lib/bunny/session.rb:365:in `block in create_channel'
+  /home/vagrant/.rvm/rubies/ruby-2.3.8/lib/ruby/2.3.0/monitor.rb:214:in `mon_synchronize'
+  .../gems/bunny-2.14.3/lib/bunny/session.rb:360:in `create_channel'
+  .../gems/sneakers-2.11.0/lib/sneakers/queue.rb:25:in `subscribe'
+```
+
+
+
+That means that it would be safer to pass connection details so that each worker can open their own connection to rabbit? (`lib/sneakers/worker.rb`)
+http://rubybunny.info/articles/connecting.html#connecting_in_web_applications_ruby_on_rails_sinatra_etc
+
+
+Rails 5.1.2
+  gem 'capistrano-sneakers', github: 'inventionlabsSydney/capistrano-sneakers', require: false
+
+When I run bundle exec rake sneakers:start, It wont go beyond this command.
+I have "daemonize: true", but it work like "daemonize: false".
+Sneakers uses inconsistent log level for messages produced by worker and publisher: worker uses `debug`, but publisher uses `info`. I think it makes sense for them to use the same log level, so it will be easy to configure logger to the right log level.
+
+Worker:
+https://github.com/jondot/sneakers/blob/master/lib/sneakers/worker.rb#L123
+I have not found any docs on the subject and I have not found any sensible ways of stopping my sneaker workers except to run `ps aux | grep sneakers` and then `kill -9 *pid*` on 5+ workers by individual PID. This sucks a lot, and means that if I push any new code I have to ssh into my production server, kill processes individually, then restart each worker for each app. Since I run several apps on the same OS and several of them use sneakers, I have had to kill ALL workers in order to push new code instead of rebooting only workers belonging to the app.
+
+I have a sneakers process running with the following config
+worker is run using `bundle exec ruby sneakers.rb`
+```ruby
+# ./sneakers.rb
+Sneakers.configure(
+  heartbeat: 30,
+  amqp: "amqp://#{ENV['RABBITMQ_USER']}:#{ENV['RABBITMQ_PASS']}@#{ENV['RABBITMQ_HOST']}",
+  daemonize: ENV['RACK_ENV'] == 'production',
+  pid_path: './sneakers.pid',
+  vhost: '/',
+  exchange: 'sneakers',
+  exchange_type: :direct,
+  timeout_job_after: 2.minutes,
+  log: './log/sneakers.log'
+)
+Sneakers.logger.level = Logger::INFO
+workers = Sneakers::Runner.new([Workers::JD])
+workers.run
+```
+and a worker module with the following
+```ruby
+# ./worker.rb
+module Workers
+  class JD
+    include Sneakers::Worker
+    from_queue :some_queue
+    def work(msg)
+      # ...
+      ack!
+    end
+  end
+end
+```
+
+```bash
+$ ps aux | grep sneakers
+alilland      69091   0.0  0.3  4398944  58044   ??  S     2:47PM   0:01.30 ruby sneakers.rb
+alilland      73846   0.0  0.0  4268296    684 s000  S+    3:12PM   0:00.00 grep --color=auto --exclude-dir=.bzr --exclude-dir=CVS --exclude-dir=.git --exclude-dir=.hg --exclude-dir=.svn sneakers
+alilland      69107   0.0  0.1  4410552  12876   ??  S     2:47PM   0:00.28 ruby sneakers.rb
+alilland      69104   0.0  0.1  4410552  12720   ??  S     2:47PM   0:00.24 ruby sneakers.rb
+alilland      69103   0.0  0.1  4410552  12864   ??  S     2:47PM   0:00.24 ruby sneakers.rb
+alilland      69092   0.0  0.1  4410552  12512   ??  S     2:47PM   0:00.26 ruby sneakers.rb
+$ kill -9 69091; kill -9 69107; kill -9 69104; kill -9 69103; kill -9 69092
+```
+
+there is no way that I can add ^ that to a bash script and execute it in a git hook :(
+
+Middleware call needs to have access to the worker class for logging purposes at least. I opened a PR with a minor change where middleware `call` method is being called. https://github.com/jondot/sneakers/pull/414
+a minor change to pass the worker object to the middleware call
+https://github.com/jondot/sneakers/issues/415
+Hi! I'm just curious is it possible to implement such behaviour. The case is that each of my workers establishes some connection to remote server (I'm fetching emails with IMAP protocol). So I'd like to have some kind of pool of established connections in advance. I want this pool to be available to newly spawned worker, so it could fetch connection instead of connecting again and again, wasting time and resources.
+Hello, I've found a bug that makes Sneakers not to report acknowledge state on error.
+
+Wiki suggests to pass `context_hash` to error notification agents. [link](https://github.com/jondot/sneakers/wiki/Configuration#error-reporter)
+```ruby
+Sneakers.error_reporters << proc { |exception, _worker, context_hash| Honeybadger.notify(exception, context_hash) }
+```
+I'm using [Sentry raven](https://github.com/getsentry/raven-ruby) for error notifications. Sometimes it fails to serialize `context_hash` to json because `Bunny::Channel` instance in `delivery_info` of `context_hash` causes
+```
+SystemStackError: stack level too deep
+```
+
+As result:
+1. RabbitMQ keeps message as Unacked
+2. Such messages number may reach number of prefetched messages for worker
+3. Worker hangs without performing any workload
+
+Sneakers handles only `StandardError` and its descendants [here](https://github.com/jondot/sneakers/blob/master/lib/sneakers/error_reporter.rb#L19) and can not handle `SystemStackError` because it is not a `StandardError`.
+
+Previously I [fixed similar bug](https://github.com/jondot/sneakers/pull/373) in another place. And I would be happy to do the same here.
+
+But I think that it would be better to rescue from `Exception` in both places and re-raise exception in case of `Interrupt`, `NoMemoryError` and other exceptions that should not be swallowed.
+
+WDYT?
+
+Is there a way to override or append to bunny client properties?
+
+<img width="906" alt="Screen Shot 2019-10-10 at 11 34 03 AM" src="https://user-images.githubusercontent.com/37820788/66584298-daab0f00-eb52-11e9-9bd9-c43a712ceb19.png">
+
+Looks like I cant use RabbitMQ in production. We are using IBM MQ, and I was wondering if there is a drop in replacement, or could I write a wrapper to work with sneakers?

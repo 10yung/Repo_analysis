@@ -1,0 +1,440 @@
+Classes needed to complete the TF-IDF example: https://spark.apache.org/docs/latest/ml-features#tf-idf that completes part of #381 
+
+- Adds Load/Save to Bucketizer
+- HashingTF
+- IDF
+- IDFModel
+- Tokenizer
+
+
+Is there a community channel like slack or gitter where we can ask questions?
+
+It would be useful to be able to ask questions when implementing changes and also it would probably stop some of the issues getting created and then left to hang around (like https://github.com/dotnet/spark/issues/303).
+
+I know the delta lake team have a public slack channel that works really well
+
+(please don't say yammer :) )
+Doc on how to add a new type to SerDe, hope it helps someone else
+**Describe the bug**
+An error occurred while trying to enumerate a DataFrame containing a column of type date.
+
+**To Reproduce**
+Steps to reproduce the behavior:
+
+```
+public void Test()
+{
+  var dataFrame1 = spark.Session.Sql("SELECT * FROM VALUES ('2020-1-1'), ('2020-1-2') AS (DateAsString)");
+  dataFrame1.Show();
+  dataFrame1.PrintSchema();
+  var rows1 = dataFrame1.Collect().Count(); // returns 2
+
+  var dataFrame2 = spark.Session.Sql("SELECT * FROM VALUES CAST('2020-1-1' AS date), CAST('2020-1-2' AS date) AS (DateAsDate)");
+  dataFrame2.Show();
+  dataFrame2.PrintSchema();
+  var rows2 = dataFrame2.Collect().Count(); // failed with "System.NotImplementedException" {"The method or operation is not implemented."}
+}
+```
+Command-Line output:
++------------+
+|DateAsString|
++------------+
+|    2020-1-1|
+|    2020-1-2|
++------------+
+
+root
+ |-- DateAsString: string (nullable = false)
+
++----------+
+|DateAsDate|
++----------+
+|2020-01-01|
+|2020-01-02|
++----------+
+
+root
+ |-- DateAsDate: date (nullable = true)
+
+**Exception**
+"System.NotImplementedException: The method or operation is not implemented.
+   at Microsoft.Spark.Sql.Row.Convert()
+   at Microsoft.Spark.Sql.Row..ctor(Object[] values, StructType schema)
+   at Microsoft.Spark.Sql.RowConstructor.GetRow()
+   at Microsoft.Spark.Sql.RowCollector.Collect(ISocketWrapper socket)+MoveNext()
+   at Microsoft.Spark.Sql.DataFrame.GetRows(String funcName)+MoveNext()
+   at System.Linq.Enumerable.Count[TSource](IEnumerable`1 source)
+   at MyTest.Test() in ..."
+
+**Expected behavior**
+A DataFrame containing columns of type date can be enumerated.
+
+**Additional context**
+Tested with a latest version (0.7.0) of the .net spark library.
+
+This PR exposes the `DataStreamWriter.Foreach` API.
+
+#208 
+
+Users can use this API by creating a `[Serializable]` class that implements the following interface:
+```csharp
+    public interface IForeachWriter
+    {
+        bool Open(long partitionId, long epochId);
+
+        void Process(Row row);
+
+        void Close(Exception errorOrNull);
+    }
+```
+
+This user-defined class will be wrapped in a Wrapper that will call its respective methods according to the spark ForeachWriter lifecycle specifications.  The lifecycle of the methods are as follows:
+
+```
+For each partition with partitionId:
+    For each batch/epoch of streaming data(if its streaming query) with epochId:
+        Method Open(partitionId, epochId) is called.
+        If Open returns true:
+            For each row in the partition and batch/epoch, method Process(row) is called.
+        Method Close(errorOrNull) is called with error(if any) seen while processing rows.
+```
+
+An example of a IForeachWriter can be something like the following:
+```csharp
+        [Serializable]
+        private class TestForeachWriter : IForeachWriter
+        {
+            [ThreadStatic]
+            private static StreamWriter s_streamWriter;
+
+            private readonly string _writePath;
+
+            public TestForeachWriter(string writePath)
+            {
+                _writePath = writePath;
+            }
+
+            public void Close(Exception errorOrNull)
+            {
+                s_streamWriter?.Dispose();
+            }
+
+            public bool Open(long partitionId, long epochId)
+            {
+                try
+                {
+                    s_streamWriter = new StreamWriter(
+                        Path.Combine(
+                            _writePath,
+                            $"sink-foreachWriter-{Guid.NewGuid()}.csv"));
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+
+            public void Process(Row value)
+            {
+                s_streamWriter.WriteLine(string.Join(",", value.Values));
+            }
+```
+**Describe the bug**
+A clear and concise description of what the bug is.
+
+**To Reproduce**
+
+Prerequisites: simple .net application with a simple SQL query and a UDF, which runs properly against a local apache spark.
+Steps to reproduce the behavior:
+1. Setup connection to a remote databricks apache spark (I have tested against an Azure Databricks) on your local dev machine using "databricks-connect configure". Test the connection using the "databricks-connect test"
+2. Test the .net application **without UDF** first: comment out UDF related line codes and make sure the simple query runs against configured remote Azure Databricks.
+3. Uncomment UDF related line codes.
+4. See error.
+
+<details>
+  <summary>Error (copied from the command line)</summary>
+  
+  ```javascript
+[2020-01-06T08:04:29.4589366Z] [L-020538381857] [Error] [JvmBridge] JVM method execution failed: Nonstatic method showString failed for class 15 when called with 3 arguments ([Index=1, Type=Int32, Value=20], [Index=2, Type=Int32, Value=20], [Index=3, Type=Boolean, Value=False], )
+[2020-01-06T08:04:29.4590049Z] [L-020538381857] [Error] [JvmBridge] org.apache.spark.SparkException: Job aborted due to stage failure: Task 0 in stage 0.0 failed 4 times, most recent failure: Lost task 0.3 in stage 0.0 (TID 3, 10.139.64.14, executor 1): org.apache.spark.api.python.PythonException: Traceback (most recent call last):
+  File "/databricks/spark/python/pyspark/worker.py", line 342, in main
+    ("%d.%d" % sys.version_info[:2], version))
+Exception: Python in worker has different version 3.7 than that in driver 0.4.0, PySpark cannot run with different minor versions.Please check environment variables PYSPARK_PYTHON and PYSPARK_DRIVER_PYTHON are correctly set.
+
+        at org.apache.spark.api.python.BasePythonRunner$ReaderIterator.handlePythonException(PythonRunner.scala:534)
+        at org.apache.spark.sql.execution.python.PythonUDFRunner$$anon$1.read(PythonUDFRunner.scala:81)
+        at org.apache.spark.sql.execution.python.PythonUDFRunner$$anon$1.read(PythonUDFRunner.scala:64)
+        at org.apache.spark.api.python.BasePythonRunner$ReaderIterator.hasNext(PythonRunner.scala:488)
+        at org.apache.spark.InterruptibleIterator.hasNext(InterruptibleIterator.scala:37)
+        at scala.collection.Iterator$$anon$12.hasNext(Iterator.scala:440)
+        at scala.collection.Iterator$$anon$11.hasNext(Iterator.scala:409)
+        at scala.collection.Iterator$$anon$11.hasNext(Iterator.scala:409)
+        at org.apache.spark.sql.catalyst.expressions.GeneratedClass$GeneratedIteratorForCodegenStage1.processNext(Unknown Source)
+        at org.apache.spark.sql.execution.BufferedRowIterator.hasNext(BufferedRowIterator.java:43)
+        at org.apache.spark.sql.execution.WholeStageCodegenExec$$anonfun$13$$anon$1.hasNext(WholeStageCodegenExec.scala:640)
+        at org.apache.spark.sql.execution.collect.UnsafeRowBatchUtils$.encodeUnsafeRows(UnsafeRowBatchUtils.scala:62)
+        at org.apache.spark.sql.execution.collect.Collector$$anonfun$2.apply(Collector.scala:159)
+        at org.apache.spark.sql.execution.collect.Collector$$anonfun$2.apply(Collector.scala:158)
+        at org.apache.spark.scheduler.ResultTask.runTask(ResultTask.scala:90)
+        at org.apache.spark.scheduler.Task.doRunTask(Task.scala:140)
+        at org.apache.spark.scheduler.Task.run(Task.scala:113)
+        at org.apache.spark.executor.Executor$TaskRunner$$anonfun$13.apply(Executor.scala:533)
+        at org.apache.spark.util.Utils$.tryWithSafeFinally(Utils.scala:1541)
+        at org.apache.spark.executor.Executor$TaskRunner.run(Executor.scala:539)
+        at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+        at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+        at java.lang.Thread.run(Thread.java:748)
+
+Driver stacktrace:
+        at org.apache.spark.scheduler.DAGScheduler.org$apache$spark$scheduler$DAGScheduler$$failJobAndIndependentStages(DAGScheduler.scala:2362)
+        at org.apache.spark.scheduler.DAGScheduler$$anonfun$abortStage$1.apply(DAGScheduler.scala:2350)
+        at org.apache.spark.scheduler.DAGScheduler$$anonfun$abortStage$1.apply(DAGScheduler.scala:2349)
+        at scala.collection.mutable.ResizableArray$class.foreach(ResizableArray.scala:59)
+        at scala.collection.mutable.ArrayBuffer.foreach(ArrayBuffer.scala:48)
+        at org.apache.spark.scheduler.DAGScheduler.abortStage(DAGScheduler.scala:2349)
+        at org.apache.spark.scheduler.DAGScheduler$$anonfun$handleTaskSetFailed$1.apply(DAGScheduler.scala:1102)
+        at org.apache.spark.scheduler.DAGScheduler$$anonfun$handleTaskSetFailed$1.apply(DAGScheduler.scala:1102)
+        at scala.Option.foreach(Option.scala:257)
+        at org.apache.spark.scheduler.DAGScheduler.handleTaskSetFailed(DAGScheduler.scala:1102)
+        at org.apache.spark.scheduler.DAGSchedulerEventProcessLoop.doOnReceive(DAGScheduler.scala:2581)
+        at org.apache.spark.scheduler.DAGSchedulerEventProcessLoop.onReceive(DAGScheduler.scala:2529)
+        at org.apache.spark.scheduler.DAGSchedulerEventProcessLoop.onReceive(DAGScheduler.scala:2517)
+        at org.apache.spark.util.EventLoop$$anon$1.run(EventLoop.scala:49)
+        at org.apache.spark.scheduler.DAGScheduler.runJob(DAGScheduler.scala:897)
+        at org.apache.spark.SparkContext.runJob(SparkContext.scala:2280)
+        at org.apache.spark.sql.execution.collect.Collector.runSparkJobs(Collector.scala:270)
+        at org.apache.spark.sql.execution.collect.Collector.collect(Collector.scala:280)
+        at org.apache.spark.sql.execution.collect.Collector$.collect(Collector.scala:80)
+        at org.apache.spark.sql.execution.collect.Collector$.collect(Collector.scala:86)
+        at org.apache.spark.sql.execution.ResultCacheManager.getOrComputeResult(ResultCacheManager.scala:508)
+        at org.apache.spark.sql.execution.CollectLimitExec.executeCollectResult(limit.scala:55)
+        at org.apache.spark.sql.execution.SparkPlan.executeCollect(SparkPlan.scala:300)
+        at com.databricks.service.SparkServiceImpl$$anonfun$executePlan$1$$anonfun$apply$2.apply(SparkServiceImpl.scala:84)
+        at com.databricks.service.SparkServiceImpl$$anonfun$executePlan$1$$anonfun$apply$2.apply(SparkServiceImpl.scala:78)
+        at org.apache.spark.sql.execution.SQLExecution$$anonfun$withCustomExecutionEnv$1.apply(SQLExecution.scala:111)
+        at org.apache.spark.sql.execution.SQLExecution$.withSQLConfPropagated(SQLExecution.scala:240)
+        at org.apache.spark.sql.execution.SQLExecution$.withCustomExecutionEnv(SQLExecution.scala:97)
+        at org.apache.spark.sql.execution.SQLExecution$.withNewExecutionId(SQLExecution.scala:170)
+        at com.databricks.service.SparkServiceImpl$$anonfun$executePlan$1.apply(SparkServiceImpl.scala:77)
+        at com.databricks.service.SparkServiceImpl$$anonfun$executePlan$1.apply(SparkServiceImpl.scala:74)
+        at com.databricks.logging.UsageLogging$$anonfun$recordOperation$1.apply(UsageLogging.scala:417)
+        at com.databricks.logging.UsageLogging$$anonfun$withAttributionContext$1.apply(UsageLogging.scala:239)
+        at scala.util.DynamicVariable.withValue(DynamicVariable.scala:58)
+        at com.databricks.logging.UsageLogging$class.withAttributionContext(UsageLogging.scala:234)
+        at com.databricks.spark.util.PublicDBLogging.withAttributionContext(DatabricksSparkUsageLogger.scala:18)
+        at com.databricks.logging.UsageLogging$class.withAttributionTags(UsageLogging.scala:276)
+        at com.databricks.spark.util.PublicDBLogging.withAttributionTags(DatabricksSparkUsageLogger.scala:18)
+        at com.databricks.logging.UsageLogging$class.recordOperation(UsageLogging.scala:398)
+        at com.databricks.spark.util.PublicDBLogging.recordOperation(DatabricksSparkUsageLogger.scala:18)
+        at com.databricks.spark.util.PublicDBLogging.recordOperation0(DatabricksSparkUsageLogger.scala:55)
+        at com.databricks.spark.util.DatabricksSparkUsageLogger.recordOperation(DatabricksSparkUsageLogger.scala:98)
+        at com.databricks.spark.util.UsageLogger$class.recordOperation(UsageLogger.scala:67)
+        at com.databricks.spark.util.DatabricksSparkUsageLogger.recordOperation(DatabricksSparkUsageLogger.scala:67)
+        at com.databricks.spark.util.UsageLogging$class.recordOperation(UsageLogger.scala:342)
+        at com.databricks.service.SparkServiceImpl$.recordOperation(SparkServiceImpl.scala:54)
+        at com.databricks.service.SparkServiceImpl$.executePlan(SparkServiceImpl.scala:74)
+        at com.databricks.service.SparkServiceRPCHandler.com$databricks$service$SparkServiceRPCHandler$$execute0(SparkServiceRPCHandler.scala:487)
+        at com.databricks.service.SparkServiceRPCHandler$$anonfun$executeRPC0$1.apply(SparkServiceRPCHandler.scala:376)
+        at com.databricks.service.SparkServiceRPCHandler$$anonfun$executeRPC0$1.apply(SparkServiceRPCHandler.scala:317)
+        at scala.util.DynamicVariable.withValue(DynamicVariable.scala:58)
+        at com.databricks.service.SparkServiceRPCHandler.executeRPC0(SparkServiceRPCHandler.scala:317)
+        at com.databricks.service.SparkServiceRPCHandler$$anon$3.call(SparkServiceRPCHandler.scala:272)
+        at com.databricks.service.SparkServiceRPCHandler$$anon$3.call(SparkServiceRPCHandler.scala:260)
+        at java.util.concurrent.FutureTask.run(FutureTask.java:266)
+        at com.databricks.service.SparkServiceRPCHandler$$anonfun$executeRPC$1.apply(SparkServiceRPCHandler.scala:304)
+        at com.databricks.service.SparkServiceRPCHandler$$anonfun$executeRPC$1.apply(SparkServiceRPCHandler.scala:284)
+        at scala.util.DynamicVariable.withValue(DynamicVariable.scala:58)
+        at com.databricks.service.SparkServiceRPCHandler.executeRPC(SparkServiceRPCHandler.scala:283)
+        at com.databricks.service.SparkServiceRPCServlet.doPost(SparkServiceRPCServer.scala:124)
+        at javax.servlet.http.HttpServlet.service(HttpServlet.java:707)
+        at javax.servlet.http.HttpServlet.service(HttpServlet.java:790)
+        at org.eclipse.jetty.servlet.ServletHolder.handle(ServletHolder.java:848)
+        at org.eclipse.jetty.servlet.ServletHandler.doHandle(ServletHandler.java:585)
+        at org.eclipse.jetty.servlet.ServletHandler.doScope(ServletHandler.java:515)
+        at org.eclipse.jetty.server.handler.ScopedHandler.handle(ScopedHandler.java:141)
+        at org.eclipse.jetty.server.handler.HandlerWrapper.handle(HandlerWrapper.java:134)
+        at org.eclipse.jetty.server.Server.handle(Server.java:539)
+        at org.eclipse.jetty.server.HttpChannel.handle(HttpChannel.java:333)
+        at org.eclipse.jetty.server.HttpConnection.onFillable(HttpConnection.java:251)
+        at org.eclipse.jetty.io.AbstractConnection$ReadCallback.succeeded(AbstractConnection.java:283)
+        at org.eclipse.jetty.io.FillInterest.fillable(FillInterest.java:108)
+        at org.eclipse.jetty.io.SelectChannelEndPoint$2.run(SelectChannelEndPoint.java:93)
+        at org.eclipse.jetty.util.thread.strategy.ExecuteProduceConsume.executeProduceConsume(ExecuteProduceConsume.java:303)
+        at org.eclipse.jetty.util.thread.strategy.ExecuteProduceConsume.produceConsume(ExecuteProduceConsume.java:148)
+        at org.eclipse.jetty.util.thread.strategy.ExecuteProduceConsume.run(ExecuteProduceConsume.java:136)
+        at org.eclipse.jetty.util.thread.QueuedThreadPool.runJob(QueuedThreadPool.java:671)
+        at org.eclipse.jetty.util.thread.QueuedThreadPool$2.run(QueuedThreadPool.java:589)
+        at java.lang.Thread.run(Thread.java:748)
+Caused by: org.apache.spark.api.python.PythonException: Traceback (most recent call last):
+  File "/databricks/spark/python/pyspark/worker.py", line 342, in main
+    ("%d.%d" % sys.version_info[:2], version))
+Exception: Python in worker has different version 3.7 than that in driver 0.4.0, PySpark cannot run with different minor versions.Please check environment variables PYSPARK_PYTHON and PYSPARK_DRIVER_PYTHON are correctly set.
+
+        at org.apache.spark.api.python.BasePythonRunner$ReaderIterator.handlePythonException(PythonRunner.scala:534)
+        at org.apache.spark.sql.execution.python.PythonUDFRunner$$anon$1.read(PythonUDFRunner.scala:81)
+        at org.apache.spark.sql.execution.python.PythonUDFRunner$$anon$1.read(PythonUDFRunner.scala:64)
+        at org.apache.spark.api.python.BasePythonRunner$ReaderIterator.hasNext(PythonRunner.scala:488)
+        at org.apache.spark.InterruptibleIterator.hasNext(InterruptibleIterator.scala:37)
+        at scala.collection.Iterator$$anon$12.hasNext(Iterator.scala:440)
+        at scala.collection.Iterator$$anon$11.hasNext(Iterator.scala:409)
+        at scala.collection.Iterator$$anon$11.hasNext(Iterator.scala:409)
+        at org.apache.spark.sql.catalyst.expressions.GeneratedClass$GeneratedIteratorForCodegenStage1.processNext(Unknown Source)
+        at org.apache.spark.sql.execution.BufferedRowIterator.hasNext(BufferedRowIterator.java:43)
+        at org.apache.spark.sql.execution.WholeStageCodegenExec$$anonfun$13$$anon$1.hasNext(WholeStageCodegenExec.scala:640)
+        at org.apache.spark.sql.execution.collect.UnsafeRowBatchUtils$.encodeUnsafeRows(UnsafeRowBatchUtils.scala:62)
+        at org.apache.spark.sql.execution.collect.Collector$$anonfun$2.apply(Collector.scala:159)
+        at org.apache.spark.sql.execution.collect.Collector$$anonfun$2.apply(Collector.scala:158)
+        at org.apache.spark.scheduler.ResultTask.runTask(ResultTask.scala:90)
+        at org.apache.spark.scheduler.Task.doRunTask(Task.scala:140)
+        at org.apache.spark.scheduler.Task.run(Task.scala:113)
+        at org.apache.spark.executor.Executor$TaskRunner$$anonfun$13.apply(Executor.scala:533)
+        at org.apache.spark.util.Utils$.tryWithSafeFinally(Utils.scala:1541)
+        at org.apache.spark.executor.Executor$TaskRunner.run(Executor.scala:539)
+        at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+        at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+        ... 1 more
+
+[2020-01-06T08:04:29.5052265Z] [L-020538381857] [Exception] [JvmBridge] JVM method execution failed: Nonstatic method showString failed for class 15 when called with 3 arguments ([Index=1, Type=Int32, Value=20], [Index=2, Type=Int32, Value=20], [Index=3, Type=Boolean, Value=False], )
+   at Microsoft.Spark.Interop.Ipc.JvmBridge.CallJavaMethod(Boolean isStatic, Object classNameOrJvmObjectReference, String methodName, Object[] args)
+Unhandled exception. System.Exception: JVM method execution failed: Nonstatic method showString failed for class 15 when called with 3 arguments ([Index=1, Type=Int32, Value=20], [Index=2, Type=Int32, Value=20], [Index=3, Type=Boolean, Value=False], )
+   at Microsoft.Spark.Interop.Ipc.JvmBridge.CallJavaMethod(Boolean isStatic, Object classNameOrJvmObjectReference, String methodName, Object[] args)
+   at Microsoft.Spark.Interop.Ipc.JvmBridge.CallNonStaticJavaMethod(JvmObjectReference objectId, String methodName, Object[] args)
+   at Microsoft.Spark.Interop.Ipc.JvmObjectReference.Invoke(String methodName, Object[] args)
+   at Microsoft.Spark.Sql.DataFrame.Show(Int32 numRows, Int32 truncate, Boolean vertical)
+   at TestApp.Program.Main(String[] args) in C:\_projects\TestApp\test-data-science\Sources\TestApp\Program.cs:line 40
+  ```
+  
+</details>
+
+**Expected behavior**
+A .net application containing a UDF works properly using connection to a remote databricks.
+
+**Additional context**
+Similar program in Python (same SQL query and similar UDF) works using the same configured remote connection properly.
+
+Application has been started using spark-submit, i.e.
+`%SPARK_HOME%\bin\spark-submit --class org.apache.spark.deploy.dotnet.DotnetRunner --master local microsoft-spark-2.4.x-0.7.0.jar dotnet TestApp.dll`
+
+The build  has successful  as 👍 
+
+C:\Users\Nivethan\mySparkApp>dotnet build
+Microsoft (R) Build Engine version 15.9.20+g88f5fadfbe for .NET Core
+Copyright (C) Microsoft Corporation. All rights reserved.
+
+  Restore completed in 55.01 ms for C:\Users\Nivethan\mySparkApp\mySparkApp.csproj.
+  mySparkApp -> C:\Users\Nivethan\mySparkApp\bin\Debug\netcoreapp2.2\mySparkApp.dll
+
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+
+Time Elapsed 00:00:02.17
+
+-----
+ And finally, try to execute on apache spark will throw an error.
+
+C:\Users\Nivethan\mySparkApp>%SPARK_HOME%\bin\spark-submit --class org.apache.spark.deploy.dotnet.DotnetRunner --master local bin\Debug\netcoreapp3.0\microsoft-spark-2.4.x-0.6.0.jar dotnet bin\Debug\netcoreapp3.0\mySparkApp.dll
+20/01/02 12:25:09 WARN NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+Using Spark's default log4j profile: org/apache/spark/log4j-defaults.properties
+20/01/02 12:25:09 WARN DependencyUtils: Local jar C:\Users\Nivethan\mySparkApp\bin\Debug\netcoreapp3.0\microsoft-spark-2.4.x-0.6.0.jar does not exist, skipping.
+20/01/02 12:25:09 WARN SparkSubmit$$anon$2: Failed to load org.apache.spark.deploy.dotnet.DotnetRunner.
+java.lang.ClassNotFoundException: org.apache.spark.deploy.dotnet.DotnetRunner
+        at java.net.URLClassLoader.findClass(Unknown Source)
+        at java.lang.ClassLoader.loadClass(Unknown Source)
+        at java.lang.ClassLoader.loadClass(Unknown Source)
+        at java.lang.Class.forName0(Native Method)
+        at java.lang.Class.forName(Unknown Source)
+        at org.apache.spark.util.Utils$.classForName(Utils.scala:238)
+        at org.apache.spark.deploy.SparkSubmit.org$apache$spark$deploy$SparkSubmit$$runMain(SparkSubmit.scala:810)
+        at org.apache.spark.deploy.SparkSubmit.doRunMain$1(SparkSubmit.scala:167)
+        at org.apache.spark.deploy.SparkSubmit.submit(SparkSubmit.scala:195)
+        at org.apache.spark.deploy.SparkSubmit.doSubmit(SparkSubmit.scala:86)
+        at org.apache.spark.deploy.SparkSubmit$$anon$2.doSubmit(SparkSubmit.scala:924)
+        at org.apache.spark.deploy.SparkSubmit$.main(SparkSubmit.scala:933)
+        at org.apache.spark.deploy.SparkSubmit.main(SparkSubmit.scala)
+20/01/02 12:25:09 INFO ShutdownHookManager: Shutdown hook called
+20/01/02 12:25:09 INFO ShutdownHookManager: Deleting directory C:\Users\Nivethan\AppData\Local\Temp\spark-92f4cb54-b23a-42c3-9e4b-96fe956df3e7
+
+C:\Users\Nivethan\mySparkApp>%SPARK_HOME%\bin\spark-submit --class org.apache.spark.deploy.dotnet.DotnetRunner --master local bin\Debug\netcoreapp3.0\microsoft-spark-2.4.x-0.6.0.jar dotnet bin\Debug\netcoreapp3.0\mySparkApp.dll
+20/01/02 12:33:28 WARN NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+Using Spark's default log4j profile: org/apache/spark/log4j-defaults.properties
+20/01/02 12:33:29 WARN DependencyUtils: Local jar C:\Users\Nivethan\mySparkApp\bin\Debug\netcoreapp3.0\microsoft-spark-2.4.x-0.6.0.jar does not exist, skipping.
+20/01/02 12:33:29 WARN SparkSubmit$$anon$2: Failed to load org.apache.spark.deploy.dotnet.DotnetRunner.
+java.lang.ClassNotFoundException: org.apache.spark.deploy.dotnet.DotnetRunner
+        at java.net.URLClassLoader.findClass(Unknown Source)
+        at java.lang.ClassLoader.loadClass(Unknown Source)
+        at java.lang.ClassLoader.loadClass(Unknown Source)
+        at java.lang.Class.forName0(Native Method)
+        at java.lang.Class.forName(Unknown Source)
+        at org.apache.spark.util.Utils$.classForName(Utils.scala:238)
+        at org.apache.spark.deploy.SparkSubmit.org$apache$spark$deploy$SparkSubmit$$runMain(SparkSubmit.scala:810)
+        at org.apache.spark.deploy.SparkSubmit.doRunMain$1(SparkSubmit.scala:167)
+        at org.apache.spark.deploy.SparkSubmit.submit(SparkSubmit.scala:195)
+        at org.apache.spark.deploy.SparkSubmit.doSubmit(SparkSubmit.scala:86)
+        at org.apache.spark.deploy.SparkSubmit$$anon$2.doSubmit(SparkSubmit.scala:924)
+        at org.apache.spark.deploy.SparkSubmit$.main(SparkSubmit.scala:933)
+        at org.apache.spark.deploy.SparkSubmit.main(SparkSubmit.scala)
+20/01/02 12:33:29 INFO ShutdownHookManager: Shutdown hook called
+20/01/02 12:33:29 INFO ShutdownHookManager: Deleting directory C:\Users\Nivethan\AppData\Local\Temp\spark-adef883b-ecee-434b-b19a-76c1fbf189cc
+
+C:\Users\Nivethan\mySparkApp> ------------------
+and my java verion details 👍 java version "1.8.0_231"
+Java(TM) SE Runtime Environment (build 1.8.0_231-b11)
+Java HotSpot(TM) 64-Bit Server VM (build 25.231-b11, mixed mode)
+
+kindly help me to resolve this issue.
+This is to track implementation of the ML-Features: https://spark.apache.org/docs/latest/ml-features
+
+Bucketizer has been implemented in https://github.com/dotnet/spark/pull/378 but there are more features that should be implemented.
+
+- [ ] Feature Extractors
+  - [x] TF-IDF
+  - [ ] Word2Vec
+  - [ ] CountVectorizer
+  - [ ] FeatureHasher
+- [ ] Feature Transformers
+  - [x] Tokenizer
+  - [ ] StopWordsRemover
+  - [ ] n-gram
+  - [ ] Binarizer
+  - [ ] PCA
+  - [ ] PolynormalExpansion
+  - [ ] Dicrete Cosine Transform (DCT)
+  - [ ] StringIndexer
+  - [ ] IndexToString
+  - [ ] OneHotEncoderEstimator
+  - [ ] VectorIndexer
+  - [ ] Normalizer
+  - [ ] StandardScaler
+  - [ ] MinMaxScaler
+  - [ ] MaxAbsScaler
+  - [X] Bucketizer
+  - [ ] ElementwiseProduct
+  - [ ] SQLTransformer
+  - [ ] VectorAssembler
+  - [ ] VectorSizeHint
+  - [ ] QuantileDiscretizer
+  - [ ] Imputer
+- [ ] Feature Selectors
+  - [ ] VectorSlicer
+  - [ ] RFormula
+  - [ ] ChiSqSelector
+- [ ] Locality Sensitive Hashing
+  - [ ] LSH Operations
+    - [ ] Feature Transformation
+    - [ ] Approximate Similarity Join
+    - [ ] Approximate Nearest Neighbour Search
+  - [ ] LSH Algorithms
+    - [ ] Bucketed Random Projection for Euclidean Distance
+    - [ ] MinHash for Jaccard Distance
+
+I'll try and carry on implementing theses (will wait until pr #378 has been completed to check that the code will go in Microsoft.Spark and not somewhere else etc.).
+
+If anyone else is going to implement probably best to put a comment here or something??
+
+Adding `DaemonWorkerTests` into the `Microsoft.Spark.Worker.UnitTest` project.
+Fixes #30.
+
+I am writing a Udf extension for DataFrame, and I found that the `Functions.Udf<string, string>(msg =>...)` only allow one message to process. Can I write a Udf that supports multiple messages processing at a time?
+Thanks in advance!

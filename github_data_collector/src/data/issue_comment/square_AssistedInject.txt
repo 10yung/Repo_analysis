@@ -1,0 +1,243 @@
+Why you add this limitation "@AssistedInject.Factory must be declared as a nested type." ?
+AssistedInject only works for construction injection. 
+Dagger on the other hand is able to inject stuff after construction with `*_MembersInjector` for some `@Inject lateinit var dep: Dependency`.
+
+Is it somehow possible to have this for AssistedInject?
+![Screen Shot 2019-12-12 at 5 12 32 PM](https://user-images.githubusercontent.com/242400/70761631-b0b4cb00-1d02-11ea-89e9-9c467ee1a9aa.png)
+
+Not sure what's causing it. Only happens in one of my projects.
+Hello.
+I want to use lifecycle-viewmodel-savedstate in my project, so I came across AssistedInject and decided to use it.
+But regardless of all my efforts to mix it with my current project stucture I get compiler errors all the time.
+Everything compiles and works fine if I don't use @AssistedInject, @AssistedInject.Factory and ViewModelAssistedFactoriesModule. 
+But as a result I obviously can't use "@Assisted SavedStateHandle savedStateHandle" which was the main goal of all this.
+So is it possible to use @AssistedInject with all this @ContributesAndroidInjector and @AuthScope stuff?
+
+Here is my simple configuration:
+
+```
+@Singleton
+@Component(modules = [AndroidSupportInjectionModule::class, 
+			AppModule::class, 
+			ActivityBuildersModule::class,
+			ViewModelFactoryModule::class, 
+			ViewModelAssistedFactoriesModule::class])
+interface AppComponent : AndroidInjector<App> {
+    @Component.Builder
+    interface Builder {
+        @BindsInstance
+        fun context(context: Context): Builder
+        fun build(): AppComponent
+    }
+}
+```
+
+AppModule provides global @Singleton dependencies like, for example, Context and so on.
+
+```
+@Module
+internal abstract class ActivityBuildersModule : BaseActivityBuildersModule() {
+    @MainScope
+    @ContributesAndroidInjector(modules = [MainFragmentBuildersModule::class, MainViewModelsModule::class, MainModule::class])
+    internal abstract fun contributeMainActivity(): MainActivity
+}
+
+```
+
+```
+@Module
+public abstract class BaseActivityBuildersModule {
+    @AuthScope
+    @ContributesAndroidInjector(
+            modules = {AuthViewModelsModule.class, AuthModule.class} //this is important, because AuthModule provides @AuthScope scoped dependencies
+    )
+    abstract AuthActivity contributeAuthActivity();
+}
+
+```
+```
+@Module
+public abstract class AuthViewModelsModule {
+
+    @Binds
+    @IntoMap
+    @ViewModelKey(AuthActivityVM.class)
+    public abstract ViewModelAssistedFactory<? extends ViewModel> bindAuthActivityViewModel(AuthActivityVM.Factory viewModelFactory);
+
+    @Binds
+    abstract SavedStateRegistryOwner bindSavedStateRegistryOwner(AuthActivity activity);
+
+    @Nullable
+    @Provides
+    static Bundle provideDefaultArgs() {
+        return null;
+    }
+}
+
+```
+```
+public interface ViewModelAssistedFactory<T extends ViewModel> {
+    T create(SavedStateHandle savedStateHandle);
+}
+```
+
+```
+@Module
+public class AuthModule {
+
+    @Provides
+    @AuthScope
+    static LoginValidator provideLoginValidator(){
+        return new AuthValidator();
+    }
+//
+//and other @AuthScope things
+//
+}
+```
+
+```
+@Module
+abstract class ViewModelFactoryModule {
+    @Binds
+    abstract fun bindViewModelFactory(viewModelFactory: ViewModelProviderFactory): ViewModelProvider.Factory
+}
+
+```
+```
+@AssistedModule
+@Module(includes = {AssistedInject_ViewModelAssistedFactoriesModule.class})
+public abstract class ViewModelAssistedFactoriesModule {
+}
+
+```
+```
+public class AuthActivityVM extends ViewModel {
+    @AssistedInject.Factory
+    public interface Factory extends ViewModelAssistedFactory<AuthActivityVM>{}
+
+    @AssistedInject
+    //@Inject
+    AuthActivityVM(@Assisted SavedStateHandle savedStateHandle,
+                   @NonNull Context context, //no complier complains
+		   ... //other @Singleton dependencies (also fine)
+		   @NonNull LoginValidator loginValidator, **//loginValidator comes from AuthModule and it is scoped with @AuthScpoe** 
+                   ...// oter things
+		){
+	...
+}	
+}
+```
+In AuthActivity I have this bit of code:
+
+```
+    @Inject
+    ViewModelProviderFactory providerFactory;
+```
+
+
+But compiler complains:
+
+**com.alidi.base.models.auth.LoginValidator cannot be provided without an @Provides-annotated method.
+javax.inject.Provider<com.alidi.base.models.auth.LoginValidator> is injected at
+com.alidi.base.ui.auth.AuthActivityVM_AssistedFactory(…, loginValidator, …)**
+
+Avoids naming requirements in the simple case.
+
+Addresses #81.
+AssistedInject fails without explanation when I try to use it with various classes that use generics. The simplest case that fails for me with Dagger 2.24, AssistedInject 0.5.0 and Kotlin 1.3.50:
+
+```kotlin
+class AClass<A> @AssistedInject constructor(
+    @Assisted dependency: String
+) {
+
+    @AssistedInject.Factory
+    interface Factory {
+
+        fun create(dependency: String): AClass<String>
+    }
+}
+```
+
+The only error that appears is the following:
+```
+error: cannot find symbol
+@dagger.Module(includes = {AssistedInject_PresentationModule.class})
+                           ^
+  symbol: class AssistedInject_PresentationModule
+FAILURE: Build failed with an exception.
+```
+
+This is just a simplified version of what I was trying to do initially, which also fails with no meaningful message:
+
+```kotlin
+abstract class Base<T>
+class Wrapper<A, B>
+
+class AClass<A, B> @AssistedInject constructor(
+    @Assisted dependency: (A) -> B
+) : Base<Wrapper<A, B>>() {
+
+    @AssistedInject.Factory
+    interface Factory {
+
+        fun <A, B> create(dependency: (A) -> B): AClass<A, B>
+    }
+}
+```
+Currently the generated AssistedInject_*Module contains all the bindings for `@AssistedInject.Factory` annotated factories in one module. As a result, it's impossible to have dependencies that exist only in subcomponents. For example:
+
+I have two ViewModels, where one of them takes an argument (`GithubApi` in this case), which exists only in one the subcomponent hosting these view models.
+
+```
+class CommitDetailViewModel @AssistedInject constructor(
+    @Assisted handle: SavedStateHandle,
+    privatel val githubApi: GithubApi // Should be provided only in CommitDetailActivitySubcomponent
+) : BaseViewModel(handle) {
+    fun loadDetail() {
+        Timber.v("Request commit detail")
+        // use githubApi here
+    }
+
+    @AssistedInject.Factory
+    interface Factory : ViewModelAssistedFactory<CommitDetailViewModel>
+}
+
+class CommitListViewModel @AssistedInject constructor(
+    @Assisted handle: SavedStateHandle
+) : BaseViewModel(handle) {
+
+    fun loadCommits() {
+        Timber.v("Request commit list")
+    }
+
+    @AssistedInject.Factory
+    interface Factory : ViewModelAssistedFactory<CommitListViewModel>
+}
+
+interface ViewModelAssistedFactory<T : ViewModel> {
+    fun create(handle: SavedStateHandle): T
+}
+
+@AssistedModule
+@Module(includes = AssistedInject_ViewModelAssistedFactoriesModule.class)
+public abstract class ViewModelAssistedFactoriesModule {
+}
+```
+
+The generated `AssistedInject_ViewModelAssistedFactoriesModule` contains the bindings for both factories above. Due to that, I have to include it in the `ApplicationComponent` so it's visible to my subcomponents. But then compilation fails since `GithubApi`'s binding is only defined in one of the subcomponents.
+
+Annotating multiple modules with `@AssistedModule` results in `error: Multiple @AssistedModule-annotated modules found`. After watching your talk from [DroidCon UK '18](https://skillsmatter.com/skillscasts/11617-helping-dagger-help-you), where you mention that there should be one (and only one?) module that is annotated with `@AssistedModule` in the whole project, it all became clear to me and I managed to fix this error eventually.
+
+At least in the current version of the library, this rule isn't mentioned (or at least unclear) in the README.md and/or the sample. Even though this behavior might change in the future, and it would be allowed to annotate multiple modules, I think it's still worth mentioning it - at least for the current behavior of the library.
+Request not to mandate same names for assisted parameters. In my case, changing params to workerParameters fixed it but would be nice not to force same names.
+
+InternalWorkerFactory.java:9: error: Factory method parameters do not match constructor @Assisted parameters.
+    public abstract T create(@org.jetbrains.annotations.NotNull()
+                      ^
+  Missing:
+   * androidx.work.WorkerParameters params
+  Unknown:
+   * androidx.work.WorkerParameters workerParameters
+I'm trying to figure out how to support views with `@InflationInject` annotated constructors whose dependencies are provided by subcomponents or components that only have a component dependency on the component that provides the `InflationInjectFactory`. So basically I need to add view factories to the `InflationInjectFactory` on the fly but it doesn't seem possible when I also have a single activity app. Is there something I'm missing?

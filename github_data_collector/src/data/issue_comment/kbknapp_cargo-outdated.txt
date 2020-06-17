@@ -1,0 +1,151 @@
+This helps resolve #191 I was having trouble with it for a while still not resolving, but ironically we are having some network issues at the office, please help test this branch! 
+
+I also noticed that the `CargoHttpConfig` struct is a [cached struct](https://docs.rs/cargo/0.41.0/src/cargo/util/config/mod.rs.html#97) so I had to remove the `Cargo.lock` to get it to cooperate in some rare cases. 
+A proxy defined via `https_proxy` environment variable isn't used.
+Instead, the following error message is produced after timeout has been reached:
+
+```text
+Caused by:
+  Unable to update registry `https://github.com/rust-lang/crates.io-index`
+
+Caused by:
+  failed to fetch `https://github.com/rust-lang/crates.io-index`
+
+Caused by:
+  failed to connect to github.com: Operation timed out; class=Os (2)
+```
+
+In contrast, `cargo update` honors the defined proxy.
+I'm using named-profiles in my Cargo.toml to support my ``[profile.test_coverage]``.
+
+When I run either of these,
+
+    cargo outdated --exit-code 1
+    cargo -Z unstable-options -Z config-profile outdated --exit-code 1
+
+I get
+
+    error: failed to parse manifest at `/path/to/project/Cargo.toml`
+    
+    Caused by:
+      unknown cargo feature `named-profiles`
+
+I'm using
+
+    Rust: nightly-2019-12-20-x86_64-unknown-linux-gnu
+    cargo-outdated: v0.9.2
+
+``cargo build`` does work, so I guess it uses a different Cargo version or something?
+If you run the latest version of `cargo-outdated` against the following manifest:
+```toml
+[package]
+name = "testresolv"
+version = "0.1.0"
+edition = "2018"
+
+[dependencies]
+rusqlite = "0.18.0"
+refinery = { version = "0.1.10", features = ["rusqlite"] }
+```
+
+you will get the following error:
+```
+error: failed to select a version for `libsqlite3-sys`.
+    ... required by package `rusqlite v0.18.0`
+    ... which is depended on by `refinery-migrations v0.1.0`
+    ... which is depended on by `refinery v0.1.10`
+    ... which is depended on by `testresolv v0.1.0 (/tmp/cargo-outdatedIHYCuQ)`
+versions that meet the requirements `^0.14` are: 0.14.0
+
+the package `libsqlite3-sys` links to the native library `sqlite3`, but it conflicts with a previous package which links to `sqlite3` as well:
+package `libsqlite3-sys v0.17.0`
+    ... which is depended on by `rusqlite v0.21.0`
+    ... which is depended on by `testresolv v0.1.0 (/tmp/cargo-outdatedIHYCuQ)`
+
+failed to select a version for `libsqlite3-sys` which could resolve this conflict
+```
+
+This is kinda unexpected, because the manifest explicitly specifies that `rusqlite` version is `0.18.0`, not `0.21.0`.
+
+The project itself builds just fine without any issues with this setup of dependencies.
+When having an aliased crate dependency, `cargo-outdated` fails to check for outdated crates returning an error.
+
+In [`ffsend`](https://github.com/timvisee/ffsend) I've a crate dependency for `clipboard` aliassed to `clip`:
+https://github.com/timvisee/ffsend/blob/d4efd984eb1c5a07d36bcba82b34d2c378db5dc0/Cargo.toml#L128
+
+When running `cargo outdated -d1` it fails with the following error:
+```
+error: Direct dependency clip not found for package ffsend
+```
+
+This _might_ be related to the [`[target.'cfg(...)'.dependencies]`](https://github.com/timvisee/ffsend/blob/d4efd984eb1c5a07d36bcba82b34d2c378db5dc0/Cargo.toml#L126) header, but I believe it's just the alias causing this issue.
+Currently release v0.8.0 is not on crates.io because [@kbknapp is busy](https://github.com/kbknapp/cargo-outdated/pull/153#issuecomment-449982916).
+
+This would not be an issues if tagged releases were automatically uploaded to crates.io by CI.
+
+Note that it also means that permissions don't need to be managed in multiple places.
+`cargo-outdated` can't show any version information if Cargo finds a conflict with the latest versions.
+
+In my case:
+
+* criterion required `lazy_static ~1.1`
+* `lazy_static 1.2` exists
+
+If a project uses `lazy_static` on its own, this creates a conflict between criterion's 1.1 and the latest 1.2.
+
+As a result, cargo-outdated fails and can't show any version information.
+
+When running `cargo outdated` on a repository with many small crates (46), this error appears after a while:
+
+```
+cargo outdated
+[1]    5557 killed     cargo outdated
+```
+
+The system is Ubuntu 16.04 with 8 GB physical memory. Investigating with:
+
+```bash
+dmesg | less
+```
+
+gives:
+
+```
+[22541.218190] Out of memory: Kill process 5557 (cargo-outdated) score 611 or sacrifice child
+[22541.218196] Killed process 5557 (cargo-outdated) total-vm:8599764kB, anon-rss:5518604kB, file-rss:4kB, shmem-rss:0kB
+[22541.529600] oom_reaper: reaped process 5557 (cargo-outdated), now anon-rss:0kB, file-rss:0kB, shmem-rss:0kB
+```
+
+I haven't checked code, but if it's trying to compile the whole repo in `/tmp` which is mounted on my RAM, perhaps that explains it.
+
+Can see from this graph that the memory usage (green) spikes before it's killed:
+
+![memory](https://user-images.githubusercontent.com/2993230/49776598-7f0ccb00-fd61-11e8-8385-fff19eb892b5.png)
+
+A proposed fix is to take in a parameter for the temporary location to compile. Maybe there's some parts of the code that can be memory optimized as well.
+My `Cargo.toml` contains the following:
+
+```
+[profile.release]
+lto = "thin"
+```
+
+And when I run `cargo outdated` I get the following error:
+
+```
+error: failed to parse manifest at `/home/drorl/dev/host-io/Cargo.toml`
+
+Caused by:
+  invalid type: string "thin", expected a boolean for key `profile.release.lto`
+```
+
+Note that this is valid as per https://doc.rust-lang.org/cargo/reference/manifest.html#the-profile-sections - `lto` can be a boolean or a string.
+Hi,
+
+I am checking the outdated packages in [quicli](https://github.com/killercup/quicli), but I get this error
+
+```rust
+dinesh@Personal (master *) /home/dinesh/prog/rust/quicli $  
+|  Personal desktop => cargo outdated
+error: Direct dependency quicli not found for package commit-msg-gen
+```

@@ -1,0 +1,156 @@
+Following on from https://github.com/adzap/timeliness/issues/37...
+
+I'm not seeing a fix for this in my spec (see below) for pre-threaded configuration / threadsafety.
+
+Results: 
+
+------
+timeliness | validates_timeliness | no reconfiguration per thread | thread-safety 
+---------- | -------------------- | ----------------------------- | ---------------
+v0.3.10 |  v4.0.10 | passes | fails
+v0.4.3 | v4.0.10 | fails | passes
+v0.4.3 | v5.0.0.alpha5 | fails | passes
+------ 
+
+My spec for this is as follows:
+
+```ruby
+# frozen_string_literal: true
+
+require "rails_helper"
+
+RSpec.describe Timeliness do
+  after(:each) do
+    # reset to not mess up other specs
+    load(Rails.root.join("config/initializers/validates_timeliness.rb"))
+  end
+
+  let(:us_date) { "06/30/2016" }
+  let(:eu_date) { "30/06/2016" }
+
+  it "doesn't need re-configuration per thread (fails with Timeliness >= 0.4 but should be fixed with ValidatesTimeliness >= 5.0.0.alpha5)" do
+    # Timeliness.use_euro_formats -- in initializer
+    expect(Timeliness.parse(eu_date)).not_to be_nil
+    expect(Timeliness.parse(us_date)).to be_nil
+    threads = []
+    threads << Thread.new { expect(Timeliness.parse(eu_date)).not_to be_nil }
+    threads << Thread.new { expect(Timeliness.parse(us_date)).to be_nil }
+    threads.each(&:join)
+  end
+
+  it "is thread_safe (fails with Timeliness < 0.4, fixed with Timeliness >= 0.4)" do
+    threads = []
+    threads << Thread.new do
+      Timeliness.use_euro_formats
+      10_000.times { expect(Timeliness.parse(eu_date)).not_to be_nil }
+    end
+    threads << Thread.new do
+      Timeliness.use_us_formats
+      10_000.times { expect(Timeliness.parse(us_date)).not_to be_nil }
+    end
+    threads.each do |t|
+      t.report_on_exception = false
+      t.join
+    end
+  end
+end
+```
+Hey @adzap!
+
+I was looking for a gem like this and stumbled upon your gem. Nice work!
+
+I thought it would be much easier to read the README if it was in markdown and if it had syntax highlighting.
+So I went ahead and converted it to markdown.
+
+Feel free to take over the PR and make any other changes (or just ignore the PR if you don't want to apply these changes). I don't think I'll have time to properly follow up on this (but still wanted to help). :(
+
+You can preview the new README here:
+https://github.com/adzap/validates_timeliness/blob/17ecab7eb3260a05b31bf9802894639883eb92c9/README.md
+I stumbled upon a weird behaviour when trying to use `allow_blank`.
+
+We have an `Intervention` model, with a legacy `started_at` column. **It also has a `started_at` method** (that looks into dependent `working_periods` to compute it).
+
+In one instance, the column is filled but the methods returns nil.
+The validator doesn't skip the validation since the column is filled but the validation breaks since the method returns `nil`.
+
+I think a more coherent behaviour would be to only take into account the method's return value — which is what ActiveModel default validators do.
+
+I think the fix should be around in [#validate_each](https://github.com/adzap/validates_timeliness/blob/master/lib/validates_timeliness/validator.rb#L56), maybe adjusting the [guard-clause](https://github.com/adzap/validates_timeliness/blob/master/lib/validates_timeliness/validator.rb#L58) or the value setting before the [blankness-check](https://github.com/adzap/validates_timeliness/blob/master/lib/validates_timeliness/validator.rb#L65).
+
+How to reproduce
+-------
+```
+class Intervention < ActiveRecord::Base
+  validates :started_at, timeliness: { on_or_before: -> { Time.now } }, allow_blank: true
+
+  def started_at
+    nil
+  end
+end
+
+Intervention.new(started_at: Time.now - 1.hour).tap(&:valid?).errors.messages
+# => { :started_at => ["Started at is not a valid datetime"] } 
+```
+Initialize instance variables so that we can silence the warning coming from (instance variable not defined)
+Error message for invalid date is not added for invalid dates like 31st February instead date is shifted forward.
+Used existing raw_value to get the date selected by user.
+Now the error for invalid datetime value is shown.
+@adzap Please review and merge PR.
+When I serialize the time field using https://github.com/jackc/tod, I get "not a valid time" error from validates_timeliness.
+
+```ruby
+# my_model.rb
+class MyModel  < ApplicationRecord
+  validates_time :closes_at, after: :opens_at
+  serialize :opens_at, Tod::TimeOfDay
+  serialize :closes_at, Tod::TimeOfDay
+end
+```
+```ruby
+MyModel.where(opens_at: "10:30", closes_at: "14:30").first_or_create
+# Closes at is not a valid time
+```
+I have an issue with format option: 
+my case is the field accepts 2 types
+```
+yyyy/mm/dd hh:nn:ss
+```
+or
+```
+yyyy-mm-dd hh:nn:ss
+```
+My code was: 
+```
+  validates_datetime :column_name,
+   timeliness: {type: :datetime, format: /yyyy[\/-]mm[\/-]dd\shh\:nn\:ss/, allow_blank: true}
+```
+The default value in migration is `2000-01-01 00:00:00`
+But It did not accept the value `2017/11/11 11:11:11`
+
+Followup for #106 
+Hi,
+Simple change to take advantage of I18n when displaying dates in error messages. I need months in French :)
+Looks like `validates_timeliness` has some issues when using SimpleDelegator. `save` method doesn't return false if validation fails. I'm not entirely sure if this is a general validation issue or specific to this gem. Here is the how to reproduce
+
+```
+class EventFormObject  < SimpleDelegator
+  include ActiveModel::Validations
+
+  validates_date :start_at,
+                 :end_at,
+                 :on_or_after => lambda { Date.current }
+
+  def initialize(event)
+    super
+  end
+end
+```
+
+```
+irb(main):087:0> e = Event.last; ef = EventFormObject.new(e);
+=> 1
+irb(main):088:0> ef.save
+=> true
+irb(main):089:0> ef.valid?
+=> false
+```

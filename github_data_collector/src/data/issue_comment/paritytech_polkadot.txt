@@ -1,0 +1,42 @@
+This is starting as a followup to #773 but is intended to perform as many moving to `async/await` as possible in the places that would benefit from it.
+check_runtime should only complain if the runtime has changed and the same spec & impl version were used in a release tag.
+We want the finalized chain to strongly imply availability in an honest case, and for the longest chain to be the "most available" chain.
+
+We'll say that a relay chain block is availability-prepared by a validator when the validator has its availability piece for every parablock referenced in the block.
+
+We'll say that a relay chain is availability-prepared by a validator when every block in that chain is availability-prepared by that validator, up to some relatively large `N` blocks before the chain head.
+
+In the past, we've proposed 2 rules for validators to alter their chain-selection rules for GRANDPA voting and block construction.
+  - Validators will vote only on chains that they have availability-prepared.
+  - Validators will build only on chains whose k-prefix (The chain computed by omitting the last `k` blocks from the target chain) they have availability-prepared.
+
+
+Nodes that observe a double-vote in the attestation process should submit a report to the chain to trigger slashing.
+
+The `polkadot-statement-table` crate already detects double-votes, at least during the block-building phase. It generates `Misbehavior` objects which could be turned into report transactions and sent on-chain.
+
+This would also benefit from keeping the `StatementTable` and gossip object live for a longer period of time to continue to fish for double-attestations that are filed after that attestation session is no longer live.
+This code-path is also taken by validators who self-select based on VRF [Availability and Validity — Research at W3F](https://research.web3.foundation/en/latest/polkadot/Availability_and_Validity.html). Validators and fishermen will select parachain blocks to re-validate. In these steps:
+* Attempt to recover the PoV block, falling back on the erasure-coding. If not available, issue report.
+* Attempt to validate the PoV block. If invalid, issue report.
+
+This issue should implement an asynchronous "fishing service" which runs in the background to automatically spawn fishing work.
+In the attestation process, validators may submit only one `Candidate` message for a given relay chain block. If issuing a `Candidate` message on a parachain block, neither a `Valid` or `Invalid` vote cannot be issued on that parachain block, as the `Candidate` message is an implicit validity vote. Otherwise, it is illegal to cast both a `Valid` and `Invalid` vote on a given parachain block.
+
+Runtime handlers that take two conflicting votes as arguments and slash the offender are needed. 
+In Polkadot, a bad parachain group can force inclusion of an invalid or unavailable parachain block. It is the job of fishermen to detect those blocks and report them to the runtime. This item is about the report handler in the runtime which aggregates votes for/against validity of a particular parablock and slashes the relevant parties.
+
+The W3F-research writeup on availability/validity provides a high-level view of the dispute resolution process: [Availability and Validity — Research at W3F](https://research.web3.foundation/en/latest/polkadot/Availability_and_Validity.html)
+
+One of the main behaviors that is unimplemented and needs to be is the _rollback_ that occurs when the dispute resolution process concludes that an error has been made. When we mark a parachain block as having been invalid or unavailable, we need to roll back all parachains to a point from just before this state.  We would also need to roll back relay chain state, because there may have been messages from a parachain to a relay chain that now need to be rolled back. The easiest thing to do would be to side-step that by putting a delay on upwards messages, but this would impact the UX of parachain participation in slot auctions, council votes, etc. considerably. Assuming we can't side-step this, we will have to find a way to roll back selected state of the relay chain.
+The `PovBlock` or `Proof-of-Validity` block contains all the data you need to validate a parablock. It will need to contain state-proofs of incoming message queues and potentially outgoing ones as well.
+Libp2p enables users to define custom protocols by implementing the `NetworkBehaviour` trait. These custom protocols use a substream via whatever multiplexing solution libp2p uses for a connection.
+
+It would be useful to pass the ability to define custom protocols through Substrate up to code within Polkadot.
+
+Related work having the gossip system open custom substreams: https://github.com/paritytech/substrate/pull/4125
+Substrate by default does not differentiate between node roles (e.g. validator, sentry, light-client, ...) when choosing who to connect to.
+
+One can enable the authority discovery module with which a node tries to connect to a set of validators or their sentry nodes.
+
+As of today every information is broadcasted to everyone. This won't scale in the long run. Thus we will need to introduce the notion of multicast to subgroups within the network based on roles. To do so it becomes more and more important to connect to the right set of nodes. E.g. a collator should connect to its validator, but probably not to collators of other parachains.

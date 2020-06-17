@@ -1,0 +1,146 @@
+I was thinking of updating the docs to add the extra steps required to run on Scala Native in #31. 
+But I'm not sure how to do this. I see markup in the `website` folder, which seems to reflect what I see on the website, and some out of date markup in `docs`.
+On current master, and at least the commit before it I cannot run the following shell command `sbt clean test && sbt test` without getting a linking error:
+
+```
+[info] Compiling to native code (1020 ms)
+[info] Linking native code (immix gc) (184 ms)
+[error] java.nio.file.ClosedFileSystemException
+[error]         at com.sun.nio.zipfs.ZipFileSystem.ensureOpen(ZipFileSystem.java:1084)
+[error]         at com.sun.nio.zipfs.ZipFileSystem.newByteChannel(ZipFileSystem.java:633)
+[error]         at com.sun.nio.zipfs.ZipPath.newByteChannel(ZipPath.java:739)
+[error]         at com.sun.nio.zipfs.ZipFileSystemProvider.newByteChannel(ZipFileSystemProvider.java:255)
+[error]         at java.nio.file.Files.newByteChannel(Files.java:361)
+[error]         at java.nio.file.Files.newByteChannel(Files.java:407)
+[error]         at java.nio.file.Files.readAllBytes(Files.java:3152)
+[error]         at scala.scalanative.io.VirtualDirectory$NioDirectory.read(VirtualDirectory.scala:72)
+```
+
+In other words, running `test` appears to produce target files that make the next run of `test` fail.
+Running `sbt clean` or manually removing `core/native/target/scala-2.11/classes` will make the next run of `test` complete successfully.
+
+I believe this is the issue I'm encountering in https://github.com/shadaj/scalapy/pull/35 and encountered in https://github.com/shadaj/scalapy/pull/36. As I think TravisCi caches per branch:
+> There is one cache per branch and language version/ compiler version/ JDK version/ Gemfile location/ etc.
+(from https://docs.travis-ci.com/user/caching/)
+This PR upgrades ScalaPy to use [Scala Native 0.4.0-M2](https://github.com/scala-native/scala-native/releases/tag/v0.4.0-M2) which is particularly attractive as it removes the dependency on `re2`.
+I don't know if this is a issue specific to Native Scala, but runing sbt inside a virtualenv points to the expected python3.7 venv path, but shows the wrong 3.6.8 version.
+How is that possible?
+
+
+```scala
+import me.shadaj.scalapy.py
+
+object Main extends App {
+    val os = py.module("os")
+    val sys = py.module("sys")
+    print("version " + sys.version)
+    print("path " + os.path.dirname(sys.executable))
+}
+```
+Output:
+
+> version 3.6.8 (default, Jan 14 2019, 11:02:34) 
+> [GCC 8.0.1 20180414 (experimental) [trunk revision 259383]]
+
+> Warning: the value <function dirname at 0x7f71ee33b730> was allocated into a global space, which means it will not be garbage collected in Scala Native
+
+> path /home/davi/git/scalapyje/venv3.7/bin
+
+I suppose it has something to do with *python3-config*, but I have no knowledge  about how to set it differently. It points to the wrong python version:
+
+`python3-config --ldflags`
+
+> -L/usr/lib/python3.6/config-3.6m-x86_64-linux-gnu -L/usr/lib -lpython3.6m -lpthread -ldl  -lutil -lm  -Xlinker -export-dynamic -Wl,-O1 -Wl,-Bsymbolic-functions
+
+Sorry about the apparent specificity of this, but the original JEP project stick with the virtualenv, once its location is given in java.library.path (if a recall correctly). So this might be some detail I am missing.
+I created a default scala-native project and included scalapy dependence as below. But I couldn't manage to make it work.
+
+plugins.sbt:
+
+    addSbtPlugin("org.scala-native" % "sbt-scala-native" % "0.3.9")
+
+build.sbt:
+```scala
+    scalaVersion := "2.11.12"
+
+    nativeLinkStubs := true
+
+    enablePlugins(ScalaNativePlugin)
+
+    libraryDependencies += "me.shadaj" % "scalapy-core_native0.3_2.11" % "0.3.0+1-e1acbe6f"
+```
+
+Main.scala:
+
+```scala
+    import me.shadaj.scalapy.py
+    object Main extends App {
+        println("Hello, world!")
+        val listLengthPython = py.global.len(List(1, 2, 3))
+        val listLength = listLengthPython.as[Int]
+    }
+```
+
+build.properties:
+
+```scala
+    sbt.version = 1.2.6
+```
+Gives several errors like this first:
+
+    [error] /home/user/hello/target/scala-2.11/native/me.shadaj.scalapy.py.ll.o: In function `me.shadaj.scalapy.py.CPyValue::cleanup_unit':
+    [error] me.shadaj.scalapy.py.ll:(.text+0x51d): undefined reference to `Py_DecRef'
+
+
+I just added scala 2.13  support, but I removed the `Seq.view` methods as they raised type error. I'm not sure about the impact of the views, so might worth correct the ViewSeq error instead
+## **System information**
+
+- Windows 10 professional
+- Scala 2.12.3 (built-in), 2.10.6 (built-in), 2.11.11 (built-in)
+- sbt 1.1.2 (local 0.13.13 as per scalapy's build.sbt specs)
+- Java 1.8 JRE 1.8.0_171
+- Java 8 JDK 171
+- Python 3.6.4 (Conda 4.4.10, Anaconda 1.6.9 64x bits)
+- jep 3.7.1
+- Eclispe Oxygen.3a (4.7.3a) build 20180405-1200
+- PyDev 6.3.3.201805051638
+- build.sbt config:
+```
+libraryDependencies += "me.shadaj" %% "scalapy" % "0.2.0"
+fork in run := true
+javaOptions += "-Djava.library.path=/Users/.../AppData/Local/Continuum/anaconda3/Lib/site-packages/jep"
+```
+
+## **Two approaches**
+
+**Approach 1 - pointing to the jar file from properties in Eclipse**
+
+Click right on project > Properties > Java Build Path > Libraries > Add External JARs
+
+**Approach 2 - setting-up a lib folder with jep.dll file**
+
+Copy and pasting Conda's built of jep.dll
+
+By the way inspecting both referenced librairies indeed yield no trace of java.lang yet I read from the Scala documentation that java.lang is imported by default (scroll down to bottom of the following [page](https://docs.scala-lang.org/tour/packages-and-imports.html) linked)
+
+## **Command triggering issue & relevant error log**
+
+Run selection in Scala Interpreter and same from command line
+
+> java.lang.UnsatisfiedLinkError: C:\Users\...\AppData\Local\Continuum\anaconda3\Lib\site-packages\jep\jep.dll: Can't find dependent libraries
+>   at java.lang.ClassLoader$NativeLibrary.load(Native Method)
+>   at java.lang.ClassLoader.loadLibrary0(Unknown Source)
+>   at java.lang.ClassLoader.loadLibrary(Unknown Source)
+>   at java.lang.Runtime.loadLibrary0(Unknown Source)
+>   at java.lang.System.loadLibrary(Unknown Source)
+>   at jep.Jep.<clinit>(Jep.java:217)
+>   ... 48 elided
+> java.lang.UnsatisfiedLinkError: C:\Users\GB5026\AppData\Local\Continuum\anaconda3\Lib\site-packages\jep\jep.dll: Can't find dependent libraries
+>   at java.lang.ClassLoader$NativeLibrary.load(Native Method)
+>   at java.lang.ClassLoader.loadLibrary0(Unknown Source)
+>   at java.lang.ClassLoader.loadLibrary(Unknown Source)
+>   at java.lang.Runtime.loadLibrary0(Unknown Source)
+>   at java.lang.System.loadLibrary(Unknown Source)
+>   at jep.Jep.<clinit>(Jep.java:217)
+>   ... 48 elided
+

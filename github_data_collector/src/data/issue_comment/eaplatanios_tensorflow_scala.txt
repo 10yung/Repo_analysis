@@ -1,0 +1,664 @@
+SBT installation instructions are not using the scala version-specific instructions which are required. Specifically, `libraryDependencies += "org.platanios" % "tensorflow" % "0.4.0"` should be `libraryDependencies += "org.platanios" %% "tensorflow" % "0.4.0"`
+
+There is a similar problem for the Precompiled Binaries.
+First of all: I have little prior experience with tensorflow; in fact I'm trying to understand it by using your package so I can work in Scala rather than python. Thank you very much for your library, it helps a ton, since I'm a lot more comfortable working within Scala.
+
+As a first step, I figured I'd translate a GloVe-implementation from python to scala, namely: https://github.com/GradySimon/tensorflow-glove/blob/master/tf_glove.py (my translation attached below; the relevant parts are all in the `train`-method, lines 98ff)
+
+I encountered two issues:
+1. In line 99 of the python implementation it says 
+`embedding_product = tf.reduce_sum(tf.multiply(focal_embedding, context_embedding), 1)`
+but I had to change the axis to -1 (as in 
+`val embedding_product = tf.sum(tf.multiply(focal_embedding,context_embedding),-1)`), otherwise I'd get an error `Inputs to operation AddN of type AddN must have the same size and shape.  Input 0: [512,50] != input 1: [512,1]` - caused by the computation of `distance_expr` (line 103 python, line 124 in the scala code below). Is there a discrepancy between the python implementation and yours regarding the axes?
+2. Having "fixed" that, I now get an error `Input to reshape is a tensor with 262144 values, but the requested shape has 512
+	 [[{{node Gradients/SumGradient/Reshape_1}}]]` that seems to occur somewhere in the `AdaGrad.minimize`-computation. I'm at a loss (pun intended) where this comes from - the graph as implemented seems to have the correct dimensionalities everywhere (all the tensors in sums seem to have the correct shape `Shape(512)`), so I wouldn't know what's wrong other than that there's an error somewhere in the implementation of the gradients involved... any help would be most welcome.
+
+
+```
+package com.jazzpirate.glove
+
+import com.jazzpirate.tensorflow._
+import info.kwarc.mmt.api.utils.File
+import org.platanios.tensorflow.api._
+import org.platanios.tensorflow.api.core.client.FeedMap
+import org.platanios.tensorflow.api.ops.Embedding.DivStrategy
+import org.platanios.tensorflow.api.ops.Output
+import org.platanios.tensorflow.api.tf
+import org.platanios.tensorflow.api.ops.variables.RandomUniformInitializer
+import org.platanios.tensorflow.api.tensors.Tensor
+
+import scala.collection.parallel.mutable
+
+class TFGloVe() {
+  private object Vocab {
+    private var itos_map : List[String] = Nil
+
+    def setElems(ls:List[String]) = {
+      itos_map = ls
+      stoi_map = mutable.ParHashMap.empty
+      w = None
+      _size = itos_map.length
+      itos_map.zipWithIndex.foreach {
+        case (s,i) => stoi_map(s) = i//+1
+      }
+    }
+
+    def load(file:File) = {
+      val vocab = file.addExtension("vocab")
+      val itos_map = File.read(vocab).split('\t')
+      stoi_map = mutable.ParHashMap.empty
+      _size = itos_map.length
+      itos_map.zipWithIndex.foreach {
+        case (s,i) => stoi_map(s) = i//+1
+      }
+      val matrix = vocab.setExtension("matrix")
+      ???
+      // w = Some(Nd4j.readTxt(matrix.toString()))
+
+    }
+
+    def setMatrix(matrix:scala.collection.mutable.ArrayBuffer[MutableVector]) = w = Some(matrix)
+
+    private var stoi_map :mutable.ParHashMap[String,Int] = mutable.ParHashMap.empty
+    def stoi(s:String) = stoi_map(s)
+    def itos(i:Int) = itos_map(i)//-1)
+    var _size = 0
+    def size = _size
+
+    var w : Option[scala.collection.mutable.ArrayBuffer[MutableVector]] = None
+
+    def getValue(s:String) = {
+      val i = stoi(s)
+      w.get(i) + w.get(i+size)
+      // w.get.getRow(i).add(w.get.getRow(i+size))
+    }
+
+    // lazy val aarrs = (0 until (w.get.rows()/2)).map(i => w.get.getRow(i).add(w.get.getRow(i+size)))
+
+    def getString(a : Tensor[Double]) = {
+      ??? // something with aarrs
+    }
+
+    def save(file:File) = {
+      val vocab = file.addExtension("vocab")
+      vocab.createNewFile()
+      File.write(vocab,itos_map.mkString("\t"))
+      val matrix = vocab.setExtension("matrix")
+      matrix.createNewFile()
+      ???
+      // Nd4j.writeTxt(w.get,matrix.toString())
+    }
+  }
+
+  def save(file:File) = Vocab.save(file)
+  def load(file:File) = Vocab.load(file)
+
+  def apply(s:String) = Vocab.getValue(s)
+
+  def train(ls:List[List[String]],
+            windowsize:Int=10,
+            minval:Double=1,
+            batch_size:Int=512,
+            learning_rate:Double = 0.05,
+            alpha:Double=0.75,
+            x_max:Double=100,
+            vector_size:Int = 50,
+            iterations:Int = 25) : Unit = {
+
+    val distinct = ls.flatten.distinct
+    Vocab.setElems(distinct)
+    println(distinct.length + " Tokens")
+    val hm = computeMatrix(ls,windowsize,minval)
+    train(hm,batch_size,vector_size,iterations,x_max,alpha,learning_rate)
+  }
+
+  private def train(cooc:mutable.ParHashMap[(Int,Int),Double], batch_size : Int, vector_size:Int, iterations:Int,x_max:Double,alpha:Double,learning_rate:Double): Unit = {
+    println("Graph building...")
+    val session = core.client.Session()
+
+    val init = RandomUniformInitializer(-1f,1f)
+
+    val count_max = tf.constant[Float](Tensor(x_max.toFloat),name="max_cooccurence_cap")
+    val scaling_factor = tf.constant[Float](Tensor(alpha.toFloat),name="scaling_factor")
+
+    val focal_input = tf.placeholder[Int](Shape(batch_size),name="focal_words")
+    val context_input = tf.placeholder[Int](Shape(batch_size),name="context_words")
+    val cooccurrence_count = tf.placeholder[Float](Shape(batch_size),name="cooccurrrence_count")
+
+    val focal_embeddings = tf.variable[Float](name="focal_embeddings",Shape(Vocab.size,vector_size),init)
+    val context_embeddings = tf.variable[Float](name="context_embeddings",Shape(Vocab.size,vector_size),init)
+    val focal_biases = tf.variable[Float]("focal_biases",Shape(Vocab.size),init)
+    val context_biases = tf.variable[Float]("context_biases",Shape(Vocab.size),init)
+
+    val focal_embedding = org.platanios.tensorflow.api.ops.Embedding.embeddingLookup(focal_embeddings,focal_input,DivStrategy)
+    val context_embedding = org.platanios.tensorflow.api.ops.Embedding.embeddingLookup(context_embeddings,context_input,DivStrategy)
+    val focal_bias = org.platanios.tensorflow.api.ops.Embedding.embeddingLookup(focal_biases,focal_input,DivStrategy)
+    val context_bias = org.platanios.tensorflow.api.ops.Embedding.embeddingLookup(context_biases,context_input,DivStrategy)
+
+    val weighting_factor = tf.minimum(1.0f,tf.pow(tf.divide(cooccurrence_count,count_max),scaling_factor))
+    val embedding_product = tf.sum(tf.multiply(focal_embedding,context_embedding),-1)
+    val log_cooccurences = tf.log(cooccurrence_count.toFloat)
+    val distance_expr = tf.square(tf.addN(Seq(embedding_product,focal_bias,context_bias,tf.negate(log_cooccurences))))
+
+    val single_losses = tf.multiply(weighting_factor,distance_expr)
+    val total_loss = tf.sum(single_losses)
+    tf.summary.scalar("GloVe_loss",total_loss)
+    val optimizer = tf.train.AdaGrad(learning_rate.toFloat).minimize(total_loss)
+    val combined_embeddings = tf.add(focal_embeddings,context_embeddings,name="combined_embeddings")
+
+    println("Training...")
+    session.run(targets=Set(tf.globalVariablesInitializer()))
+    val writer = tf.summary.FileWriter(File("/home/jazzpirate/work/Scala/ML/data/tf").toPath,session.graph)
+    val (allis,alljs,allcs) = cooc.toParArray.map{case ((i,j),c) => (Tensor(i),Tensor(j),Tensor(c.toFloat))}.unzip3
+    var data = (0 until Vocab.size by batch_size).map(ii => (
+      Tensor(allis.slice(ii,ii+batch_size).toArray:_*),
+      Tensor(alljs.slice(ii,ii+batch_size).toArray:_*),
+      Tensor(allcs.slice(ii,ii+batch_size).toArray:_*)
+      ))
+    /*
+    var data = (0 until Vocab.size).flatMap(i => (0 until Vocab.size).map{j =>
+      val counts = if (i<j) cooc.getOrElse((i,j),0.0) else cooc.getOrElse((j,i),0.0)
+      (0 until Vocab.size by batch_size).map(ii => ()) Tensor()
+    })
+     */
+    val max = Vocab.size*Vocab.size
+
+    (1 to iterations).foreach { it =>
+      print("Iteration " + it + "/" + iterations + "... ")
+      data = scala.util.Random.shuffle(data)
+      data.indices.foreach { ii =>
+        print("\rIteration " + it + "/" + iterations + ": " + (ii + 1) + "/" + max + "     ")
+        val (is,js,counts) = data(ii)
+        //val counts = if (is<js) cooc.getOrElse((is,js),0.0) else cooc.getOrElse((js,is),0.0)
+        val feed_dict = Map((focal_input,is),(context_input,js),(cooccurrence_count,counts)).asInstanceOf[Map[Output[_], Tensor[_]]]
+        session.run(targets=Set(optimizer),feeds=FeedMap(feed_dict))
+      }
+    }
+    val ret = session.run(fetches=Seq(combined_embeddings))
+    writer.close()
+    ret
+    // Vocab.setMatrix(w)
+  }
+
+  private def computeMatrix(ls:List[List[String]],windowsize:Int,minval:Double) = {
+    val hm = mutable.ParHashMap[(Int,Int),Double]()
+    def update(p1:Int,p2:Int,inc:Double) : Unit = {
+      if (p2<p1) update(p2,p1,inc) else {
+        val old = hm.getOrElse((p1,p2),0.0)
+        hm.update((p1,p2),old+inc)
+      }
+    }
+    ls foreach {region =>
+      region.indices.foreach { ri =>
+        val start = ri - windowsize
+        val end = ri + windowsize
+        val word = Vocab.stoi(region(ri))
+        val left = region.slice(Math.max(start,0),Math.min(ri-1,region.length+1) + 1)
+        val right = region.slice(Math.max(ri+1,0),Math.min(end,region.length+1) + 1)
+        left.reverse.zipWithIndex.foreach { case (s,i) =>
+          val cont_word = Vocab.stoi(s)
+          update(word,cont_word,1.0/(i+1))
+        }
+        right.zipWithIndex.foreach { case (s,i) =>
+          val cont_word = Vocab.stoi(s)
+          update(word,cont_word,1.0/(i+1))
+        }
+      }
+    }
+    hm.foreach{ case (k,v) if v<=minval => hm.remove(k) case _ => }
+    hm
+  }
+
+}
+```
+
+I am using tensorflow_scala to train a model. The data is large and I want to use distributed training. Does tensorflow_scala support distributed training.  If so, how can I get some documents and examples?
+Thanks in advance.
+## Linear Algebra Support
+
+Created a starting point for linear algebra support (solving #84). Added eager and lazy versions of ops. 
+
+Also added new type check `IsRealOrComplex` to check if underlying type of a tensor or output is float, double or complex.
+
+### Ops Added
+  - Cholesky
+  - Matrix Determinant
+  - Log Matrix Determinant
+  - Matrix Inverse
+  - Matrix Solve A\B 
+  - Least squares matrix solve
+  - Triangular matrix solve
+  - Eigen-decomposition of self-adjoint matrices
+  -  QR decomposition
+  - SVD decomposition
+
+
+```scala 
+tf.matrixDeterminant[T: TF: IsRealOrComplex](
+  matrix: Output[T], 
+  name: String = "MatrixDeterminant"): Output[T]
+
+tfi.matrixDeterminant[T: TF: IsRealOrComplex](matrix: Tensor[T]): Tensor[T]
+```
+
+
+@eaplatanios @sbrunk @lucataglia @DirkToewe : What do you guys think?
+Tensorflow for python supports conv2d_transpose, which I need for a U-net implementation but seems to be missing from TF4S. 
+
+What is involved with adding support for additional ops? 
+
+Happy to help out &/ have my company sponsor development.
+
+
+I'm interested in a windows version - what would be involved with getting the published artifacts to also support Windows? 
+
+JavaCPP seems like a potentially interesting helper project here, see: 
+* [Create New Presets](https://github.com/bytedeco/javacpp-presets/wiki/Create-New-Presets)
+* [JavaCPP Presets for TensorFlow](https://github.com/bytedeco/javacpp-presets/tree/master/tensorflow) (Based on C++ Tensorflow, not the C API)
+
+Happy to help out &/ have my company sponsor development. 
+The accuracy dose not increase in mnist example, while the loss decreases.
+How should we settle it?
+
+
+~~~
+2019-07-27 08:46:04.766 [run-main-0] INFO  MNIST Data Loader - Extracting images from file 'datasets/MNIST/train-images-idx3-ubyte.gz'.
+2019-07-27 08:46:06.639 [run-main-0] INFO  MNIST Data Loader - Extracting labels from file 'datasets/MNIST/train-labels-idx1-ubyte.gz'.
+2019-07-27 08:46:06.660 [run-main-0] INFO  MNIST Data Loader - Extracting images from file 'datasets/MNIST/t10k-images-idx3-ubyte.gz'.
+2019-07-27 08:46:06.830 [run-main-0] INFO  MNIST Data Loader - Extracting labels from file 'datasets/MNIST/t10k-labels-idx1-ubyte.gz'.
+2019-07-27 08:46:06.837 [run-main-0] INFO  MNIST Data Loader - Finished loading the MNIST dataset.
+2019-07-27 08:46:07.306 [run-main-0] INFO  Examples / MNIST - Building the logistic regression model.
+2019-07-27 08:46:07.510 [run-main-0] INFO  Examples / MNIST - Training the linear regression model.
+2019-07-27 08:46:08.028791: I tensorflow/core/platform/cpu_feature_guard.cc:141] Your CPU supports instructions that this TensorFlow binary was not compiled to use: SSE4.1 SSE4.2 AVX AVX2
+2019-07-27 08:46:16.223 [run-main-0] INFO  Learn / Hooks / Checkpoint Saver - Saving checkpoint for step 0.
+2019-07-27 08:46:16.234 [run-main-0] INFO  Variables / Saver - Saving parameters to '/home/miyazawakohei/tensorflow-scala-0721/temp/mnist-mlp/model.ckpt-0'.
+2019-07-27 08:46:17.021 [run-main-0] INFO  Variables / Saver - Saved parameters to '/home/miyazawakohei/tensorflow-scala-0721/temp/mnist-mlp/model.ckpt-0'.
+2019-07-27 08:46:17.032 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    N/A    ) Step:      0, Loss: 496006.0625
+2019-07-27 08:46:17.249 [run-main-0] INFO  Variables / Saver - Restoring parameters from '/home/miyazawakohei/tensorflow-scala-0721/temp/mnist-mlp/model.ckpt-0'.
+2019-07-27 08:46:17.471 [run-main-0] INFO  Learn / Hooks / Evaluation - Step 0 Evaluator:
+2019-07-27 08:46:17.479 [run-main-0] INFO  Learn / Hooks / Evaluation - ╔═══════╤════════════╗
+2019-07-27 08:46:17.479 [run-main-0] INFO  Learn / Hooks / Evaluation - ║       │   Accuracy ║
+2019-07-27 08:46:17.480 [run-main-0] INFO  Learn / Hooks / Evaluation - ╟───────┼────────────╢
+2019-07-27 08:46:21.569 [run-main-0] INFO  Learn / Hooks / Evaluation - ║ Train │     0.0848 ║
+2019-07-27 08:46:22.327 [run-main-0] INFO  Learn / Hooks / Evaluation - ║  Test │     0.0805 ║
+2019-07-27 08:46:22.336 [run-main-0] INFO  Learn / Hooks / Evaluation - ╚═══════╧════════════╝
+2019-07-27 08:46:25.165 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    8.134 s) Step:    100, Loss: 4524.1426
+2019-07-27 08:46:27.622 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    2.456 s) Step:    200, Loss: 1435.9475
+2019-07-27 08:46:29.908 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    2.287 s) Step:    300, Loss: 752.1824
+2019-07-27 08:46:32.760 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    2.852 s) Step:    400, Loss: 335.2845
+2019-07-27 08:46:35.205 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    2.445 s) Step:    500, Loss: 298.3430
+2019-07-27 08:46:37.642 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    2.437 s) Step:    600, Loss: 256.3721
+2019-07-27 08:46:39.741 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    2.098 s) Step:    700, Loss: 141.6279
+2019-07-27 08:46:41.965 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    2.224 s) Step:    800, Loss: 50.8881
+2019-07-27 08:46:44.184 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    2.220 s) Step:    900, Loss: 19.6008
+2019-07-27 08:46:46.435 [run-main-0] INFO  Learn / Hooks / Checkpoint Saver - Saving checkpoint for step 1000.
+2019-07-27 08:46:46.436 [run-main-0] INFO  Variables / Saver - Saving parameters to '/home/miyazawakohei/tensorflow-scala-0721/temp/mnist-mlp/model.ckpt-1000'.
+2019-07-27 08:46:46.870 [run-main-0] INFO  Variables / Saver - Saved parameters to '/home/miyazawakohei/tensorflow-scala-0721/temp/mnist-mlp/model.ckpt-1000'.
+2019-07-27 08:46:46.880 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    2.696 s) Step:   1000, Loss: 63.2028
+2019-07-27 08:46:46.887 [run-main-0] INFO  Variables / Saver - Restoring parameters from '/home/miyazawakohei/tensorflow-scala-0721/temp/mnist-mlp/model.ckpt-1000'.
+2019-07-27 08:46:47.079 [run-main-0] INFO  Learn / Hooks / Evaluation - Step 1000 Evaluator:
+2019-07-27 08:46:47.080 [run-main-0] INFO  Learn / Hooks / Evaluation - ╔═══════╤════════════╗
+2019-07-27 08:46:47.080 [run-main-0] INFO  Learn / Hooks / Evaluation - ║       │   Accuracy ║
+2019-07-27 08:46:47.080 [run-main-0] INFO  Learn / Hooks / Evaluation - ╟───────┼────────────╢
+2019-07-27 08:46:50.503 [run-main-0] INFO  Learn / Hooks / Evaluation - ║ Train │     0.0848 ║
+2019-07-27 08:46:51.176 [run-main-0] INFO  Learn / Hooks / Evaluation - ║  Test │     0.0805 ║
+2019-07-27 08:46:51.182 [run-main-0] INFO  Learn / Hooks / Evaluation - ╚═══════╧════════════╝
+2019-07-27 08:46:53.333 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    6.453 s) Step:   1100, Loss: 89.3396
+2019-07-27 08:46:55.671 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    2.338 s) Step:   1200, Loss: 49.0971
+2019-07-27 08:46:57.945 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    2.274 s) Step:   1300, Loss: 60.7999
+2019-07-27 08:47:00.081 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    2.136 s) Step:   1400, Loss: 23.6350
+2019-07-27 08:47:02.289 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    2.208 s) Step:   1500, Loss: 20.9953
+2019-07-27 08:47:04.474 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    2.184 s) Step:   1600, Loss: 12.6117
+2019-07-27 08:47:06.740 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    2.267 s) Step:   1700, Loss: 12.0621
+2019-07-27 08:47:09.053 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    2.313 s) Step:   1800, Loss: 14.9911
+2019-07-27 08:47:11.742 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    2.689 s) Step:   1900, Loss: 8.6479
+2019-07-27 08:47:13.968 [run-main-0] INFO  Learn / Hooks / Checkpoint Saver - Saving checkpoint for step 2000.
+2019-07-27 08:47:13.968 [run-main-0] INFO  Variables / Saver - Saving parameters to '/home/miyazawakohei/tensorflow-scala-0721/temp/mnist-mlp/model.ckpt-2000'.
+2019-07-27 08:47:14.370 [run-main-0] INFO  Variables / Saver - Saved parameters to '/home/miyazawakohei/tensorflow-scala-0721/temp/mnist-mlp/model.ckpt-2000'.
+2019-07-27 08:47:14.375 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    2.633 s) Step:   2000, Loss: 6.1439
+2019-07-27 08:47:14.377 [run-main-0] INFO  Variables / Saver - Restoring parameters from '/home/miyazawakohei/tensorflow-scala-0721/temp/mnist-mlp/model.ckpt-2000'.
+2019-07-27 08:47:14.600 [run-main-0] INFO  Learn / Hooks / Evaluation - Step 2000 Evaluator:
+2019-07-27 08:47:14.602 [run-main-0] INFO  Learn / Hooks / Evaluation - ╔═══════╤════════════╗
+2019-07-27 08:47:14.603 [run-main-0] INFO  Learn / Hooks / Evaluation - ║       │   Accuracy ║
+2019-07-27 08:47:14.603 [run-main-0] INFO  Learn / Hooks / Evaluation - ╟───────┼────────────╢
+2019-07-27 08:47:20.007 [run-main-0] INFO  Learn / Hooks / Evaluation - ║ Train │     0.0848 ║
+2019-07-27 08:47:20.975 [run-main-0] INFO  Learn / Hooks / Evaluation - ║  Test │     0.0805 ║
+2019-07-27 08:47:20.988 [run-main-0] INFO  Learn / Hooks / Evaluation - ╚═══════╧════════════╝
+2019-07-27 08:47:22.912 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    8.537 s) Step:   2100, Loss: 8.0373
+2019-07-27 08:47:25.258 [run-main-0] INFO  Learn / Hooks / Loss Logger - (    2.346 s) Step:   2200, Loss: 4.5865
+...
+~~~
+
+
+the scala code:
+~~~
+import org.platanios.tensorflow.api._
+import org.platanios.tensorflow.api.core.types.UByte
+import org.platanios.tensorflow.api.implicits.helpers.{OutputStructure, OutputToDataType, OutputToShape}
+import org.platanios.tensorflow.api.learn.ClipGradientsByGlobalNorm
+import org.platanios.tensorflow.api.ops.Output
+import org.platanios.tensorflow.data.image.MNISTLoader
+//import org.platanios.tensorflow.examples
+
+import com.typesafe.scalalogging.Logger
+import org.slf4j.LoggerFactory
+
+import java.nio.file.Paths
+
+/**
+  * @author Emmanouil Antonios Platanios
+  */
+object MNIST {
+  private val logger = Logger(LoggerFactory.getLogger("Examples / MNIST"))
+
+  // Implicit helpers for Scala 2.11.
+  //implicit val evOutputStructureFloatLong : OutputStructure[(Output[Float], Output[Long])]  = examples.evOutputStructureFloatLong
+  //implicit val evOutputToDataTypeFloatLong: OutputToDataType[(Output[Float], Output[Long])] = examples.evOutputToDataTypeFloatLong
+  //implicit val evOutputToShapeFloatLong   : OutputToShape[(Output[Float], Output[Long])]    = examples.evOutputToShapeFloatLong
+
+  def main(args: Array[String]): Unit = {
+    val dataSet = MNISTLoader.load(Paths.get("datasets/MNIST"))
+    val trainImages = tf.data.datasetFromTensorSlices(dataSet.trainImages).map(_.toFloat)
+    val trainLabels = tf.data.datasetFromTensorSlices(dataSet.trainLabels).map(_.toLong)
+    val testImages = tf.data.datasetFromTensorSlices(dataSet.testImages).map(_.toFloat)
+    val testLabels = tf.data.datasetFromTensorSlices(dataSet.testLabels).map(_.toLong)
+    val trainData =
+      trainImages.zip(trainLabels)
+          .repeat()
+          .shuffle(10000)
+          .batch(256)
+          .prefetch(10)
+    val evalTrainData = trainImages.zip(trainLabels).batch(1000).prefetch(10)
+    val evalTestData = testImages.zip(testLabels).batch(1000).prefetch(10)
+
+    logger.info("Building the logistic regression model.")
+
+    val input = tf.learn.Input(FLOAT32, Shape(-1, dataSet.trainImages.shape(1), dataSet.trainImages.shape(2)))
+    val trainInput = tf.learn.Input(INT64, Shape(-1))
+    val layer = tf.learn.Flatten[Float]("Input/Flatten") >>
+        tf.learn.Linear[Float]("Layer_0/Linear", 128) >> tf.learn.ReLU[Float]("Layer_0/ReLU", 0.1f) >>
+        tf.learn.Linear[Float]("Layer_1/Linear", 64) >> tf.learn.ReLU[Float]("Layer_1/ReLU", 0.1f) >>
+        tf.learn.Linear[Float]("Layer_2/Linear", 32) >> tf.learn.ReLU[Float]("Layer_2/ReLU", 0.1f) >>
+        tf.learn.Linear[Float]("OutputLayer/Linear", 10)
+    val loss = tf.learn.SparseSoftmaxCrossEntropy[Float, Long, Float]("Loss/CrossEntropy") >>
+        tf.learn.Mean[Float]("Loss/Mean") >>
+        tf.learn.ScalarSummary[Float]("Loss/Summary", "Loss")
+    val optimizer = tf.train.YellowFin()
+
+    val model = tf.learn.Model.simpleSupervised(
+      input = input,
+      trainInput = trainInput,
+      layer = layer,
+      loss = loss,
+      optimizer = optimizer,
+      clipGradients = ClipGradientsByGlobalNorm(5.0f))
+
+    logger.info("Training the linear regression model.")
+    val summariesDir = Paths.get("temp/mnist-mlp")
+    val accMetric = tf.metrics.MapMetric(
+      (v: (Output[Float], (Output[Float], Output[Int]))) => {
+        (tf.argmax(v._1, -1, INT64).toFloat, v._2._2.toFloat)
+      }, tf.metrics.Accuracy("Accuracy"))
+    val estimator = tf.learn.InMemoryEstimator(
+      model,
+      tf.learn.Configuration(Some(summariesDir)),
+      tf.learn.StopCriteria(maxSteps = Some(100000)),
+      Set(
+        tf.learn.LossLogger(trigger = tf.learn.StepHookTrigger(100)),
+        tf.learn.Evaluator(
+          log = true, datasets = Seq(("Train", () => evalTrainData), ("Test", () => evalTestData)),
+          metrics = Seq(accMetric), trigger = tf.learn.StepHookTrigger(1000), name = "Evaluator"),
+        tf.learn.StepRateLogger(log = false, summaryDir = summariesDir, trigger = tf.learn.StepHookTrigger(100)),
+        tf.learn.SummarySaver(summariesDir, tf.learn.StepHookTrigger(100)),
+        tf.learn.CheckpointSaver(summariesDir, tf.learn.StepHookTrigger(1000))),
+      tensorBoardConfig = tf.learn.TensorBoardConfig(summariesDir, reloadInterval = 1))
+    estimator.train(() => trainData, tf.learn.StopCriteria(maxSteps = Some(10000)))
+
+    def accuracy(images: Tensor[UByte], labels: Tensor[UByte]): Float = {
+      val predictions = estimator.infer(() => images.toFloat)
+      predictions
+          .argmax(1).toUByte
+          .equal(labels).toFloat
+          .mean().scalar
+    }
+
+    logger.info(s"Train accuracy = ${accuracy(dataSet.trainImages, dataSet.trainLabels)}")
+    logger.info(s"Test accuracy = ${accuracy(dataSet.testImages, dataSet.testLabels)}")
+  }
+}
+~~~
+I've understood estimator as an instance of InMemoryEstimator can provide checkpoint file in the file system. Then, is there any method to use the checkpoint to test?
+In short, I want an alternative method of 
+
+model = tf.keras.models.Sequential(...)
+model.load_weights(checkpoint_path)
+
+of python code.
+Surprisingly, I'm currently facing this same issue as [this error #29 ](https://github.com/eaplatanios/tensorflow_scala/issues/29).  A program which works well on my mac, throws this same error when I run on a CentOS 7 machine. I'm using JDK 11, and the precompiled binaries - 0.4.1 of artifact tensorflow_2.21. I update the flag to linux-cpu-x86_64 on mac, use Maven to package it to a JAR, then ship to CentOS7.
+
+StackTrace:
+```
+Exception in thread "main" java.lang.UnsatisfiedLinkError: /tmp/tensorflow_scala_native_libraries8675119614557414070/libtensorflow_jni.so: /lib64/libstdc++.so.6: version `CXXABI_1.3.8' not found (required by /tmp/tensorflow_scala_native_libraries8675119614557414070/libtensorflow_jni.so)
+	at java.lang.ClassLoader$NativeLibrary.load(Native Method)
+	at java.lang.ClassLoader.loadLibrary0(ClassLoader.java:1941)
+	at java.lang.ClassLoader.loadLibrary(ClassLoader.java:1824)
+	at java.lang.Runtime.load0(Runtime.java:809)
+	at java.lang.System.load(System.java:1086)
+	at org.platanios.tensorflow.jni.TensorFlow$.$anonfun$load$4(TensorFlow.scala:95)
+	at org.platanios.tensorflow.jni.TensorFlow$.$anonfun$load$4$adapted(TensorFlow.scala:93)
+	at scala.Option.foreach(Option.scala:274)
+	at org.platanios.tensorflow.jni.TensorFlow$.load(TensorFlow.scala:93)
+	at org.platanios.tensorflow.jni.TensorFlow$.<init>(TensorFlow.scala:155)
+	at org.platanios.tensorflow.jni.TensorFlow$.<clinit>(TensorFlow.scala)
+	at org.platanios.tensorflow.jni.Tensor$.<init>(Tensor.scala:24)
+	at org.platanios.tensorflow.jni.Tensor$.<clinit>(Tensor.scala)
+	at org.platanios.tensorflow.api.tensors.Tensor$.fill(Tensor.scala:835)
+	at org.platanios.tensorflow.api.tensors.Tensor$.zeros(Tensor.scala:726)
+	at com.cambridgesemantics.anzograph.tf.TFVersion.apply(TFVersion.scala:37)
+	at Test.main(Test.java:9)
+```
+
+To get more insight on what dependencies am missing, I tried:
+```
+[ashwinravishankar@ash-test-00 so]$ ldd libtensorflow_jni.so
+ldd: warning: you do not have execution permission for `./libtensorflow_jni.so'
+./libtensorflow_jni.so: /lib64/libstdc++.so.6: version `CXXABI_1.3.8' not found (required by ./libtensorflow_jni.so)
+./libtensorflow_jni.so: /lib64/libstdc++.so.6: version `CXXABI_1.3.8' not found (required by /home/ashwinravishankar/so/./libtensorflow.so)
+./libtensorflow_jni.so: /lib64/libstdc++.so.6: version `GLIBCXX_3.4.21' not found (required by /home/ashwinravishankar/so/./libtensorflow.so)
+./libtensorflow_jni.so: /lib64/libstdc++.so.6: version `GLIBCXX_3.4.20' not found (required by /home/ashwinravishankar/so/./libtensorflow.so)
+./libtensorflow_jni.so: /lib64/libm.so.6: version `GLIBC_2.23' not found (required by /home/ashwinravishankar/so/./libtensorflow.so)
+./libtensorflow_jni.so: /lib64/libstdc++.so.6: version `GLIBCXX_3.4.20' not found (required by /home/ashwinravishankar/so/./libtensorflow_framework.so)
+./libtensorflow_jni.so: /lib64/libstdc++.so.6: version `GLIBCXX_3.4.21' not found (required by /home/ashwinravishankar/so/./libtensorflow_framework.so)
+./libtensorflow_jni.so: /lib64/libstdc++.so.6: version `CXXABI_1.3.8' not found (required by /home/ashwinravishankar/so/./libtensorflow_framework.so)
+	linux-vdso.so.1 =>  (0x00007ffc72fd8000)
+	libtensorflow.so => /home/ashwinravishankar/so/./libtensorflow.so (0x00007f5e79fde000)
+	libtensorflow_framework.so => /home/ashwinravishankar/so/./libtensorflow_framework.so (0x00007f5e79204000)
+	libstdc++.so.6 => /lib64/libstdc++.so.6 (0x00007f5e78efd000)
+	libgcc_s.so.1 => /lib64/libgcc_s.so.1 (0x00007f5e78ce7000)
+	libc.so.6 => /lib64/libc.so.6 (0x00007f5e7891a000)
+	libdl.so.2 => /lib64/libdl.so.2 (0x00007f5e78716000)
+	libpthread.so.0 => /lib64/libpthread.so.0 (0x00007f5e784fa000)
+	libm.so.6 => /lib64/libm.so.6 (0x00007f5e781f8000)
+	librt.so.1 => /lib64/librt.so.1 (0x00007f5e77ff0000)
+	/lib64/ld-linux-x86-64.so.2 (0x00007f5e821d4000)
+```
+This issue is possibly related to #157 
+
+## Motivation
+
+The main reason why I need to use the `tf.data.datasetFromOutputSlices` is because the Tensorflow python docs mention that [`tf.data.Dataset.from_tensor_slices()`](https://www.tensorflow.org/guide/datasets#consuming_numpy_arrays) is not ideal when loading large data sets.
+
+So I thought its better to use `tf.data.datasetFromOutputSlices` instead. But using that in any `Model\Estimator` based API leads to the `ShapeRefiner` based `FailedPreconditionException`.
+
+## Example
+
+The following is a minimal reproduction of the issue
+
+```scala
+
+import _root_.java.nio.file.Paths
+import org.platanios.tensorflow.api._
+import org.platanios.tensorflow.data.image.MNISTLoader
+
+val dataSet = MNISTLoader.load(Paths.get("datasets/MNIST"))
+val trainImages =
+  tf.data.datasetFromOutputSlices(dataSet.trainImages.toOutput).map(_.toFloat)
+val trainLabels =
+  tf.data.datasetFromOutputSlices(dataSet.trainLabels.toOutput).map(_.toLong)
+val testImages =
+  tf.data.datasetFromOutputSlices(dataSet.testImages.toOutput).map(_.toFloat)
+val testLabels =
+  tf.data.datasetFromOutputSlices(dataSet.testLabels.toOutput).map(_.toLong)
+val trainData =
+  trainImages
+    .zip(trainLabels)
+    .repeat()
+    .shuffle(10000)
+    .batch(256)
+    .prefetch(10)
+val evalTrainData = trainImages.zip(trainLabels).batch(1000).prefetch(10)
+val evalTestData  = testImages.zip(testLabels).batch(1000).prefetch(10)
+
+logger.info("Building the logistic regression model.")
+
+val input = tf.learn.Input(
+  FLOAT32,
+  Shape(-1, dataSet.trainImages.shape(1), dataSet.trainImages.shape(2))
+)
+val trainInput = tf.learn.Input(INT64, Shape(-1))
+val layer = tf.learn.Flatten[Float]("Input/Flatten") >>
+  tf.learn.Linear[Float]("Layer_0/Linear", 128) >> tf.learn
+  .ReLU[Float]("Layer_0/ReLU", 0.1f) >>
+  tf.learn.Linear[Float]("Layer_1/Linear", 64) >> tf.learn
+  .ReLU[Float]("Layer_1/ReLU", 0.1f) >>
+  tf.learn.Linear[Float]("Layer_2/Linear", 32) >> tf.learn
+  .ReLU[Float]("Layer_2/ReLU", 0.1f) >>
+  tf.learn.Linear[Float]("OutputLayer/Linear", 10)
+val loss = tf.learn.SparseSoftmaxCrossEntropy[Float, Long, Float](
+  "Loss/CrossEntropy"
+) >>
+  tf.learn.Mean[Float]("Loss/Mean") >>
+  tf.learn.ScalarSummary[Float]("Loss/Summary", "Loss")
+val optimizer = tf.train.YellowFin()
+
+val model = tf.learn.Model.simpleSupervised(
+  input = input,
+  trainInput = trainInput,
+  layer = layer,
+  loss = loss,
+  optimizer = optimizer,
+  clipGradients = tf.learn.ClipGradientsByGlobalNorm(5.0f)
+)
+
+logger.info("Training the linear regression model.")
+val summariesDir = Paths.get("temp/mnist-mlp")
+val accMetric =
+  tf.metrics.MapMetric((v: (Output[Float], (Output[Float], Output[Int]))) => {
+    (tf.argmax(v._1, -1, INT64).toFloat, v._2._2.toFloat)
+  }, tf.metrics.Accuracy("Accuracy"))
+val estimator = tf.learn.InMemoryEstimator(
+  model,
+  tf.learn.Configuration(Some(summariesDir)),
+  tf.learn.StopCriteria(maxSteps = Some(100000)),
+  Set(
+    tf.learn.LossLogger(trigger = tf.learn.StepHookTrigger(100)),
+    tf.learn.Evaluator(
+      log = true,
+      datasets =
+        Seq(("Train", () => evalTrainData), ("Test", () => evalTestData)),
+      metrics = Seq(accMetric),
+      trigger = tf.learn.StepHookTrigger(1000),
+      name = "Evaluator"
+    ),
+    tf.learn.StepRateLogger(
+      log = false,
+      summaryDir = summariesDir,
+      trigger = tf.learn.StepHookTrigger(100)
+    ),
+    tf.learn.SummarySaver(summariesDir, tf.learn.StepHookTrigger(100)),
+    tf.learn.CheckpointSaver(summariesDir, tf.learn.StepHookTrigger(1000))
+  ),
+  tensorBoardConfig =
+    tf.learn.TensorBoardConfig(summariesDir, reloadInterval = 1)
+)
+estimator.train(
+  () => trainData,
+  tf.learn.StopCriteria(maxSteps = Some(10000))
+)
+
+def accuracy(images: Tensor[UByte], labels: Tensor[UByte]): Float = {
+  val predictions = estimator.infer(() => images.toFloat)
+  predictions
+    .argmax(1)
+    .toUByte
+    .equal(labels)
+    .toFloat
+    .mean()
+    .scalar
+}
+
+logger.info(
+  s"Train accuracy = ${accuracy(dataSet.trainImages, dataSet.trainLabels)}"
+)
+logger.info(
+  s"Test accuracy = ${accuracy(dataSet.testImages, dataSet.testLabels)}"
+)
+
+```
+
+## Stack Trace
+
+```
+
+2019-05-09 14:54:35.812 [main] INFO  MNIST Data Loader - Extracting images from file '/Users/mandar/datasets/MNIST/train-images-idx3-ubyte.gz'.
+2019-05-09 14:54:37.756 [main] INFO  MNIST Data Loader - Extracting labels from file '/Users/mandar/datasets/MNIST/train-labels-idx1-ubyte.gz'.
+2019-05-09 14:54:37.760 [main] INFO  MNIST Data Loader - Extracting images from file '/Users/mandar/datasets/MNIST/t10k-images-idx3-ubyte.gz'.
+2019-05-09 14:54:37.843 [main] INFO  MNIST Data Loader - Extracting labels from file '/Users/mandar/datasets/MNIST/t10k-labels-idx1-ubyte.gz'.
+2019-05-09 14:54:37.844 [main] INFO  MNIST Data Loader - Finished loading the MNIST dataset.
+2019-05-09 14:54:38.074001: I tensorflow/core/platform/cpu_feature_guard.cc:141] Your CPU supports instructions that this TensorFlow binary was not compiled to use: SSE4.2 AVX AVX2 FMA
+org.platanios.tensorflow.jni.FailedPreconditionException: Input 0 ('Constant') for 'Evaluator/TensorSlicesDataset' was not previously added to ShapeRefiner.
+  org.platanios.tensorflow.jni.Op$.finish(Native Method)
+  org.platanios.tensorflow.api.ops.Op$Builder.$anonfun$build$1(Op.scala:2646)
+  org.platanios.tensorflow.api.utilities.package$.using(package.scala:31)
+  org.platanios.tensorflow.api.ops.Op$Builder.build(Op.scala:2589)
+  org.platanios.tensorflow.api.ops.data.Data$$anon$4.createHandle(Data.scala:210)
+  org.platanios.tensorflow.api.ops.data.Dataset$$anon$9.createHandle(Dataset.scala:455)
+  org.platanios.tensorflow.api.ops.data.Dataset$$anon$21.createHandle(Dataset.scala:1230)
+  org.platanios.tensorflow.api.ops.data.Dataset$$anon$14.createHandle(Dataset.scala:857)
+  org.platanios.tensorflow.api.ops.data.Dataset$$anon$17.createHandle(Dataset.scala:1026)
+  org.platanios.tensorflow.api.ops.data.DatasetIterator.createInitializer(DatasetIterator.scala:87)
+  org.platanios.tensorflow.api.learn.hooks.Evaluator.$anonfun$begin$4(Evaluator.scala:95)
+  scala.collection.TraversableLike.$anonfun$map$1(TraversableLike.scala:234)
+  scala.collection.immutable.List.foreach(List.scala:389)
+  scala.collection.TraversableLike.map(TraversableLike.scala:234)
+  scala.collection.TraversableLike.map$(TraversableLike.scala:227)
+  scala.collection.immutable.List.map(List.scala:295)
+  org.platanios.tensorflow.api.learn.hooks.Evaluator.$anonfun$begin$1(Evaluator.scala:93)
+  scala.runtime.java8.JFunction0$mcV$sp.apply(JFunction0$mcV$sp.java:12)
+  scala.util.DynamicVariable.withValue(DynamicVariable.scala:58)
+  org.platanios.tensorflow.api.ops.Op$.createWith(Op.scala:2043)
+  org.platanios.tensorflow.api.learn.hooks.Evaluator.begin(Evaluator.scala:90)
+  org.platanios.tensorflow.api.learn.hooks.Hook.internalBegin(Hook.scala:129)
+  org.platanios.tensorflow.api.learn.hooks.Hook.internalBegin$(Hook.scala:129)
+  org.platanios.tensorflow.api.learn.hooks.TriggeredHook.internalBegin(TriggeredHook.scala:52)
+  org.platanios.tensorflow.api.learn.MonitoredSession$.$anonfun$apply$2(SessionWrapper.scala:441)
+  org.platanios.tensorflow.api.learn.MonitoredSession$.$anonfun$apply$2$adapted(SessionWrapper.scala:441)
+  scala.collection.Iterator.foreach(Iterator.scala:929)
+  scala.collection.Iterator.foreach$(Iterator.scala:929)
+  scala.collection.AbstractIterator.foreach(Iterator.scala:1417)
+  scala.collection.IterableLike.foreach(IterableLike.scala:71)
+  scala.collection.IterableLike.foreach$(IterableLike.scala:70)
+  scala.collection.AbstractIterable.foreach(Iterable.scala:54)
+  org.platanios.tensorflow.api.learn.MonitoredSession$.apply(SessionWrapper.scala:441)
+  org.platanios.tensorflow.api.learn.estimators.Estimator$.monitoredTrainingSession(Estimator.scala:353)
+  org.platanios.tensorflow.api.learn.estimators.InMemoryEstimator.$anonfun$session$1(InMemoryEstimator.scala:171)
+  scala.util.DynamicVariable.withValue(DynamicVariable.scala:58)
+  org.platanios.tensorflow.api.ops.Op$.createWith(Op.scala:2043)
+  org.platanios.tensorflow.api.learn.estimators.InMemoryEstimator.<init>(InMemoryEstimator.scala:156)
+  org.platanios.tensorflow.api.learn.estimators.InMemoryEstimator$.apply(InMemoryEstimator.scala:412)
+  ammonite.$file.scripts.mnist_test$.<init>(mnist_test.sc:61)
+  ammonite.$file.scripts.mnist_test$.<clinit>(mnist_test.sc)
+
+
+
+```

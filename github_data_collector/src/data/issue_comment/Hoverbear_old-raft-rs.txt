@@ -1,0 +1,73 @@
+I would like to testdrive this raft consensus implementation, however at the moment I cannot build master.
+
+I solved a couple of problems by changing in the Cargo.toml the following version:
+bincode = "0.9.2"   # because 1.0.2 alpha is yanked
+capnp-nonblock = "0.4" # the lib isn't mantained but receveid an update to fix a bug
+
+now the problem is:
+```
+$ rustc --version
+rustc 1.24.0-nightly (8503b3ff8 2017-12-04)
+$ cargo build
+   Compiling raft v0.0.1 (file:///root/raft-rs)
+error: failed to run custom build command for `raft v0.0.1 (file:///root/raft-rs)`
+process didn't exit successfully: `/root/raft-rs/target/debug/build/raft-bea158e5c097963c/build-script-build` (exit code: 101)
+--- stderr
+thread 'main' panicked at 'called `Result::unwrap()` on an `Err` value: Io(Error { repr: Os { code: 2, message: "No such file or directory" } })', /checkout/src/libcore/result.rs:906:4
+note: Run with `RUST_BACKTRACE=1` for a backtrace.
+```
+
+Authors propose capnp_futures to be used instead
+I want to use Rust and therefore `raft-rs` as a consensus algorithm for some distributed management systems. The readme says that is currently not designed for production use and log compaction is not implemented (which means the log wil grow without bounds if I understood this correctly). Is this library eventually going to be complete?
+
+I get the following errors:
+
+```
+test server::tests::test_client_accept ... FAILED
+test server::tests::test_invalid_client_message ... FAILED
+```
+
+When running the key value storage example I repeatedly get the following error:
+
+```
+WARN:raft::server: Server(1): unable to accept connection: A request to send
+or receive data was disallowed because the socket is not connected and (when
+sending on a datagram socket using a sendto call) no address was supplied.
+(os error 10057)
+```
+
+Apparently, the nodes cannot communicate with each other, so they all stay in candidate status.
+
+Is this a problem of `mio`? I looked at `raft::server` but couldn't find any obvious bug.
+
+When a client proposes a command (at the leader) but the leader steps down before the command commits, the client is left waiting.
+Simply telling the waiting client that its proposed command failed isn't a great option: The command may still commit (if it has been replicated to another node, it's likely that that node has obtained leadership).
+
+One convenient way out is the following: We (already) internally store not only the pending command, but also the log index `i` of that command. Once a command commits at `i`, it's guaranteed that either a) the command committed is the one we were waiting for, or b) the command will not commit at any point in the future. So followers can abort any pending commands when their respective index is exceeded.
+
+Currently the pending proposals are a property of `LeaderState`, so that would have to change. Likely makes sense to move them into `Consensus` proper.
+
+I noticed that `raft-rs` **almost** builds on stable (only the `socket_timeout` feature which is used in a single location requires `nightly`). The tests don't pass, but I think (but haven't checked) that that's mostly the way we use `serde` (which can be taken care of).
+Is getting to `stable` sooner rather than later interesting or do we not care?
+
+As of today the master will immediately satisfy client queries, which may result in stale reads during failover scenarios.  Diego's thesis goes into detail about the cause and possible solutions to this issue in section 6.4.  We should come up with a plan for how to tackle this.
+
+In chapter 6 on client interaction of the thesis, there is a paragraph regarding the requirements for achieving linearizability in Raft.
+
+> To achieve linearizability in Raft, servers must filter out duplicate requests. The basic idea is
+> that servers save the results of client operations and use them to skip executing the same request
+> multiple times. To implement this, each client is given a unique identifier, and clients assign unique
+> serial numbers to every command. Each server’s state machine maintains a session for each client.
+> The session tracks the latest serial number processed for the client, along with the associated response. If a server receives a command whose serial number has already been executed, it responds immediately without re-executing the request.
+> 
+> Given this filtering of duplicate requests, Raft provides linearizability.
+
+Looking through the raft-rs implementation, I didn't find support for client request serial numbers or session management as described above.   Is this intentional, or an oversight?
+
+As mentioned [here](https://github.com/Hoverbear/raft/pull/99/files#r37699824) it'd be good to be able to fetch `(low, high)` from the log.
+
+@tschottdorf will likely expand on this as he brought it up on IRC.
+
+The log currently does not store `applied_index` and `last_commited_index` and this will likely be necessary if, say, a machine is rebooted and it needs to know what's been committed and applied.
+
+We noted that both are needed because we might be committing say 100 entries but the state machine may take time to apply them.

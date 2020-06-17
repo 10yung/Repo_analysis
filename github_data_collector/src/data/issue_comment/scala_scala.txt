@@ -1,0 +1,288 @@
+
+Hi folks, I thought I would bring up yet an other `immutable.SeqMap` impelementation for discussion, which beats the current best implementation (VectorMap) in terms of:  
+* memory usage (~16% less memory usage than VectorMap) 
+* build time (from ~50% faster for small to ~15% faster for large maps)
+* iteration (2x as fast as VectorMap)
+
+, is equal to VectorMap in:  
+
+* lookups
+
+, and performs worse than VectorMap in:
+
+* updates (VectorMap is ~30% faster)
+* removals (VectorMap is ~43% faster)
+
+
+I won't describe here the exact explanation of the data structure, since [there is a quite detailed explanation of the structure, as well as the algorithms for the above operations, included in the Scaladoc for the `immutable.LinkedHashMap` class itself](https://github.com/scala/scala/pull/8644/files#diff-4fb0a2a81364b15cd17f335f3a30c263R20).
+
+### Benchmarks:
+
+I have included benchmark results for the above operations in this gist :https://gist.github.com/joshlemer/af5dcfe6d7a7e34a9ddb0c4d0dcec79f which includes as well memory consumption for building.
+
+### Arity 
+`arity` is what I'm calling the maximum length of chains of forward-referencing Links in the Map (please see the scaladoc for a complete explanation). It can be finely tuned by changing the `LinkedHashMap.arity` method, but after playing around with it a bit, it seems that arity=2 strikes the best balance between iteration and writes. There's something like a 50% speedup in going from arity=1 to arity=2 with very little cost to writes, but going from arity=2 to arity=3, there's a significant slowdown to writes with diminishing benefits to iteration.
+
+The general `updated` method is fully general over any arity, but it pays for that generality in speed. For this reason I've written hand-optimized versions of the method for when arity=1 and arity=2, these are the `updatedArity1` and `updatedArity2` methods respectively. Once an arity is decided on, we can just replace `updated` with the appropriate implementation.   
+  
+### Thoughts?
+
+I've opened this draft PR just to get some feedback on if this data structure seems valuable? If folks here think that the gains in build/iteration/memory are worth the cost to updates/removals, and maybe for consideration as possibly the default SeqMap in much later versions of Scala?
+
+ When 2.13 was released I think there were a few unknowns or work left to do but time kinda ran out before they could be fully thought through:
+
+* which SeqMap to set as default (VectorMap or TreeSeqMap)
+* which SeqMap to include at all (VectorMap, or VectorMap+TreeSeqMap)
+* if we should deprecate ListMap (IMO, yes)
+* Can VectorMap be further optimized? Maybe an implementation with RelaxedRadixBalancedVector would be make VectorMap strictly dominate TreeSeqMap and so TreeSeqMap would be rendered obsolete. Now with Stefan's improvements to Vector this is also worth revisiting IMO.
+* Are there other potential contenders for best general SeqMap we haven't considered yet? (Enter: LinkedHashMap)
+
+
+So this proposal / draft is just a continuation of that whole discussion. @odd @Ichoran 
+
+
+
+
+
+
+In particular, this fixes https://github.com/scala/bug/issues/11840 which is a blocker for getting Spark on Scala 2.13.
+
+None
+This implementation results in a 5x-10x speedup of the method.
+Fixes scala/bug#11843
+Quick POC.
+(2.12.x only, of course)
+
+The keys in the resulting map are the same, so the internal structure will also be the same, and that can be used to avoid allocating tuples and going through `MapBuilder` and other such convolutions.
+
+Benchmark results:
+- 2.12.x:
+```
+[info] Benchmark                                                            (size)  Mode  Cnt       Score      Error   Units
+[info] HashMapBenchmark.transform                                               10  avgt   20     656.603 ±    2.354   ns/op
+[info] HashMapBenchmark.transform:·gc.alloc.rate                                10  avgt   20    1355.348 ±    4.860  MB/sec
+[info] HashMapBenchmark.transform:·gc.alloc.rate.norm                           10  avgt   20    1400.001 ±    0.002    B/op
+[info] HashMapBenchmark.transform:·gc.churn.PS_Eden_Space                       10  avgt   20    1362.048 ±   52.022  MB/sec
+[info] HashMapBenchmark.transform:·gc.churn.PS_Eden_Space.norm                  10  avgt   20    1406.807 ±   50.904    B/op
+[info] HashMapBenchmark.transform:·gc.churn.PS_Survivor_Space                   10  avgt   20       0.143 ±    0.028  MB/sec
+[info] HashMapBenchmark.transform:·gc.churn.PS_Survivor_Space.norm              10  avgt   20       0.147 ±    0.029    B/op
+[info] HashMapBenchmark.transform:·gc.count                                     10  avgt   20     241.000             counts
+[info] HashMapBenchmark.transform:·gc.time                                      10  avgt   20     181.000                 ms
+[info] HashMapBenchmark.transform                                              100  avgt   20    5664.033 ±   20.978   ns/op
+[info] HashMapBenchmark.transform:·gc.alloc.rate                               100  avgt   20    2280.462 ±    8.412  MB/sec
+[info] HashMapBenchmark.transform:·gc.alloc.rate.norm                          100  avgt   20   20320.009 ±    0.018    B/op
+[info] HashMapBenchmark.transform:·gc.churn.PS_Eden_Space                      100  avgt   20    2275.425 ±   98.654  MB/sec
+[info] HashMapBenchmark.transform:·gc.churn.PS_Eden_Space.norm                 100  avgt   20   20275.297 ±  878.556    B/op
+[info] HashMapBenchmark.transform:·gc.churn.PS_Survivor_Space                  100  avgt   20       0.114 ±    0.036  MB/sec
+[info] HashMapBenchmark.transform:·gc.churn.PS_Survivor_Space.norm             100  avgt   20       1.012 ±    0.325    B/op
+[info] HashMapBenchmark.transform:·gc.count                                    100  avgt   20     249.000             counts
+[info] HashMapBenchmark.transform:·gc.time                                     100  avgt   20     186.000                 ms
+[info] HashMapBenchmark.transform                                             1000  avgt   20  111883.999 ± 2776.556   ns/op
+[info] HashMapBenchmark.transform:·gc.alloc.rate                              1000  avgt   20    1519.829 ±   37.714  MB/sec
+[info] HashMapBenchmark.transform:·gc.alloc.rate.norm                         1000  avgt   20  267298.361 ±    6.651    B/op
+[info] HashMapBenchmark.transform:·gc.churn.PS_Eden_Space                     1000  avgt   20    1512.921 ±   66.094  MB/sec
+[info] HashMapBenchmark.transform:·gc.churn.PS_Eden_Space.norm                1000  avgt   20  266064.016 ± 9137.317    B/op
+[info] HashMapBenchmark.transform:·gc.churn.PS_Survivor_Space                 1000  avgt   20       0.170 ±    0.048  MB/sec
+[info] HashMapBenchmark.transform:·gc.churn.PS_Survivor_Space.norm            1000  avgt   20      29.943 ±    8.709    B/op
+[info] HashMapBenchmark.transform:·gc.count                                   1000  avgt   20     239.000             counts
+[info] HashMapBenchmark.transform:·gc.time                                    1000  avgt   20     182.000                 ms
+[info] HashMapBenchmark.transformConserve                                       10  avgt   20     619.002 ±    4.256   ns/op
+[info] HashMapBenchmark.transformConserve:·gc.alloc.rate                        10  avgt   20    1437.758 ±    9.867  MB/sec
+[info] HashMapBenchmark.transformConserve:·gc.alloc.rate.norm                   10  avgt   20    1400.001 ±    0.002    B/op
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Eden_Space               10  avgt   20    1431.354 ±   43.512  MB/sec
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Eden_Space.norm          10  avgt   20    1393.801 ±   42.144    B/op
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Survivor_Space           10  avgt   20       0.114 ±    0.029  MB/sec
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Survivor_Space.norm      10  avgt   20       0.111 ±    0.028    B/op
+[info] HashMapBenchmark.transformConserve:·gc.count                             10  avgt   20     244.000             counts
+[info] HashMapBenchmark.transformConserve:·gc.time                              10  avgt   20     181.000                 ms
+[info] HashMapBenchmark.transformConserve                                      100  avgt   20    5459.810 ±   30.177   ns/op
+[info] HashMapBenchmark.transformConserve:·gc.alloc.rate                       100  avgt   20    2365.863 ±   13.078  MB/sec
+[info] HashMapBenchmark.transformConserve:·gc.alloc.rate.norm                  100  avgt   20   20320.009 ±    0.018    B/op
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Eden_Space              100  avgt   20    2360.973 ±   69.873  MB/sec
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Eden_Space.norm         100  avgt   20   20278.754 ±  607.945    B/op
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Survivor_Space          100  avgt   20       0.111 ±    0.033  MB/sec
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Survivor_Space.norm     100  avgt   20       0.957 ±    0.283    B/op
+[info] HashMapBenchmark.transformConserve:·gc.count                            100  avgt   20     255.000             counts
+[info] HashMapBenchmark.transformConserve:·gc.time                             100  avgt   20     190.000                 ms
+[info] HashMapBenchmark.transformConserve                                     1000  avgt   20  100900.656 ±  621.356   ns/op
+[info] HashMapBenchmark.transformConserve:·gc.alloc.rate                      1000  avgt   20    1684.007 ±   10.358  MB/sec
+[info] HashMapBenchmark.transformConserve:·gc.alloc.rate.norm                 1000  avgt   20  267290.290 ±    4.321    B/op
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Eden_Space             1000  avgt   20    1685.846 ±   53.919  MB/sec
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Eden_Space.norm        1000  avgt   20  267592.455 ± 8666.193    B/op
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Survivor_Space         1000  avgt   20       0.159 ±    0.039  MB/sec
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Survivor_Space.norm    1000  avgt   20      25.298 ±    6.220    B/op
+[info] HashMapBenchmark.transformConserve:·gc.count                           1000  avgt   20     244.000             counts
+[info] HashMapBenchmark.transformConserve:·gc.time                            1000  avgt   20     188.000                 ms
+```
+
+- This PR:
+```
+[info] Benchmark                                                            (size)  Mode  Cnt      Score      Error   Units
+[info] HashMapBenchmark.transform                                               10  avgt   20    110.214 ±    0.501   ns/op
+[info] HashMapBenchmark.transform:·gc.alloc.rate                                10  avgt   20   2768.441 ±   12.595  MB/sec
+[info] HashMapBenchmark.transform:·gc.alloc.rate.norm                           10  avgt   20    480.000 ±    0.001    B/op
+[info] HashMapBenchmark.transform:·gc.churn.PS_Eden_Space                       10  avgt   20   2770.594 ±  121.884  MB/sec
+[info] HashMapBenchmark.transform:·gc.churn.PS_Eden_Space.norm                  10  avgt   20    480.376 ±   21.031    B/op
+[info] HashMapBenchmark.transform:·gc.churn.PS_Survivor_Space                   10  avgt   20      0.138 ±    0.044  MB/sec
+[info] HashMapBenchmark.transform:·gc.churn.PS_Survivor_Space.norm              10  avgt   20      0.024 ±    0.008    B/op
+[info] HashMapBenchmark.transform:·gc.count                                     10  avgt   20    235.000             counts
+[info] HashMapBenchmark.transform:·gc.time                                      10  avgt   20    179.000                 ms
+[info] HashMapBenchmark.transform                                              100  avgt   20   1314.796 ±   10.701   ns/op
+[info] HashMapBenchmark.transform:·gc.alloc.rate                               100  avgt   20   2490.990 ±   19.863  MB/sec
+[info] HashMapBenchmark.transform:·gc.alloc.rate.norm                          100  avgt   20   5152.002 ±    0.004    B/op
+[info] HashMapBenchmark.transform:·gc.churn.PS_Eden_Space                      100  avgt   20   2490.424 ±   71.604  MB/sec
+[info] HashMapBenchmark.transform:·gc.churn.PS_Eden_Space.norm                 100  avgt   20   5151.372 ±  157.034    B/op
+[info] HashMapBenchmark.transform:·gc.churn.PS_Survivor_Space                  100  avgt   20      0.142 ±    0.033  MB/sec
+[info] HashMapBenchmark.transform:·gc.churn.PS_Survivor_Space.norm             100  avgt   20      0.293 ±    0.068    B/op
+[info] HashMapBenchmark.transform:·gc.count                                    100  avgt   20    254.000             counts
+[info] HashMapBenchmark.transform:·gc.time                                     100  avgt   20    199.000                 ms
+[info] HashMapBenchmark.transform                                             1000  avgt   20  14301.752 ±   69.119   ns/op
+[info] HashMapBenchmark.transform:·gc.alloc.rate                              1000  avgt   20   2225.222 ±   10.718  MB/sec
+[info] HashMapBenchmark.transform:·gc.alloc.rate.norm                         1000  avgt   20  50064.024 ±    0.047    B/op
+[info] HashMapBenchmark.transform:·gc.churn.PS_Eden_Space                     1000  avgt   20   2227.828 ±   69.428  MB/sec
+[info] HashMapBenchmark.transform:·gc.churn.PS_Eden_Space.norm                1000  avgt   20  50122.329 ± 1533.214    B/op
+[info] HashMapBenchmark.transform:·gc.churn.PS_Survivor_Space                 1000  avgt   20      0.173 ±    0.028  MB/sec
+[info] HashMapBenchmark.transform:·gc.churn.PS_Survivor_Space.norm            1000  avgt   20      3.888 ±    0.630    B/op
+[info] HashMapBenchmark.transform:·gc.count                                   1000  avgt   20    252.000             counts
+[info] HashMapBenchmark.transform:·gc.time                                    1000  avgt   20    188.000                 ms
+[info] HashMapBenchmark.transformConserve                                       10  avgt   20     72.495 ±    0.174   ns/op
+[info] HashMapBenchmark.transformConserve:·gc.alloc.rate                        10  avgt   20    911.916 ±    2.184  MB/sec
+[info] HashMapBenchmark.transformConserve:·gc.alloc.rate.norm                   10  avgt   20    104.000 ±    0.001    B/op
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Eden_Space               10  avgt   20    909.602 ±   26.879  MB/sec
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Eden_Space.norm          10  avgt   20    103.740 ±    3.143    B/op
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Survivor_Space           10  avgt   20      0.117 ±    0.030  MB/sec
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Survivor_Space.norm      10  avgt   20      0.013 ±    0.003    B/op
+[info] HashMapBenchmark.transformConserve:·gc.count                             10  avgt   20    255.000             counts
+[info] HashMapBenchmark.transformConserve:·gc.time                              10  avgt   20    193.000                 ms
+[info] HashMapBenchmark.transformConserve                                      100  avgt   20    949.201 ±    1.603   ns/op
+[info] HashMapBenchmark.transformConserve:·gc.alloc.rate                       100  avgt   20   1269.699 ±    2.140  MB/sec
+[info] HashMapBenchmark.transformConserve:·gc.alloc.rate.norm                  100  avgt   20   1896.002 ±    0.003    B/op
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Eden_Space              100  avgt   20   1267.611 ±   29.572  MB/sec
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Eden_Space.norm         100  avgt   20   1892.899 ±   44.587    B/op
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Survivor_Space          100  avgt   20      0.156 ±    0.035  MB/sec
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Survivor_Space.norm     100  avgt   20      0.233 ±    0.053    B/op
+[info] HashMapBenchmark.transformConserve:·gc.count                            100  avgt   20    254.000             counts
+[info] HashMapBenchmark.transformConserve:·gc.time                             100  avgt   20    189.000                 ms
+[info] HashMapBenchmark.transformConserve                                     1000  avgt   20   9524.194 ±  111.590   ns/op
+[info] HashMapBenchmark.transformConserve:·gc.alloc.rate                      1000  avgt   20   1202.089 ±   14.115  MB/sec
+[info] HashMapBenchmark.transformConserve:·gc.alloc.rate.norm                 1000  avgt   20  18008.016 ±    0.031    B/op
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Eden_Space             1000  avgt   20   1201.171 ±   40.637  MB/sec
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Eden_Space.norm        1000  avgt   20  17995.335 ±  594.724    B/op
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Survivor_Space         1000  avgt   20      0.137 ±    0.039  MB/sec
+[info] HashMapBenchmark.transformConserve:·gc.churn.PS_Survivor_Space.norm    1000  avgt   20      2.056 ±    0.565    B/op
+[info] HashMapBenchmark.transformConserve:·gc.count                           1000  avgt   20    253.000             counts
+[info] HashMapBenchmark.transformConserve:·gc.time                            1000  avgt   20    190.000                 ms
+```
+
+- Alternative with [more aggressive conservation](https://gist.github.com/hrhino/c2fd850395b93ca6a7f84b85e5ec1317):
+```
+REG (with conserve)
+[info] Benchmark                                                    (size)  Mode  Cnt      Score      Error   Units
+[info] HashMapBenchmark.transform                                       10  avgt   20    114.979 ±    0.622   ns/op
+[info] HashMapBenchmark.transform:·gc.alloc.rate                        10  avgt   20   2653.780 ±   14.209  MB/sec
+[info] HashMapBenchmark.transform:·gc.alloc.rate.norm                   10  avgt   20    480.000 ±    0.001    B/op
+[info] HashMapBenchmark.transform:·gc.churn.PS_Eden_Space               10  avgt   20   2649.555 ±   65.764  MB/sec
+[info] HashMapBenchmark.transform:·gc.churn.PS_Eden_Space.norm          10  avgt   20    479.241 ±   11.759    B/op
+[info] HashMapBenchmark.transform:·gc.churn.PS_Survivor_Space           10  avgt   20      0.141 ±    0.038  MB/sec
+[info] HashMapBenchmark.transform:·gc.churn.PS_Survivor_Space.norm      10  avgt   20      0.025 ±    0.007    B/op
+[info] HashMapBenchmark.transform:·gc.count                             10  avgt   20    252.000             counts
+[info] HashMapBenchmark.transform:·gc.time                              10  avgt   20    190.000                 ms
+[info] HashMapBenchmark.transform                                      100  avgt   20   1369.913 ±    6.994   ns/op
+[info] HashMapBenchmark.transform:·gc.alloc.rate                       100  avgt   20   2390.664 ±   12.162  MB/sec
+[info] HashMapBenchmark.transform:·gc.alloc.rate.norm                  100  avgt   20   5152.002 ±    0.004    B/op
+[info] HashMapBenchmark.transform:·gc.churn.PS_Eden_Space              100  avgt   20   2393.799 ±   78.711  MB/sec
+[info] HashMapBenchmark.transform:·gc.churn.PS_Eden_Space.norm         100  avgt   20   5158.951 ±  172.124    B/op
+[info] HashMapBenchmark.transform:·gc.churn.PS_Survivor_Space          100  avgt   20      0.152 ±    0.037  MB/sec
+[info] HashMapBenchmark.transform:·gc.churn.PS_Survivor_Space.norm     100  avgt   20      0.328 ±    0.080    B/op
+[info] HashMapBenchmark.transform:·gc.count                            100  avgt   20    256.000             counts
+[info] HashMapBenchmark.transform:·gc.time                             100  avgt   20    192.000                 ms
+[info] HashMapBenchmark.transform                                     1000  avgt   20  14520.254 ±   73.534   ns/op
+[info] HashMapBenchmark.transform:·gc.alloc.rate                      1000  avgt   20   2191.753 ±   11.074  MB/sec
+[info] HashMapBenchmark.transform:·gc.alloc.rate.norm                 1000  avgt   20  50064.024 ±    0.047    B/op
+[info] HashMapBenchmark.transform:·gc.churn.PS_Eden_Space             1000  avgt   20   2185.506 ±   86.944  MB/sec
+[info] HashMapBenchmark.transform:·gc.churn.PS_Eden_Space.norm        1000  avgt   20  49919.103 ± 1925.011    B/op
+[info] HashMapBenchmark.transform:·gc.churn.PS_Survivor_Space         1000  avgt   20      0.160 ±    0.056  MB/sec
+[info] HashMapBenchmark.transform:·gc.churn.PS_Survivor_Space.norm    1000  avgt   20      3.664 ±    1.275    B/op
+[info] HashMapBenchmark.transform:·gc.count                           1000  avgt   20    244.000             counts
+[info] HashMapBenchmark.transform:·gc.time                            1000  avgt   20    182.000                 ms
+[info] HashMapBenchmark.transformConserve                               10  avgt   20     15.104 ±    0.013   ns/op
+[info] HashMapBenchmark.transformConserve:·gc.alloc.rate                10  avgt   20      0.001 ±    0.002  MB/sec
+[info] HashMapBenchmark.transformConserve:·gc.alloc.rate.norm           10  avgt   20     ≈ 10⁻⁵               B/op
+[info] HashMapBenchmark.transformConserve:·gc.count                     10  avgt   20        ≈ 0             counts
+[info] HashMapBenchmark.transformConserve                              100  avgt   20    176.766 ±    0.472   ns/op
+[info] HashMapBenchmark.transformConserve:·gc.alloc.rate               100  avgt   20      0.001 ±    0.002  MB/sec
+[info] HashMapBenchmark.transformConserve:·gc.alloc.rate.norm          100  avgt   20     ≈ 10⁻⁴               B/op
+[info] HashMapBenchmark.transformConserve:·gc.count                    100  avgt   20        ≈ 0             counts
+[info] HashMapBenchmark.transformConserve                             1000  avgt   20   3624.239 ±   59.248   ns/op
+[info] HashMapBenchmark.transformConserve:·gc.alloc.rate              1000  avgt   20      0.001 ±    0.002  MB/sec
+[info] HashMapBenchmark.transformConserve:·gc.alloc.rate.norm         1000  avgt   20      0.006 ±    0.012    B/op
+[info] HashMapBenchmark.transformConserve:·gc.count                   1000  avgt   20        ≈ 0             counts
+```
+
+@mkeskells 
+Currently `BitSet` is using implementations of `minAfter`/`maxBefore` inherited from `SortedSet`. These implementations are very inefficient for `BitSet`:
+- allocate a clone of `BitSet` and erase bits outside of the range (`rangeFrom`/`rangeUntil`)
+- allocate and traverse first `Iterator` for `isEmpty` check
+- allocate and traverse another `Iterator` for `head` / `last`
+
+This PR implements dedicated overrides of `minAfter`/`maxBefore` for `BitSet`. No object allocations are performed, and a minimal traversal of `BitSet` words is done.
+
+Current implementation:
+```
+[info] Benchmark                               (spacing)  Mode  Cnt     Score    Error  Units
+[info] BitSetBoundedMinMaxBenchmark.maxBefore          0  avgt    6  2058.881 ± 23.838  ns/op
+[info] BitSetBoundedMinMaxBenchmark.maxBefore          8  avgt    6   345.129 ±  4.539  ns/op
+[info] BitSetBoundedMinMaxBenchmark.maxBefore        255  avgt    6    87.353 ±  0.714  ns/op
+[info] BitSetBoundedMinMaxBenchmark.minAfter           0  avgt    6    64.473 ±  1.092  ns/op
+[info] BitSetBoundedMinMaxBenchmark.minAfter           8  avgt    6    62.591 ±  0.859  ns/op
+[info] BitSetBoundedMinMaxBenchmark.minAfter         255  avgt    6    62.375 ±  0.426  ns/op
+```
+
+This PR:
+```
+[info] Benchmark                               (spacing)  Mode  Cnt   Score   Error  Units
+[info] BitSetBoundedMinMaxBenchmark.maxBefore          0  avgt    6  13.595 ± 0.148  ns/op
+[info] BitSetBoundedMinMaxBenchmark.maxBefore          8  avgt    6  13.725 ± 0.344  ns/op
+[info] BitSetBoundedMinMaxBenchmark.maxBefore        255  avgt    6  15.008 ± 0.535  ns/op
+[info] BitSetBoundedMinMaxBenchmark.minAfter           0  avgt    6  13.334 ± 0.134  ns/op
+[info] BitSetBoundedMinMaxBenchmark.minAfter           8  avgt    6  13.270 ± 0.155  ns/op
+[info] BitSetBoundedMinMaxBenchmark.minAfter         255  avgt    6  16.770 ± 0.054  ns/op
+```
+
+Benchmark code:
+```scala
+package scala.collection.mutable
+
+import java.util.concurrent.TimeUnit
+
+import org.openjdk.jmh.annotations._
+
+import scala.collection.mutable
+
+@BenchmarkMode(Array(Mode.AverageTime))
+@Fork(1)
+@Threads(1)
+@Warmup(iterations = 6)
+@Measurement(iterations = 6)
+@OutputTimeUnit(TimeUnit.NANOSECONDS)
+@State(Scope.Benchmark)
+class BitSetBoundedMinMaxBenchmark {
+
+  @Param(Array("0", "8", "255"))
+  var spacing: Int = _
+
+  var bs: mutable.BitSet = _
+  var middle: Int = _
+
+  @Setup(Level.Iteration) def initializeRange(): Unit = {
+    bs = mutable.BitSet(0 until 1000 by (spacing + 1): _*)
+    middle = bs.max / 2
+  }
+
+  @Benchmark def minAfter = bs.minAfter(middle)
+
+  @Benchmark def maxBefore = bs.maxBefore(middle)
+
+}
+```
+

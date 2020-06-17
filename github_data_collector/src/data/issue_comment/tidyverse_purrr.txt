@@ -1,0 +1,253 @@
+Occasionally it is useful to flip the arguments of a function. Particularly when pipping data, if the function you want to use expects the data argument to be the second argument the current best approaches as far as I can tell would be:
+
+1. `data %>% partial(fn, x = "value")`
+2. `data %>% fn("value", .)`
+
+Haskell implements a function called [flip](http://zvon.org/other/haskell/Outputprelude/flip_f.html) t(this was previously mentioned by @lionel- in https://github.com/tidyverse/purrr/pull/42#issuecomment-138890361 but I can't see that there was any further discussion about this function). The implementation in R AFAIK shouldn't be too difficult. As a very minimal example of this function working:
+
+``` r
+flip <- function(fn) {
+  function(.x, .y, ...) fn(.y, .x, ...)
+}
+
+(`>`)(5, 3)
+#> [1] TRUE
+
+flip(`>`)(5, 3)
+#> [1] FALSE
+```
+
+A bit more of an (admittedly contrived) example of the use of this function is below. Here I am working with an sf table, which if I join some extra data to, but have the sf table as the right table, I lose all of the sf metadata. But, if I flip inner_join I am pipping my data to be the right input, and it stays as a sfc.
+
+``` r
+library(tidyverse)
+library(sf)
+#> Linking to GEOS 3.6.1, GDAL 2.2.3, PROJ 4.9.3
+nc <- st_read(system.file("shape/nc.shp", package="sf"),
+              as_tibble = TRUE)
+#> Reading layer `nc' from data source `C:\Program Files\R\R-3.6.2\library\sf\shape\nc.shp' using driver `ESRI Shapefile'
+#> Simple feature collection with 100 features and 14 fields
+#> geometry type:  MULTIPOLYGON
+#> dimension:      XY
+#> bbox:           xmin: -84.32385 ymin: 33.88199 xmax: -75.45698 ymax: 36.58965
+#> epsg (SRID):    4267
+#> proj4string:    +proj=longlat +datum=NAD27 +no_defs
+
+nc %>%
+  as_tibble() %>%
+  select(CNTY_ID) %>%
+  mutate(rn = row_number()) %>%
+  flip(inner_join)(nc, by = "CNTY_ID")
+#> Simple feature collection with 100 features and 15 fields
+#> geometry type:  MULTIPOLYGON
+#> dimension:      XY
+#> bbox:           xmin: -84.32385 ymin: 33.88199 xmax: -75.45698 ymax: 36.58965
+#> epsg (SRID):    4267
+#> proj4string:    +proj=longlat +datum=NAD27 +no_defs
+#> # A tibble: 100 x 16
+#>     AREA PERIMETER CNTY_ CNTY_ID NAME  FIPS  FIPSNO CRESS_ID BIR74 SID74 NWBIR74
+#>    <dbl>     <dbl> <dbl>   <dbl> <fct> <fct>  <dbl>    <int> <dbl> <dbl>   <dbl>
+#>  1 0.114      1.44  1825    1825 Ashe  37009  37009        5  1091     1      10
+#>  2 0.061      1.23  1827    1827 Alle… 37005  37005        3   487     0      10
+#>  3 0.143      1.63  1828    1828 Surry 37171  37171       86  3188     5     208
+#>  4 0.07       2.97  1831    1831 Curr… 37053  37053       27   508     1     123
+#>  5 0.153      2.21  1832    1832 Nort… 37131  37131       66  1421     9    1066
+#>  6 0.097      1.67  1833    1833 Hert… 37091  37091       46  1452     7     954
+#>  7 0.062      1.55  1834    1834 Camd… 37029  37029       15   286     0     115
+#>  8 0.091      1.28  1835    1835 Gates 37073  37073       37   420     0     254
+#>  9 0.118      1.42  1836    1836 Warr… 37185  37185       93   968     4     748
+#> 10 0.124      1.43  1837    1837 Stok… 37169  37169       85  1612     1     160
+#> # … with 90 more rows, and 5 more variables: BIR79 <dbl>, SID79 <dbl>,
+#> #   NWBIR79 <dbl>, geometry <MULTIPOLYGON [°]>, rn <int>
+```
+
+If this would be a useful addition to purrr I will happily raise a PR.
+`ave()` is the base functional I use the most if I attach *tidyverse*, but it has several issues : 
+
+* Its name, and default, are awkward, I was a bit intimidated of this function as a beginner
+* The doc is misleading, and only numeric input AND output are documented, so technically we "shouldn't" use it on characters and to return character for instance
+* The `FUN` argument [must always be spelt explicitly](https://stackoverflow.com/questions/26198908/why-this-simple-ave-function-is-not-working) as it comes after the dots
+* We can't use *purrr* lambdas
+* We can't pass additional arguments to dots, so many times we have to type a soul crushing (ok, maybe dramatizing a bit!) `FUN = function(x) mean(x, na.rm = TRUE)`, when we'd really rather type `mean, na.rm = TRUE`
+* `ave()` [can't output lists](https://stackoverflow.com/questions/14551492/using-ave-with-function-which-returns-a-vector)
+* Type stability (especially as `ave()` sometimes returns a ["wrong type"](https://r.789695.n4.nabble.com/ave-returns-wrong-type-td885247.html))
+* It could play well with *vctrs*
+* peformance could be improved it seems, given that [Hadley's remarks from 2010](https://r.789695.n4.nabble.com/Performance-enhancement-for-ave-td2271707.html) have not been considered as far as I can see
+
+It might have been considered but since I found no relevant issues here it is.
+
+Here's rough implementation (not type stable and not very efficient), to get my point across.
+
+``` r
+map_along <- function(.x, .along, .f, ...) {
+  if (is.list(.along))
+    .along <- interaction(.along) # as used by base::split.default
+  .f <- rlang::as_function(.f)
+  body <- as.call(c(quote(.f), quote(.x), eval(substitute(alist(...)))))
+  fun <- rlang::new_function(alist(.x=), body)
+  ave(.x, .along, FUN = fun)
+}
+map_along(c(1:4,NA),c(1,1,2,2,2), mean)
+#> [1] 1.5 1.5  NA  NA  NA
+map_along(c(1:4,NA),c(1,1,2,2,2), mean, na.rm = TRUE)
+#> [1] 1.5 1.5 3.5 3.5 3.5
+map_along(c(1:4,NA),c(1,1,2,2,2), ~mean(., na.rm = TRUE))
+#> [1] 1.5 1.5 3.5 3.5 3.5
+```
+
+<sup>Created on 2020-01-13 by the [reprex package](https://reprex.tidyverse.org) (v0.3.0)</sup>
+
+A neat additional feature would be to have a magical function or pronoun to access the relevant instance of `.along` in the loop, `ave` doesn't support this and I missed it a few times (helps with debugging too).
+
+Fix #426 
+
+The only item missing relative to the discussion in #426 is the capturing of conditions other than messages and warnings, but I think that warrants a separate discussion and fix.
+Fixes #701 
+Currently, I don't see a nice and easy way to extract information from a list of lists, e.g. to extract the names of all labels in `repurrrsive::discog`
+
+``` r
+repurrrsive::discog[1:4] %>% 
+ map(c("basic_information", "labels")) %>% 
+ map(function(label) map_chr(label, ~ .x$name))
+```
+
+There it would be nice to write something along the lines of
+
+``` r
+map(
+   repurrrsive::discog[1:4],
+   list("basic_information", "labels", iterate(), "name")
+)
+#> [[1]]
+#> [1] "Tobi Records (2)"
+#> 
+#> [[2]]
+#> [1] "La Vida Es Un Mus"
+#> 
+#> [[3]]
+#> [1] "La Vida Es Un Mus"
+#> 
+#> [[4]]
+#> [1] "La Vida Es Un Mus" "Beat Generation"   "Beat Generation"  
+```
+
+Maybe one could also have something like `iterate(c("a", "b"))` to only iterate over elements with these names.
+
+In this spirit one might also have a special version of `map()`
+
+``` r
+x <- list(
+ comp1 = list(
+   labels = list(
+     label1 = list(name = "labelA1"),
+     label2 = list(name = "labelA2"),
+     label3 = list(name = "labelA3")
+   )
+ ),
+ comp2 = list(
+   labels = list(
+     label1 = list(name = "labelB1"),
+     label2 = list(name = "labelB2")
+   )
+ )
+)
+
+# produce columns for named iterators
+my_map(x, list(component = iterate(), "labels", label = iterate(), "name"))
+#> # A tibble: 5 x 5
+#>   component_id component_name label_id label_name label  
+#>          <int> <chr>             <int> <chr>      <chr>  
+#> 1            1 comp1                 1 label1     labelA1
+#> 2            1 comp1                 2 label2     labelA2
+#> 3            1 comp1                 3 label3     labelA3
+#> 4            2 comp2                 1 label1     labelB1
+#> 5            2 comp2                 2 label2     labelB2
+```
+Consider the following data.frame: 
+
+    df <- data.frame(x = 1, y = NA)
+
+As expected we have: 
+
+    purrr::pmap(df, sum)
+    #> [[1]]
+    #> [1] NA
+
+However, I would expect to obtain the same result when I run: 
+
+    purrr::pmap(df, ~ sum(.))
+    #> [[1]]
+    #> [1] 1
+
+which is not the case. This latter result seems to relate to the following behavior: 
+
+    sum(c(1, NA)) 
+    #> NA
+    sum(1, NA)
+    #> NA
+    sum2 <- rlang::as_function(~ sum(.))
+    sum2(c(1, NA))
+    #> NA
+    sum2(1, NA)
+    #> 1
+
+A common scenario for me is to map over nested lists. AFAIK there is no built in or purr functionality for this. 
+
+Basically an rapply version but which would operate not just on leaves but also on the inner nodes. 
+
+Example:
+
+```R
+rmap(sessionInfo(), unclass)
+```
+https://code.jsoftware.com/wiki/Vocabulary/Loopless
+
+Seems like this might make a nice entry in vignette
+This is the anticipated behavior I guess
+``` r
+# purrr v0.2.5
+env <- rlang::empty_env()
+add <- function(x, y) {
+  print(rlang::env_parent())
+  x + y
+}
+
+add1 <- purrr::partial(add, x = 1, .env = env)
+add1(2)
+#> Error in add(x = 1, ...): could not find function "add"
+```
+
+<sup>Created on 2019-11-01 by the [reprex package](https://reprex.tidyverse.org) (v0.3.0)</sup>
+
+Then, with `v0.3.0`
+``` r
+# purrr v0.3
+env <- rlang::empty_env()
+add <- function(x, y) {
+  print(rlang::env_parent())
+  x + y
+}
+
+add1 <- purrr::partial(add, x = 1, .env = env)
+#> Warning: The `.env` argument is soft-deprecated as of purrr 0.3.0.
+#> This warning is displayed once per session.
+add1(2)
+#> <environment: R_GlobalEnv>
+#> [1] 3
+```
+
+<sup>Created on 2019-11-01 by the [reprex package](https://reprex.tidyverse.org) (v0.3.0)</sup>
+
+When looking at the [source code](https://github.com/tidyverse/purrr/blob/master/R/partial.R#L132), I think the problem is that `.env` is not in `...` when in ` purrr::partial(add, x = 1, .env = env)` and hence not in `args`, so it won't be spliced: 
+```r
+partial <- function(.f,
+                    ...,
+                    .env = NULL,
+                    .lazy = NULL,
+                    .first = NULL) {
+  args <- enquos(...)
+  # ... 
+  call <- call_modify(call2(fn), ... = , !!!args)
+  # ...
+}
+```

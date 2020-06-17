@@ -1,0 +1,569 @@
+# Summary
+As I don't see any activity since January 2019 on this repository, I'm wandering if the project is still maintained. My use case is the integration with open-source[ DC/OS external persistent storage](https://docs.d2iq.com/mesosphere/dcos/1.12/storage/external-storage/).
+Will new features be added?
+Will new bugs be fixed? 
+
+The question is mainly for the the vmware Rex-Ray project maintainers: @codenrhoden @akutz @clintkitson
+ 
+
+Since a few weeks, the Website Rexray.io won't load any more!
+# Summary
+In our production environment we connect several CoreOS instances to each other, with one of the scripts installing `rexray/s3fs:0.11.4` as a docker plugin, to enable accessing several AWS S3 buckets. This functions exactly as desired most of the time, but sometimes randomly stops working. 
+
+Once we find that one of the buckets does not mount properly anymore, and we mount one of the other ones which hasn't been used so far (`docker container run -it --rm -v s3-backup-bucket:/mnt/s3 busybox`), we get journalctl logging detailing a successful mount, but showing a failure upon container exiting due to failure to dismount. As expected, succeeding mounts fail. This leads to ultimately all s3 mounts becoming unreachable for that particular worker node.
+
+Dis- & Enabling the plugin does not solve the issue, removing & re-installing the plugin fixes each bucket for a single time, showing failure during dismounting on exit again. Rebooting the docker daemon, which is a no-go for production environments, fixes the issue until at some point it fails again.
+
+The above scenario is detailed & demonstrated in the steps to reproduce.
+
+Since usually we find the plugin broken through thresholds of minimum number of back-ups being broken, by the time we check the logs have been rotated -> I can not find the exact moment of the plugin breaking.
+
+## Version
+```shell
+core@prod-1-worker-10.0.21.50 ~ $ uname -a
+Linux prod-1-worker-10.0.21.50 4.19.34-coreos #1 SMP Mon Apr 22 20:32:34 -00 2019 x86_64 Intel(R) Xeon(R) Platinum 8175M CPU @ 2.50GHz GenuineIntel GNU/Linux
+core@prod-1-worker-10.0.21.50 ~ $ docker info
+...
+Server Version: 18.06.3-ce
+Kernel Version: 4.19.34-coreos
+Operating System: Container Linux by CoreOS 2079.3.0 (Rhyolite)
+...
+core@prod-1-worker-10.0.21.50 ~ $ docker plugin inspect <rexray/s3fs plugin id>
+...
+        "PluginReference": "docker.io/rexray/s3fs:0.11.4",
+...
+```
+In short: AWS EC2 instances with CoreOS 2079.3.0, docker 18.06.3-ce & rexray/s3fs:0.11.4.
+
+## Expected Behavior
+Not to break and/or to restore itself in time.
+
+## Actual Behavior
+Stays broken & requires a docker daemon restart for a proper fix, meaning services that do not use S3 are affected as well.
+
+## Steps To Reproduce
+I'm still working on a from working properly to broken guide, which I'll add if I find it, but once broken I can 're-break' it through:
+
+1. Cancel/kill/stop/rm any job involving S3 usage
+2. `docker volume ls` should now show the S3 buckets (that fail to mount)
+```
+DRIVER              VOLUME NAME
+local               48ad58d7cdc5d4ee536f1f48372938a3c88d368d8aba950ffb170be120f1eb12
+local               87d2870e8bdf17cc8f0d0454c0b76d0b9712fd074af5fc5ac3c8bffd100c42aa
+local               a846fb1bf44d067c29d83f3b13eed74e04ce2a66d9585cfecb7813cbceb00ada
+s3fs:latest         remote-s3-bucket1
+s3fs:latest         remote-s3-bucket2
+s3fs:latest         remote-s3-bucket3
+...
+```
+3. `docker plugin disable -f s3fs && docker plugin rm -f s3fs`
+`-f` are required due to https://github.com/rexray/rexray/issues/1176, I think, as I've killed literally every job that had something to do with S3. Without, I get blocked by 'still in use'.
+4. `docker volume ls` should now no longer show the S3 buckets
+5.  
+```shell
+docker plugin install --disable --grant-all-permissions rexray/s3fs:0.11.4 --alias s3fs \
+  REXRAY_LOGLEVEL=debug \
+  S3FS_ACCESSKEY=<access-key> \
+  S3FS_SECRETKEY=<secret-key> \
+  S3FS_REGION=eu-west-1 \
+  LINUX_VOLUME_FILEMODE=0777 \
+  S3FS_OPTIONS="allow_other,iam_role=auto,umask=000"
+docker plugin enable --timeout 120 s3fs
+```
+Logs: https://gist.github.com/Forvaine/1465f6e045a1c60168724a84e60435a3
+6. `docker volume ls` should now show the present S3 buckets, again
+```
+DRIVER              VOLUME NAME
+local               48ad58d7cdc5d4ee536f1f48372938a3c88d368d8aba950ffb170be120f1eb12
+local               87d2870e8bdf17cc8f0d0454c0b76d0b9712fd074af5fc5ac3c8bffd100c42aa
+local               a846fb1bf44d067c29d83f3b13eed74e04ce2a66d9585cfecb7813cbceb00ada
+s3fs:latest         remote-s3-bucket1
+s3fs:latest         remote-s3-bucket2
+s3fs:latest         remote-s3-bucket3
+...
+```
+Logs: https://gist.github.com/Forvaine/1cbf891dcec67f18b9e1f64d4c0d1b84
+7. `docker container run -it --rm -v remote-s3-bucket1:/s3fs busybox` should now work
+```sh
+core@prod-1-worker-10.0.21.50 /var/lib/docker $ docker container run -it --rm -v remote-s3-bucket1:/s3fs busybox
+/ #
+```
+Logs: https://gist.github.com/Forvaine/4ee8ebaf08fb0d7231bd8605db83fe15
+8. Inside the container: `exit`
+Logs: https://gist.github.com/Forvaine/d63c4e399f818ce372ef0b1c1bb8a391
+9. `docker container run -it --rm -v remote-s3-bucket1:/s3fs busybox` should now be broken again:
+```sh
+core@prod-1-worker-10.0.21.50 /var/lib/docker $ docker container run -it --rm -v remote-s3-bucket1:/s3fs busybox
+/run/torcx/bin/docker: Error response from daemon: error while mounting volume '': VolumeDriver.Mount: docker-legacy: Mount: remote-s3-bucket1: failed: error mounting s3fs bucket.
+```
+Logs: https://gist.github.com/Forvaine/be62e216568bf5b26bf8ca2ab73eb919
+
+## Configuration Files
+`docker plugin inspect s3fs:latest`
+```json
+[
+    {
+        "Config": {
+            "Args": {
+                "Description": "",
+                "Name": "",
+                "Settable": null,
+                "Value": null
+            },
+            "Description": "REX-Ray FUSE Driver for Amazon Simple Storage Service (S3FS)",
+            "DockerVersion": "18.06.1-ce",
+            "Documentation": "https://github.com/thecodeteam/rexray/.docker/plugins/s3fs",
+            "Entrypoint": [
+                "/rexray.sh",
+                "rexray",
+                "start",
+                "-f",
+                "--nopid"
+            ],
+            "Env": [
+                {
+                    "Description": "",
+                    "Name": "REXRAY_LOGLEVEL",
+                    "Settable": [
+                        "value"
+                    ],
+                    "Value": "warn"
+                },
+                {
+                    "Description": "",
+                    "Name": "LIBSTORAGE_INTEGRATION_VOLUME_OPERATIONS_MOUNT_ROOTPATH",
+                    "Settable": [
+                        "value"
+                    ],
+                    "Value": ""
+                },
+                {
+                    "Description": "",
+                    "Name": "LINUX_VOLUME_ROOTPATH",
+                    "Settable": [
+                        "value"
+                    ],
+                    "Value": ""
+                },
+                {
+                    "Description": "",
+                    "Name": "LINUX_VOLUME_FILEMODE",
+                    "Settable": [
+                        "value"
+                    ],
+                    "Value": ""
+                },
+                {
+                    "Description": "",
+                    "Name": "HTTP_PROXY",
+                    "Settable": [
+                        "value"
+                    ],
+                    "Value": ""
+                },
+                {
+                    "Description": "",
+                    "Name": "S3FS_ENDPOINT",
+                    "Settable": [
+                        "value"
+                    ],
+                    "Value": ""
+                },
+                {
+                    "Description": "",
+                    "Name": "S3FS_ACCESSKEY",
+                    "Settable": [
+                        "value"
+                    ],
+                    "Value": ""
+                },
+                {
+                    "Description": "",
+                    "Name": "S3FS_DISABLEPATHSTYLE",
+                    "Settable": [
+                        "value"
+                    ],
+                    "Value": ""
+                },
+                {
+                    "Description": "",
+                    "Name": "S3FS_MAXRETRIES",
+                    "Settable": [
+                        "value"
+                    ],
+                    "Value": ""
+                },
+                {
+                    "Description": "",
+                    "Name": "S3FS_OPTIONS",
+                    "Settable": [
+                        "value"
+                    ],
+                    "Value": ""
+                },
+                {
+                    "Description": "",
+                    "Name": "S3FS_REGION",
+                    "Settable": [
+                        "value"
+                    ],
+                    "Value": ""
+                },
+                {
+                    "Description": "",
+                    "Name": "S3FS_SECRETKEY",
+                    "Settable": [
+                        "value"
+                    ],
+                    "Value": ""
+                },
+                {
+                    "Description": "",
+                    "Name": "CSI_ENDPOINT",
+                    "Settable": [
+                        "value"
+                    ],
+                    "Value": ""
+                },
+                {
+                    "Description": "The name of the CSI plug-in used by the CSI module.",
+                    "Name": "X_CSI_DRIVER",
+                    "Settable": [
+                        "value"
+                    ],
+                    "Value": ""
+                },
+                {
+                    "Description": "A flag that disables the CSI to libStorage bridge.",
+                    "Name": "X_CSI_NATIVE",
+                    "Settable": [
+                        "value"
+                    ],
+                    "Value": "false"
+                }
+            ],
+            "Interface": {
+                "Socket": "rexray.sock",
+                "Types": [
+                    "docker.volumedriver/1.0"
+                ]
+            },
+            "IpcHost": false,
+            "Linux": {
+                "AllowAllDevices": true,
+                "Capabilities": [
+                    "CAP_SYS_ADMIN"
+                ],
+                "Devices": null
+            },
+            "Mounts": [
+                {
+                    "Description": "",
+                    "Destination": "/dev",
+                    "Name": "",
+                    "Options": [
+                        "rbind"
+                    ],
+                    "Settable": null,
+                    "Source": "/dev",
+                    "Type": "bind"
+                }
+            ],
+            "Network": {
+                "Type": "host"
+            },
+            "PidHost": false,
+            "PropagatedMount": "/var/lib/rexray",
+            "User": {},
+            "WorkDir": "",
+            "rootfs": {
+                "diff_ids": [
+                    "sha256:bbb8bdd9792301285c4b73fe541acab7d65ea9396b95bd2255ae2a6075be4b5f"
+                ],
+                "type": "layers"
+            }
+        },
+        "Enabled": true,
+        "Id": "47e7a1618608ff2423824400345618f2f04da6e279bc181c6af62b84233fa75f",
+        "Name": "s3fs:latest",
+        "PluginReference": "docker.io/rexray/s3fs:0.11.4",
+        "Settings": {
+            "Args": [],
+            "Devices": [],
+            "Env": [
+                "REXRAY_LOGLEVEL=debug",
+                "LIBSTORAGE_INTEGRATION_VOLUME_OPERATIONS_MOUNT_ROOTPATH=",
+                "LINUX_VOLUME_ROOTPATH=",
+                "LINUX_VOLUME_FILEMODE=0777",
+                "HTTP_PROXY=",
+                "S3FS_ENDPOINT=",
+                "S3FS_ACCESSKEY=<access key>",
+                "S3FS_DISABLEPATHSTYLE=",
+                "S3FS_MAXRETRIES=",
+                "S3FS_OPTIONS=allow_other,iam_role=auto,umask=000",
+                "S3FS_REGION=eu-west-1",
+                "S3FS_SECRETKEY=<secret key>",
+                "CSI_ENDPOINT=",
+                "X_CSI_DRIVER=",
+                "X_CSI_NATIVE=false"
+            ],
+            "Mounts": [
+                {
+                    "Description": "",
+                    "Destination": "/dev",
+                    "Name": "",
+                    "Options": [
+                        "rbind"
+                    ],
+                    "Settable": null,
+                    "Source": "/dev",
+                    "Type": "bind"
+                }
+            ]
+        }
+    }
+]
+```
+
+## Logs
+Instead of pasting the full logs here, I've opted to paste them as gists/snippets in between the steps to reproduce. Let me know if you'd still prefer a full log.
+# Summary
+Often after reboot of a docker host, Rexray managed docker volume plugins will fail to automatically enable. This results in disabled volume plugins, containers unable to access those volumes, and probably a cascade of catastrophic failures.
+
+The cause I isolated was a default watchdog timer in Docker. The fix is to change the length of that timer. See below.
+
+# Bug Reports
+
+## Version
+
+docker.io/rexray/ebs:0.11.4
+docker.io/rexray/s3fs:0.11.4
+(perhaps all of them)
+
+## Steps To Reproduce
+
+Use AWS. However, other hosts, cloud services, and your own private servers may also reproduce this issue.
+
+1. Create three S3 buckets
+2. Create two EBS volumes
+3. Create an IAM role that is granted permissions to access the S3 and EBS resources. Follow docs like https://rexray.readthedocs.io/en/stable/user-guide/storage-providers/aws/#troubleshooting
+4. Create and start a `t3.nano` instance with the `Amazon Linux 2 ECS-optimized AMI` that uses the IAM role you created. This should provide you `docker 18.06`
+5. SSH to that instance
+6. Install the Rexray EBS and S3FS managed volume plugins. Replace us-east-1 with your AWS region. Change the s3 url and endpoint options if your region is not us-east-1.
+   ```bash
+   docker plugin install --grant-all-permissions rexray/ebs:0.11.4 \
+    REXRAY_LOGLEVEL=debug \
+    LIBSTORAGE_INTEGRATION_VOLUME_OPERATIONS_MOUNT_ROOTPATH=/ \
+    LINUX_VOLUME_ROOTPATH=/ \
+    LINUX_VOLUME_FILEMODE=0750 \
+    EBS_REGION=us-east-1
+   docker plugin install --grant-all-permissions rexray/s3fs:0.11.4 \
+    REXRAY_LOGLEVEL=debug \
+    LIBSTORAGE_INTEGRATION_VOLUME_OPERATIONS_MOUNT_ROOTPATH=/ \
+    LINUX_VOLUME_ROOTPATH=/ \
+    LINUX_VOLUME_FILEMODE=0750 \
+    S3FS_REGION=us-east-1 \
+    S3FS_OPTIONS="allow_other,umask=0027,noexec,mp_umask=0027,uid=0,gid=0,noatime,use_path_request_style,iam_role=auto,url=https://s3.amazonaws.com,endpoint=us-east-1"
+   ```
+7. Verify both plugins report they installed. Fix any issues before continuing to the next step.
+8. Verify you can see the names of all your S3 and EBS volumes using `docker volume ls`. Fix any issues before continuing to the next step.
+9. Reboot your instance using something like `sudo reboot now`
+10. ssh to your instance
+11. View the status of volume plugins with `docker plugin ls`
+
+## Actual Behavior
+
+After reboot, some or all of the rexray docker volume plugins are disabled. ☹ If they are all enabled, keep rebooting...some will eventually be disabled.
+
+`/var/log/messages` (or other logfiles if you didn't use the AMI described above) you find entries like the following. The *most important* entry for this scenario is the `received signal; shutting down` entry.
+
+```
+
+Sep  8 13:43:06 ip-10-10-35-252 dockerd: time="2019-09-08T13:43:06Z" level=error msg="time=\"2019-09-08T13:43:06Z\" level=info msg=\"received signal; shutting down\" signal=terminated time=1567950186194 " plugin=edbc0aa2bad9f7c519d465cfea75eb06e037195e30b2f5af7b74dd5f247bfc61
+Sep  8 13:43:06 ip-10-10-35-252 dockerd: time="2019-09-08T13:43:06Z" level=error msg="time=\"2019-09-08T13:43:06Z\" level=info msg=\"received exit signal\" signal=terminated time=1567950186195 " plugin=edbc0aa2bad9f7c519d465cfea75eb06e037195e30b2f5af7b74dd5f247bfc61
+
+Sep  8 13:43:15 ip-10-10-35-252 dockerd: time="2019-09-08T13:43:15Z" level=error msg="error: service startup failed: agent: mod init failed: context canceled" plugin=7043bd78c2f1c8b2972782fdb4381e0d90c54720c3801bd584e8d8d81ccc233c
+Sep  8 13:43:16 ip-10-10-35-252 dockerd: time="2019-09-08T13:43:16.202499786Z" level=error msg="failed to enable plugin" error="dial unix /run/docker/plugins/7043bd78c2f1c8b2972782fdb4381e0d90c54720c3801bd584e8d8d81ccc233c/rexray.sock: connect: no such file or directory" id=7043bd78c2f1c8b2972782fdb4381e0d90c54720c3801bd584e8d8d81ccc233c
+
+```
+
+## Expected Behavior
+
+After reboot, all rexray docker volume plugins should be enabled.
+
+## Cause
+
+After rebooting, the OS starts dockerd.  dockerd has code to also start any plugins that were previously enabled. dockerd iterates through each of them and calls a function `enable(p *v2.Plugin, c *controller, force bool)`.
+
+This is the code in Docker 18.06 https://github.com/docker/docker-ce/blob/a464a87eb6d811607638ebcd9f186063b1b9b262/components/engine/plugin/manager_linux.go#L69-L82
+
+The code then calls `plugins.NewClientWithTimeout()` with a default timeout of 30s. This timeout is an overarching _watchdog_ timeout that will kill the plugin if that timeout is exceeded during the `NewClient` startup. This is mentioned in passing at https://docs.docker.com/engine/reference/commandline/plugin_enable/#options
+
+The Rexray managed plugins like EBS and S3 do a lot of work during startup. This is a significant difference from some other plugins that do very little work during startup and instead do all their work on attach/mount.
+
+During busy times on the instance (like reboots), the time needed for the services within the managed volume plugins to startup, have a fully working network, the API calls to EBS/S3 to complete, and results to be compiled might exceed this default 30s watchdog timer. If that occurs, then the watchdog calls `shutdownPlugin()` which then uses `Signal(pluginID, int(unix.SIGTERM)` to send a kill SIGTERM to the volume plugin.
+
+While isolating this, I saw in the logs entries where the S3 https APIs returned results that looked ok. Yet I also saw the `received signal` entries which the caused the S3 managed plugin to shutdown. Naturally, this is because this watchdog timer naturally runs in parallel. The S3 plugin was running correctly, but it wasn't getting the result back to the watchdog code within the 30 seconds.
+
+## Fix
+
+The easiest fix that worked for me is to make this watchdog timeout longer. Of course, this is a race condition and there are more robust solutions possible if the core Docker team were to make code changes.
+
+This timeout _can only_ be changed using the `docker plugin enable` command. There is no possibility with Docker 18.06 to use the `docker plugin install` command.
+
+To change this watchdog timer from its default 30s to a longer timeout, use the following. This example is for the s3fs plugin and changing it to 120s. It applies also to other plugins and other timeouts might better meet your needs. Notice the use of the `--disable` and `--timeout` options.
+```
+docker plugin install --disable rexray/s3fs:0.11.4 [options...]
+docker plugin enable --timeout 120 rexray/s3fs:0.11.4
+```
+
+## Related issues
+
+https://github.com/rexray/rexray/issues/912
+https://github.com/rexray/rexray/issues/1191
+https://github.com/moby/moby/issues/37426
+# Summary
+Travis CI always fails in job `docker driver=scaleio` due to failure of 'apk add numactl'
+This job error is in all PRs for the past 6 months
+See https://travis-ci.org/rexray/rexray/pull_requests for them.
+They all fail on the same job `docker driver=scaleio` with an error due to `apk add numactl`
+
+## Expected Behavior
+No Travis error with `apk add numactl`
+
+## Actual Behavior
+
+https://travis-ci.org/rexray/rexray/jobs/581922834
+
+```
+Step 4/20 : RUN echo http://dl-cdn.alpinelinux.org/alpine/edge/testing >> /etc/apk/repositories && apk update && apk add numactl
+ ---> Running in b59741dd0455
+fetch http://dl-cdn.alpinelinux.org/alpine/v3.6/main/x86_64/APKINDEX.tar.gz
+fetch http://dl-cdn.alpinelinux.org/alpine/v3.6/community/x86_64/APKINDEX.tar.gz
+fetch http://dl-cdn.alpinelinux.org/alpine/edge/testing/x86_64/APKINDEX.tar.gz
+v3.6.5-44-gda55e27396 [http://dl-cdn.alpinelinux.org/alpine/v3.6/main]
+v3.6.5-34-gf0ba0b43d5 [http://dl-cdn.alpinelinux.org/alpine/v3.6/community]
+v20190809-1748-g659bd3f21e [http://dl-cdn.alpinelinux.org/alpine/edge/testing]
+OK: 13013 distinct packages available
+WARNING: This apk-tools is OLD! Some packages might not function properly.
+WARNING: This apk-tools is OLD! Some packages might not function properly.
+  numactl (missing):
+ERROR: unsatisfiable constraints:
+    required by: world[numactl]
+The command '/bin/sh -c echo http://dl-cdn.alpinelinux.org/alpine/edge/testing >> /etc/apk/repositories && apk update && apk add numactl' returned a non-zero code: 1
+make: *** [.docker/plugins/scaleio/rootfs/rexray.sh] Error 1
+The command "make build-docker-plugin" exited with 2.
+```
+
+
+## Steps To Reproduce
+Please list the steps to reproduce the issue in this section.
+
+1. Submit a PR
+2. Wait for Travis to fail on the job `docker driver=scaleio`
+
+
+In Makefile, the parameters to `find` cause warnings/errors of deprecated options and expression precedence. This is due to an invalid use of the `-d` parameter. `-d` is deprecated and `-d` doesn't take a numeric value after it. This two actions cause the warning and error seen.
+
+https://github.com/rexray/rexray/blob/362035816046e87f7bc5a6ca745760d09a69a40c/Makefile#L383
+
+I think the intention was to use the `-maxdepth` parameter.
+
+In addition, there is the possibility of an error sometime in the future by using a wildcard in the following `-name`. It needs to be single quoted so the shell glob doesn't expand it.
+
+https://github.com/rexray/rexray/blob/362035816046e87f7bc5a6ca745760d09a69a40c/Makefile#L227
+
+## Setup
+
+Ubuntu 18.04
+Docker 19.03.1 is installed
+Go is not installed
+
+## Repo
+
+1. clone the rexray repo
+2. change pwd into the root of the repo
+3. `DRIVER=ebs make`
+
+## Result
+
+```
+find: warning: the -d option is deprecated; please use -depth instead, because the latter is a POSIX-compliant feature.
+find: paths must precede expression: `1'
+```
+
+## Expected
+
+No warnings or errors
+This continues #1262 .   We're starting to hit the digital ocean rate limits during our provisioning.  Digital Ocean limits requests to 5,000 per hour and provides feedback on how many you have left.
+
+Would it be possible to "scale back" any non-essential requests when the threshold is near?
+
+**Example:**
+```
+if RateLimit-Remaining <  total rexray volumes * 25
+  skip status checks, etc.
+```
+Hi, I am using macOS and I tried to install rexray. And it shows "tar: Unrecognized archive format".
+It was quite confusing and I had to do some research to find out what happened.
+It was not until then that I realized macOS is not supported. 
+So this commit will make the script show the warning message "Unable to download the package. Please make sure your platform is supported." when curl can't download the tarball. I think it may make the error message a little bit more friendly.
+# Summary
+Create s3fs volume, then inspect this volume  and found filed "Mountpoint" is ""
+
+# New Feature
+```
+1. install plugin
+docker plugin install rexray/s3fs:latest  
+--grant-all-permissions 
+S3FS_REGION=cn-south-1 
+S3FS_ENDPOINT=https://obs.cn-south-1.myhuaweicloud.com 
+S3FS_ACCESSKEY=ak
+S3FS_SECRETKEY=sk 
+```
+2. create volume
+```
+docker volume create --driver rexray/s3fs --name rexray-s3
+```
+
+
+3. check volume
+```
+[root@qxg-dev /]# docker volume ls
+DRIVER               VOLUME NAME
+rexray/s3fs:latest   rexray-s3
+```
+4. inspect volume
+```
+[root@qxg-dev volumes]# docker volume inspect rexray-s3
+[
+    {
+        "CreatedAt": "0001-01-01T00:00:00Z",
+        "Driver": "rexray/s3fs:latest",
+        "Labels": {},
+        "Mountpoint": "",
+        "Name": "rexray-s3",
+        "Options": {},
+        "Scope": "global",
+        "Status": {
+            "availabilityZone": "",
+            "fields": null,
+            "iops": 0,
+            "name": "rexray-s3",
+            "server": "s3fs",
+            "service": "s3fs",
+            "size": 0,
+            "type": ""
+        }
+    }
+]
+```
+Why filed "Mountpoint" is null ???
+
+5. run image with this volume
+```
+[root@qxg-dev volumes]# docker run -it -v rexray-s3:/opt centos 
+docker: Error response from daemon: error while mounting volume '': VolumeDriver.Mount: docker-legacy: Mount: rexray-s3: failed: error mounting s3fs bucket.
+```
+Run a centos image fail, which step is wrong?
+

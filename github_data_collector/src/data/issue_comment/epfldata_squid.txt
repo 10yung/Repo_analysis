@@ -1,0 +1,109 @@
+It is entirely possible to use Squid without statically checking scopes, similar to MetaOCaml or Dotty's quotes (but of course with more features, like pattern matching).
+
+This simpler mode of usage is less type-safe, but makes many things much easier and less intimidating for beginners. One has to use the `OpenCode[T]` type (which is a super type of the contextual `Code[T,C]`), and use `.unsafe_asClosedCode` whenever one wants to run or compile the piece of code.
+
+However, currently we emphasize the contextual mode of Squid as the default/normal mode, which is intimidating and may scare beginners away. Instead, I think we should promote the simpler interface as the default interface, and reserve the contextual interface for advanced users. This would mean:
+
+ - [ ] Changing the type synonyms: `OpenCode[T]` is long-winded and a bit ugly; we'd like to use `Code[T]` instead. The new scheme would be: `Code[T]` for when you do not know the context, `ClosedCode[T]` for code that is assuredly closed and can be run; `OpenCode[T,C]` for open code for which we statically track the scope using contextual type `C` (for advanced users).  
+Alternatively, as I previously proposed in [LPTK/squid-type-experiments](https://github.com/LPTK/squid-type-experiments), we could have type synonym `in` to enable the nice `Code[T] in C` syntax (meaning `Code[T]{ type Ctx >: C }`), though that would likely require changes in Squid to look at the `Ctx` member of code types instead of their `C` type argument, which _may_ cause [weird typing problems](https://github.com/LPTK/squid-type-experiments/blob/839066eef685ce52e5ae6556fd570d1c1a38fdc1/src/test/scala/squid/Basics.scala#L50) down the line.
+
+ - [ ] Changing the code types inferred by default: we should have a `SimplePredef` which is configured to make quasiquotes infer `Code[T]` types by default, instead of `Code[T,C]` types; even though `OpenCode[T,C] <: Code[T]`, this still does help with type inference, such as when doing `var c = code"0"; ... ; c = code"<open term>"`.
+
+ - [ ] Splitting the basic tutorial in two: there should be a basic tutorial using simple `Code[T]` types and [cross-quotation references](https://github.com/epfldata/squid/pull/61), which are now supported, and a tutorial for advanced users that demonstrates the `OpenCode[T,C]` type and its interaction with path-dependent `Variable[T]#Ctx` types.
+
+
+See: https://github.com/emmalanguage/emma/issues/369
+
+It turns out they are encoded differently than Scala varargs. See [report here](https://github.com/emmalanguage/emma/issues/369#issuecomment-397022718).
+It would be nice being able to use simple `def`'s (without type parameters) in embedded code, as well as `lazy` values. For example, it would avoid a workaround mentioned in https://github.com/emmalanguage/emma/issues/369.
+
+This should be doable in the same [way it's done](https://github.com/epfldata/squid/blob/9efb10fca43ceed6007d3e6303bdb22f31691dc8/core/src/main/scala/squid/quasi/ModularEmbedding.scala#L414) with things like `if`/`else`, i.e.:
+
+```scala
+code"if ($cnd) $thn else $els"
+// really is equivalent to:
+code"squid.lib.IfThenElse($cnd, $thn, $els)"
+```
+
+In the same way, we could have:
+
+```scala
+code"lazy val $x = $v; $b"
+// virtualized as:
+code"val $y = squid.utils.Lazy($v); ${b.subs(x) ~> code"$y.value"}"
+```
+
+and:
+
+```scala
+code"def f(...) = ... ; ..."
+// if f is not recursive, as:
+code"val f = (...) => ... ; ..."
+```
+
+and for recursive definitions, using a Y combinator with by-name parameters, for example for a recursive definition:
+
+```scala
+code"def f(...) = ... ; ..."
+// if f is recursive, as:
+code"val f = Y(f => ...) ; ..."
+```
+
+Finally, it would use an annotation (similar to [the one used for implicit bindings](https://github.com/epfldata/squid/blob/9efb10fca43ceed6007d3e6303bdb22f31691dc8/core/src/main/scala/squid/quasi/ModularEmbedding.scala#L169)) in order to mark virtualized bindings so they can be generated back to their original form when emitting Scala trees.
+This is to prepare the ground for the new IR implementations that will replace the legacy `AST`/`SimpleAST`/`SimpleANF` IRs which are bloated and unoptimal.
+
+We need to:
+
+ * [ ] add a `Context` abstract type member and an `implicit` parameter to reification methods, so as to avoid needless global state in the reification process;
+
+ * [ ] abstract over the representation of argument lists `List[ArgList]`, so as to allow alternative and possibly more efficient representations;
+
+ * [ ] abstract over the `Extract` data type, for the same reason;
+
+ * [ ] perhaps take the precautions needed to make the IRs threadsafe, if it does not incur significant overhead (otherwise make it opt-in) – IIRC the main place where threadsafety would be a problem is with the pattern caching mechanism, and with variable-id generation.
+The `rewrite` macros comprise top-level `rewrite` calls from the `RuleBasedTransformer` class, as well as term-level `t.rewrite` calls, which desugar into the same.
+
+These are currently expanded into calls to `RuleBasedTransformer#registerRule` – _conceptually_, an invocation such as `rewrite { case code"t" if c => rhs }` expands into:
+```scala
+registerRule(
+  expression representation of code pattern t, 
+  extractArtifact => {
+    // ... extract the different trees obtained from extractArtifact
+    // ... and pass them through the sub-patterns
+    //       (for example, see `SubPattern` in `case code"${SubPattern(x,y,z)}:Int" => ...`)
+    if (the guard/condition c of the pattern matching case is respected)
+      Some(adapted version of rhs)
+    else None
+  }
+)
+```
+
+This is generated after some [crazy macro hackery](https://github.com/epfldata/squid/blob/3e10f3275104a6c653bbfcd83e06ed7a2c64cc09/core/src/main/scala/squid/ir/RuleBasedTransformer.scala#L162) during which `untypecheck` is used to get around owner chain corruptions, which incurs [limitations](https://github.com/epfldata/squid/blob/master/doc/Transformers.md#limitations) on what can go inside a rewrite rule right-hand side. It incurs problems with path-dependent types, some of which are [fixed in a very ad-hoc way](https://github.com/epfldata/squid/commit/7f72d1f20531960b4e5fa26202f259a1be8add0a#diff-7a2037dec4ac7d6a7dce7a3e074dcf28R275).
+
+A saner approach would likely be to perform the main code transformation _before_ type checking (using a macro annotation), since the translation is mostly syntactic anyway. But we would have to split from that code the functionality that inspects the types of the pattern and right-hand side in order to refine the type of the rewritten term and to check that the transformation is type-preserving. Indeed, that functionality needs to be expressed in a macro def, as it requires type checking information – but the good news is that it does not change the shape of the tree and should not result in owner chain problems.
+Implementation of Fast-ANF, a mutable version of ANF in order to provide O(1) substitution. 
+Basic implementation of HOP-holes.
+Does not encode types.
+This adds the numbering of bound variables. It introduces some mutable state in the PrettyPrinter (which I also changed into a trait). 
+
+Not sure if this is the best way to do it since the numbering does not always work as expected (e.g. see `val exp14` in  `test("Virtualized Constructs")` where `x_0` is followed by `y_4` (instead of `y_1`).
+
+@LPTK if you have a better idea of how to handle this, let me know :)
+Direct function application syntax on a pattern hole is currently interpreted as higher-order matching. To extract a function, one should ascribe the hole with a function type. This can lead to confusing error, such as the following:
+
+```scala
+[error] Embedding Error: Unexpected expression in higher-order pattern variable argument: 42
+[error]     case ir"$f(42)" => println(s"$f(42)")
+[error]          ^
+```
+
+In this case, the error message should inform and guide users who just wanted to extract a function...
+
+To make the new IR faster, and compatible with ScalaJS/ScalaNative (and also to lower its startup time), we would like not to rely on Scala Reflection at runtime.
+
+This means we implement our own representation of types, type symbols and method symbols.
+
+The downside is that we won't be able to inspect at runtime the annotations (such as effects annotations) defined on method symbols. To work around this, we:
+ * [ ] will provide nice tools to provide effects annotations manually for external libraries (in the same vein as [this](https://github.com/epfldata/squid/blob/1985a94de979a7b14d1e7b5f5a7984c581cfa07f/src/main/scala/squid/ir/SimpleEffects.scala#L117));
+ * [ ] will extend the functionalities of the `@embed` macro annotation to look at the annotations placed on methods and register them in the IR;
+ * [ ] also, we have to remove the runtime dependencies on Scala Reflection that currently exists in the code that `@embed` generates.

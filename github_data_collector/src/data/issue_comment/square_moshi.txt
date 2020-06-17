@@ -1,0 +1,190 @@
+This resolves #1046 by tracking mappings of superclass type vars to their materialized types in subclasses. This is tested with some pathologically complex examples, so hope it's sturdy!
+
+Other small bits:
+- This exposes an awkward case where type inference can't be relied upon at construction. We could try to figure this out, but the overhead of determining that at build time outweighs the cost of just being pedantic here, so this effectively reverts #1041. 
+- Opportunistic - suppression of `RedundantExplicitType` in known suppressions.
+Kotlin-reflect has been a long-standing thorn for `KotlinJsonAdapter` for a number of reasons:
+
+- It has a huge impact on binary size, both in terms of the library and the compiler impact. When removing it from the slack code base recently, it saved us nearly 10k methods just by removing it (even though only 2 were used!)
+- It's super slow and heavyweight
+- It has a number of tricky proguard considerations
+
+This PR replaces kotlin-reflect entirely with kotlinx-metadata-reflect, the low-level metadata library we use in code gen (via kotlinpoet-metadata). It's also what the `kotlinx.reflect.lite` project is in the process of being [migrated to](https://github.com/Kotlin/kotlinx.reflect.lite/pull/12), and used in a number of other major toolchains now (Dagger, R8, etc).
+
+Effectively, this skips past `kotlinx.reflect.lite` and replaces `kotlin-reflect` with something closer to an "ultralight" setup, set up specific to Moshi's needs. It's a significant change to the adapter, but the core logic remains the same with one notable exception (documented at the end).
+
+This supersedes #307, but effectively resolves #307 in spirit.
+
+### Stats
+
+Quick androidx-benchmark on my serialization benchmarks project shows this is ~21.5% faster for buffer reads as well! https://github.com/ZacSweers/json-serialization-benchmarking/pull/10
+
+```
+AndroidBenchmark.moshi_kotlin_codegen_buffer_toJson[minified=true]                   5,052,032  ns
+AndroidBenchmark.moshi_kotlin_codegen_string_toJson[minified=true]                   7,072,449  ns
+AndroidBenchmark.moshi_kotlin_reflective_metadata_buffer_toJson[minified=true]       8,096,823  ns
+AndroidBenchmark.moshi_kotlin_reflective_buffer_toJson[minified=true]                9,461,355  ns
+AndroidBenchmark.moshi_kotlin_reflective_string_toJson[minified=true]               11,308,542  ns
+
+AndroidBenchmark.moshi_kotlin_codegen_buffer_fromJson[minified=true]                 7,553,282  ns
+AndroidBenchmark.moshi_kotlin_codegen_string_fromJson[minified=true]                 8,746,668  ns
+AndroidBenchmark.moshi_kotlin_reflective_metadata_buffer_fromJson[minified=true]     9,167,501  ns
+AndroidBenchmark.moshi_kotlin_codegen_buffer_fromJson[minified=false]               10,039,950  ns
+AndroidBenchmark.moshi_kotlin_reflective_buffer_fromJson[minified=true]             10,454,168  ns
+AndroidBenchmark.moshi_kotlin_reflective_metadata_buffer_fromJson[minified=false]   11,691,721  ns
+AndroidBenchmark.moshi_kotlin_codegen_string_fromJson[minified=false]               11,716,408  ns
+AndroidBenchmark.moshi_kotlin_reflective_string_fromJson[minified=true]             11,734,532  ns
+AndroidBenchmark.moshi_kotlin_reflective_buffer_fromJson[minified=false]            12,930,158  ns
+AndroidBenchmark.moshi_kotlin_reflective_string_fromJson[minified=false]            14,747,397  ns
+```
+
+### Two open questions
+* The behavior change is that moshi-kotlin still allowed extending from and encoding non-kotlin superclasses and their properties. I think this was an oversight when we stopped supporting mixing them in Moshi 1.8, as this doesn't match the behavior of code gen.
+* ~~What are the appropriate proguard rules for this?~~
+Resolves #822. Definitely open to feedback
+This wasn't actually running reflection before because the reflection adapter will use generated adapters anyway if available. I've added an overload that allows controlling this behavior (default is enabled), as I'm not sure how else to set this up.
+
+This also makes an opportunistic optimization to defer checking for generated classes until just before the ClassJsonAdapter, as it avoids unnecessary reflection checks before other non-generatable-types like collections/maps/arrays.
+Moshi version: 1.9.0, 1.9.1, 1.9.2 (on previous versions it works fine)
+
+The following code causes Gradle build failed with exception:
+
+```kotlin
+open class Response<T> {
+    var data: T? = null
+}
+
+class Person(val name: String)
+
+@JsonClass(generateAdapter = true)
+class PersonResponse : Response<Person>()
+```
+Exception:
+
+```
+[kapt] An exception occurred: java.lang.IllegalStateException: Unexpected type variable T
+	at com.squareup.moshi.kotlin.codegen.api.AdapterGenerator$generateType$typeRenderer$1.renderTypeVariable(AdapterGenerator.kt:162)
+	at com.squareup.moshi.kotlin.codegen.api.TypeRenderer.render(TypeRenderer.kt:100)
+	at com.squareup.moshi.kotlin.codegen.api.TypeRenderer.render$default(TypeRenderer.kt:43)
+	at com.squareup.moshi.kotlin.codegen.api.TypeRenderer.renderObjectType(TypeRenderer.kt:110)
+	at com.squareup.moshi.kotlin.codegen.api.TypeRenderer.render(TypeRenderer.kt:45)
+	at com.squareup.moshi.kotlin.codegen.api.TypeRenderer.render$default(TypeRenderer.kt:43)
+        (...)
+```
+Classes that are generated look like this:
+```
+@Suppress("DEPRECATION", "unused", "ClassName", "REDUNDANT_PROJECTION")
+class FooJsonAdapter(
+  moshi: Moshi
+) : JsonAdapter<Foo>() {
+```
+where `Parameter 'moshi' is never used` is the warning.
+Which then becomes an error in projects that has 
+```
+    kotlinOptions {
+        allWarningsAsErrors = true
+```
+I'm using `PolymorphicJsonAdapterFactory` in order to serialize/deserialize a bit more complex data structure. Here is my data structure:
+
+```kotlin
+open class DocumentData(
+    val documentType: String
+)
+
+open class FormDocument(
+    documentType: String,
+    open val title: String,
+    open val form: List<String>
+): DocumentData(documentType)
+
+data class SpecificFormDocument(
+    override val title: String,
+    override val form: List<String>,
+
+    val info: String?,
+    val contributors: List<String>?,
+    val description: String?
+): FormDocument("FORM_DOCUMENT_SPECIFIC", title, form)
+```
+When I'm trying to serialize some instances of these objects I receive 
+```
+Caused by: java.lang.IllegalArgumentException: Conflicting fields:
+    private final java.util.List com.app.document.SpecificFormDocument.form
+    private final java.util.List com.app.document.FormDocument.form
+```
+Which looks a bit odd as `title` does not cause any issues. Am I doing something wrong ? 
+```kotlin
+inline class Inline(val i: Int)
+@JsonClass(generateAdapter = true)
+class InlineConsumer(val i: Inline = Inline(42)
+```
+This leads to a exception when deserializing an `InlineConsumer`. The problem is that the generated constructor call uses reflection. 
+The adapter tries to find the constructor based on the types of the arguments. The argument in this case is `Int`(it is inlined), but the current version of moshi looks for `Inline`. 
+Also when passing the inline object to the constructor it needs to be unwrapped to `Int` or it will lead to a typecast exception.
+I fixed this in a branch here: 353a86dff0fa27c8719f3840cb06636bd368c09d, but the fix is kinda hacky and should probably not be used in a proper release, so I wouldn't merge it.
+The problematic part is figuring out which types to inline. I do this by checking the jvm signature of the getter of each property and comparing this to the `returnType` of `ImmutableKmProperty`. I use the same system to get the inlined type. This should at least be properly refactored (maybe needs support by kotlinpoet).
+___
+PS: This is the issue I mention a few days ago. So I hope it's the last I submit (at least in the near future :wink:)
+PPS: I know inline classes are not officaly supported by moshi, but tracking this is still useful for the future.
+I need to define the `JsonAdapter` for `BigDecimal` by the `JsonQualifier` annotation and use it on the items in a list.
+
+```kotlin
+@JsonQualifier
+@Target(AnnotationTarget.TYPE)
+@Retention(AnnotationRetention.RUNTIME)
+annotation class JsonCoordinates
+```
+
+```kotlin
+@JsonClass(generateAdapter = true)
+data class LocationData(
+        val coordinates: List<@JvmSuppressWildcards @JsonCoordinates BigDecimal>
+)
+```
+
+```kotlin
+class LocationDataAdapterTest {
+
+    @Test
+    fun toJsonWithQualifier() {
+        val moshi: Moshi
+        val adapter: JsonAdapter<LocationData>
+
+        moshi = Moshi.Builder()
+                .add(BigDecimal::class.java, JsonCoordinates::class.java,
+                        DecimalAdapter())
+                .build()
+        adapter = moshi.adapter(LocationData::class.java)
+
+        val data = LocationData(listOf(BigDecimal(10), BigDecimal(20)))
+        assertEquals("{\"coordinates\":[\"10\",\"20\"]}", adapter.toJson(data))
+    }
+
+    @Test
+    fun toJsonWithoutQualifier() {
+        val moshi: Moshi
+        val adapter: JsonAdapter<LocationData>
+
+        moshi = Moshi.Builder()
+                .add(BigDecimal::class.java, DecimalAdapter())
+                .build()
+        adapter = moshi.adapter(LocationData::class.java)
+
+        val data = LocationData(listOf(BigDecimal(10), BigDecimal(20)))
+        assertEquals("{\"coordinates\":[\"10\",\"20\"]}", adapter.toJson(data))
+    }
+}
+```
+
+The test `toJsonWithoutQualifier` has success.
+The test `toJsonWithQualifier` fails with the following exception:
+
+```
+java.lang.IllegalArgumentException: Platform class java.math.BigDecimal (with no annotations) requires explicit JsonAdapter to be registered
+for class java.math.BigDecimal
+for java.util.List<java.math.BigDecimal> coordinates
+for class app.klosed.api.model.LocationData
+```
+
+Here is the complete code https://gist.github.com/dscoppelletti/a5937124e1b33e5e33771b7845b2ed9a
+These don't require kotlin-reflect after all.

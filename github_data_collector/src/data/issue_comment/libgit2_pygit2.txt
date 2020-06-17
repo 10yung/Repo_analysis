@@ -1,0 +1,221 @@
+`Repository.create_reference` only accepts `str` and not `bytes`. This is because `Repository_create_reference_direct` in `repository.c` uses the `s` specifier for parsing that argument, which only accepts `str` and implicitly encodes it using UTF-8. I would expect it to accept `str` or `bytes`, and if you pass `bytes`, it uses exactly what you pass in with no encoding/decoding.
+
+This is a similar problem to #932.
+PatchTest.test_no_context_lines fails with python 3.8 on Alpine linux edge on s390x. Test passes on all other arches, so I wonder if this may be a big-endian problem?
+
+Appears to be introduced with the 1.0.0 update.
+
+````
+======================================================= FAILURES =======================================================
+___________________________________________ PatchTest.test_no_context_lines ____________________________________________
+
+self = <test.test_patch.PatchTest testMethod=test_no_context_lines>
+
+    def test_no_context_lines(self):
+        old_blob = self.repo[BLOB_OLD_SHA]
+        new_blob = self.repo[BLOB_NEW_SHA]
+    
+        patch = pygit2.Patch.create_from(
+            old_blob,
+            new_blob,
+            old_as_path=BLOB_OLD_PATH,
+            new_as_path=BLOB_NEW_PATH,
+            context_lines=0,
+        )
+    
+        context_count = len(
+            [line for line in patch.text.splitlines() if line.startswith(" ")]
+        )
+    
+>       assert context_count == 0
+E       AssertionError: assert 1 == 0
+E         -1
+E         +0
+
+test/test_patch.py:184: AssertionError
+============================================ 1 failed, 380 passed in 8.79s =============================================
+
+````
+Much to my surprise reading `delta.is_binary` returns the wrong value if one does not iterate over the patches beforehand. Given
+```bash
+mkdir test && cd test
+touch README.md
+dd if=/dev/urandom of=data.bin bs=256K count=1
+git init .
+git add README.md && git commit -m "initial"
+git add data.bin && git commit -m "binary"
+```
+this script
+```python
+import pygit2
+
+repo = pygit2.Repository('.git')
+diff = repo.diff('HEAD', 'HEAD~1')
+
+for delta in diff.deltas:
+    print(delta.is_binary)
+
+for patch in diff:
+    pass
+
+for delta in diff.deltas:
+    print(delta.is_binary)
+```
+prints
+```bash
+False
+True
+```
+I am trying to do something relatively simple which is just add and commit file changes to an existing repository as i would through the command line. The one complicating caveat is i am calling the code to do this from inside a submodule, however everything seems to be okay until the commit part.
+
+In the folder above the code/submodule folder i have another which is the main git repo and which also has a folder of data i wish to monitor and commit changes of.
+
+The code is
+```python
+data_repo = pygit2.Repository('../')
+
+index = data_repo.index
+index.add_all(pathspecs=["tables/"]) # Because of the data repo path we are already in that repo local path so all paths relative to that
+index.write()
+tree = index.write_tree()
+modified_tables = [ x for x in data_repo.status().keys() if 'tables' in x]
+
+author = pygit2.Signature('Alice Author', 'alice@authors.tld')
+committer = pygit2.Signature('GitRateWatcher', 'me@internet.com')
+msg  = f"GitRateWatcher commit on {datetime.datetime.today().date()} modified tables: {', '.join(modified_tables)}"
+oid = data_repo.create_commit('refs/heads/master', author, committer, msg, tree, [] )
+data_repo.head.set_target(oid)
+```
+
+However when I try this i get 
+```
+_pygit2.GitError: failed to create commit: current tip is not the first parent
+```
+
+if i remove the 'refs/heads/master' part it works but it basically does a rebase and wipes all previous stuff which is no good either. What am I missing?
+It would be nice if pygit2 supported [pathlib paths](https://docs.python.org/3/library/pathlib.html) in addition to just strings.
+I'm not sure I'm using it right, but the following code throws `git_remote_fetch` into some sort of infinite loop in case the agent can't find an appropriate key.
+```py
+import pygit2
+
+class MyCallbacks(pygit2.RemoteCallbacks):
+    def credentials(self, url, username_from_url, allowed_types):
+        # print('Credentials callback called')
+        return pygit2.KeypairFromAgent(username_from_url)
+
+repo = pygit2.Repository('foo')
+repo.remotes['origin'].fetch(callbacks=MyCallbacks())
+print("OK")
+```
+
+Here's an example:
+```sh
+$ git clone git@<some-ssh-repository> foo
+Cloning into 'foo'...
+remote: Enumerating objects: 3, done.
+remote: Counting objects: 100% (3/3), done.
+remote: Total 3 (delta 0), reused 0 (delta 0)
+Receiving objects: 100% (3/3), done.
+$ python3 test.py  # Using my regular ssh agent which has the correct key
+OK
+$ eval $(ssh-agent)  # Create a new ssh-agent with no key and update env variables
+$ python3 test.py  # Never returns...
+```
+
+If I uncomment the `print` statement in the python snippet above, I can see that my callback is called over and over.
+
+There's one more thing that is odd but might help: when I interrupt the script with ctrl-c, I don't always get the same traceback.  In the second case bellow it seems that the "correct" exception (`_pygit2.GitError: callback failed to initialize SSH credentials`) is raised at some point but just doesn't reach my code:
+```sh
+❯❯❯ python3 test.py
+# ^C
+Traceback (most recent call last):
+  File "test.py", line 11, in <module>
+    repo.remotes['origin'].fetch(callbacks=MyCallbacks())
+  File "/home/gregoire/.local/lib/python3.7/site-packages/pygit2/remote.py", line 406, in fetch
+    err = C.git_remote_fetch(self._remote, arr, fetch_opts, to_bytes(message))
+KeyboardInterrupt
+❯❯❯ python3 test.py
+# ^C
+From cffi callback <function RemoteCallbacks._credentials_cb at 0x7f5e027700d0>:
+Traceback (most recent call last):
+  File "/home/gregoire/.local/lib/python3.7/site-packages/pygit2/remote.py", line 304, in _credentials_cb
+    ccred = get_credentials(credentials, url, username, allowed)
+  File "/home/gregoire/.local/lib/python3.7/site-packages/pygit2/remote.py", line 515, in get_credentials
+    if pubkey is None and privkey is None:
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "test.py", line 11, in <module>
+    repo.remotes['origin'].fetch(callbacks=MyCallbacks())
+  File "/home/gregoire/.local/lib/python3.7/site-packages/pygit2/remote.py", line 409, in fetch
+    check_error(err)
+  File "/home/gregoire/.local/lib/python3.7/site-packages/pygit2/errors.py", line 64, in check_error
+    raise GitError(message)
+_pygit2.GitError: callback failed to initialize SSH credentials
+```
+If a submodule has been added without the `--branch` option, accessing the `Submodule.branch` property raises a `RuntimeError`:
+
+```
+❯❯❯ git init
+Initialized empty Git repository in /tmp/gregoire/tmp.R3p5f9ZTwD/.git/
+❯❯❯ git submodule add https://github.com/libgit2/pygit2.git pygit2  --branch=master          
+[...]
+❯❯❯ python3 -c 'import pygit2; print(pygit2.Repository(".").lookup_submodule("pygit2").branch)'          
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/home/gregoire/.local/lib/python3.7/site-packages/pygit2/submodule.py", line 80, in branch
+    return ffi.string(branch).decode('utf-8')
+RuntimeError: cannot use string() on <cdata 'char *' NULL>
+```
+
+It works fine if `--branch` is added to `git submodule add`:
+```
+❯❯❯ git init
+Initialized empty Git repository in /tmp/gregoire/tmp.R3p5f9ZTwD/.git/
+❯❯❯ git submodule add https://github.com/libgit2/pygit2.git pygit2
+[...]
+❯❯❯ python3 -c 'import pygit2; print(pygit2.Repository(".").lookup_submodule("pygit2").branch)'
+master
+```
+
+Please see https://github.com/tobgu/pyrsistent/issues/182
+Hi there, I'm using a python 3.7.2 and pygit2 in TravisCI for building and deploying my github pages. The python script is used to scan all the commit and find the latest commit time for every file. But now I got an error in TravisCI when building, just like this: 
+```python
+Traceback (most recent call last):
+  File "travisPorcess.py", line 1, in <module>
+    from meta import meta_data, path
+  File "/home/travis/build/yindaheng98/My-docs/meta.py", line 5, in <module>
+    from getDate import data
+  File "/home/travis/build/yindaheng98/My-docs/getDate.py", line 71, in <module>
+    for commit in commits:
+KeyError: 'object not found - no match for id (c170b110850200770e9c0d1b35b2616dfe18614d)'
+```
+And this error was throw from:
+```python
+repo = pygit2.Repository('./')
+commits=repo.walk(repo.head.target,GIT_SORT_TOPOLOGICAL|GIT_SORT_REVERSE)
+
+last_tree=None
+for commit in commits:#<<<<<<<<-throw from here
+    date=time.gmtime(commit.commit_time)
+    date=time.strftime('%Y-%m-%d %H:%M:%S',date)
+    print("scanning commit %s at %s"%(commit.message,date))
+
+    tree=commit.tree
+    if last_tree is None:
+        last_tree=tree
+        continue
+
+    diff=tree.diff_to_tree(last_tree)
+    updateData(date,diff)
+    last_tree=tree
+```
+This error is **only appear in TravisCI**, it can done its work properly in my Notebook.
+
+Is this error caused by bugs? Or just my improper usage?
+
+PS: The complete python scripts is [here](https://github.com/yindaheng98/My-docs/tree/dae3fae37f32bef45a37759d02f023fe6eec6af2/getDate.py)
+Commit e442edaa7d02afcf97f1f2976ab413dab8283b1d can be found in this repository:
+
+https://git.sr.ht/~kvik/unionfs
+
+git upstream shows this commit as being authored at the epoch.

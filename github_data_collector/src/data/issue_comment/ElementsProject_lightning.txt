@@ -1,0 +1,507 @@
+### Issue and Steps to Reproduce
+<!-- Describe your issue and tell us how to reproduce it (include any useful information). -->
+
+The [documentation](https://lightning.readthedocs.io/) could benefit a lot from examples for the RPC commands. For example, from the [synopsis](https://lightning.readthedocs.io/lightning-sendpay.7.html)
+```
+sendpay route payment_hash [label] [msatoshi] [bolt11] [partid]
+```
+the following might not be immediately clear (judging from own experience):
+
+* `route` and `payment_hash` are mandatory, others are optional
+* specifying argument names for mandatory arguments (`route=`) is not required
+* `route` should be in the form `[nodeid1, nodeid2, nodeid3]`, without quotes
+* `payment_hash` must be in the form... (not sure, see #3419)
+* if any optional arguments are provided, all of them must be provided
+* optional arguments must be provided as a JSON objects, (add rules on escaping, quotes, etc)
+
+Some of the points above are command-specific, some are related to the API as a whole, but I haven't been able to find these points written down explicitly.
+
+For the command-specific issues, most of the uncertainties can probably be resolved by adding a simple example.
+
+### `getinfo` output
+
+### Issue and Steps to Reproduce
+<!-- Describe your issue and tell us how to reproduce it (include any useful information). -->
+
+It's not clear from [the documentation](https://lightning.readthedocs.io/lightning-sendpay.7.html) how this command should be used:
+```
+sendpay route payment_hash [label] [msatoshi] [bolt11] [partid]
+```
+I send a payment to a neighboring node 03b6 with the hash value of ones and get an error:
+
+```
+lightning-cli sendpay [03b66cddd29beb92f9fbdce91924cde26904ba7f5c44ddf73c4d3e0379541b3987] '1111111111111111111111111111111111111111111111111111111111111111' 
+{
+   "code": -32602,
+   "message": "Expected array or object for params"
+}
+```
+How should I use `sendpay`?
+
+### `getinfo` output
+```
+{
+   "id": "03068d9ac7f6973cbdb7212f2598afee2db14becd3d31e937659b0c09cee9f78f2",
+   "alias": "clightningM",
+   "color": "03068d",
+   "num_peers": 2,
+   "num_pending_channels": 0,
+   "num_active_channels": 2,
+   "num_inactive_channels": 0,
+   "address": [],
+   "binding": [
+      {
+         "type": "ipv4",
+         "address": "127.0.0.1",
+         "port": 9737
+      }
+   ],
+   "version": "v0.8.0-40-g899f5de",
+   "blockheight": 995,
+   "network": "regtest",
+   "msatoshi_fees_collected": 0,
+   "fees_collected_msat": "0msat",
+   "lightning-dir": "/home/sergei/.lightning/regtest"
+}
+```
+
+## Dual Funding
+
+This PR updates the channel establishment (aka openingd's responsiblity) to allow for both the originating and the reciprocating peer to contribute UTXOs to the funding transaction. The protocol for this has been laid out in [#524](https://github.com/lightningnetwork/lightning-rfc/pull/524) in the lightning-rfc's, but for ease of review, I'll include it here as well, along with some explanation for the decisions.
+
+Note that this PR does *not* encompass the RBF flows illustrated; those will be covered in a future update.
+
+
+        +-------+                              +-------+
+        |       |--(1)--- open_channel2  ----->|       |
+        |       |<-(2)--- accept_channel2 -----|       |
+        |       |                              |       |
+        |       |--(3a)-  funding_add_input -->|       |
+        |       |<-(3b)-  funding_add_input ---|       |
+        |       |--(3c)-  funding_add_input -->|       |
+        |       |--(3d)-  funding_add_output ->|       |
+        |       |<-(3e)-  funding_add_output --|       |
+        |       |                              |       |
+        |       |--(4a)- funding_add_complete >|       |
+        |       |<-(4b)- funding_add_complete -|       |
+        |   A   |                              |   B   |
+    --->|       |--(5)--  commitment_signed -->|       |
+    |   |       |<-(6)--  commitment_signed ---|       |
+    |   |       |                              |       |
+    |   |       |<-(7)--  funding_signed2   ---|       |
+    |   |       |                              |       |
+    |   |       |--(a)--- init_rbf ----------->|       |
+    ----|       |<-(b)--- ack_rbf  ------------|       |
+        |       |                              |       |
+        |       |--(8)--- funding_locked ----->|       |
+        |       |<-(9)--  funding_locked ------|       |
+        +-------+                              +-------+
+
+
+There are a few notable changes. First, the funding inputs and outputs are exchanged via rounds, where either peer may submit almost any number of `funding_add_input` or `funding_add_output` messages. The round is finished when both peers have sent a `funding_add_complete` message, with a tally of all the inputs and outputs that they sent.
+
+The peers construct the funding transaction from the set of inputs and outputs that have been sent and received, and update the message's `channel_id` accordingly, such that `commitment_signed` now includes both the correct funding transaction id and a valid commitment signature for that transaction.
+
+Finally, the reciprocating peer (also known as the accepter) sends the originating peer (opener) the signatures for their inputs in the funding transaction.
+
+### Why Rounds of Inputs/Outputs
+
+Originally, the dual funding protocol called for both peers to exchange signatures for their inputs. However, we've softened this to just the accepter side sending their signatures. The reason for this has to do with why we introduced the rounds of `funding_add` in the first place. The goal is to enable the accepter and the opener to both solicit and then include funding transaction outputs from other peers simultaneously. Here's a quick example of how the Accepter of a channel open might include a second open in the same transaction.
+
+
+	OPENER_A	ACCEPTER_A/OPENER_B		ACCEPTER_B
+	   -- open_channel --->
+	   <- accept_channel --
+	  -- funding_add_input->        -- open_channel --->
+	  <- funding_add_input -        <- accept_channel -- 
+	 -- funding_add_output ->       -- funding_add_input ->
+         <- funding_add_output --       -- funding_add_output ->
+	 -- funding_add_complete->      <- funding_add_input --
+	 <- funding_add_input --	<- funding_add_output --
+	 <- funding_add_output --	<- funding_add_complete --
+	 <- funding_add_complete -      -- funding_add_complete ->
+	 -- commitment_signed ->	-- commitment_signed ->
+	 <- commtment_signed --         <- commitment_signed --
+				        <- funding_signed2 --
+	 <- funding_signed2 --
+
+
+In this scenario, OPENER_A will be the peer that broadcasts the funding transaction, as they're the only peer who knows the signatures to their funding transaction inputs.
+
+Note that the `commitment_signed` message is broken out from the `funding_signed2` message. Originally I had these as the same message, but that would delay the communication of the `commitments` in the case where the the first accepter (ACCEPTER_A) needs to get the funding signatures from ACCEPTER_B before sending their signatures to OPENER_A.
+
+Note that this construction allows a small ambiguity into the origination of any input that an opener receives for a funding transaction. One downside to this is that the opener, as a result of their receiving all of the inputs and having control over the broadcast of the transaction, pays all of the fees.
+
+This makes opens more brittle, as more peers are required to be online and participate in order to RBF an open transaction. It has no effect on the operation of channels opened in this manner.
+
+### How to Dual Fund a Channel
+To dual fund a channel, we make use of the `openchannel` plugin hook. We've expanded the `openchannel` payload to include a few new fields. First, we now provide a `version` number of the channel open protocol that this `openchannel` request is using. Second, we rename `funding_satoshis` to `opener_satoshis`, as this amount is the satoshi value that the `opener` is contributing to the channel, not the total funding amount. Finally we also include an `available_funds` value, which tells the plugin the total amount of funds that the internal wallet currently has available to fund this channel.
+
+To contribute funds to an openchannel request, the hook must respond with a `continue` JSON object that also includes a `funding_sats` member, indicating the total value of satoshi that we should add to this channel.
+
+See `tests/plugins/funder.py` as a very simple example of this.
+
+
+### Channel Open Tracking
+With the first version of channel establishment, the publishing node was the one that owned all of the outputs as well as the funding transaction. Any failure of the channel to open was within your own purview; forgetting a failed channel open as an accepting peer had no consequences.
+
+v2, however, changes these assumptions. We now need to know if a channel open gets voided via the spend of any of its inputs. Until the channel funding transaction or an input to it is seen on chain, we must keep track and not forget any data about the channel open.
+
+To this end, this PR also includes a series of commits which add a new table to the database, called `output_tracking`. This is where we keep data of every input which pertains to a channel.
+
+If we detect a spend of an input for a channel's funding transaction (and not in that funding transaction), we move a channel to a temporary state called BORKED. It persists in the BORKED state until the offending transaction that contains the input spend reaches a depth of 6. At this point, the channel is forgotten, and a new open may be attempted with this peer. We also track these across re-orgs and restarts. If you restart a node with a rescan value of less than 6 there's a good chance you'll break this and your channel will get stuck in BORKED mode forever.
+
+### Errata
+Because of how fundchannel_start and fundchannel_complete are used under the hood to make `fundchannel` work, we do a few hacky things to work around the fact that txprepare/txsend hold the transaction for this channel. 
+
+Dual-funded transactions expect a zero-value output from the opener that will be used/filled in with the feerate; in order to accommodate this, `txprepare` has an option `zero_out_change`, which will supply a transaction with a change output of value zero. (Likewise, hsmd has been adjusted to make sure that we never actually sign a transaction with any output of value zero, so these are unspendable, as is). Completing a funding open (`fundchannel_complete`) will return the updated txid for the funding transaction. This updated txid is what must be passed into `txsend` in order to send the transaction, as the v2 channel open pathways modify the underlying prepared transaction in c-lightning's wallet.
+
+This is admittedly suboptimal; I've got some sketches done of how to transition this to PSBT.
+
+### Ongoing Work
+- [ ] The python tests are currently not passing (32 failed + 12 error on my machine)
+- [x] The commits for this PR are missing CHANGELOG entries
+- [ ] Protocol tests need to be fixed up for the new SIGS() and message updates
+- [ ] Protocol tests for the opener side need to be completed
+
+### Future Work
+- [ ] RBF 
+- [ ] Using PBST to handle the inputs/outputs for fundchannel_start/fundchannel_complete
+
+### Issue and Steps to Reproduce
+
+See unilateral close and INFO: 002... [here](https://Bitkoins.nl/out.txt)
+
+The node id is: `02ad6fb8d693dc1e4569bcedefadf5f72a931ae027dc0f0c544b34c1c6f3b9a02b`
+so what is that extra 0 doing in INFO 002ad6fb8d693dc...?
+
+### `getinfo` output
+{
+   "id": "02888244029c5909593038ab19f269947c720de3423e491791b46c7c92f76279b6",
+   "alias": "Bitkoins.nl",
+   "color": "23354d",
+   "num_peers": 10,
+   "num_pending_channels": 0,
+   "num_active_channels": 7,
+   "num_inactive_channels": 1,
+   "address": [
+      {
+         "type": "ipv4",
+         "address": "217.104.4.71",
+         "port": 9735
+      },
+      {
+         "type": "torv2",
+         "address": "tjeuwxa2rr24iprs.onion",
+         "port": 9735
+      },
+      {
+         "type": "torv3",
+         "address": "2bh7psr4dinasuz3d6jm5o56ebkmlnotqqptoesikzvsyqxwmaneyiad.onion",
+         "port": 9735
+      }
+   ],
+   "binding": [
+      {
+         "type": "ipv4",
+         "address": "192.168.178.20",
+         "port": 9735
+      }
+   ],
+   "version": "v0.8.0-1-gb14b2b0",
+   "blockheight": 613076,
+   "network": "bitcoin",
+   "msatoshi_fees_collected": 175554,
+   "fees_collected_msat": "175554msat",
+   "lightning-dir": "/home/user/.lightning/bitcoin"
+}
+
+### Issue and Steps to Reproduce
+I was trying to check the availability of nodes to make better routing decisions. While doing that I tried to connect to every node on the network and discovered the error from the title several times. You can reuse the code from: https://github.com/renepickhardt/lightning-helpers/blob/master/availability/probe_online_nodes.py
+
+I get several errors (as expected) because there is just a timeout of the connection. However I get several errors with a `crypotgraphic handshake` error for example this one: 
+
+```
+could not connect to 034389078da79098ffa96712a659fe58086a9f22e0b3dfd543d931e270037516e3 RPC call failed: method: connect, payload: {'id': '034389078da79098ffa96712a659fe58086a9f22e0b3dfd543d931e270037516e3'}, error: {'code': -1, 'message': '139.198.123.250:9835: Cryptographic handshake: Connection reset by peer. '}
+```
+
+I even reproduced it with loglevel-io and a new clear node:
+
+```
+$ lightningd --lightning-dir=/tmp/ln --network=bitcoin --bind-addr 127.0.0.1:9376 --log-level=io`
+$ lightning-cli --lightning-dir=/tmp/ln connect 034389078da79098ffa96712a659fe58086a9f22e0b3dfd543d931e270037516e3 139.198.123.250 9835
+```
+
+which produces the following log output.
+```
+2020-01-15T12:17:36.399Z jsonrpc#25: [IN] 7b20226a736f6e72706322203a2022322e30222c20226d6574686f6422203a2022636f6e6e656374222c2022696422203a20226c696768746e696e672d636c69
+2020-01-15T12:17:36.399Z jsonrpc#25: [IN] 2d3130303735222c2022706172616d7322203a5b2022303334333839303738646137393039386666613936373132613635396665353830383661396632326530
+2020-01-15T12:17:36.399Z jsonrpc#25: [IN] 623364666435343364393331653237303033373531366533222c20223133392e3139382e3132332e323530222c20393833355d207d
+2020-01-15T12:17:36.758Z DEBUG 034389078da79098ffa96712a659fe58086a9f22e0b3dfd543d931e270037516e3-connectd: Connected out, starting crypto
+2020-01-15T12:17:41.498Z DEBUG lightningd: ... feerate estimate for normal hit floor 253
+2020-01-15T12:17:41.498Z DEBUG lightningd: ... feerate estimate for slow hit floor 253
+2020-01-15T12:18:11.505Z DEBUG gossipd: seeker: no peers, waiting
+2020-01-15T12:18:11.541Z DEBUG lightningd: ... feerate estimate for normal hit floor 253
+2020-01-15T12:18:11.541Z DEBUG lightningd: ... feerate estimate for slow hit floor 253
+2020-01-15T12:18:37.112Z jsonrpc#25: [OUT] 7b226a736f6e727063223a22322e30222c226964223a226c696768746e696e672d636c692d3130303735222c226572726f72223a7b22636f6465223a2d312c226d657373616765223a223133392e3139382e3132332e3235303a393833353a2043727970746f677261706869632068616e647368616b653a20436f6e6e656374696f6e20726573657420627920706565722e20227d207d0a0a
+2020-01-15T12:18:37.112Z DEBUG 034389078da79098ffa96712a659fe58086a9f22e0b3dfd543d931e270037516e3-connectd: Failed connected out: 139.198.123.250:9835: Cryptographic handshake: Connection reset by peer.
+ ```
+
+### `getinfo` output
+```
+{
+   "id": "02a5d7aa269cec5aa53990d8424760cf4d2bed45a3608aef7d8d81489702f13266",
+   "alias": "ANGRYSUCKER",
+   "color": "02a5d7",
+   "num_peers": 903,
+   "num_pending_channels": 0,
+   "num_active_channels": 0,
+   "num_inactive_channels": 0,
+   "address": [
+      {
+         "type": "ipv4",
+         "address": "XXXXXXXX",
+         "port": 9735
+      },
+      {
+         "type": "ipv6",
+         "address": "XXXXXXXXX",
+         "port": 9735
+      }
+   ],
+   "binding": [
+      {
+         "type": "ipv6",
+         "address": "::",
+         "port": 9735
+      },
+      {
+         "type": "ipv4",
+         "address": "0.0.0.0",
+         "port": 9735
+      }
+   ],
+   "version": "v0.8.0",
+   "blockheight": 612949,
+   "network": "bitcoin",
+   "msatoshi_fees_collected": 0,
+   "fees_collected_msat": "0msat",
+   "lightning-dir": "/home/rpickhardt/.lightning/bitcoin"
+}
+```
+
+
+While studying the existing `fundchannel` in preparation for fully implementing #1936 , I noticed that the current `fundchannel` does this:
+
+* `connect` to peer.
+* `txprepare` a "dry-run" fundchannel using a dummy funding address.
+  * Extract the funding output amount in the returned transaction --- presumably this is how we determine the actual amount when given `all`.
+* `fundchannel_start` to peer using the extracted amount, receiving a target funding address
+* `txdiscard` the previous "dry-run" transaction.
+* `txprepare`, this time with the now-filled-in funding address.
+* `fundchannel_complete` with the transaction ID.
+* `txsend` the transaction.
+
+What I want to point is that in theory, it would be possible for a sufficiently heavily-used server to have some *other* `withdraw`, `fundchannel`, or `txprepare` execute between the `txdiscard` of the dry-run transaction and the subsequent `txprepare` as a multithreaded race condition.
+
+As locking of the RPC is not implemented (and would be dangerous as well --- consider that a plugin can easily deadlock itself with an incorrect lock behavior), we might instead want to have an atomic operation that combines a `txdiscard` with a `txprepare` that uses the exact same inputs and outputs, just redirects the address of an output.
+
+So let me propose:
+
+    txmodifypayee txid modifications
+
+Where `modifications` is an array containing objects with fields:
+
+    {
+        'outnum' : 0,
+        'address': "3LXPWUpTGKmeatx6NpyQ8A8TZr2GCXkK4u"
+    }
+
+The `address` would have to take up the same amount of space as the current address at that `outnum`.
+
+The command succeeds or fails "atomically".  If it succeeds, then the old txid is no longer passable to `txdiscard` or `txsend`.  If it fails, then the old txid can still be passed to `txdiscard` or `txsend`.
+
+Thoughts @niftynei @cdecker @rustyrussell ?
+### Issue and Steps to Reproduce
+<!-- Describe your issue and tell us how to reproduce it (include any useful information). -->
+I've set up a regtest LN on a local machine with one c-lightning instance and two Eclair instances (clightning - Eclair1 - Eclair2). The problem is that clightning doesn't know on the channel between Eclair1 and Eclair2 and can't route payments to Eclair2. Connecting clightning to Eclair2 (meaning P2P connection, not a channel) doesn't help: the channel isn't added to clightning's view of the graph.
+
+Is there a way to manually add a channels to clightning's view?
+
+(Another solution may be to force Eclair to send a channel update, but that is not a clightning issue. Asked about it [on Eclair's Gitter](https://gitter.im/ACINQ/eclair?at=5e1892c9c39503490276bc67).)
+
+### `getinfo` output
+```
+{
+   "id": "03068d9ac7f6973cbdb7212f2598afee2db14becd3d31e937659b0c09cee9f78f2",
+   "alias": "clightningM",
+   "color": "03068d",
+   "num_peers": 2,
+   "num_pending_channels": 0,
+   "num_active_channels": 1,
+   "num_inactive_channels": 0,
+   "address": [],
+   "binding": [
+      {
+         "type": "ipv4",
+         "address": "127.0.0.1",
+         "port": 9737
+      }
+   ],
+   "version": "v0.8.0-40-g899f5de",
+   "blockheight": 702,
+   "network": "regtest",
+   "msatoshi_fees_collected": 0,
+   "fees_collected_msat": "0msat",
+   "lightning-dir": "/home/sergei/.lightning/regtest"
+}
+```
+As a challenge, I (with some help from others) built https://onion.studio to explore how the `createonion`, `sendonion` and generally the TLV stuff can be used for building apps. Also, maybe help spread awareness of the associated concepts out there. The full code is all at: https://github.com/jarret/onionstudio
+
+First, thanks to all of you in the C-Lightning project for building this stuff, exposing it to be used from the outside and performing the handful of public talks to explain it. Very cool stuff that I am excited to follow the future of.
+
+Here are some of my thoughts and feedback about some of the bumpy parts I encountered in my arc of building. A lot of it is along the lines of "other app developers will likely have need for the same stuff I wrote, so shared plugin/platform code that makes these operations easier would be a benefit". This type of thing also might be premature to action on without additional feedback from others trying to build apps.
+
+I hope this account is useful info to help refine going forward. I apologize in advance for verbosity:
+
+1.
+
+The documentation for `createonion` refers to BOLT 4 for how to encode a payload. That was a rabbit hole for me to go down and I ended up having to implement the stuff in BOLT 1 in Python in order to build the TLV payloads myself.
+
+[This library](https://github.com/jarret/onionstudio/tree/master/bolt) is somewhat generalized such that it could be used by a different Python app and has four main modules - `bigsize.py`, `tlv.py`, `namespace.py` and `hop_payload.py` which build on each other (in that order).
+
+For my app-specific extension TLVs, I extend a generated hop payload with my [extension module](https://github.com/jarret/onionstudio/blob/master/onionstudio/extension.py).
+
+When writing this, I was thinking about how C-Lightning has the `invoice` and `decodepay` commands which, in a way, go together as a pair for creating and decoding a BOLT 11. `invoice` also is able to prevent the creation of an incorrect BOLT 11 with the benefit of context. The net effect is that the application developer doesn't have to think much about the details of BOLT 11 encodings, so maybe that is similarly achievable for the BOLT 4 payload encodings.
+
+SUGGESTION 1:
+It might be good to provide an 'on rails' payload creator that can to all the TLV encoding/decoding according to spec with the main codebase such that encoders/decoders don't have to be written in N different languages. Also, it is imaginably straightforward to include optional parameters for extension TLVs to be appended after.
+
+
+2.
+
+Since a) there is the hard cap of 1300 bytes for the payload + HMAC data in the onion packet and b) the data is all variably-length encoded for compactness and c) The quantity of hops to get to the destination (and back) can also be fluid, it makes it difficult to determine how much data is ultimately available in the packet for application extension data.
+
+My solution for Onion Studio is a [fudgy estimate](https://github.com/jarret/onionstudio/blob/81717e295a70499495c39e27e91e934118424f7e/onionstudio/onion.py#L72) starting point and a couple iteration of finding hops and attempting an encoding, and reducing the amount of payload pixels I encode until it fits under the 1300 byte limit.
+
+Also, when playing with this stuff I hit the two crashing bugs: https://github.com/ElementsProject/lightning/issues/3377 https://github.com/ElementsProject/lightning/issues/3370 which were additional pain for trying to use the `createonion` command before I had a proper clue about what I was doing.
+
+Overall, this was kind of gnarly to get done, but I now have some solution logic written that might be helpful to others.
+
+SUGGESTION 2a:
+Aside from fixing the crashes and giving nice error messages when you give wrong input, it might be good to provide a fuller-featured onion packet creator functionality that is more aware of the content and give you less rope to hang yourself with. Application-side fudgy estimates like mine are doomed to be less accurate and maintained than the internal code for creating onions doing validation, so it seems to make sense to provide a better service.
+
+SUGGESTION 2b:
+Perhaps in conjunction with SUGGESTION 1, the workflow for such an onion creator tool might have two phases. First, a phase for creating the routing instructions as desired since that is the most important thing. Second, the first phase might tell you how many 'spare' bytes are left for non-routing/extension concerns and then lets you fill them in.
+
+
+3.
+
+Onion Studio's client sends the pixel data via a circular route and pays for the pixels by 'overpaying' the routing fee at that hop. The route creation uses `getroute` with a `fuzzpercent` setting of `0.0`. It uses the `fromid` to compute the reverse route in the same way, which is can be identical to the outgoing route. It has to be deterministic simply because the algorithm need to hold the route relatively constant as it iterates on the onion construction to fit the pixel payload and appropriate payment using the rest of the space (and changing the payment amount also can influence the chosen route, changing the available space, changing the number of pixels in the payload, changing the payment, etc.).
+
+This implementation trickiness resulted in me abandoning the desire to construct a 'good' circular route that would prefer the outgoing and returning route to be fuzzy and avoid node overlaps. The result is an implementation that is perhaps sub-par for the purpose of passing a maximally-discreet message.
+
+The chosen circular scheme is also convenient for sending data without some out-of-band negotiation between the source in the destination. An alternative for a similar app might be the "Key Send" scheme to make it a unidirectional send of a payment + extension data. However, choosing between the two schemes for a particular style of app is a complex discussion that I don't have a clear formed opinion on.
+
+However, I observe that the circular scheme might be useful for obscuring the real destination of a 'TLV RPC call' among the set of participants in the circular route.
+
+Also, I observe that if there are schemes designed (I expect this to be inevitable, if not already happened) for 'TLV RPC calls' where there is a call out with a payload to a node, and a call back with a payload to the source, this might look exactly like a circular operation, even though it might be two different unidirectional sub-operations in implementation. Having both schemes around and supported might be a good platform for privacy for the variety of possible operations.
+
+SUGGESTION 3:
+A "get circular route" operation might be a good plugin/command to provide as a common utility. Also, given that the 'real' payment might be in the form of a forwarding fee somewhere along the route, it would be a nice feature if that amount could be optionally be selected as a criteria.
+
+
+4.
+
+A noted fact of the extension TLVs is that they are delivered to their intended recipient before the preimage is revealed to trigger the associated payment. Onion Studio's design is such that the pixels don't draw until the payment is received.
+
+On the application side, it has to catch the 'payload' field upon a call from the `htlc_accepted` hook notification and hold on to the data it until getting a `forward_event` notification. Also, the application needs to have a scheduled 'pruning' step to cull the stored payload data from forwarding HTLCs that never get paid.
+
+SUGGESTION 4a:
+Possibly consider a design for notifications to the plugin to give notification of the extension TLVs specifically along their lifecycle such that the application can get a notification upon 1) HTLC accepted 2) HTLC fulfilled or 3) HTLC expired. This way the extension TLV might not need to be held separately by the application
+
+SUGGESTION 4b:
+One (perhaps half-baked) thought is that there might be value in the protocol supporting encrypted extended TLVs that can only be decrypted with knowledge of the preimage. This would be such that the recipient doesn't know what the requested extension operation is until the payment is received. This would give sender the option to avoid revealing the content of request until the sender has definitively decided to go ahead with the payment/operation.
+
+
+5.
+
+With Onion Studio, typically only ~250 encoded pixels fit in the onion packet. Unless they are tiny `.png` images, they have to be split up into many separate payments. For example, a 200x200 pixel image will require approximately 160 payments of 250 satoshis each totalling 40,000 satoshis to transmit all the pixels.
+
+There is a challenge in estimating channel capacity for this kind of payment because it isn't quite "I wish to route 40k sats to the destination", it is "I wish to route many small payments totaling 40k sats to the destination which can go via different routes". Ideally, we would want to determine for the user whether it looks like that can realistically be done to completion before deciding to proceed. Right now, the approach of Onion Studio is to allow failure if there is a capacity exhaustion event midway, but gives the user the option to manually resume the transmission from the point it left off later. However, this might be frustrating user experience to have to babysit the operation and restart.
+
+I imagine this is a similar problem for other data-publishing apps where it doesn't really deliver full value to only get a partial set of payments through to their destination.
+
+
+SUGGESTION 5:
+This probably needs a chunk of science done to figure out good algorithms for this, but I can perhaps spot a similarity between this and the routing considerations needed for AMP. In this specific concern, we want the full message transmission to be the concern for atomicity. It might make sense to include this problem for consideration in that discussion.
+
+
+~
+
+FIN
+
+Currently, libplugin inherently assumes that every plugin-level command will have a single "thread" of operations.
+
+For example, `pay` might do something like:
+
+     ... --> getroute --> sendpay --> waitsendpay ---> ...
+
+While designing a C plugin for `multifundchannel` for #1936, however, I think it is best if we can support sending multiple commands in parallel, e.g.:
+
+          +-> connect -+              +-> fundchannel_start -+
+          |            |              |                      |
+     ... -+-> connect -+-> txprepare -+-> fundchannel_start -+-> ...
+          |            |   (dryrun)   |                      |
+          +-> connect -+              +-> fundchannel_start -+
+
+Currently `send_outreq` is designed to just send commands one at a time, with processing of the plugin command suspended while the lower-level command is executed.
+
+This is undesirable for `multifundchannel` since we would end up waiting for one peer to finish some step, then move to the next peer, when in principle since those are (presumably) separate peers then we should be able to at least start the phase in parallel with all of them.  That way, the time of a phase is only the slowest peer, instead of the sum of all the times of all peers.
+
+What I would *like* to have is something in `libplugin.h` that  is very much like:
+
+
+    struct plugin_spark;
+    struct plugin_spark_completion;
+
+    /* Perform some commands in the background.  */
+    struct plugin_spark *
+    plugin_spark(struct command *cmd,
+                 struct command_result *(*spark_cb)(struct command *cmd,
+                                                    struct plugin_spark_completion *complete,
+                                                    void *arg),
+                 void *arg);
+
+    /* Called within the spark_cb.  */
+    struct command_result *
+    plugin_complete_spark(struct command *cmd,
+                          struct plugin_spark_completion *complete);
+
+    /* Called by the caller of plugin_spark.
+     * Wait for one or more sparks to call plugin_complete_spark,
+     * then invoke the callback when all of them have completed.
+     */
+    struct command_result *
+    plugin_wait_sparks(struct command *cmd,
+                       /* Allows us to static-alloc a fixed array of sparks
+                        * instead of always requiring a tallocated array.  */
+                       unsigned int num_sparks,
+                       struct plugin_spark **sparks,
+                       struct command_result *(*cb)(struct command *cmd,
+                                                    void *arg),
+                       void *arg);
+
+To some extent, the current `plugin_timer` has a lot of similarities to this, and with some modification to `plugin_timer` (specifically, allow creating a timer that has an argument and a `struct command`) and access to the `struct command_result pending, complete;`, it *might* be possible to build the above sparks system on top of the plugin timers (by using timers with `0` `timerel` as the spark, construct a spark object that serves as coordinator between the timer and the "main thread", etc.....).
+
+Then for the `multifundchannel` case, during the `connect` phase we would start sparks for each peer listed, saving the `spark` for each, then wait for all the sparks to complete and check the results for the `connect` commands.
+
+Of course, concurrency is much harder.................. sigh.
+
+Thoughts? @rustyrussell @niftynei @cdecker ?
+Rationale described here: https://github.com/ElementsProject/lightning/issues/3354#issuecomment-569715461.
+
+Summary: We may be going to rely on plugin-exposed RPC methods for crucial operations (such as Bitcoin backend), a versioning is useful to avoid nasty corner cases.
+
+Open questions:
+- should we allow to register multiple RPC methods with the same name, but different versions ?

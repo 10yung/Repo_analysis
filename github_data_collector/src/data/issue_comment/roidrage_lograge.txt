@@ -1,0 +1,189 @@
+This pull request enables CI against Ruby 2.7.
+Rails 6 provides allocations to event subscribers now, so it would be nice to include these in the default stats when available
+My lograge configuration look as below
+```
+    config.lograge.enabled = true
+    config.lograge.base_controller_class = ['ActionController::Base']
+    config.lograge.formatter = Lograge::Formatters::Logstash.new
+```
+But whenever i use `Rails.logger.info("this is my log string")`, in log files it comes like this
+
+```
+this is my log string
+{"method":"GET","path":"/some-api","format":"json","controller":"controller-some","action":"ping","status":200,"duration":3.72,"view":0.41,"db":0.0,"transaction.id":null,"span.id":null,"trace.id":null,"params":{},"exception":null,"exception_object":null,"remote_ip":"127.0.0.1","@timestamp":"2019-11-26T09:53:12.184Z","@version":"1","message":"[200] GET /some-api"}
+```
+
+I want to append timestamp before all `Rails.logger.` entries.
+I wan to format the log based on a type parameter sent in the logger.info message.
+For example:
+`Rails.logger.info({type: 'test_log'})`, used something similar in a non-lograge setup.
+
+I have build a custom formatter for this, the problem is the actual rails logger message is not included in the custom formatter data parameter, all the info i get there is the one sent from the event in 
+`config.lograge.custom_options = lambda do |event|`
+since i sent multiple parameters that i wan included in all the logs.
+
+Thank You
+https://github.com/roidrage/lograge/blob/2347f635f0cd3d8c21f0159e797ed341f63a925d/lib/lograge/rails_ext/action_cable/connection/base.rb#L8
+
+where is the `websocket` object initialized?
+
+Application error: undefined method `protocol' for nil:NilClass
+Application error: undefined method `protocol' for nil:NilClass
+# Problem
+https://github.com/roidrage/lograge/issues/255 and https://github.com/roidrage/lograge/issues/272 highlight the problem. To summarize, it's great that lograge by default tacks on fields like 'action', 'controller', 'format', etc onto the controller log entries. But it's unfortunate that other log entries triggered throughout the request do not have these fields tacked on.
+
+# Goal
+The goal of this PR is to make it so that you can opt into having all log entries (even those triggered from third-party gems) within a request have the default fields that lograge typically adds on, plus any fields added on by the user's supplied `config.lograge.custom_payload` by using a special formatter.
+
+# Example Config
+Below is an example of how the newly added formatter, `Lograge::LogStashLoggerFormatters::MergedWithLogragePayload`, can be used to add all the fields on all the log entries.
+
+```ruby
+require 'lograge/logstash_logger_formatters/merged_with_lograge_payload'
+
+Rails.application.configure do
+  config.lograge.enabled = true
+  config.lograge.formatter = Lograge::Formatters::Logstash.new
+  config.lograge.custom_payload do |controller|
+    request = controller.request
+    {
+      remote_ip: request.remote_ip,
+      request_id: request.request_id
+      # ...
+    }
+  end
+  config.lograge.logger = LogStashLogger.new(
+    type: :multi_delegator,
+    formatter: Lograge::LogStashLoggerFormatters::MergedWithLogragePayload,
+    outputs: [
+      { type: :file, path: 'log/development.log' },
+      { type: :tcp, host: 'listener.example.com', port: 5050 }
+    ],
+    customize_event: ->(event) {
+      event['token'] = 'logstash_service_token'
+    }
+  )
+  Rails.logger = config.lograge.logger
+end
+```
+
+# Open Questions
+I have left a couple of `TODO`s in the code that I think warrant more discussion; please feel free to comment and we can come to a consensus on the right approach.
+
+# Limitations
+Logs triggered from middleware that is run before the Rails application is run will not get the additional fields tacked on because this change relies on the [start_processing.action_controller event](https://guides.rubyonrails.org/active_support_instrumentation.html#start-processing-action-controller). As far as I can tell, there is no trivial fix for this, though this can be revisited later.
+
+# Callouts
+1. Provided this approach is on the right path, I will add to the specs and README.
+2. Using a formatter in this way with logstash-logger doesn't totally work out of the box, I have submitted a fix PR: https://github.com/dwbutler/logstash-logger/pull/155. If there is lag in getting that merged, I think I can outline a temporary workaround.
+
+### Context
+Hi, I have a project using https://github.com/binarylogic/authlogic and I had trouble to get it running in production, because of a railties setup problem: `ActionController` was required before the authlogic lazy setup could trigger.
+
+### Why I think it's lograge related?
+Because I checked all my gems by disabling them individually. And when I disable lograge, everything runs fine.
+
+Digging further, I found out that the culprit was an initializer invoking Lograge `custom_payload`.
+
+### demo-app
+https://github.com/bobmaerten/authlogic_rails_adapter_loaded_to_late
+
+I've set up an example application which trigger an error with authologic when precompiling production assets with a configured Lograge initializer (same effect when config is placed in `config/environment/production.rb`)
+
+Running assets precompilation fails:
+
+```
+$ DISABLE_SPRING=1 RAILS_ENV=production bundle exec rails assets:clean assets:precompile
+rails aborted!
+Authlogic::ControllerAdapters::RailsAdapter::AuthlogicLoadedTooLateError: Authlogic is trying to add a callback to ActionController::Base but ApplicationController has already been loaded, so the callback won't be copied into your application. Generally this is due to another gem or plugin requiring your ApplicationController prematurely, such as the resource_controller plugin. Please require Authlogic first, before these other gems / plugins.
+/Users/bob/Work/authlogic_rails_adapted_loaded_to_late/config/environment.rb:5:in `<main>'
+bin/rails:9:in `<main>'
+Tasks: TOP => environment
+(See full trace by running task with --trace)
+```
+
+
+When removing `config/initializers/lograge.rb` or block in `config/environment/production.rb` or even simple usage of `config.lograge.custom_payload`from those files.
+
+```
+$ DISABLE_SPRING=1 RAILS_ENV=production bundle exec rails assets:clean assets:precompile
+yarn install v1.17.3
+[1/4] 🔍  Resolving packages...
+success Already up-to-date.
+✨  Done in 0.41s.
+```
+
+### What did I do to make the whole gems work together?
+We managed to split the configuration from the initializer to production environment file and ApplicationController by overriding the rails `append_info_to_payload` method as suggested in the documentation.
+
+```
+# app/controllers/application_controller.rb
+class ApplicationController < ActionController::Base
+  def append_info_to_payload(payload)
+    super
+    payload[:host] = request.host
+  end
+end
+```
+
+```
+# config/initializers/lograge.rb
+Rails.application.configure do
+  config.lograge.enabled = true
+
+  # add time to lograge
+  config.lograge.custom_options = lambda do |event|
+    {host:  event.payload[:host]}
+  end
+end
+```
+
+With this setup, it works. With the documented `custom_payload` it's not.
+
+### Trying to find what is not working
+Authlogic just got upgraded to 5.0.3 with a change in its `ActionController` setup.
+
+I'm not super fluent in railties, but Lograge seems not use the rails setup best practise, and instead juste requiring rails components like this https://github.com/roidrage/lograge/blob/397c830208a7ec1601c0eacc0dddd09274afff5b/lib/lograge/railtie.rb#L1
+
+May be you could replace the code with something like 
+```ruby
+require "active_support"
+
+ActiveSupport.on_load(:action_controller) do
+  # do whatever Lograge need to do
+end
+```
+
+or may be just drop the `custom_payload` example from the documentation?
+
+* Exclude CI matrix between Ruby 2.6 and Rails 6.0
+Rails 6.0 requires Ruby 2.5
+  - https://github.com/rails/rails/pull/34754
+
+No need to exclude any JRuby because "JRuby 9.2.x is compatible with Ruby 2.5.x"
+  - https://www.jruby.org/2019/04/09/jruby-9-2-7-0.html
+This PR updates the CI matrix to use latest JRuby, **9.2.9.0**.
+
+[JRuby 9.2.9.0 release blog post](https://www.jruby.org/2019/10/30/jruby-9-2-9-0.html)
+Hello,
+
+Any ideas why AR SQLs are not showing in `logs/test.log`?
+
+I've got:
+
+**Gemfile**
+```
+  gem 'lograge'
+  gem 'lograge-sql'
+```
+
+**config/environments/test.rb**
+```
+require 'lograge/sql/extension'
+
+Rails.application.configure do
+  config.log_level = :debug
+  config.lograge.enabled = true
+  config.lograge.keep_original_rails_log = true
+end
+```

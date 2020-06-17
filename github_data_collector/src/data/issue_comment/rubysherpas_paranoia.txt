@@ -1,0 +1,157 @@
+
+Hi.
+I call throw(:abort) in before_destroy callback and wait rollback for restore has_many :dependent => :destroy records, but rollback does not occur
+
+https://gist.github.com/Able1991/8291b9ba95fd5f1d1adb6d6c751932a1
+
+![69525378-0bb39780-0f79-11ea-8396-fcd78a66a244](https://user-images.githubusercontent.com/3898046/72324041-1eb23080-36bb-11ea-89b1-c0e54f2f9ccd.png)
+
+but I expect a rollback)
+`gem update --system` fails with Ruby 2.2.
+
+This should also make #482 succeed.
+Trigger after_commit on destroy to work with rails 6
+
+This addresses https://github.com/rubysherpas/paranoia/issues/478
+Using the `recovery_window` option with a custom column name raises an exception since the `deleted_at` value is hard coded.
+Can I set a future date to soft delete an object?
+
+```ruby
+object.deleted_at = DateTime.tomorrow
+```
+
+So the gem would check if `deleted_at != nil` and `DateTime.today < deleted_at`
+Rails 5.1.6, Ruby 2.4.3, paranoia 2.4.1. MySQL 5.7
+
+I have the following model setup:
+```ruby
+class Parent < ApplicationRecord
+    acts_as_paranoid
+    has_many :children, dependent: :destroy
+    accepts_nested_attributes_for :children, reject_if: :all_blank, allow_destroy: true
+    ...
+end
+class Child < ApplicationRecord
+    acts_as_paranoid
+    belongs_to :parent
+    ...
+end
+````
+I'm seeing issues when trying to do get the associated children records for a given parent:
+```ruby
+parent = Parent.find(1)
+```
+One record in the `associated_children` collection is soft-deleted, but the others are not.
+```ruby 
+parent.children.count 
+=> 0 # returns 0 even though I can see 32 non-deleted associated_children records in the DB and Rails console
+
+parent.children.with_deleted.count
+=> 33
+```
+So there should be 32 records returned for `associated_children`, but instead I see:
+```ruby
+parent.children.without_deleted.count
+=> 0
+
+parent.children.with_deleted.pluck(:deleted_at)
+=> [nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, Thu, 03 Jan 2019 16:56:33 UTC +00:00, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil]
+```
+
+The kicker is this is only happening on 1 table of my database, and only on production. When I copy the production database locally the exact same queries as above work just fine for the same models that are failing on production.
+When a freshly loaded record is destroyed, then `after_commit` callbacks are not called. I.e.:
+
+```ruby
+user = User.first
+user.destroy # after_commit callbacks don't work
+```
+
+However if the record is updated after it has been loaded, then everything works as expected.
+
+```ruby
+user = User.first
+user.touch
+user.destroy # after_commit callbacks work
+```
+
+It works also on freshly created records therefore the current test suite did not catch this bug.
+
+```ruby
+user = User.create!
+user.destroy # after_commit callbacks work
+```
+
+This happens only on Rails 6.0.0. It works as expected with Rails 5.2.3.
+
+### Steps to reproduce
+
+Run the following ruby script:
+
+```ruby
+# frozen_string_literal: true
+
+require "bundler/inline"
+
+gemfile(true) do
+  source "https://rubygems.org"
+
+  git_source(:github) { |repo| "https://github.com/#{repo}.git" }
+
+  # Activate the gem you are reporting the issue against.
+  gem "activerecord", "6.0.0"
+  # gem "activerecord", "5.2.3" <- this version works
+  gem "paranoia"
+  gem "sqlite3"
+end
+
+require "active_record"
+require "minitest/autorun"
+require "paranoia"
+
+ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
+
+ActiveRecord::Schema.define do
+  create_table :users, force: true do |t|
+    t.datetime :updated_at
+    t.datetime :deleted_at
+  end
+end
+
+class User < ActiveRecord::Base
+  acts_as_paranoid
+
+  after_commit -> { @after_commit_called = true }
+
+  def reset_callback_variables
+    @after_commit_called = nil
+  end
+
+  def after_commit_callback_called?
+    @after_commit_called
+  end
+end
+
+class BugTest < Minitest::Test
+  def setup
+    User.create!
+    @user = User.first
+    refute @user.after_commit_callback_called?
+  end
+
+  def test_freshly_loaded_model
+    @user.destroy
+
+    assert @user.after_commit_callback_called?
+  end
+
+  def test_touched_model
+    @user.touch
+
+    @user.destroy
+
+    assert @user.after_commit_callback_called?
+  end
+end
+```
+
+When a model has no :dependent option in their association, this is nil. `target.send(options[:dependent])` will fail in this case.

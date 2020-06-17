@@ -1,0 +1,286 @@
+Apparently the Cygwin platform is not supported as compiling ctx.c results in:
+
+  CC       libdill_la-stack.lo
+  CC       libdill_la-ctx.lo
+ctx.c:102:2: error: #error "Cannot determine which thread is the main thread."
+ #error "Cannot determine which thread is the main thread."
+  ^~~~~
+ctx.c: In function ‘dill_ctx_term’:
+ctx.c:123:8: warning: implicit declaration of function ‘dill_ismain’; did you mean ‘dill_clean’? [-Wimplicit-function-declaration]
+     if(dill_ismain()) dill_main = NULL;
+        ^~~~~~~~~~~
+        dill_clean
+make[1]: *** [Makefile:1729: libdill_la-ctx.lo] Error 1
+
+Is there any workaround for this? Some research brought up the function pthread_equal() as the portable way to compare thread IDs. Of course, this would mean that some initialisation is required to make sure the ID of the main thread is stored.
+(For the moment my naïve workaround to use pthread_self() as with the __sun case works for my current very limited use case, connecting programs via TCP.)
+
+
+Hello Martin,
+
+Is there a reason why happy eyeballs is not exported? I'd be happy to fix, but not sure if you wanted to keep it private for a reason.
+
+Sincerely,
+James
+Allows to configure the default stack size, when it is not specified by the application.
+Also allows to configure the max number of stacks kept in cache.
+
+This patch is licensed under the terms of the MIT License.
+The PR is supposed to address the issue https://github.com/sustrik/libdill/issues/191
+Tested with:
+
+```
+> gcc --version
+gcc (GCC) 9.1.0
+```
+Code:
+```c
+#include <libdill.h>
+#include <assert.h>
+
+coroutine void empty() {}
+
+int main() {
+	int all = bundle();
+	assert(all != -1);
+	bundle_go(all, empty()); /* #9 */
+	assert(hclose(all) != -1);
+}
+```
+
+When trying to compile:
+```bash
+gymmasssorla@gymmasssorla-desktop:~$ gcc main.c -std=c99 -ldill -pthread
+In file included from main.c:1:0:
+main.c: In function ‘main’:
+main.c:9:2: error: expected ‘)’ before ‘:’ token
+  bundle_go(all, empty()); /* #9 */
+  ^
+main.c:9:2: error: expected ‘)’ before ‘:’ token
+  bundle_go(all, empty()); /* #9 */
+  ^
+main.c:9:2: error: expected ‘;’ before ‘volatile’
+  bundle_go(all, empty()); /* #9 */
+  ^
+gymmasssorla@gymmasssorla-desktop:~$ gcc main.c -std=c11 -ldill -pthread
+In file included from main.c:1:0:
+main.c: In function ‘main’:
+main.c:9:2: error: expected ‘)’ before ‘:’ token
+  bundle_go(all, empty()); /* #9 */
+  ^
+main.c:9:2: error: expected ‘)’ before ‘:’ token
+  bundle_go(all, empty()); /* #9 */
+  ^
+main.c:9:2: error: expected ‘;’ before ‘volatile’
+  bundle_go(all, empty()); /* #9 */
+  ^
+gymmasssorla@gymmasssorla-desktop:~$ gcc main.c -std=c90 -ldill -pthread
+In file included from main.c:1:0:
+main.c: In function ‘main’:
+main.c:9:2: error: expected ‘)’ before ‘:’ token
+  bundle_go(all, empty()); /* #9 */
+  ^
+main.c:9:2: error: expected ‘)’ before ‘:’ token
+  bundle_go(all, empty()); /* #9 */
+  ^
+main.c:9:2: error: expected ‘;’ before ‘volatile’
+  bundle_go(all, empty()); /* #9 */
+  ^
+```
+
+But everything works without the `--std=X` option. Is this a bug in the LibDill's source code?
+I don't know if you are interested in some QuickCheck property tests? I am studying property-based testing using QuickCheck, and I choose libdill as one of my test projects. I have written a few tests for the channel interface based on the tests in tests/chan.c, yet I haven't uncovered any bugs.
+Failure:
+
+``` shell
+$ arm-linux-musleabi-gcc -I. -c ipaddr.c -o libdill_la-ipaddr.o
+In file included from ipaddr.c:44:
+ipaddr.c: In function 'dill_ipaddr_remotes':
+dns/dns.h:1009:24: error: lvalue required as unary '&' operand
+ 1009 | #define dns_opts(...) (&dns_quietinit((struct dns_options)DNS_OPTS_INIT(__VA_ARGS__)))
+      |                        ^
+ipaddr.c:335:47: note: in expansion of macro 'dns_opts'
+  335 |         dill_dns_hosts, dill_dns_hints, NULL, dns_opts(), &rc);
+      |                                               ^~~~~~~~
+$ gcc -I. -c ipaddr.c -o libdill_la-ipaddr.o
+$
+```
+
+Compiler versions:
+
+``` shell
+$ arm-linux-musleabi-gcc --version
+arm-linux-musleabi-gcc (GCC) 9.1.0
+Copyright (C) 2019 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+$ gcc --version
+gcc (Ubuntu 8.3.0-6ubuntu1) 8.3.0
+Copyright (C) 2018 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+$
+```
+
+I've only tested with these two compilers.
+For example, add some api like dill_tcp_get_fd, by using it, it provides the possibility to do something like ioctl:
+ioctl(dill_tcp_get_fd(s), SIOCOUTQ, &pending);
+The test code is below：
+```
+#include <stdio.h>
+#include <libdill.h>
+
+static dill_coroutine void
+test_1(void)
+{
+  int ret;
+
+  while(dill_msleep(dill_now() + 1000) == 0)
+  {
+    printf("test_1: %d\n", ret);
+  }
+}
+
+static int bndl;
+static int socket;
+
+static dill_coroutine void
+test_process_tx(void)
+{
+  while(1)
+  {
+    if (dill_bsend(socket, "Hello\n", 6, -1) < 0)
+    {
+      break;
+    }
+    if (dill_msleep(dill_now() + 1000) < 0)
+    {
+      break;
+    }
+  }
+}
+
+static dill_coroutine void
+test_process_rx(void)
+{
+  uint8_t c;
+
+  while(dill_brecv(socket, &c, 1, -1) == 0)
+  {
+    printf("rx: 0x%02x\n", c);
+  }
+  printf("=================== test_process_rx done !!!\n");
+}
+
+static dill_coroutine void
+test_tcp_ok(void)
+{
+  struct dill_ipaddr addr;
+
+  if (dill_ipaddr_remote(&addr, "127.0.0.1", 2345, 0, dill_now() + 5000) < 0)
+  {
+    printf("server addr not reachable\n");
+    return;
+  }
+  socket = dill_tcp_connect(&addr, dill_now() + 10 * 1000);
+  if (socket < 0)
+  {
+    printf("server connect failed\n");
+    return;
+  }
+
+  dill_bundle_go(bndl, test_process_tx());
+
+  test_process_rx();
+
+  dill_tcp_close(socket, -1);
+}
+
+static dill_coroutine void
+test_tcp_failed(void)
+{
+  struct dill_ipaddr addr;
+
+  if (dill_ipaddr_remote(&addr, "127.0.0.1", 2345, 0, dill_now() + 5000) < 0)
+  {
+    printf("server addr not reachable\n");
+    return;
+  }
+  socket = dill_tcp_connect(&addr, dill_now() + 10 * 1000);
+  if (socket < 0)
+  {
+    printf("server connect failed\n");
+    return;
+  }
+
+  dill_bundle_go(bndl, test_process_rx());
+
+  test_process_tx();
+
+  dill_tcp_close(socket, -1);
+}
+
+
+int
+main(void)
+{
+  bndl = dill_bundle();
+
+  dill_bundle_go(bndl, test_1());
+  //dill_bundle_go(bndl, test_tcp_ok());
+  dill_bundle_go(bndl, test_tcp_failed());
+
+  dill_msleep(dill_now() + 10 * 1000);
+
+  dill_hclose(bndl);
+
+  return 0;
+}
+```
+
+- test_tcp_ok is the ok case, the dill_brecv is in the same dill_coroutine whith dill_tcp_connect. When dill_hclose(bndl); invoked, then “test_process_rx done” printed. 
+```
+~ # ./test_dill
+test_1: 0
+test_1: 0
+test_1: 0
+rx: 0x73
+rx: 0x64
+rx: 0x66
+rx: 0x67
+rx: 0x73
+rx: 0x64
+rx: 0x66
+rx: 0x67
+rx: 0x0a
+test_1: 0
+test_1: 0
+test_1: 0
+test_1: 0
+test_1: 0
+test_1: 0
+=================== test_process_rx done !!!
+```
+
+- test_tcp_failed is the failed case, the dill_brecv is run in another dill_coroutine. When dill_hclose(bndl); invoked, the “test_process_rx done” not printed, but assert failed in fd.c 
+```
+~ # ./test_dill
+test_1: 0
+test_1: 0
+test_1: 0
+test_1: 0
+test_1: 0
+rx: 0x73
+rx: 0x61
+rx: 0x64
+rx: 0x66
+rx: 0x61
+test_1: 0
+test_1: 0
+test_1: 0
+test_1: 0
+Assert failed: rc == 0 (fd.c:388)
+Aborted
+```

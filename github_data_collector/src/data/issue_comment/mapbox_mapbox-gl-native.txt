@@ -1,0 +1,247 @@
+Add iOS equivalent of https://github.com/mapbox/mapbox-gl-native/pull/16024
+
+GL-native implementation attempts to show geometry from lower zoom levels when panning/zooming out a map and not having those tiles available yet. Imo, this is the best possible UX that we could give to our end users and this should remain our default implementation. 
+
+A customer however is reaching out to make this behavior configurable to match gl-js implementation. With gl-js, you pan/zoom and see the background of the style until the tiles are loaded. 
+
+Sidenote: using `setPrefetchZoomDelta` doesn't result in the expected behavior. 
+
+cc @tmpsantos @malwoodsantoro 
+## Launch Checklist
+
+<!-- Thanks for the PR! Feel free to add or remove items from the checklist. -->
+
+ - [ ] briefly describe the changes in this PR
+ - [ ] include before/after visuals or gifs if this PR includes visual changes
+ - [ ] write tests for all new functionality
+ - [ ] document any changes to public APIs
+ - [ ] tagged `@mapbox/maps-android @mapbox/maps-ios @mapbox/core-sdk` if this PR adds or updates a public API
+ - [ ] tagged `@mapbox/gl-js` if this PR includes shader changes or needs a js port
+ - [ ] apply `needs changelog` label if a changelog is needed (remove label when added)
+
+
+
+**Summary of the issue**
+
+The customer creates and adds a layer, that is built from 4 images to his style. At the horizontal boundary between the lower 2 images and the upper 2 images is a small gap, even though the images themselves do not include a gap in their bitmap. (256x256) There is no vertical gap between the left and the right images.
+
+They do this by 
+
+```
+val style = mapBoxMap.style ?: return
+val rasterLayer = RasterLayer(layerId, sourceId)
+rasterLayer.setProperties(PropertyFactory.rasterOpacity(0.7f))
+style.addLayer(rasterLayer)
+
+for (tile in tiles) {
+ val layerId = getLayerId(tile)
+ val sourceId = getSourceId(tile)
+
+ val imageQuad = getLatLngQuad(tile.x, tile.y, tile.zoom)
+ val bitmap = loadBitmapFromAssets(tile)
+
+    addImageSource(imageQuad, bitmap, sourceId)
+
+    addRasterLayer(layerId, sourceId)
+}
+private fun getLatLngQuad(x: Int, y: Int, zoom: Int): LatLngQuad {
+ val top = TileUtil.tile2lat(y, zoom)
+ val left = TileUtil.tile2lon(x, zoom)
+
+ val bottom = TileUtil.tile2lat(y + 1  , zoom)
+ val right = TileUtil.tile2lon(x + 1, zoom)
+
+ val topLeft = LatLng(top, left)
+ val topRight = LatLng(top, right)
+ val bottomRight = LatLng(bottom, right)
+ val bottomLeft = LatLng(bottom, left)
+
+ return LatLngQuad(
+        topLeft,
+        topRight,
+        bottomRight,
+        bottomLeft
+    )
+}
+```
+[source code](https://drive.google.com/file/d/1tiVAYm710yBqrj_l_1kqIUQ439ZKYbD0/view?usp=drive_open) is available 
+
+
+
+
+**What have you tried so far?**
+
+I have so far reproduced the issue. The customer is building with a pre-release version of Android Studio. Version 3.6rc1
+I was able to compile it with the version available[ here](https://developer.android.com/studio/preview):
+
+
+They are using the new method for databinding "ViewBinding". This new method does not appear to be the problem. I have modified the code to be compileable on Android Studio 3.5.3, without the use of ViewBinding. The issue persists.
+
+**Workaround:**
+The only workaround I found was to stretch the image by changing the bottom border of the top images by -0.00035. After that no gap was visible, when zooming in.
+
+```
+private fun getLatLngQuad(x: Int, y: Int, zoom: Int): LatLngQuad {
+
+
+ var top = TileUtil.tile2lat(y, zoom)
+ var left = TileUtil.tile2lon(x, zoom)
+
+ var bottom = TileUtil.tile2lat (y + 1, zoom)
+ var right = TileUtil.tile2lon(x + 1, zoom)
+
+ when (x) {
+ 35 -> when (y) { //left 2 images
+ 17 -> {
+                top = 64.16810689799152;
+                bottom = 61.60604637138627;// reduced the bottom by 0.00035
+
+ }
+ 18 -> {
+                top = 61.60639637138627;
+                bottom = 58.813741715707806; 
+            }
+
+        }
+ 36 -> when (y) { //right 2 images
+ 17 -> {
+                top = 64.16810689799152;
+                bottom = 61.60639637138627; // did not reduce the bottom, so the difference is visible
+
+            }
+ 18 -> {
+                top = 61.60639637138627;
+                bottom = 58.813741715707806;
+            }
+
+        }
+
+    }
+
+
+ val topLeft = LatLng(top, left)
+ val topRight = LatLng(top, right)
+ val bottomRight = LatLng(bottom, right)
+ val bottomLeft = LatLng(bottom, left)
+
+ return LatLngQuad(
+        topLeft,
+        topRight,
+        bottomRight,
+        bottomLeft
+    )
+}
+```
+
+
+
+
+Steps to reproduce
+
+The customer has shared his [source code](https://drive.google.com/file/d/1tiVAYm710yBqrj_l_1kqIUQ439ZKYbD0/view?usp=drive_open)
+
+In order to compile it, please use Android Studio 3.6rc1, available[ here](https://developer.android.com/studio/preview):
+
+**FYI:** Same issue occurs when removing ViewBinding and using findViewById and compiling with a released version of Android Studio.
+
+**Platform: Android**
+**Mapbox SDK version: Android Mapbox SDK 8.5.0**
+
+### Steps to trigger behavior
+
+ 1. Run the application
+
+
+### Expected behavior
+
+There should not be a gap in between the top images and the bottom images.
+
+### Actual behavior
+
+There is a horizontal gap between the top images and the bottom images.
+The issue was raised in https://github.com/mapbox/mapbox-gl-native/pull/16030#issuecomment-571138465.
+
+Preliminary profiling (running 1024-symbol render test) shows heap peak increase from `master branch: 28.90 MB` to `stretchable-icons: 29.30 MB`, however, memory usage goes back to original level when temporary heap allocated vectors are destructed.
+
+We should investigate where small vectors are used and possibility of inlining those. Few known places in a codebase: `ImageStretches` in Image, `Cuts` in quads creation, `StyledText` in BiDi.
+Why do white lines appear gray？
+![image](https://user-images.githubusercontent.com/49389971/72395642-1f0f0200-3775-11ea-8357-5f06a4d555c4.png)
+![image](https://user-images.githubusercontent.com/49389971/72395654-2afac400-3775-11ea-99a0-2c82c860c4cf.png)
+
+
+Hello how to add marker on map location on MapBox SDK 8.6.1
+Thank you in advance.
+We were able to reproduce this crash on CI when updating a downstream project:
+Original stacktrace [here](https://gist.github.com/tobrun/802ed9f24ea796aa57ccb81fef8f3aec).
+Symbolicated stacktrace:
+```
+********** Crash dump: **********
+Build fingerprint: 'Huawei/H60-L04/hwH60:4.4.2/HDH60-L04/C00B390:user/ota-rel-keys,release-keys'
+pid: 9815, tid: 9969, name: OkHttp Dispatch  >>> com.mapbox.mapboxsdk.plugins.china.testapp <<<
+signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr deadbaad
+Stack frame #00  pc 00011958  /system/lib/libc.so (dlfree+1191)
+Stack frame #01  pc 0000dea7  /system/lib/libc.so (free+10)
+Stack frame #02  pc 0008394b  /system/lib/libcrypto.so (CRYPTO_free+34)
+Stack frame #03  pc 0002f673  /system/lib/libssl.so (ssl_parse_serverhello_tlsext+738)
+Stack frame #04  pc 000181d1  /system/lib/libssl.so (ssl3_get_server_hello+1008)
+Stack frame #05  pc 000175cf  /system/lib/libssl.so (ssl3_connect+566)
+Stack frame #06  pc 00027f1b  /system/lib/libssl.so (SSL_do_handshake+50)
+Stack frame #07  pc 0000ae61  /system/lib/libjavacrypto.so
+Stack frame #08  pc 0001eb8c  /system/lib/libdvm.so (dvmPlatformInvoke+112)
+Stack frame #09  pc 0004f253  /system/lib/libdvm.so (dvmCallJNIMethod(unsigned int const*, JValue*, Method const*, Thread*)+398)
+Stack frame #10  pc 00027fa0  /system/lib/libdvm.so
+Stack frame #11  pc 0002f110  /system/lib/libdvm.so (dvmMterpStd(Thread*)+76)
+Stack frame #12  pc 0002c774  /system/lib/libdvm.so (dvmInterpret(Thread*, Method const*, JValue*)+184)
+Stack frame #13  pc 00061705  /system/lib/libdvm.so (dvmCallMethodV(Thread*, Method const*, Object*, bool, JValue*, std::__va_list)+336)
+Stack frame #14  pc 00061729  /system/lib/libdvm.so (dvmCallMethod(Thread*, Method const*, Object*, JValue*, ...)+20)
+Stack frame #15  pc 00056423  /system/lib/libdvm.so
+Stack frame #16  pc 0000d408  /system/lib/libc.so (__thread_entry+72)
+Stack frame #17  pc 0000d5a0  /system/lib/libc.so (pthread_create+240)
+```
+
+@tmpsantos can this be investigated by your team? 
+
+<!--
+Hello and thanks for contributing to the Mapbox Maps SDKs for iOS and macOS! To help us diagnose your problem quickly, please:
+
+ - Include a minimal demonstration of the bug, including code, logs, and screenshots.
+ - Ensure you can reproduce the bug using the latest release.
+ - Only post to report a bug or request a feature; direct all other questions to: https://stackoverflow.com/questions/tagged/mapbox
+
+Start with a brief description below this line. -->
+
+When `iconAllowsOverlap` is `false` and the values for the `symbolSortKey` evaluate to doubles, the ordering of those values doesn't change the z-level of where the icons are drawn in a style layer. The same feature will always appear on top of the other whether you reverse the values for the sort (by multiplying by -1) or leave them as-is.
+
+Somewhat similar to https://github.com/mapbox/mapbox-gl-native/issues/15964.
+
+### Steps to reproduce
+
+ 1. Add a symbol style layer to the map with 2 overlapping features
+ 2. Set `textAllowsOverlap` and `iconAllowsOverlap` to `false`
+ 3. Set `textOptional` to `true`
+ 4. Ensure both features have values for the `symbolSortKey`
+      - Make sure these values are doubles. I used `0.99999896` and `0.99999898`
+
+### Expected behavior
+
+I'm trying to get the feature with the higher sort of `0.99999898` to appear on top.
+
+### Actual behavior
+
+With the floating points above, the feature with the sort value of `0.99999896` will always be on top. This is also true if you reverse the order by multiplying the sort values by `-1`.
+
+If I set `iconAllowsOverlap` to `true`, the sort order appears to be honored and the feature with the larger sort of `0.99999898` is drawn on top. 
+
+This gist replicates the issue: https://gist.github.com/johnnewman/d69b5c28c9f8d0895f9bb5e36eb1baeb.
+
+Here is a working project with the code from the gist. Just supply an API key in AppDelegate.swift.
+[IconOrderingProject.zip](https://github.com/mapbox/mapbox-gl-native-ios/files/4055818/IconOrderingProject.zip)
+
+
+
+### Configuration
+
+**Mapbox SDK versions: 5.6.1** 
+**iOS/macOS versions: iOS 13.3** 
+**Device/simulator models: iPhone 7**
+**Xcode version: 11.3** 

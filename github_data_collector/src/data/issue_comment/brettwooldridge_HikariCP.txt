@@ -1,0 +1,247 @@
+`ProxyDatabaseMetaData` is full of methods that follow this pattern:
+```java
+   @Override
+   public ResultSet getTables(String catalog, String schemaPattern, String tableNamePattern, String[] types) throws SQLException {
+      ResultSet resultSet = delegate.getTables(catalog, schemaPattern, tableNamePattern, types);
+      ProxyStatement statement = (ProxyStatement) ProxyFactory.getProxyStatement(connection, resultSet.getStatement());
+      return ProxyFactory.getProxyResultSet(connection, statement, resultSet);
+   }
+```
+
+At first glance, this all looks okay. However, when using H2 (just for example), I see failures like this:
+```
+[INFO] java.lang.NullPointerException: null
+[INFO] 	at com.zaxxer.hikari.pool.ProxyStatement.close(ProxyStatement.java:76)
+[INFO] 	at net.java.ao.Common.closeQuietly(Common.java:504)
+[INFO] 	at net.java.ao.sql.SqlUtils.closeQuietly(SqlUtils.java:122)
+[INFO] 	at net.java.ao.schema.helper.DatabaseMetaDataReaderImpl.getSequenceNames(DatabaseMetaDataReaderImpl.java:212)
+[INFO] 	at net.java.ao.schema.helper.DatabaseMetaDataReaderImpl.getFields(DatabaseMetaDataReaderImpl.java:84)
+[INFO] 	at net.java.ao.schema.ddl.SchemaReader.readFields(SchemaReader.java:126)
+[INFO] 	at net.java.ao.schema.ddl.SchemaReader.readTable(SchemaReader.java:110)
+[INFO] 	at net.java.ao.schema.ddl.SchemaReader.access$000(SchemaReader.java:62)
+[INFO] 	at net.java.ao.schema.ddl.SchemaReader$1.apply(SchemaReader.java:99)
+[INFO] 	at net.java.ao.schema.ddl.SchemaReader$1.apply(SchemaReader.java:97)
+```
+
+Based on the line number, it's getting a `NullPointerException` in `ProxyStatement` trying to call `delegate.close()`. That delegate is retrieved with `ResultSet.getStatement()`, so that must be returning `null`.
+
+Looking at the Javadocs for `ResultSet.getStatement()` shows this:
+```
+     * Retrieves the <code>Statement</code> object that produced this
+     * <code>ResultSet</code> object.
+     * If the result set was generated some other way, such as by a
+     * <code>DatabaseMetaData</code> method, this method  may return
+     * <code>null</code>.
+```
+
+Based on that, the H2 database driver is _entirely within spec_ to return `null` from `getStatement()`.
+
+It seems to me like the `ProxyDatabaseMetaData` methods need to actually _check_ the `getStatement()` result for `null` and only proxy the statement if there is one. Something like this:
+```java
+   @Override
+   public ResultSet getTables(String catalog, String schemaPattern, String tableNamePattern, String[] types) throws SQLException {
+      ResultSet resultSet = delegate.getTables(catalog, schemaPattern, tableNamePattern, types);
+      Statement statement = resultSet.getStatement();
+      if (statement != null) {
+         statement = ProxyFactory.getProxyStatement(connection, statement);
+      }
+      return ProxyFactory.getProxyResultSet(connection, (ProxyStatement) statement, resultSet);
+   }
+```
+
+This way the proxied `ResultSet` will return `null` from `getStatement()` when the underlying `ResultSet` does, and will return a proxied `Statement` otherwise. As it stands, a proxied `ResultSet` _always_ returns a proxy `Statement`, even when it's not wrapping anything.
+HikariCP: 3.4.1
+Java: 11.0.5
+PostgreSQL JDBC: 42.2.8
+PostgreSQL: Amazon Aurora 10.x
+
+Got this today after months of no problems.  Hikari is serving up connections that are closed causing a major data loss.  Please advise:
+```
+2020-01-16 19:09:41.497 ERROR 8 --- [normalTaskExecutor-78] c.b.w.service.DefaultWaveformService     : Failed to insert entries into table XXX for org XXX
+
+org.springframework.jdbc.CannotGetJdbcConnectionException: Failed to obtain JDBC Connection; nested exception is java.sql.SQLTransientConnectionException: Waveforms DataSource - Connection is not available, request timed out after 30000ms.
+        at org.springframework.jdbc.datasource.DataSourceUtils.getConnection(DataSourceUtils.java:82)
+        at org.springframework.jdbc.core.JdbcTemplate.execute(JdbcTemplate.java:612)
+        at org.springframework.jdbc.core.JdbcTemplate.execute(JdbcTemplate.java:647)
+        at org.springframework.jdbc.core.JdbcTemplate.batchUpdate(JdbcTemplate.java:936)
+        at org.springframework.jdbc.core.JdbcTemplate.batchUpdate(JdbcTemplate.java:990)
+        at org.springframework.jdbc.core.JdbcTemplate.batchUpdate(JdbcTemplate.java:981)
+        at com.boxview.waveformserver.service.DefaultWaveformService.publishEntries(DefaultWaveformService.java:128)
+        at com.boxview.waveformserver.service.DefaultWaveformService.handleNewWaveformEntryEvent(DefaultWaveformService.java:92)
+        at com.boxview.waveformserver.service.WaveformReceiver$WaveformReceiverWorker.readAndProcess(WaveformReceiver.java:746)
+        at com.boxview.waveformserver.service.WaveformReceiver$WaveformReceiverWorker$QueueProcessor.run(WaveformReceiver.java:799)
+        at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1128)
+        at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:628)
+        at com.boxview.concurrency.LoggingRunnable.run(LoggingRunnable.java:21)
+        at java.base/java.lang.Thread.run(Thread.java:834)
+Caused by: java.sql.SQLTransientConnectionException: Waveforms DataSource - Connection is not available, request timed out after 30000ms.
+        at com.zaxxer.hikari.pool.HikariPool.createTimeoutException(HikariPool.java:697)
+        at com.zaxxer.hikari.pool.HikariPool.getConnection(HikariPool.java:196)
+        at com.zaxxer.hikari.pool.HikariPool.getConnection(HikariPool.java:161)
+        at com.zaxxer.hikari.HikariDataSource.getConnection(HikariDataSource.java:100)
+        at org.springframework.jdbc.datasource.DataSourceUtils.fetchConnection(DataSourceUtils.java:158)
+        at org.springframework.jdbc.datasource.DataSourceUtils.doGetConnection(DataSourceUtils.java:116)
+        at org.springframework.jdbc.datasource.DataSourceUtils.getConnection(DataSourceUtils.java:79)
+        ... 13 common frames omitted
+Caused by: org.postgresql.util.PSQLException: This connection has been closed.
+        at org.postgresql.jdbc.PgConnection.checkClosed(PgConnection.java:782)
+        at org.postgresql.jdbc.PgConnection.setNetworkTimeout(PgConnection.java:1560)
+        at com.zaxxer.hikari.pool.PoolBase.setNetworkTimeout(PoolBase.java:552)
+        at com.zaxxer.hikari.pool.PoolBase.isConnectionAlive(PoolBase.java:168)
+        at com.zaxxer.hikari.pool.HikariPool.getConnection(HikariPool.java:185)
+        ... 18 common frames omitted
+
+```
+```
+Jan 14, 2020 1:23:12 AM org.slf4j.impl.JCLLoggerAdapter warn
+WARNING: HikariPool-1 - Failed to validate connection com.mysql.jdbc.JDBC4Connection@3c0d1159 (No operations allowed after connection closed.). Possibly consider using a shorter maxLifetime value.
+```
+
+This warning message seems not too descriptive.. my configuration looks like this:
+```java
+static
+{
+    HikariConfig config = new HikariConfig();
+    config.setDriverClassName(ServerConstants.DB_DRIVER); // "com.mysql.jdbc.Driver"
+    config.setJdbcUrl(ServerConstants.DB_URL); // "jdbc:mysql://localhost:3306/maindb"
+    config.setUsername(ServerConstants.DB_USER); // "shavitush"
+    config.setPassword(ServerConstants.DB_PASS); // ""
+    config.setMaximumPoolSize(ServerConstants.DB_POOL_SIZE); // 30
+    config.setLeakDetectionThreshold(15 * 1000);
+
+    config.addDataSourceProperty("cachePrepStmts", true);
+    config.addDataSourceProperty("prepStmtCacheSize", 400);
+    config.addDataSourceProperty("prepStmtCacheSqlLimit", 2048);
+    config.addDataSourceProperty("autoReconnect", "true");
+
+    hikari = new HikariDataSource(config);
+}
+```
+
+I don't set `maxLifetime` at all! It's the default value.
+
+So.. I have questions about this message.
+
+1. What are the consequences of this? It popped up in production and I haven't noticed anything going wrong so far. Are any of my queries not going through because of this? Am I leaking memory? Is this bad for my database server?
+2. How can I debug this warning message, or find its source? I call `hikari.getConnection()` from 179 places in my code-base. I interpret the warning message as "you're attempting to query the connection after closing it. don't do that" - is that correct? I don't see any stack trace either and I'm unable to reproduce this locally. 
+3. The readme mentions `.. it should be several seconds shorter than any database or infrastructure imposed connection time limit..` for the `maxLifetime` setting. Is that referring to my MariaDB's configuration connection time limit? These are my timeout variables. So if `connect_timeout` is 5 seconds, should it be even shorter on Hikari? I'm confused
+![](https://i.imgur.com/8ji3wE4.png)
+Hello, the video link on this page [About Pool Sizing](https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing) do not exist anymore.
+
+Thanks.
+I have set a pool name to eg. "foobar". Then I expect pool names should be named "foobar-1", ... is it correct assumption? Or is there some reason why there is hardcoded this string?
+```
+final String prefix = "HikariPool-";
+```
+I know it's cosmetic issue only (?) but it looks strange in logs, causing operations to ask what's wrong.
+
+```
+14:04:18,061 INFO  [main] co.za.hi.HikariDataSource -- foobar - Starting...
+14:04:18,069 INFO  [main] co.za.hi.HikariDataSource -- HikariPool-1 - Starting...
+14:04:18,295 INFO  [main] co.za.hi.HikariDataSource -- HikariPool-1 - Start completed.
+14:04:18,304 INFO  [main] co.za.hi.HikariDataSource -- foobar - Start completed.
+```
+
+expected:
+
+```
+14:04:18,061 INFO  [main] co.za.hi.HikariDataSource -- foobar - Starting...
+14:04:18,069 INFO  [main] co.za.hi.HikariDataSource -- foobar-1 - Starting...
+14:04:18,295 INFO  [main] co.za.hi.HikariDataSource -- foobar-1 - Start completed.
+14:04:18,304 INFO  [main] co.za.hi.HikariDataSource -- foobar - Start completed.
+```
+
+Patch can be provided. I'm just curious if there is some hidden reason for it...
+Hello, the pro environment found a large number of errors that could not obtain the connection to the database, like:
+
+org.mybatis.spring.MyBatisSystemException: nested exception is org.apache.ibatis.exceptions.PersistenceException:
+### Error querying database. Cause: org.springframework.jdbc.CannotGetJdbcConnectionException: Failed to obtain JDBC Connection; nested exception is java.sql.SQLTransientConnectionException: HikariPool-2 - Connection is not available, request timed out after 30000ms.
+### The error may exist in class path resource [mapper/friends/write/WriteUfotoUserUnmatchFriendMapper.xml]
+### The error may involve com.ufoto.dao.write.WriteUfotoUserUnmatchFriendsMapper.selectByUids
+### The error occurred while executing a query
+### Cause: org.springframework.jdbc.CannotGetJdbcConnectionException: Failed to obtain JDBC Connection; nested exception is java.sql.SQLTransientConnectionException: HikariPool-2 - Connection is not available, request timed out after 30000ms.
+at org.mybatis.spring.MyBatisExceptionTranslator.translateExceptionIfPossible(MyBatisExceptionTranslator.java:77)
+at org.mybatis.spring.SqlSessionTemplate$SqlSessionInterceptor.invoke(SqlSessionTemplate.java:446)
+at com.sun.proxy.$Proxy186.selectOne(Unknown Source)
+at org.mybatis.spring.SqlSessionTemplate.selectOne(SqlSessionTemplate.java:166)
+at org.apache.ibatis.binding.MapperMethod.execute(MapperMethod.java:82)
+at org.apache.ibatis.binding.MapperProxy.invoke(MapperProxy.java:59)
+at com.sun.proxy.$Proxy242.selectByUids(Unknown Source)
+at com.ufoto.manager.friends.UfotoUserFriendsManager.checkWasFriendBeforeAndDelMsg(UfotoUserFriendsManager.java:138)
+at com.ufoto.manager.friends.UfotoUserFriendsManager$$FastClassBySpringCGLIB$$d7f2c480.invoke(<generated>)
+at org.springframework.cglib.proxy.MethodProxy.invoke(MethodProxy.java:204)
+at org.springframework.aop.framework.CglibAopProxy$DynamicAdvisedInterceptor.intercept(CglibAopProxy.java:684)
+at
+
+open debug,found the connetion always Repeat loop creation：
+
+![image](https://user-images.githubusercontent.com/8140511/71973281-898de280-3249-11ea-98ca-50e03d8003f8.png)
+
+What is the reason ？？？
+JDK Version: 1.8
+lib version: 'com.zaxxer:HikariCP:3.4.1'
+database: mariaDB
+connector lib: 'org.mariadb.jdbc:mariadb-java-client:1.8.0' (for Java 7, only version that worked for me)
+Android Studio version: latest
+Kotlin version: latest
+compileSdkVersion: 29
+targetSdkVersion: 29
+minSdkVersion: 21
+
+
+`
+val driver = "org.mariadb.jdbc.Driver"
+val url = "jdbc:mariadb://host:3306/db"
+
+val config = HikariConfig()
+config.driverClassName = driver
+config.jdbcUrl = url
+config.username = "aaa"
+config.password = "bbb"
+config.addDataSourceProperty("cachePrepStmts", "true")
+config.addDataSourceProperty("prepStmtCacheSize", "250")
+config.addDataSourceProperty("prepStmtCacheSqlLimit", "2048")
+
+
+val ds = HikariDataSource(config)
+`
+
+ds is always null. And with properties:
+
+`
+val props = Properties()
+props.setProperty("dataSourceClassName", "org.mariadb.jdbc.MariaDbDataSource")
+props.setProperty("dataSource.user", "aaa")
+props.setProperty("dataSource.password", "bbb")
+props.setProperty("dataSource.portNumber", "3306")
+props.setProperty("dataSource.serverName", "host")
+props.setProperty("dataSource.databaseName", "db")
+
+val config = HikariConfig(props)
+val ds = HikariDataSource(config)
+`
+
+I get the error that he Didn't find the Class: "org.mariadb.jdbc.MariaDbDataSource" although I can import this class properly.
+When I "DriverManager.getConnection()" it works and I can read data from tables too.
+
+Can someone help?
+
+
+#### Environment : windows
+
+HikariCP version : 3.4.1
+JDK version     :   11.0.4+10-LTS 
+Database        :   SAP SQL Anywhere 17 - 17.0.4.2053
+Driver version  : jconn4-16.0_SP03_b28836.jar
+
+We are migrating from java-7 to java-11. besides other dependencies, we have upgraded the driver and hikari-cp as above. However, at run time, we are getting below connection pool issue : 
+java.lang.IllegalStateException: The configuration of the pool is sealed once started. Use HikariConfigMXBean for runtime changes.
+            at com.zaxxer.hikari.HikariConfig.checkIfSealed(HikariConfig.java:1015)
+            at com.zaxxer.hikari.HikariConfig.setTransactionIsolation(HikariConfig.java:839)
+            at *common.service.dsfactory.DataSourceFactory.createDataSource(DataSourceFactory.java:93)
+            at *common.service.dsfactory.DataSourceFactory.createDataSource(DataSourceFactory.java:50)
+            at *.ApplicationContext.getDataSource(ApplicationContext.java:160)
+            at *.ApplicationContextFactory.augmentApplicationContext(ApplicationContextFactory.java:91)
+            at *.InitBasicsThread.run(InitBasicsThread.java:91) 
+
+

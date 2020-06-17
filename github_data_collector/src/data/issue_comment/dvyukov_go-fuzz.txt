@@ -1,0 +1,282 @@
+There is a decent chance I am just confused here, but as far as I can tell, I suspect if your starting point is a clean environment, then running `go generate` in the go-fuzz/go-fuzz directory requires first installing some flavor of `go-bindata`.
+
+If you don't, you get an (unhelpful?) error:
+
+```
+Cannot find go-bindata executable in path"
+Maybe you need: go get github.com/elazarl/go-bindata-assetfs/..."
+```
+
+(I suspect the advice emitted on the second line there by `elazarl/go-bindata-assetfs` is incorrect based on briefly looking at that repo, as well as based on trying that suggested step and then seeing it not help ;-)
+
+`elazarl/go-bindata-assetfs` is vendored by go-fuzz, but I suspect it alone is not complete.
+
+The corresponding `go generate` commands are:
+https://github.com/dvyukov/go-fuzz/blob/1810d380ab9c2786af00db592f86d83063216ed0/go-fuzz/main.go#L23-L26
+
+I tried a couple different flavors of `go-bindata`. 
+
+Based on comparing the output results, I suspect the most recent `go generate` run by @josharian in https://github.com/dvyukov/go-fuzz/commit/1e7aea50942f7d9c5c9ecfbb2e2826e92bd0a417 was using https://github.com/kevinburke/go-bindata, but not 100% sure. (The older https://github.com/jteeuwen/go-bindata seems pretty clearly not to be the flavor that was used).
+
+If you are starting in a clean environment with a copy of dvyukov/go-fuzz, then this seems to work for me:
+
+```
+go get -u github.com/kevinburke/go-bindata/...
+go get -u golang.org/x/tools/cmd/goimports
+go get -u golang.org/x/tools/cmd/stringer
+cd dvyukov/go-fuzz/go-fuzz
+go generate
+```
+
+Part of the context here is that at the time I was looking into what it would take to embed the support packages into the binaries (#252).
+
+I haven't dived very deeply here, so sorry in advance if this is incorrect. 
+[broken out from discussion in #273]
+
+It'd be better to do as std does with testing and emit an executable instead of a zip file and using an external runner.
+
+Off the top of my head, steps for this:
+
+* figure out how to have instrumented code live alongside regular code (test runner)
+* make sonar instrumentation always present and controlled on a run by run basis
+* do dynamic rather than static literal collection
+* refactor everything to support this
+
+I don't know how to do step one. The rest are non-trivial, but seem possible.
+Regarding #262 
+
+**The problem:**
+If a Fuzz function crashes on every initial input provided, the fuzzer
+still executes and posts stats to stdout. However, since no inputs
+are provided to the workers, nothing meaningful happens.
+The behavior is confusing because of two points:
+1. No proper logging is done. The coordinator continues to execute and 
+    posts stats.
+2. Crashing inputs in general are allowed. The problem arises only if
+    all initial inputs crash.
+
+**The problem in more detail:**
+The coordinator maps the initial corpus into memory. If no corpus is
+provided the coordinator creates a default input (the empty input).
+Workers then access the corpus over the hub, not over the coordinator.
+Before this happens they are given the initial corpus files and are
+testing them. If the Fuzz function crashes on these inputs, they will
+never be passed to the hub. Therefore they are not available to the
+workers after this initial stage.
+
+**The proposed solution:**
+After the initial triage stage we wait a short amount of time for
+synchronization purposes. Then we check if the corpus is still empty.
+If it is we conclude that the target crashed on every input and
+shut down the fuzzer with the respective error message.
+
+Please comment if the solution lacks in anything.
+
+cc @thepudds @mvdan 
+
+In #249, @dvyukov wrote:
+
+> Re CoverTab, it always was supposed to be of tunable size. It's just that I did fixed 64K initially as the simplest option and then never had time/need to improve that.
+
+This issue is to track/discuss this.
+
+From previous experience changing `CoverTab` size manually to a different hard-coded value, here's the places that need updating:
+
+* Generate code that masks down a high-width counter at runtime. (As Dmitry wrote: `CoverTab[LOCATION_HASH & GlobalSizeMask]++`.) For folks who just want to tweak CoverTab manually, you can also just change `func genCounter` in go-fuzz-build to generate different width counters.
+* const `CoverSize` in go-fuzz-defs.
+* `go-fuzz/compare_amd64.s` assembly implementations for clearing the covertab. Probably easiest to just pass in log2(CoverSize). And require that CoverSize be a power of two. Look for the `BTL` instructions.
+
+The other TODO here is to do a bit of performance tuning with higher values of CoverSize. My experience is that cranking up the size of covertab uncovers new performance pain points. I've fixed a few of these, but more remain.
+
+cc @thepudds 
+
+**Issue:** The code of the function `times3` produced by instrumentation is wrong.
+
+#### This is the minimal reproducible example.
+
+File: **fuzz.go**
+```go
+package fuzz
+
+func timesN(b []byte, n int) { b[0] *= byte(n) }
+func times3(b []byte)        { timesN(b, 3) }
+
+//go:noescape
+func times5(b []byte)
+
+func Fuzz(data []byte) int {
+	times3(data)
+	times5(data)
+
+	return 0
+}
+```
+
+File: **times.s**
+```go
+#include "textflag.h"
+
+TEXT ·times5(SB), NOSPLIT,$0
+    RET
+
+```
+Command
+```sh
+ $ go-fuzz-build
+```
+Output: 
+```sh
+ $ go-fuzz-build
+    fuzz.go:4: can only use //go:noescape with external func implementations
+```
+
+##### Instrumented code (wrong)
+```go 
+//line /home/user/bug/fuzz.go:1
+package fuzz
+
+//line /home/user/bug/fuzz.go:1
+import _go_fuzz_dep_ "go-fuzz-dep"
+
+func timesN(b []byte, n int)	{ _go_fuzz_dep_.CoverTab[22588]++; b[0] *= byte(n) }
+func times3(b []byte)		{ _go_fuzz_dep_.CoverTab[
+
+//go:noescape
+//line /home/user/bug/fuzz.go:4
+44810]++; timesN(b, 3) }
+
+//line /home/user/bug/fuzz.go:7
+func times5(b []byte)
+
+//line /home/user/bug/fuzz.go:10
+func Fuzz(data []byte) int {
+//line /home/user/bug/fuzz.go:10
+	_go_fuzz_dep_.CoverTab[5262]++
+							times3(data)
+							times5(data)
+
+							return 0
+}
+
+//line /home/user/bug/fuzz.go:15
+var _ = _go_fuzz_dep_.CoverTab
+```
+##### Instrumented code (expected/correct)
+```go 
+//line /home/user/bug/fuzz.go:1
+package fuzz
+
+//line /home/user/bug/fuzz.go:1
+import _go_fuzz_dep_ "go-fuzz-dep"
+
+func timesN(b []byte, n int)	{ _go_fuzz_dep_.CoverTab[22588]++; b[0] *= byte(n) }
+func times3(b []byte)		{ _go_fuzz_dep_.CoverTab[44810]++;
+//line /home/user/bug/fuzz.go:4
+    timesN(b, 3) 
+}
+
+//line /home/user/bug/fuzz.go:7
+//go:noescape
+func times5(b []byte)
+
+//line /home/user/bug/fuzz.go:10
+func Fuzz(data []byte) int {
+//line /home/user/bug/fuzz.go:10
+	_go_fuzz_dep_.CoverTab[5262]++
+							times3(data)
+							times5(data)
+
+							return 0
+}
+
+//line /home/user/bug/fuzz.go:15
+var _ = _go_fuzz_dep_.CoverTab
+```
+If my fuzz function panics, it seems to cause cessation of all fuzzing. Output starts showing `execs: 0 (0/sec)`. Not sure if that's the expected behavior or not. I was imagining it would log the panic as a crash then keep mutating.
+
+[`pineapple`](https://github.com/bookmoons/pineapple) has a test case.
+
+```go
+package pineapple
+
+func Fuzz(input []byte) int {
+	panic("tried to eat a pinecone")
+}
+```
+
+```shell
+go-fuzz-build && go-fuzz -v=4
+```
+
+```
+2019/08/22 20:23:28 worker 0 triages coordinator input [0][218 57 163 238 94 107 75 13 50 85 191 239 149 96 24 144 175 216 7 9] minimized=true smashed=true
+2019/08/22 20:23:28 worker 0: triageq=0 execs=0 mininp=0 mincrash=0 triage=1 fuzz=0 versifier=0 smash=0 sonar=0 hint=0
+2019/08/22 20:23:28 testee: panic: tried to eat a pinecone
+
+goroutine 1 [running]:
+github.com/bookmoons/pineapple.Fuzz(0x7e8337694000, 0x0, 0x0, 0x4)
+	/home/user/go/src/github.com/bookmoons/pineapple/pineapple_fuzz.go:4 +0x51
+go-fuzz-dep.Main(0xc00007cf80, 0x1, 0x1)
+	/tmp/go-fuzz-build984651294/goroot/src/go-fuzz-dep/main.go:36 +0x1b6
+main.main()
+	/tmp/go-fuzz-build984651294/gopath/src/github.com/bookmoons/pineapple/go.fuzz.main/main.go:15 +0x52
+
+2019/08/22 20:23:28 testee: 
+2019/08/22 20:23:28 worker 0 processes crasher [0][218 57 163 238 94 107 75 13 50 85 191 239 149 96 24 144 175 216 7 9]
+2019/08/22 20:23:30 workers: 2, corpus: 1 (3s ago), crashers: 1, restarts: 1/0, execs: 0 (0/sec), cover: 0, uptime: 3s
+2019/08/22 20:23:31 hub: corpus=0 bootstrap=0 fuzz=0 minimize=0 versifier=0 smash=0 sonar=0
+2019/08/22 20:23:33 workers: 2, corpus: 1 (6s ago), crashers: 1, restarts: 1/0, execs: 0 (0/sec), cover: 0, uptime: 6s
+2019/08/22 20:23:34 hub: corpus=0 bootstrap=0 fuzz=0 minimize=0 versifier=0 smash=0 sonar=0
+2019/08/22 20:23:36 workers: 2, corpus: 1 (9s ago), crashers: 1, restarts: 1/0, execs: 0 (0/sec), cover: 0, uptime: 9s
+2019/08/22 20:23:37 hub: corpus=0 bootstrap=0 fuzz=0 minimize=0 versifier=0 smash=0 sonar=0
+2019/08/22 20:23:39 workers: 2, corpus: 1 (12s ago), crashers: 1, restarts: 1/0, execs: 0 (0/sec), cover: 0, uptime: 12s
+2019/08/22 20:23:40 hub: corpus=0 bootstrap=0 fuzz=0 minimize=0 versifier=0 smash=0 sonar=0
+```
+
+It never seems to pick back up:
+
+```shell
+go-fuzz
+```
+
+```
+2019/08/22 20:27:09 workers: 2, corpus: 1 (3s ago), crashers: 1, restarts: 1/0, execs: 0 (0/sec), cover: 0, uptime: 3s
+2019/08/22 20:27:12 workers: 2, corpus: 1 (6s ago), crashers: 1, restarts: 1/0, execs: 0 (0/sec), cover: 0, uptime: 6s
+2019/08/22 20:27:15 workers: 2, corpus: 1 (9s ago), crashers: 1, restarts: 1/0, execs: 0 (0/sec), cover: 0, uptime: 9s
+2019/08/22 20:27:18 workers: 2, corpus: 1 (12s ago), crashers: 1, restarts: 1/0, execs: 0 (0/sec), cover: 0, uptime: 12s
+2019/08/22 20:27:21 workers: 2, corpus: 1 (15s ago), crashers: 1, restarts: 1/0, execs: 0 (0/sec), cover: 0, uptime: 15s
+2019/08/22 20:27:24 workers: 2, corpus: 1 (18s ago), crashers: 1, restarts: 1/0, execs: 0 (0/sec), cover: 0, uptime: 18s
+2019/08/22 20:27:27 workers: 2, corpus: 1 (21s ago), crashers: 1, restarts: 1/0, execs: 0 (0/sec), cover: 0, uptime: 21s
+2019/08/22 20:27:30 workers: 2, corpus: 1 (24s ago), crashers: 1, restarts: 1/0, execs: 0 (0/sec), cover: 0, uptime: 24s
+2019/08/22 20:27:33 workers: 2, corpus: 1 (27s ago), crashers: 1, restarts: 1/0, execs: 0 (0/sec), cover: 0, uptime: 27s
+2019/08/22 20:27:36 workers: 2, corpus: 1 (30s ago), crashers: 1, restarts: 1/0, execs: 0 (0/sec), cover: 0, uptime: 30s
+2019/08/22 20:27:39 workers: 2, corpus: 1 (33s ago), crashers: 1, restarts: 1/0, execs: 0 (0/sec), cover: 0, uptime: 33s
+2019/08/22 20:27:42 workers: 2, corpus: 1 (36s ago), crashers: 1, restarts: 1/0, execs: 0 (0/sec), cover: 0, uptime: 36s
+2019/08/22 20:27:45 workers: 2, corpus: 1 (39s ago), crashers: 1, restarts: 1/0, execs: 0 (0/sec), cover: 0, uptime: 39s
+```
+When running fuzz tests, I very often come across cases where it will run for hours without generating additional cases:
+
+```
+2019/08/19 09:18:10 workers: 11, corpus: 551 (9h53m ago), crashers: 0, restarts: 1/9859, execs: 12274551 (344/sec), cover: 1378, uptime: 9h55m
+```
+
+However, when restarting, it will generate new cases, usually within minutes:
+```
+2019/08/19 09:24:35 workers: 11, corpus: 551 (4m36s ago), crashers: 0, restarts: 1/1016, execs: 11183 (41/sec), cover: 1378, uptime: 4m36s
+2019/08/19 09:24:38 workers: 11, corpus: 552 (1s ago), crashers: 0, restarts: 1/1025, execs: 11280 (40/sec), cover: 1378, uptime: 4m39s
+```
+
+To me (no expert) this seems like a missed opportunity, and I am wondering if it is possible to do this without having to manually restart the process?
+
+The libFuzzer integration works pretty smooth though the backtrace is much less clear then the equivalent go-fuzz vanilla engine. Is there a theoretical possibility that libFuzzer will be able to output a better stack trace?
+
+The integration to libFuzzer imho is important and also can save some time for example implementing same logic again in go-fuzz like distributed fuzzing, timeouts, etc... and only focus on the go compilation. instrumentation and integration part.
+
+I didn't deep dive into the go-fuzz core source so I don't really know if this idea is possible or makes sense. Will be happy to hear feedback.
+
+EDIT: I saw something similar implemented in rust [fuzzer](https://rust-fuzz.github.io/book/cargo-fuzz/tutorial.html) using a flag `RUST_BACKTRACE=1` though I don't know specifically how they implemented it yet.
+
+CC @dvyukov 
+It'd be nice if we could embed the support packages go-fuzz-build needs into the binary, rather than relying on the go tool being able to find them on disk. See discussion at https://github.com/golang/go/issues/30515#issuecomment-480612782 and the following few comments.
+
+https://go-review.googlesource.com/c/tools/+/172409/ added "package overlay" support to go/packages. This is a reminder issue to experiment with whether it would suffice for embedding our support packages, and if so, to start using it.

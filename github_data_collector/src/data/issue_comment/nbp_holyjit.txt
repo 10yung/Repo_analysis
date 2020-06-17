@@ -1,0 +1,160 @@
+The `Const<T>` type would necessarily compile to a const, an immediate operand, or something of the sort. Additionally it could have extra bounds on it to make some optimizations possible, altho I'm not sure how those would be done in practice.
+
+It would, for the most part, only exist at compile-time (as in, host/rust compile-time, not JIT compile-time).
+
+And also the host code would specify when things get compiled, rather than doing it whenever the library wants to.
+
+The basic idea is to do the most work of optimizing and stuff at Rust compile-time so that very little work needs to be done at runtime. That is, zero-cost abstractions for your JIT compiler. JITs should be performant and tuneable, and HolyJIT might well be performant (altho I doubt it compares to e.g. V8), but it doesn't look very tuneable as it currently stands. I do not believe the library should handle all the details of the JIT but rather it should be a glorified self-modifying code library (just, without being able to modify yourself while you're running. it should make copies ofc).
+
+
+This pull request is a work-in-progress to handle the LIR to Cranelift IR conversion. It adds a LIR representation #29 and adds a Cranelift backend #28 .
+
+However it does not yet change the MIR to LIR mapping nor the serialization of the LIR. Thus, this pull request cannot yet be tested with a complete pipeline to handle the Brainfuck example. Tests for this pull requests are added as part of the test of the newly added `codegen` sub-project. These tests are creating LIR units which are then lowered into Cranelift IR, compiled and tested.
+
+The current IR is a quick and dirty format made only to support the needs of a proof of concept than something which deserve to remain as-is in the next version.
+
+However, one concept might still be interesting to investigate, such as having SSA values which sizes are not restricted to simple types, and being able to address memory inside them. Thus we could have SSA values which are representing complex data structures, and the need of addressing in them could force them to be stack allocated.
+
+One of the feature that needs to be added, and is not yet tried in any JIT as far as I know, it to version parts of the data flow graph and control flow graph, in order to make the graph patchable (literally applying patches in a version control system).  Among the required features to be able to frequently apply previously recorded patches — graph mutation made during previous compilations — to a graph, we need the nodes (instructions) of the graph to have a limited context. Thus, having a little as possible ordering edges and no indexes. (Should this be named VSSA for Versioned SSA?)
+
+The usual control flow represenation approach of SSA, made out of basic blocks, which forces the order of all instructions from the beginning might cause the patches to not be applicable because of newly inserted nodes.  The sea-of-nodes representation would remove the ordering of instructions until the scheduling pass, which would help.
+
+Also, SSA relies on the indexing of instructions, in order to access them quickly. For a VSSA, we have to add a way to index instruction which is stable across multiple compilations. A content-addressing will cause the data-flow of an instruction to be replaced each time an instruction is mutated, which is too much. However, we can have a content-addressing which ignores a `replaced_by` field which can be mutated (patched) and record the content-address of the newer instruction.
+
+Cranelift (previously named Cretonne) is far from being ideal as the Cranelift IR does not provide the features needed to express versioning needs, and using it as a backend implies having an additional intermediate representation.
+
+However, Cranelift does have more stable code base and would remove a good chunk of work from HolyJIT early days. Thus, it makes sense to base HolyJIT on Cranelift for the early days of HolyJIT until it becomes a pain point.
+
+I tried running the example command in the README, but I got this:
+
+~/projects/holyjit$ RUSTC_WRAPPER=$(pwd)/rustc.sh cargo run --example brainfuck 
+    Finished dev [unoptimized + debuginfo] target(s) in 0.0 secs
+     Running `target/debug/examples/brainfuck`
+Did not found JIT Code in the context.
+Start compiling ...
+bincode::ErrorKind = IoError: failed to fill whole buffer
+JIT Compiler Error: Deserialize
+
+Currently, it might seems opaque to a lot of persons why will HolyJit should use its own LIR representation instead of relying on LLVM IR or *directly* targeting Cretonne for doing transformations on the code extracted from the MIR.
+
+The problem with existing projects is that it is hard to retro-fit new constraints on an existing compiler without rewriting large parts of the compiler.
+
+In order to avoid mistakes our-self, we should explicit and document the constraints that we want on the LIR, on analysis and on transformation phases before implementing of it. The core idea is that HolyJit should be **optimized for re-compilation**.
+
+Optimizing for re-compilation means that the compiler should minimize the time needed to re-compile after a de-optimization which invalidated the previously optimized code.  This comes from the conclusion that the cost of a de-optimization is proportional to the cost of the re-compilation.  Reducing the de-optimization cost implies that we can afford to do more speculative optimization, reducing the need for proves in the compiler in the early tiers of the JIT compiler.
+
+I came across this while trying to implement input/output for brainfuck.
+I looked at the crash for a bit in rr, it seems that something is calling index_mut without setting registers properly.
+`rsi = 0x0`, which causes a null deref
+
+In short:
+```rust
+Program received signal SIGSEGV, Segmentation fault.
+0x00005586bde7eacc in alloc::vec::{{impl}}::index_mut<u8> (self=0x7fff4ff77878, index=...) at /shared/dev/rust/rust-patch/src/liballoc/vec.rs:1627
+1627	    fn index_mut(&mut self, index: ops::Range<usize>) -> &mut [T] {
+(rr) print *self
+$1 = alloc::vec::Vec<u8> {buf: alloc::raw_vec::RawVec<u8, alloc::heap::Heap> {ptr: core::ptr::Unique<u8> {pointer: core::nonzero::NonZero<*const u8> (0x7f0f8621e000 "\000"), _marker: core::marker::PhantomData<u8>}, cap: 256, a: alloc::heap::Heap}, len: 256}
+(rr) bt
+#0  0x00005586bde7eacc in alloc::vec::{{impl}}::index_mut<u8> (self=0x7fff4ff77878, index=...) at /shared/dev/rust/rust-patch/src/liballoc/vec.rs:1627
+#1  0x00007f0f87570de8 in ?? ()
+#2  0x00005586be19f250 in panic_loc.C ()
+#3  0x00005586bdf4bcc1 in str.j ()
+#4  0x000000000001459c in ?? ()
+#5  0x00005586be19f250 in panic_loc.C ()
+#6  0x00000000000005b0 in ?? ()
+#7  0x00007f0f86229040 in ?? ()
+#8  0x0000000000000004 in ?? ()
+#9  0x0000000000000004 in ?? ()
+#10 0x00007f0f8622a200 in ?? ()
+#11 0x0000000000000096 in ?? ()
+#12 0x0000000000000096 in ?? ()
+#13 0x0000000000000000 in ?? ()
+```
+
+So this is definitely crashing on indexing the `mem` variable.
+
+Here's code that triggers this crash: [Note: I use boxed traits, because the `jit!()` macro doesn't accept generic functions]
+```rust
+#![feature(plugin, custom_attribute)]
+#![plugin(holyjit_plugin)]
+#![feature(unboxed_closures)]
+#[macro_use] extern crate holyjit_lib as hj;
+
+use std::io;
+use std::io::{Read, Write, Cursor};
+
+jit!{ fn eval(jc: hj::JitContext, program: String, input: Box<Read>, output: Box<Write>) -> Result<(), ()> = eval_impl in jc; }
+fn eval_impl(_jc: hj::JitContext, program: String, mut input: Box<Read>, mut output: Box<Write>) -> Result<(), ()> {
+    let prog = program.as_bytes();
+    let mut pc : usize = 0;
+    let mut ptr : usize = 0;
+    let mut mem : Vec<u8> = Vec::with_capacity(256);
+    mem.resize(256, 0);
+    loop {
+        if pc >= prog.len() {
+            return Ok(());
+        }
+        match *prog.get(pc).unwrap() {
+            b'>' => {
+                ptr += 1;
+                if ptr >= mem.len() {
+                    mem.push(0);
+                }
+            }
+            b'<' => { ptr = ptr.saturating_sub(1); }
+            b'-' => { mem[ptr] = mem[ptr].wrapping_sub(1); }
+            b'+' => { mem[ptr] = mem[ptr].wrapping_add(1); }
+            b'.' => { output.write(&mem[ptr .. ptr + 1]).unwrap(); }
+            b',' => { input.read_exact(&mut mem[ptr .. ptr + 1]).unwrap(); }
+            b'[' => {
+                if mem[ptr] == 0 {
+                    let mut iter = (pc + 1, 0);
+                    loop {
+                        iter = match (iter, prog[iter.0]) {
+                            ((p, 0), b']') => {
+                                pc = p + 1;
+                                break;
+                            },
+                            ((p, d), b'[') => (p + 1, d + 1),
+                            ((p, d), b']') => (p + 1, d - 1),
+                            ((p, d), _) => (p + 1, d)
+                        }
+                    }
+                    continue; // skip pc increment
+                }
+            }
+            b']' => {
+                let mut iter = (pc - 1, 0);
+                loop {
+                    iter = match (iter, prog[iter.0]) {
+                        ((p, 0), b'[') => {
+                            pc = p;
+                            break;
+                        },
+                        ((p, d), b'[') => (p - 1, d + 1),
+                        ((p, d), b']') => (p - 1, d - 1),
+                        ((p, d), _) => (p - 1, d)
+                    }
+                }
+                continue; // skip pc increment
+            }
+            _ => { panic!("Unknown Symbol"); }
+        }
+        pc += 1;
+    }
+}
+
+fn main() {
+    let jc : hj::JitContext = Default::default();
+    let res = eval(jc, ",[.,]".into(), Box::new(Cursor::new(b"Hello, world!")), Box::new(io::stderr()));
+    // let res = eval(jc, "-[>-[>-[>-<-]<-]<-]<-]".into());
+    res.unwrap();
+}
+```
+With this program `eval(jc, "-[>-[>-<-]<-]<-]".into())`, the brainfuck interpreter panics, because it sees an unknown symbol at the program counter (garbage memory)
+With `eval(jc, "-[>-[>-[>-<-]<-]<-]<-]".into())` - the program receives a SIGSEGV, caused by a read of one byte before an allocated page.
+
+I'll try to run these with ASAN and report the results
+
+EDIT: I can't build with ASAN, ~~because `kernel32-sys` fails to link~~. Brainfart, I need to pass the `--target` flag, but `holyjit` also fails to link.
+EDIT2: I just realized the brackets in these programs are mismatched, which means bounds checks aren't emitted properly under jit!()

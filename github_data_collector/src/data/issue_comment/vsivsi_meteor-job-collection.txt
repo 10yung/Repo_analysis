@@ -1,0 +1,138 @@
+Hi,
+
+I'm using a function to create jobs. When creating them like this, I have no problems at all:
+
+```javascript
+startPurgeOldJobsJob: function() {
+  console.log('startPurgeOldJobsJob');
+  // creates job with no data:
+  let job = new Job(
+    jobsCollection,
+    JOB_TYPES.PURGE_OLD_JOBS,
+    {}
+  );
+  // sets repeating schedule:
+  job.repeat({
+    schedule: jobsCollection.later.parse.text('on the first day at 1:00')
+  });
+  // set retry options in case of failure:
+  job.retry({
+    retries: 5,
+    wait: 10*60*1000,
+    backoff: 'exponential'
+  });
+  // saves job cancelling other jobs generated for repetitions:
+  job.save({cancelRepeats: true});
+  // returns generated job:
+  return job;
+}
+```
+
+However, when I remove the `{cancelRepeats: true}` options in the `.save()`, I start getting this errors about `UnhandledPromiseRejectionWarning` like this:
+
+```
+(STDERR) (node:60748) UnhandledPromiseRejectionWarning: Unhandled promise rejection (rejection id: 1): RangeError: Maximum call stack size exceeded
+(STDERR) (node:60748) [DEP0018] DeprecationWarning: Unhandled promise rejections are deprecated. In the future, promise rejections that are not handled will terminate the Node.js process with a non-zero exit code.
+```
+
+Any ideas on this issue?
+I guess this code:
+
+https://github.com/vsivsi/meteor-job-collection/blob/3ec32befcf195c157bcdc100a4a82603045970d5/src/shared.coffee#L888
+
+should check for if `doc.repeatWait` isn't a number - not if the actual value isn't `number`, right? This is also shown a few lines earlier:
+
+https://github.com/vsivsi/meteor-job-collection/blob/3ec32befcf195c157bcdc100a4a82603045970d5/src/shared.coffee#L876
+As mentioned in https://github.com/vsivsi/meteor-job-collection/pull/268, this (in combination with https://github.com/meteortesting/meteor-mocha/pull/51) gives us the possibility to measure how much of the library actually is covered by tests.
+Fixes #264.
+TypeError: Class constructor Collection cannot be invoked without 'new'
+There are some breaking changes between Coffeescript v1 and v2 - I tried to figure them out to get job-collection compatible with v2, but I know little to nothing about Coffeescript and don't use many of Javascript's advanced capabilities yet, so I couldn't figure out making all the necessary changes. 
+
+Figured I'd pose the question about having job-collection updated to support v2 before it goes into it's maintenance mode come January.
+Explained how to avoid zombie-jobs
+I'm a long time user of this package. But recently I run into a problem that a single repeating job is cloning itself hundreds of time. This is the code:
+
+```
+    checkLinkedInExpirationJob = new Job(Jobs, 'checkLinkedInExpiration', {})
+    checkLinkedInExpirationJob.repeat(
+      schedule:Jobs.later.parse.text('at 4:05 am')
+    ).retry({ retries: 0 }).save() 
+```
+
+It correctly creates a single job to run at 4:05am.
+
+Then it starts running, and it creates hundreds copies of itself. Each copy runs, gets status 'completed' and none of them failed (I checked the logs).
+
+Here's the abbreviated code of the worker:
+
+```
+@checkLinkedInExpirationWorker = Jobs.processJobs 'checkLinkedInExpiration', (job, callback) ->
+  Log.info "checkLinkedInExpirationWorker starting"
+
+  users = AppUser.find({'providers.provider': 'linkedin'})
+
+  for u in users
+    linkedIn = _.find u.providers, (p) -> p.provider is 'linkedin'
+    
+    # find the admins of the user's account, exclude if the user is the admin
+    accountAdmins = AppUser.find(
+      _id: $ne: u._id
+      roles: 'admin'
+      accountId: u.accountId
+    ).fetch()
+
+    expDate = moment(linkedIn.access_token.date_expiration, 'MM/DD/YYYY H:m:s').add(1, 'days')
+    expiresInFourteenDays = moment(linkedIn.access_token.date_expiration, 'MM/DD/YYYY H:m:s').subtract(14, 'days')
+    # expiresIntwoDays = moment(linkedIn.access_token.date_expiration, 'MM/DD/YYYY H:m:s').subtract(2, 'days')
+    now = new Date()
+
+    # if expired
+    if expDate.isSame(now, 'day')
+      Log.info "checkLinkedInExpirationWorker -> user #{u._id} LinkedIn is expired"
+      if u.emails[0]?.address
+        # send an email
+
+      for admin in accountAdmins
+         # send an email   
+
+      Meteor.defer ->
+        Meteor.call 'linkedin.remove', (err, res) ->
+            Log.info "checkLinkedInExpirationWorker -> removed LinkedIn" if res
+      continue
+
+    # if expires in 14 days
+    if expiresInFourteenDays.isSame(now, 'day')
+        # send an email
+
+      for admin in accountAdmins
+         # send an email
+  
+  job.done()
+  callback()
+```
+
+With another job I have exactly the same issue. I just clones itself about 40-50 times. I checked the Job collection and the cloning is kind of random. 
+
+I'm literally out of ideas, starting to think about replacing this package :-(
+
+Any idea what could result in jobs cloning themselves?
+First of all, this is a great package and it has shorten my development by a lot as I move a lot of long running tasks in the background like sending SMS or uploading to S3.
+
+But if there is one part that we can improve, it is with dynamically importing this package in the client. In my case, less than 5% of my users actions use background jobs but it is the 5th biggest resource being downloaded.
+
+Is there a possibility to setup the package for dynamic import as supported by Meteor since 1.5?
+
+https://github.com/meteor/meteor/issues/8745
+Hi Vaughn,
+
+I have the following requirement, hope you have an answer for this question:
+
+A) We do have several different services (meaning different web services, which we call via their API) and for each service we have several jobs.
+
+B) On top of that we do a need concurrent number of jobs of the same service (with let's say a maximum of 5 concurrent jobs). But this concurrent jobs should only be executed if it's for a different user.
+
+For requirement A), would you use a different job queue for each service or how would organize that jobs for the same service are all lined up (queued). So something like jobQueueServiceA, jobQueueServiceB etc?
+
+For requirement B) we can set the concurrency to 5 (jobs) but how can we at the same time control that two jobs for the same user aren't executed in parallel? Would it be best to chain them up, meaning when we create the jobs we do check if there is already a job for that userId and we would use the `depends` field to wait for the last job to finish?
+
+As always, thanks in advance!

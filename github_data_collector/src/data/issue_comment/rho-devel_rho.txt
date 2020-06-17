@@ -1,0 +1,100 @@
+From the build logs:
+
+```
+> Error in texi2dvi(file = file, pdf = TRUE, clean = clean, quiet = quiet,  : 
+>   unable to run 'pdflatex' on 'NEWS.tex'
+> Calls: <Anonymous> -> texi2pdf -> texi2dvi
+> Execution halted
+> make[1]: *** [NEWS.pdf] Error 1
+```
+
+Presumably NEWS.tex is invalid.
+
+
+I get build errors when trying to build with `R_MEMORY_PROFILING` enabled. Some errors are trivial to fix, but some seem to be nontrivial. For example, the `Rf_memtrace_report()` function seems to have gone missing.
+
+I merged Arun's branch into the current master branch and tried to build on OSX with Clang 3.6.2. I get this build error:
+
+```
+In file included from ../../../src/main/names.cpp:40:
+In file included from ../../../src/include/Internal.h:40:
+../../../src/include/rho/BuiltInFunction.hpp:524:6: error: definition with same mangled
+      name as another definition
+            TableEntry(const char* name, FUNCTION function,
+            ^
+../../../src/include/rho/BuiltInFunction.hpp:524:6: note: previous definition is here
+../../../src/include/rho/BuiltInFunction.hpp:524:6: error: definition with same mangled
+      name as another definition
+            TableEntry(const char* name, FUNCTION function,
+            ^
+../../../src/include/rho/BuiltInFunction.hpp:524:6: note: previous definition is here
+```
+
+The line it complains about is the declaration of the `TableEntry` constructor. The constructor is templated and is used only as a convenience to construct table entries for the builtin function table. Here is the entirety of the `TableEntry` struct:
+
+```
+  struct TableEntry {
+            template<typename FUNCTION>
+            TableEntry(const char* name, FUNCTION function,
+                       unsigned int variant, unsigned int flags, int arity,
+                       PPinfo ppinfo,
+                       const char* first_arg_name = nullptr,
+                       DispatchType dispatch = DispatchType::NONE)
+                : function(new BuiltInFunction(name, function, variant,
+                                               flags, arity, ppinfo,
+                                               s_next_offset++,
+                                               first_arg_name, dispatch))
+            {}
+            BuiltInFunction* function;
+            static unsigned int s_next_offset;
+        };
+```
+
+It seems like it should be possible to remove the `TableEntry` struct and instead constructing builtin functions directly could solve the compile error. The `s_next_offset` counter would need to be moved to `BuiltInFunction` instead.
+
+In R, almost every symbol can be redefined, which forces the interpreter / JIT to continuous check what it's bound to.
+
+In practice, the most common and performance critical symbols ('<-', '(', '{', 'if') are never redefined and promoting them to keywords should improve performance without sacrificing compatibility.
+
+Since this is a change to the semantics of the R language, we need to be careful here.  Making it an error to assign to any of those symbols in an environment would reduce the risk of ever having rho silently produce incorrect results, but might also break code that uses environments as hash tables.  Perhaps we can automatically distinguish between the two cases:
+
+An environment is executable if:
+- Any function has it as its environment.
+- Any executable environment has it as its parent.
+- It is a package environment, namespace, namespace imports or namespace exports.
+- A promise uses it as its evaluation environment.
+- A call to 'eval' uses it as it's execution environment.
+- Others?
+
+In order to get this correct reliably and robustly, we'd need to check that the environment has been tagged as executable on each entry to a function or eval and possibly symbol lookups as well.  Changing an environments parent might need extra care too. 
+
+For compatibility with packages that explicitly use Tierney's byte compiler, we need to add a 'compiler' package with a matching API, but where all the functions are no-ops.
+
+I reliably get a crash on my machine when I hit `Ctrl+D` and then type `c` and hit enter. This happens in the current  commit b14c3aecb78090d4eb2efc3ab88a3f41d2516653, but it has also happened for a few previous commits that I've built.
+
+The segfault happens only when I press `Ctrl+D`, running `quit()` does not trigger the segfault.
+
+This was my configure command:
+
+```
+CXX=clang++ CC=clang ../configure --with-boost-libdir=/usr/lib/x86_64-linux-gnu --with-blas --with-lapack --with-llvm=/usr/bin/llvm-config-3.4 --enable-llvm-jit --enable-byte-compiled-packages=no
+
+
+Program terminated with signal SIGABRT, Aborted.
+```
+
+Here is the backtrace:
+
+```
+#0  0x00007fdc7489ccc9 in __GI_raise (sig=sig@entry=6) at ../nptl/sysdeps/unix/sysv/linux/raise.c:56
+#1  0x00007fdc748a00d8 in __GI_abort () at abort.c:89
+#2  0x00007fdc74e9f6db in __cxxabiv1::__terminate (handler=<optimized out>) at ../../../../src/libstdc++-v3/libsupc++/eh_terminate.cc:42
+#3  0x00007fdc74e9f703 in std::terminate () at ../../../../src/libstdc++-v3/libsupc++/eh_terminate.cc:48
+#4  0x00007fdc74e9f976 in __cxxabiv1::__cxa_rethrow () at ../../../../src/libstdc++-v3/libsupc++/eh_throw.cc:125
+#5  0x0000000000626f0c in jump_to_top_ex (traceback=<optimized out>, tryUserHandler=<optimized out>, processWarnings=<optimized out>, resetConsole=<optimized out>, ignoreRestartContexts=<optimized out>)
+    at ../../../src/main/errors.cpp:856
+#6  0x0000000000628dba in Rf_jump_to_toplevel () at ../../../src/main/errors.cpp:870
+#7  0x0000000000719e1a in Rstd_CleanUp (saveact=<optimized out>, status=<optimized out>, runLast=<optimized out>) at ../../../src/unix/sys-std.c:1072
+#8  0x000000000064f4ef in Rf_mainloop () at ../../../src/main/main.cpp:1172
+#9  0x000000000057353b in main (ac=29050, av=0x717a) at ../../../src/main/Rmain.cpp:46
+```

@@ -1,0 +1,315 @@
+I have recently spent most of a day tracking a bug that did not reproduce in debug build. The issue was just a stack overflow, but since debug is the only mode with stack guards the crashes were super hard to track since they manifested as corrupted data structures. Once I manually enabled the stack guard the problem became obvious.
+
+I have seen enough crashes in scylla that look impossible, so I am a bit suspicious that we might be hitting a stack overflow from time to time in there.
+
+Right now the stack protector actually allocates a page and changes the protection. It should be possible to not back the guard page and not count that memory as used in our own allocator. With that the stack guards would be effectively free and we could always enable them.
+
+HEAD: 33406cfe146f19084c96b65c6fe3097e12ca3242
+
+## Description
+Native stack doesn't check UDP checksum at all. 
+According to the specificatiopn it's optional for IPv4 but in this case it should carry all-zeros. 
+For IPv6 is obligatory.
+In reactor.cc, there are the following codes and comments:
+```c++
+// expire_lowres_timers must be before sig_poller, because lowres_timer_pollfn
+// may arm the first highres timer, which can add a new signal to be registerd. If the order
+// is reversed, then signal_pollfn::exit_interrupt_mode() can re-block the timer signal.
+poller expire_lowres_timers(std::make_unique<lowres_timer_pollfn>(*this));
+poller sig_poller(std::make_unique<signal_pollfn>(*this));
+```
+That means the lowres_timer_pollfn must be before signal_pollfn。But when we build seastar in debug mode, the flag `SEASTAR_SHUFFLE_TASK_QUEUE ` will enable the following code in reactor.hh, and swap the positions of the 2 pollfers:
+```c++
+void add_task(std::unique_ptr<task>&& t) {
+  auto sg = t->group();
+  auto* q = _task_queues[sg._id].get();
+  bool was_empty = q->_q.empty();
+  q->_q.push_back(std::move(t));
+#ifdef SEASTAR_SHUFFLE_TASK_QUEUE
+  shuffle(q->_q.back(), *q);
+#endif
+  if (was_empty) {
+    activate(*q);
+  }
+}
+```
+Not sure when was this introduced.
+Most recently, seen in https://jenkins.scylladb.com/view/master/job/scylla-master/job/next/1467/consoleText
+
+FWIW, I couldn't reproduce this warning when building seastar as standalone. 
+
+```
+[2020-01-05T23:15:12.206Z] [6/74] Building CXX object CMakeFiles/seastar.dir/gen/src/proto/metrics2.pb.cc.o
+[2020-01-05T23:15:12.206Z] In member function 'void io::prometheus::client::Bucket::SharedCtor()',
+[2020-01-05T23:15:12.206Z]     inlined from 'io::prometheus::client::Bucket::Bucket()' at gen/src/proto/metrics2.pb.cc:2398:13,
+[2020-01-05T23:15:12.206Z]     inlined from 'void protobuf_metrics2_2eproto::InitDefaultsBucket()' at gen/src/proto/metrics2.pb.cc:2394:1:
+[2020-01-05T23:15:12.206Z] gen/src/proto/metrics2.pb.cc:2413:11: warning: 'void* memset(void*, int, size_t)' offset [33, 40] from the object at 'io::prometheus::client::_Bucket_default_instance_' is out of the bounds of referenced subobject 'io::prometheus::client::Bucket::cumulative_count_' with type 'long unsigned int' at offset 24 [-Warray-bounds]
+[2020-01-05T23:15:12.206Z]  2413 |   ::memset(&cumulative_count_, 0, static_cast<size_t>(
+[2020-01-05T23:15:12.206Z]       |   ~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[2020-01-05T23:15:12.206Z]  2414 |       reinterpret_cast<char*>(&upper_bound_) -
+[2020-01-05T23:15:12.206Z]       |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[2020-01-05T23:15:12.206Z]  2415 |       reinterpret_cast<char*>(&cumulative_count_)) + sizeof(upper_bound_));
+[2020-01-05T23:15:12.206Z]       |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[2020-01-05T23:15:12.206Z] In member function 'void io::prometheus::client::Quantile::SharedCtor()',
+[2020-01-05T23:15:12.206Z]     inlined from 'io::prometheus::client::Quantile::Quantile()' at gen/src/proto/metrics2.pb.cc:1253:13,
+[2020-01-05T23:15:12.206Z]     inlined from 'void protobuf_metrics2_2eproto::InitDefaultsQuantile()' at gen/src/proto/metrics2.pb.cc:1249:1:
+[2020-01-05T23:15:12.206Z] gen/src/proto/metrics2.pb.cc:1268:11: warning: 'void* memset(void*, int, size_t)' offset [33, 40] from the object at 'io::prometheus::client::_Quantile_default_instance_' is out of the bounds of referenced subobject 'io::prometheus::client::Quantile::quantile_' with type 'double' at offset 24 [-Warray-bounds]
+[2020-01-05T23:15:12.206Z]  1268 |   ::memset(&quantile_, 0, static_cast<size_t>(
+[2020-01-05T23:15:12.206Z]       |   ~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[2020-01-05T23:15:12.206Z]  1269 |       reinterpret_cast<char*>(&value_) -
+[2020-01-05T23:15:12.206Z]       |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[2020-01-05T23:15:12.206Z]  1270 |       reinterpret_cast<char*>(&quantile_)) + sizeof(value_));
+[2020-01-05T23:15:12.206Z]       |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[2020-01-05T23:15:12.206Z] In member function 'void io::prometheus::client::Summary::SharedCtor()',
+[2020-01-05T23:15:12.206Z]     inlined from 'io::prometheus::client::Summary::Summary()' at gen/src/proto/metrics2.pb.cc:1529:13,
+[2020-01-05T23:15:12.206Z]     inlined from 'void protobuf_metrics2_2eproto::InitDefaultsSummary()' at gen/src/proto/metrics2.pb.cc:1525:1:
+[2020-01-05T23:15:12.206Z] gen/src/proto/metrics2.pb.cc:1545:11: warning: 'void* memset(void*, int, size_t)' offset [57, 64] from the object at 'io::prometheus::client::_Summary_default_instance_' is out of the bounds of referenced subobject 'io::prometheus::client::Summary::sample_count_' with type 'long unsigned int' at offset 48 [-Warray-bounds]
+[2020-01-05T23:15:12.206Z]  1545 |   ::memset(&sample_count_, 0, static_cast<size_t>(
+[2020-01-05T23:15:12.206Z]       |   ~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[2020-01-05T23:15:12.206Z]  1546 |       reinterpret_cast<char*>(&sample_sum_) -
+[2020-01-05T23:15:12.206Z]       |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[2020-01-05T23:15:12.206Z]  1547 |       reinterpret_cast<char*>(&sample_count_)) + sizeof(sample_sum_));
+[2020-01-05T23:15:12.206Z]       |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[2020-01-05T23:15:12.206Z] In member function 'void io::prometheus::client::Histogram::SharedCtor()',
+[2020-01-05T23:15:12.206Z]     inlined from 'io::prometheus::client::Histogram::Histogram()' at gen/src/proto/metrics2.pb.cc:2077:13,
+[2020-01-05T23:15:12.206Z]     inlined from 'void protobuf_metrics2_2eproto::InitDefaultsHistogram()' at gen/src/proto/metrics2.pb.cc:2073:1:
+[2020-01-05T23:15:12.206Z] gen/src/proto/metrics2.pb.cc:2093:11: warning: 'void* memset(void*, int, size_t)' offset [57, 64] from the object at 'io::prometheus::client::_Histogram_default_instance_' is out of the bounds of referenced subobject 'io::prometheus::client::Histogram::sample_count_' with type 'long unsigned int' at offset 48 [-Warray-bounds]
+[2020-01-05T23:15:12.206Z]  2093 |   ::memset(&sample_count_, 0, static_cast<size_t>(
+[2020-01-05T23:15:12.206Z]       |   ~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[2020-01-05T23:15:12.206Z]  2094 |       reinterpret_cast<char*>(&sample_sum_) -
+[2020-01-05T23:15:12.206Z]       |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[2020-01-05T23:15:12.206Z]  2095 |       reinterpret_cast<char*>(&sample_count_)) + sizeof(sample_sum_));
+[2020-01-05T23:15:12.206Z]       |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[2020-01-05T23:15:12.206Z] In member function 'void io::prometheus::client::Metric::SharedCtor()',
+[2020-01-05T23:15:12.206Z]     inlined from 'io::prometheus::client::Metric::Metric()' at gen/src/proto/metrics2.pb.cc:2690:13,
+[2020-01-05T23:15:12.206Z]     inlined from 'void protobuf_metrics2_2eproto::InitDefaultsMetric()' at gen/src/proto/metrics2.pb.cc:2686:1:
+[2020-01-05T23:15:12.206Z] gen/src/proto/metrics2.pb.cc:2729:11: warning: 'void* memset(void*, int, size_t)' offset [57, 96] from the object at 'io::prometheus::client::_Metric_default_instance_' is out of the bounds of referenced subobject 'io::prometheus::client::Metric::gauge_' with type 'io::prometheus::client::Gauge*' at offset 48 [-Warray-bounds]
+[2020-01-05T23:15:12.206Z]  2729 |   ::memset(&gauge_, 0, static_cast<size_t>(
+[2020-01-05T23:15:12.206Z]       |   ~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[2020-01-05T23:15:12.206Z]  2730 |       reinterpret_cast<char*>(&timestamp_ms_) -
+[2020-01-05T23:15:12.206Z]       |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[2020-01-05T23:15:12.206Z]  2731 |       reinterpret_cast<char*>(&gauge_)) + sizeof(timestamp_ms_));
+[2020-01-05T23:15:12.206Z]       |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+```
+
+On startup on fedora 31 I see
+
+```
+WARN  2019-12-30 16:20:12,076 seastar - Couldn't read cgroup file /sys/fs/cgroup/cpuset/cpuset.cpus.
+WARN  2019-12-30 16:20:12,076 seastar - Unable to parse cgroup's cpuset. Ignoring.
+WARN  2019-12-30 16:20:12,085 seastar - Couldn't read cgroup file /sys/fs/cgroup/memory/memory.limit_in_bytes.
+```
+
+in /sys/fs/cgroup/ I have
+
+```
+cgroup.controllers  cgroup.max.descendants  cgroup.stat             cgroup.threads  cpuset.cpus.effective  init.scope/  machine.slice/   system.slice/
+cgroup.max.depth    cgroup.procs            cgroup.subtree_control  cpu.pressure    cpuset.mems.effective  io.pressure  memory.pressure  user.slice/
+```
+
+The test has
+
+```
+    future<> do_work() {
+        ++current;
+        max_concurrent_observed = std::max(current, max_concurrent_observed);
+        return sleep(10ms).then([this] {
+            max_concurrent_observed = std::max(current, max_concurrent_observed);
+            --current;
+        });
+    }
+```
+The hope seems to be that all increments execute before all decrements, but that is timing dependent. On my workstation that started failing in debug builds for some reason.
+
+Changing the delay to 100ms hides the problem, but that is likely not the right fix.
+
+
+
+Can we fix the compilation warnings?
+
+core/transfer.hh:53:23: warning: unused parameter 'a' [-Wunused-parameter]
+ transfer_pass2(Alloc& a, T* from, T* to,
+                       ^
+core/transfer.hh:53:29: warning: unused parameter 'from' [-Wunused-parameter]
+ transfer_pass2(Alloc& a, T* from, T* to,
+                             ^~~~
+core/transfer.hh:53:38: warning: unused parameter 'to' [-Wunused-parameter]
+ transfer_pass2(Alloc& a, T* from, T* to,
+
+core/circular_buffer.hh:125:50: warning: unused parameter 'unused' [-Wunused-parameter]
+
+
+HEAD: 626f956ef9df06199ac5838c2033e1034f054ccd
+
+## Description
+Timers (e.g. steady_clock_timer) don't work.
+In particular `lowres_clock_impl::update()` is not called and as a result lowres_clock doesn't work either.
+
+This seems to be specific to a `linux-aio` backend because when we switch to an `epoll` backend I can't reproduce the issue.
+
+## How to reproduce
+1) Provision m5d.8xl (smaller VMs with ENA NICs would do nicely too) with 2 NICs.
+2) Compile httpd application.
+3) Allocate 1024 huge pages per NUMA node:
+```
+NUM_HUGE_PAGES_PER_NODE=1024
+echo "Allocating $NUM_HUGE_PAGES_PER_NODE 2MB huge pages on each NUMA Node:"
+for d in /sys/devices/system/node/node? ; do
+    echo $NUM_HUGE_PAGES_PER_NODE > $d/hugepages/hugepages-2048kB/nr_hugepages
+    cur_node=`basename $d`
+    echo "...$cur_node done..."
+done
+
+```
+4) `modeprobe vfio-pci`
+5) Enable unsafe_noiommu_mode:
+```
+echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode
+```
+6) Bind on of NICs to vfio-pci, e.g.:
+```
+./scripts/dpdk_nic_bind.py -b vfio-pci ens6
+```
+7) Run httpd:
+```
+./build/release/apps/httpd/httpd --network-stack native --smp 4 --dpdk-pmd --dhcp 0 --host-ipv4-addr 10.0.0.7 --hugepages /dev/hugepages -m 2G --lro off --netmask-ipv4-addr 255.255.240.0 --collectd 0 --default-log-level info --argv0 "-l 0-3"
+```
+
+`httpd` is going to stuck waiting for a link.
+
+Run it this way: 
+```
+./build/release/apps/httpd/httpd --network-stack native --smp 4 --dpdk-pmd --dhcp 0 --host-ipv4-addr 10.0.0.7 --hugepages /dev/hugepages -m 1G --lro off --netmask-ipv4-addr 255.255.240.0 --collectd 0 --default-log-level info --argv0 "-l 0-3" --reactor-backend epoll
+```
+
+And it will be fully operational.
+
+## Note 
+The above relies on a not-yet-merged (nor sent to the mlist) patches pasted below:
+
+for seastar:
+```
+commit b2c6847a61edfc7a56af9b2b24c541f6899791eb
+Author: Vlad Zolotarov <vladz@scylladb.com>
+Date:   Wed Sep 25 20:02:54 2019 -0400
+
+    DPDK: actually implement --argv0 parameter
+    
+    One can pass additional parameter to DPDK using this new parameter.
+    
+    For instance:
+    
+    Giving --argv0 "-v /dev/vsock0 -t bla-bla" will result in passing the following
+    additional list of parameters to DPDK: "-v", "/dev/vsock0", "-t", "bla-bla".
+    
+    Signed-off-by: Vlad Zolotarov <vladz@scylladb.com>
+
+diff --git a/src/core/dpdk_rte.cc b/src/core/dpdk_rte.cc
+index c928d229..16cd17db 100644
+--- a/src/core/dpdk_rte.cc
++++ b/src/core/dpdk_rte.cc
+@@ -18,12 +18,15 @@
+ #ifdef SEASTAR_HAVE_DPDK
+ 
+ #include <cinttypes>
++// #include <iostream>
+ #include <seastar/net/dpdk.hh>
+ #include <seastar/core/dpdk_rte.hh>
+ #include <seastar/util/conversions.hh>
+ #include <seastar/util/std-compat.hh>
+ #include <rte_pci.h>
+ 
++#include <boost/algorithm/string.hpp>
++
+ namespace seastar {
+ 
+ namespace dpdk {
+@@ -46,13 +49,25 @@ void eal::init(cpuset cpus, boost::program_options::variables_map opts)
+     std::string mask_str = mask.str();
+     std::reverse(mask_str.begin(), mask_str.end());
+ 
+-    // TODO: Inherit these from the app parameters - "opts"
+     std::vector<std::vector<char>> args {
+-        string2vector(opts["argv0"].as<std::string>()),
++//        string2vector(opts["argv0"].as<std::string>()),
+         string2vector("-c"), string2vector(mask_str),
+         string2vector("-n"), string2vector("1")
+     };
+ 
++    std::string argv0 = opts["argv0"].as<std::string>();
++    std::vector<std::string> argv0_params;
++
++    if (!argv0.empty()) {
++        boost::split(argv0_params, argv0, boost::is_any_of(" "));
++    }
++
++    for (const std::string& p : argv0_params) {
++        args.push_back(string2vector(p));
++    }
++
++//    std::cout << "dpdk args for far: " << args << std::endl;
++
+     compat::optional<std::string> hugepages_path;
+     if (opts.count("hugepages")) {
+         hugepages_path = opts["hugepages"].as<std::string>();
+diff --git a/src/core/reactor.cc b/src/core/reactor.cc
+index 7e8c3058..c34e188b 100644
+--- a/src/core/reactor.cc
++++ b/src/core/reactor.cc
+@@ -3226,6 +3226,9 @@ smp::get_options_description()
+         ("mbind", bpo::value<bool>()->default_value(true), "enable mbind")
+ #ifndef SEASTAR_NO_EXCEPTION_HACK
+         ("enable-glibc-exception-scaling-workaround", bpo::value<bool>()->default_value(true), "enable workaround for glibc/gcc c++ exception scalablity problem")
++#endif
++#ifdef SEASTAR_HAVE_DPDK
++        ("argv0", bpo::value<std::string>(), "Additional DPDK parameters")
+ #endif
+         ;
+     return opts;
+```
+
+For DPDK:
+```
+diff --git a/drivers/net/ena/ena_ethdev.c b/drivers/net/ena/ena_ethdev.c
+index 3eb38165c..ead68e696 100644
+--- a/drivers/net/ena/ena_ethdev.c
++++ b/drivers/net/ena/ena_ethdev.c
+@@ -1326,8 +1326,8 @@ static int ena_rx_queue_setup(struct rte_eth_dev *dev,
+                return ENA_COM_FAULT;
+        }
+ 
+-       if (nb_desc == RTE_ETH_DEV_FALLBACK_RX_RINGSIZE)
+-               nb_desc = adapter->rx_ring_size;
++//     if (nb_desc == RTE_ETH_DEV_FALLBACK_RX_RINGSIZE)
++//             nb_desc = adapter->rx_ring_size;
+ 
+        if (!rte_is_power_of_2(nb_desc)) {
+                RTE_LOG(ERR, PMD,
+```
+
+Hi,
+
+I am trying to run the Memcached application with DPDK and native network stack on a system wit Mellanox ConnectX5 cards. Previously, I could use `dpdk-target` to specify my custom DPDK, but it seems this option is not available anymore.
+
+With the current Seastar build system, mlx5 PMD is not linked with the applications, which does not enable Memcached to detect my NIC. 
+
+I am using the following command to build seastar:
+
+`./configure.py --mode=dev --enable-dpdk --cook fmt --cook Boost --cook yaml-cpp`
+
+Do you have any suggestion that could fix my problem
+
+BR,
+Amir
+Seastar's command line options are parsed using boost, the problem is that if a seastar based
+application can't decide to have unregistered options.
+The reason is here:
+https://github.com/scylladb/seastar/blob/86ee207e68e4668e73c0f883aca0deddea4df001/src/core/app-template.cc#L144-L149
+
+I have two possible solution suggestions:
+1. Add a boolean to run_deprecated and another run method parameter/overload that will run the parser with allow_unregistered.
+2. Have seastar open with allow_unregistered unconditionally and transfer the responsibility to detect unregistered options and throw to the application.
+
+I am in favor of the first solution (patch will follow :) ) since there is no real reason to duplicate the
+options handling logic, we should probably just make the options available to the application's main
+logic.

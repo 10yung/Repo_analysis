@@ -1,0 +1,72 @@
+### BC Break Report
+
+When executing `cache:clear` after `composer update` there is PHP fatal error.
+
+```
+PHP Fatal error:  Declaration of Doctrine\ORM\MappingClassMetadataFactory::wakeupReflection(Doctrine\Common\Persistence\Mapping\ClassMetadata $class, Doctrine\Common\Persistence\Mapping\ReflectionService $reflService) must be compatible with Doctrine\Persistence\MappingAbstractClassMetadataFactory::wakeupReflection(Doctrine\Persistence\Mapping\ClassMetadata $class, Doctrine\Persistence\Mapping\ReflectionService $reflService) in /var/www/html/vendor/doctrine/orm/lib/Doctrine/ORM/Mapping/ClassMetadataFactory.php on line 797
+
+PHP Stack trace:
+1. {main}() /var/www/html/bin/console:0
+2. Symfony\Bundle\FrameworkBundle\Console\Application->run() /var/www/html/bin/console:44
+3. Symfony\Bundle\FrameworkBundle\Console\Application->doRun() /var/www/html/vendor/symfony/console/Application.php:148
+4. Symfony\Bundle\FrameworkBundle\Console\Application->registerCommands() /var/www/html/vendor/symfony/framework-bundle/Console/Application.php:65
+5. App\Kernel->boot() /var/www/html/vendor/symfony/framework-bundle/Console/Application.php:159
+6. App\Kernel->initializeContainer() /var/www/html/vendor/symfony/http-kernel/Kernel.php:136
+7. Symfony\Component\HttpKernel\CacheWarmer\CacheWarmerAggregate->warmUp() /var/www/html/vendor/symfony/http-kernel/Kernel.php:658
+8. ContainerEPFlGxJ\srcApp_KernelDevDebugContainer->{closure:/var/www/html/var/cache/dev/ContainerEPFlGxJ/getCacheWarmerService.php:12-25}() /var/www/html/vendor/symfony/http-kernel/CacheWarmer/CacheWarmerAggregate.php:89
+9. ContainerEPFlGxJ\srcApp_KernelDevDebugContainer->load() /var/www/html/var/cache/dev/ContainerEPFlGxJ/getCacheWarmerService.php:17
+10. require() /var/www/html/var/cache/dev/ContainerEPFlGxJ/srcApp_KernelDevDebugContainer.php:785
+11. ContainerEPFlGxJ\srcApp_KernelDevDebugContainer->getValidator_BuilderService() /var/www/html/var/cache/dev/ContainerEPFlGxJ/getValidator_Mapping_CacheWarmerService.php:13
+12. ContainerEPFlGxJ\srcApp_KernelDevDebugContainer->getDoctrine_Orm_DefaultEntityManagerService() /var/www/html/var/cache/dev/ContainerEPFlGxJ/srcApp_KernelDevDebugContainer.php:3127
+13. Doctrine\ORM\EntityManager::create() /var/www/html/var/cache/dev/ContainerEPFlGxJ/srcApp_KernelDevDebugContainer.php:1111
+14. Doctrine\ORM\EntityManager->__construct() /var/www/html/vendor/doctrine/orm/lib/Doctrine/ORM/EntityManager.php:873
+15. spl_autoload_call() /var/www/html/vendor/doctrine/orm/lib/Doctrine/ORM/EntityManager.php:159
+16. Symfony\Component\Debug\DebugClassLoader->loadClass() /var/www/html/vendor/doctrine/orm/lib/Doctrine/ORM/EntityManager.php:159
+
+In ClassMetadataFactory.php line 797:
+Compile Error: Declaration of Doctrine\ORM\Mapping\ClassMetadataFactory::wakeupReflection(Doctrine\Common\Persistence\Mapping\ClassMetadata $class, Doctrine\Common\Persistence\Mapping\ReflectionService $reflService) must be compatible with Doctrine\Persistence\Mapping\AbstractClassMetadataFactory::wakeupReflection(Doctrine\Persistence\Mapping\ClassMetadata $class, Doctrine\Persistence\Mapping\ReflectionService $reflService)
+```
+
+|    Q        |   A
+|------------ | ------
+| BC Break    | yes
+| Version     | 2.0.4
+
+Package `mongodb-odm` is provided through `doctrine/mongodb-odm-bundle` (^4.0).
+Adding fixed `"doctrine/mongodb-odm": "2.0.3"` to composer as a temporary fix does the trick.
+As was done in doctrine/collections, we should add support for generics using the `@psalm-template` annotations for generic classes like Repositories and Registries. We should also ensure that generics in PHPStan are supported as well.
+
+See https://github.com/doctrine/collections/pull/177 for the reference implementation in collections.
+TODO: Tests have opinions on cache keys. We should fix that.
+
+#SymfonyHackday
+This came to me while reading through https://github.com/symfony/symfony-docs/issues/9878. In a few of those cases, people have the same entity managed by multiple entity managers. While I'm not sure whether that constitutes a valid use-case, the manager registry is equipped to handle this by allowing to specify en entity manager to use when calling `AbstractManagerRegistry::getRepository`.
+
+However, `AbstractManagerRegistry::getManagerForClass` handles those cases wrong IMO: it simply returns the first entity manager that manages the entity in question. In cases like the above, this can lead to undesired behaviour as we're ignoring the fact that we can't reliably say which entity manager is responsible for.a given class.
+
+Assuming the use-case of having the same entity managed by multiple entity managers is valid, we should throw an exception in `getManagerForClass` if we realise that the same class is managed by more than a single entity manager.
+In this patch I want to discuss the possibility of adding an optional parameter to the `findAll` method, that IMO makes sense to be there: `$orderBy`. 
+
+When one needs to fetch the data sorted differently than the default method `findAll` is of no use and one has to use `findBy([], $orderBy)`, which makes it slightly less readable as there are no filters being applied, but rather it is used only for sorting.  Said calls then can be changed to `findAll($orderBy)`
+
+If the maintainers agree that this is a positive change then I can also send the corresponding PR for `doctrine/orm` and any documentation changes.
+The check
+
+https://github.com/doctrine/persistence/blob/43526ae63312942e5316100bb3ed589ba1aba491/lib/Doctrine/Common/Persistence/AbstractManagerRegistry.php#L181
+
+seems to be insufficient as a transient class may have an alias defined using `ResolveTargetEntityListener`.
+- Evaluate if we should return iterable instead of array in some cases
+- It may make more sense to add new methods that return iterable instead of changing existing methods. e.g. `findAllIterator()` or something instead of changing `findAll()` to return an array.
+The current `AbstractManagerRegistry` implementation provides abstract `getService` and `resetService` methods to allow subclasses to implement their own logic how to retrieve connection and manager services. However, with PSR-11 defining a lightweight container interface, I believe it's best to deprecate `AbstractManagerRegistry` in favour of a `ContainerManagerRegistry` that takes a `ContainerInterface` in the constructor and forwards all calls to the `ContainerInterface::get`.
+
+A basic example implementation for this would be the `ManagerRegistry` provided in the Symfony DoctrineBridge: https://github.com/symfony/symfony/blob/master/src/Symfony/Bridge/Doctrine/ManagerRegistry.php. There is some dark magic going on with `resetService`, where we'd have to discuss how to best solve this. Not sure why we need resetting services, but again, this shouldn't be an implementation detail of an abstract registry.
+
+This new class could be added in 1.2 with the `AbstractManagerRegistry` potentially being deprecated in either the same release or in a subsequent 2.x release.
+I've closed PR https://github.com/doctrine/persistence/pull/21 and created new one, because that PR is targeted on master.
+
+This PR fixed 2 bugs:
+
+1. Using https://www.doctrine-project.org/projects/doctrine-orm/en/2.6/cookbook/resolve-target-entity-listener.html with metadata cache is not working, because ResolveTargetEntityListener calls setMetadataFor without any effect on generated cache.
+2. Fallback metadata is not caching now.
+Based on the idea from https://github.com/doctrine/common/issues/681, it'd be nice to have a set of fine-grained base exceptions defined in doctrine/persistence that implementation-agnostic consumers may rely on.
+Right now there's only MappingException.

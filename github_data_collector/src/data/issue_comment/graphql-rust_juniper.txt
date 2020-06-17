@@ -1,0 +1,541 @@
+Hello,
+
+It is possible to upgrade the uuid deps to > 0.8?
+
+Thanks
+**Describe the bug**
+Errors that occur in a list of items do not have the index in the path.
+
+**To Reproduce**
+Steps to reproduce the behavior:
+Building off the actix_web example I used this as my schema.rs
+
+```
+use juniper::{FieldResult, FieldError};
+use juniper::RootNode;
+use juniper;
+
+use std::collections::HashMap;
+
+pub struct Database {
+    pub humans: HashMap<i32, String>,
+}
+
+impl juniper::Context for Database {}
+
+pub struct Human {
+    id: String,
+    name: String,
+}
+
+#[juniper::object(
+    name = "Human",
+    Context = Database,
+)]
+impl Human {
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn name(&self, context: &Database) -> FieldResult<Option<&str>> {
+        if context.humans.len() > 0 {
+            if "testing" == self.name { //Fake Check for permission for the field
+                Ok(Some(&self.name))
+            } else {
+                Err(FieldError::new(
+                    "DENIED",
+                    graphql_value!({ "internal_error": "DENIED" })
+                ))
+            }
+        } else {
+            Err(FieldError::new(
+                "Could not open connection to the database",
+                graphql_value!({ "internal_error": "Connection refused" })
+            ))
+        }
+    }
+
+    pub fn humans(context: &Database) -> Vec<Human> {
+        // Fake a query to get a friend
+        vec![Human {id: "456".to_string(), name: "not_testing".to_string()}]
+    }
+
+}
+
+#[derive(GraphQLInputObject)]
+#[graphql(description = "A humanoid creature in the Star Wars universe")]
+struct NewHuman {
+    name: String,
+}
+
+pub struct QueryRoot;
+
+#[juniper::object(
+    name = "QueryRoot",
+    Context = Database,
+)]
+impl QueryRoot {
+    pub fn human(id: String, context: &Database) -> FieldResult<Vec<Human>> {
+        let humans = context.humans.iter()
+            // .filter(|(_, name)| id == **name)
+            .map(|(_, name)| Human { id: name.clone(), name: name.clone() })
+            .collect();
+        Ok(humans)
+    }
+
+    pub fn count(context: &Database) -> i32 {
+        context.humans.len() as i32
+    }
+}
+
+
+pub struct MutationRoot;
+
+#[juniper::object(
+    name = "MutationRoot",
+    Context = Database,
+)]
+impl MutationRoot {
+    pub fn human(id: String, new_human: NewHuman) -> Human {
+        unimplemented!()
+        // Human{
+        //     id,
+        //     name: Ok(new_human.name),
+        //     // appears_in: new_human.appears_in,
+        //     // home_planet: new_human.home_planet,
+        // }
+    }
+}
+
+pub type Schema = RootNode<'static, QueryRoot, MutationRoot>;
+
+pub fn create_schema() -> Schema {
+    Schema::new(QueryRoot {}, MutationRoot {})
+}
+```
+and this as my main.rs
+```
+//! Actix web juniper example
+//!
+//! A simple example integrating juniper in actix-web
+use std::io;
+use std::sync::Arc;
+
+#[macro_use]
+extern crate juniper;
+
+use actix_web::{middleware, web, App, Error, HttpResponse, HttpServer};
+use juniper::http::graphiql::graphiql_source;
+use juniper::http::GraphQLRequest;
+
+mod schema;
+
+use crate::schema::{create_schema, Schema, Database};
+
+use std::collections::HashMap;
+
+async fn graphiql() -> HttpResponse {
+    let html = graphiql_source("http://127.0.0.1:8080/graphql");
+    HttpResponse::Ok()
+        .content_type("text/html; charset=utf-8")
+        .body(html)
+}
+
+async fn graphql(
+    st: web::Data<Arc<Schema>>,
+    data: web::Json<GraphQLRequest>,
+) -> Result<HttpResponse, Error> {
+    let user = web::block(move || {
+        let mut humans = HashMap::new();
+        humans.insert(123, "Luke".to_string());
+        humans.insert(321, "testing".to_string());
+        let db = Database { humans };
+        let res = data.execute(&st, &db);
+        Ok::<_, serde_json::error::Error>(serde_json::to_string(&res)?)
+    })
+    .await?;
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .header("Access-Control-Allow-Origin", "http://localhost:8080")
+        .header("Access-Control-Allow-Credentials", "true")
+        .header("Access-Control-Allow-Headers", "content-type")
+        .body(user))
+}
+
+async fn handle_options() -> Result<HttpResponse, Error> {
+    Ok(HttpResponse::Ok()
+       .header("Access-Control-Allow-Origin", "http://localhost:8080")
+       .header("Access-Control-Allow-Credentials", "true")
+       .header("Access-Control-Allow-Headers", "content-type")
+       .body("")
+    )
+}
+
+#[actix_rt::main]
+async fn main() -> io::Result<()> {
+    std::env::set_var("RUST_LOG", "actix_web=info");
+    env_logger::init();
+
+    // Create Juniper schema
+    let schema = std::sync::Arc::new(create_schema());
+
+    // Start http server
+    HttpServer::new(move || {
+        App::new()
+            .data(schema.clone())
+            .wrap(middleware::Logger::default())
+            .service(web::resource("/graphql")
+                     .route(web::post().to(graphql))
+                     .route(actix_web::Route::new().method(actix_web::http::Method::OPTIONS).to(handle_options))
+            )
+            .service(web::resource("/graphiql").route(web::get().to(graphiql)))
+    })
+    .bind("127.0.0.1:8080")?
+    .start()
+    .await
+}
+```
+
+when going to http://localhost:8080/graphiql and running the query:
+```
+{
+  human(id: "Luke") {
+    id
+    name
+    humans {
+      id,
+      name
+    }
+  }
+}
+```
+I get the result:
+```
+{
+  "data": {
+    "human": [
+      {
+        "id": "testing",
+        "name": "testing",
+        "humans": [
+          {
+            "id": "456",
+            "name": null
+          }
+        ]
+      },
+      {
+        "id": "Luke",
+        "name": null,
+        "humans": [
+          {
+            "id": "456",
+            "name": null
+          }
+        ]
+      }
+    ]
+  },
+  "errors": [
+    {
+      "message": "DENIED",
+      "locations": [
+        {
+          "line": 4,
+          "column": 5
+        }
+      ],
+      "path": [
+        "human",
+        "name"
+      ],
+      "extensions": {
+        "internal_error": "DENIED"
+      }
+    },
+    {
+      "message": "DENIED",
+      "locations": [
+        {
+          "line": 7,
+          "column": 7
+        }
+      ],
+      "path": [
+        "human",
+        "humans",
+        "name"
+      ],
+      "extensions": {
+        "internal_error": "DENIED"
+      }
+    },
+    {
+      "message": "DENIED",
+      "locations": [
+        {
+          "line": 7,
+          "column": 7
+        }
+      ],
+      "path": [
+        "human",
+        "humans",
+        "name"
+      ],
+      "extensions": {
+        "internal_error": "DENIED"
+      }
+    }
+  ]
+}
+```
+
+**Expected behavior**
+I expected the path value of the error to contain the index of the "human" that couldn't return its name and as such is null, otherwise I don't know exactly which error maps to which place. In the graphql documentation for a similar example the error includes an index see https://graphql.github.io/graphql-spec/June2018/#example-90475.
+
+Since in my example the query is returning a list of humans that internally have a list of humans it would expect a result like:
+
+```
+{
+  "data": {
+    "human": [
+      {
+        "id": "testing",
+        "name": "testing",
+        "humans": [
+          {
+            "id": "456",
+            "name": null
+          }
+        ]
+      },
+      {
+        "id": "Luke",
+        "name": null,
+        "humans": [
+          {
+            "id": "456",
+            "name": null
+          }
+        ]
+      }
+    ]
+  },
+  "errors": [
+    {
+      "message": "DENIED",
+      "locations": [
+        {
+          "line": 4,
+          "column": 5
+        }
+      ],
+      "path": [
+        "human",
+         1,
+        "name"
+      ],
+      "extensions": {
+        "internal_error": "DENIED"
+      }
+    },
+    {
+      "message": "DENIED",
+      "locations": [
+        {
+          "line": 7,
+          "column": 7
+        }
+      ],
+      "path": [
+        "human",
+         0,
+        "humans",
+         0,
+        "name"
+      ],
+      "extensions": {
+        "internal_error": "DENIED"
+      }
+    },
+    {
+      "message": "DENIED",
+      "locations": [
+        {
+          "line": 7,
+          "column": 7
+        }
+      ],
+      "path": [
+        "human",
+         1,
+        "humans",
+         0,
+        "name"
+      ],
+      "extensions": {
+        "internal_error": "DENIED"
+      }
+    }
+  ]
+}
+```
+Note the paths now have indexes to indicate which item the error applies to in the path.
+
+**Is your feature request related to a problem? Please describe.**
+A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]
+
+I want to display the integer on enum, like
+
+```rust
+#[derive(juniper::GraphQLEnum)]
+pub enum Gender {
+    Man = 0,
+    Woman = 1,
+}
+```
+
+and
+
+```rust
+field something(&executor, name: String) -> FieldResult<Something> {
+  Ok(Something{
+      gender: Gender::Man
+  )
+}
+```
+
+when I call it and it will display `0` on `gender`
+Adds two workflows based on the Travis and Azure setup.
+
+I haven't looked into the Codecov stuff whether an additional secret is required for the CI workflow
+or how it could be possible to use the [Codecov Action][codecov].
+
+The Book workflows requires a `ACTION_DEPLOY_KEY` secret for deployment to GitHub Pages.
+See [`peaceiris/actions-gh-pages#1-add-ssh-deploy-key`][gh-pages] for the configuration.
+The `secrets.GITHUB_TOKEN` token wouldn't trigger a page rebuild.
+
+I don't know what's wrong with the [macOS nightly] run.
+
+related to: #453 
+
+[macOS nightly]: https://github.com/nickelc/juniper/runs/355009442#step:7:1583
+[codecov]: https://github.com/marketplace/actions/codecov
+[gh-pages]: https://github.com/peaceiris/actions-gh-pages#1-add-ssh-deploy-key
+**Is your feature request related to a problem? Please describe.**
+No
+
+**Describe the solution you'd like**
+I find the serde macro `#[serde(rename_all = "camelCase")]` really useful on a day to day basis. I think it would be nice to have the same thing in juniper.
+
+**Describe alternatives you've considered**
+Wiriting `#[graphql(name = "fieldName")]` on evry single field
+
+**Additional context**
+serde reference https://serde.rs/attr-rename.html
+
+I'm not that much an advanced rust user, I can try send a PR but I'm not very confident with 
+proc_macros code.
+This removes the dependencies on `ring` inside the `rocket` crate.
+
+Allowing me to use the `jsonwebtoken` crate which requires a newer version of `ring`.
+Adapter Ports
+- [x] Port `juniper_rocket`
+- [ ] Port `juniper_warp`
+- [ ] Port `juniper_hyper`
+- [ ] Port `juniper_iron`
+- [ ] Port `juniper_actix_web` (depends on #459)
+Is it possible to access `Context` when defaulting fields for `GraphQLInputObjects`? (I don't believe it is...)
+
+I think it would be really useful to support dynamic defaulting of input field values based on the current `Context`:
+
+```rust
+struct Context {
+    /// The ID of the user making this request, obtained from a JWT.
+    current_user: Id,
+}
+```
+```rust
+#[derive(serde::Serialize, juniper::GraphQLInputObject)]
+struct MessageInput {
+    #[graphql(default = "context.current_user")]
+    author: Id,
+    
+    body: String,
+}
+```
+
+This could either be combined with the `skip` attribute (from #463) or validated elsewhere to ensure that `context.current_user` has authorization to set the `author` of a `Message` to the provided value.
+
+**Drawbacks**
+- Not sure how "official" this is and would have to be documented in playground/graphiql etc...
+
+**Alternatives**
+- Making the field an `Option` and then later mutating it/creating a new struct with the default from the `Context`. I don't like this method because then you have to be careful about exactly *when* the field will become `Some` and *what* sets it.
+- Using a different struct and using a custom `From` like trait to fill it in with the field from `Context`
+
+I need to have a generic context that is instantiated differently in testing.  (The context contains a handler to the DB that is mocked during tests).
+
+In non-test mode, the context contains a handler to the DB and a reference to a read transaction, the type that represents the read transaction has an explicit lifetime, whose lifetime will therefore correspond to the lifetime of the context.
+
+That's why I need to instantiate a different context for each request.
+
+The problem is that the new macro `[juniper::object]` does not seem to allow to declare a context with generics without the generics going back to the Query type and therefore to the Schema.
+
+I try: 
+
+```
+pub struct Query {}
+
+#[juniper::object(
+    // Here we specify the context type for this object.
+    Context = QueryContext<DB: BcDbInReadTx>,
+)]
+impl Query {
+```
+
+But obviously it doesn't compile.
+It compiles if I pass the generics back to Query, but as explained above it is not a possible solution in my case.
+
+How can we declare a generic to the context only?
+
+It seems that this was possible with the macro `graphql_object!`: https://docs.rs/juniper/0.14.1/juniper/macro.graphql_object.html#generics-and-lifetimes.
+But I didn't try because I don't want to imply time on something depreciated.
+
+my environment: 
+rust 1.39
+juniper 0.14.1
+
+**Is your feature request related to a problem? Please describe.**
+This may be a wild, breaking change, but I found it error-prone for `FieldError` to implement `From<Display>` trait.
+
+According to [the document](https://docs.rs/juniper/0.9.1/juniper/struct.FieldError.html#impl-From%3CT%3E), `FieldError` now implements `From<Display>` trait, which can transform anything implementing `Display` into `FieldError`. This is dangerous with the `?` operator.
+
+For example, I may have something like
+```rust
+impl Mutation {
+    fn some_mutation(context: &Ctx) -> Result<bool, FieldError> {
+        do_the_mutation()?;  // Danger!!
+        // Something else...
+        Ok(true)
+    }
+}
+fn do_the_mutation() -> Result<(), SuperSecretError> {
+    // implementation
+}
+```
+where `SuperSecretError` implements `Display` trait, and contains some critical information I don't like users to know.
+
+However, when i use the `?` operator in `some_mutaion` function, rust will automatically transform `SuperSecretError` into `FieldError`, and send it to users. There __WON'T__ be any compile error or warning. Such transformation simply relies on `format!` macro.
+
+As a backend programmer, I implement the `Display` trait for better logging, not for web users. The leakage of information is counter-intuitive. Even if there's no critical information leakage, such transformation is not what a programmer would expect.
+
+**Describe the solution you'd like**
+Remove the `From<Dispaly>` trait for `FieldError`
+
+**Describe alternatives you've considered**
+Now in my own project, I use the trait `IntoFieldError`, and strictly forbid anyone to use the raw `FieldError`.
+
+We can document the danger of `FieldError` + `Display`, so people can still take advantage of such transformation, while it is encouraged not to do so.

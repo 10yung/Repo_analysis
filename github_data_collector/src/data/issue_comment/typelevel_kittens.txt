@@ -1,0 +1,117 @@
+As discussed [here](https://stackoverflow.com/a/59266384/334519), this allows things like error accumulation when validating with `Either`.
+
+This could be done without changing `Sequence`, just as syntax (via the approach in the Stack Overflow answer), but that involves a lot of extra overhead (of the syntactic, runtime, and compile-time variety). 
+
+I would have added a record version and `parTraverse`, but both `RecordSequence` and `Traverse` don't preserve the `F[_]` context, which makes it a little more complicated (I can understand the reasoning for `Traverse` not having an `F[_]`, but not `RecordSequence`, which seems like it should match `Sequence`'s type members).
+`semiauto` doesn't use `Lazy`.
+
+That improves compile time performance marginally and has better error messages on Scala 2.13.
+Moved `semiauto` test instances to companion objects to ensure serializability.
+
+This would have to go into a 2.1.0 release.
+I have a problem with Show instance derivation of GADT defined in companion object. 
+Here is the example:
+
+```
+scala 2.13.1 // but I think, I see the same issue on scala 2.12.8
+kittens 2.0.0
+```
+
+```scala
+object example {
+
+  import cats.Show
+  import cats.derived.semi
+  import cats.implicits._
+
+  sealed trait Response
+  object Response {
+
+    final case class OK(message: String) extends Response
+    final case class Failure(message: String, error: Error[Int]) extends Response
+
+    sealed trait Error[T]
+    object Error {
+      final case class Recoverable(cause: Int) extends Error[Int]
+      case object Unexpected extends Error[Unit]
+    }
+  }
+
+  implicit val show: Show[Response] = {
+    semi.show
+  }
+}
+```
+
+ends up with compilation error:
+```
+Error:(21, 10) diverging implicit expansion for type cats.derived.util.VersionSpecific.Lazy[cats.derived.MkShow[A]]
+starting with method catsKernelStdHashForSortedMap in trait SortedMapInstances
+    semi.show
+```
+
+The workaround is pretty simple - I have to move `Error` definition outside of `Response` companion object:
+
+```scala
+object example {
+
+  import cats.Show
+  import cats.derived.semi
+  import cats.implicits._
+
+  sealed trait Response
+  object Response {
+
+    final case class OK(message: String) extends Response
+    final case class Failure(message: String, error: Error[Int]) extends Response
+  }
+
+  sealed trait Error[T]
+  object Error {
+    final case class Recoverable(cause: Int) extends Error[Int]
+    case object Unexpected extends Error[Unit]
+  }
+
+  implicit val show: Show[Response] = {
+    semi.show
+  }
+}
+```
+
+Now it compiles. 
+Also there is no issue when `Error` is not GADT or have no generic type.
+
+But still, looks like a bug. I'm not pretty sure if this applies to kittens or shapeless, but I think you have now enough info to figure it out ;)
+
+Cheers. Great lib guys.
+When updating version numbers for [scalaz-and-cats](https://github.com/fosskers/scalaz-and-cats) I noticed a fairly stark performance regression for kittens-derived `Eq` between RC1 and RC3.
+
+For a simple case-class:
+```scala
+case class Foo(age: Int, msg: String, truthy: Boolean)
+```
+Previously the deriving syntax was:
+```scala
+implicit val fooEq: Eq[Foo] = derive.eq[Foo]
+```
+And now it is:
+```scala
+    implicit val fooEq: Eq[Foo] = {
+      import derived.auto.eq._
+      derived.semi.eq
+    }
+```
+For two length-10000 `List[Foo]` who have the same contents but are not the same object, to compare every element dropped from **38,630 ns** to **45,416 ns**. Either number is an order of magnitude slower than a hand-written instance, vanilla Scala's `==`, or a ScalaZ auto-derived instance.
+Kittens allows us to work with raw HLists and Coproducts:
+```scala
+import cats.instances.all._
+import cats.derived.MkMonoid._
+import cats.syntax.monoid._
+
+1 :: "a" :: HNil |+| 2 :: "b" ::HNil // ok
+```
+However, we can't work with raw Records and Unions:
+```scala
+'k ->> 1 :: HNil |+| 'k ->> 2 :: HNil // no Monoid instance
+```
+The same goes for other type classes as well. It mostly boils down to defining an instance for `FieldType[K, V]`. Are there any objections to adding them?

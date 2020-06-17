@@ -1,0 +1,206 @@
+Hi， I was research the gpdb code recently, and I find the duplicate statement below:
+https://github.com/greenplum-db/gpdb/blob/c9989a93c5a8c10ec19dbb326060f5191fd78b5b/src/backend/tcop/postgres.c#L4679
+
+```
+	/* We need to allow SIGINT, etc during the initial transaction */
+	PG_SETMASK(&UnBlockSig);
+
+	/*
+	 * We need to allow SIGINT, etc during the initial transaction.
+	 * Also, currently if this is the Master with standby support
+	 * we need to allow SIGUSR1 for performing sync replication (used by latch).
+	 */
+	PG_SETMASK(&UnBlockSig);
+```
+
+I was wondering if it is a duplicate statement or feature not implemented.
+I think  it is a little ugly, maybe you want to code like this (Pseudo code):
+```
+if(Gp_role == GP_ROLE_DISPATCH && master has standby ) 
+{
+    sigdelset(&BlockSig, SIGUSR1);
+    PG_SETMASK(&UnBlockSig);
+}
+```
+
+Please ignore me if it's just a typo.
+2pc prepared commit/abort retry failure is an annoying issue since it causes
+PANIC in production.  We've seen some users' complaints about reducing such
+cases when the cluster is in healthy state or during recovery (e.g. via
+gprecoverseg). There are many reasons that 2pc retry could not complete, e.g.
+primary is recovering (for this create gang could tolerate and retry), or
+could not create connections to segments (e.g. too many connections?), etc
+Ideally 2pc retry dispatch/execute code should be run as first-class citizen
+but it seems to be hard to inspect all cases, so this patch simply adds a guc
+dtx_phase2_retry_second to set retry time limit.
+
+we have had a guc dtx_phase2_retry_count (default 10) - that's the limit of 2pc
+retry times, also we do sleep 100ms in each try but this is not enough sometime
+(e.g. how if dispatch fails soon even fts shows the segments are all ok) so we
+could enforce the retry time limit also. With this we stop retry when both
+control is exhausted.
+…ion.
+
+Statement `Insert on conflict do update` will invoke update on segments.
+If the on conflict update modifies the distkeys of the table, this would
+lead to wrong data distribution.
+
+This commit avoid this issue by raising error when transformInsertStmt,
+if it finds that the on conflict update will touch the distribution keys of
+the table.
+
+Fixes github issue: https://github.com/greenplum-db/gpdb/issues/9444
+
+## Here are some reminders before you submit the pull request
+- [ ] Add tests for the change
+- [ ] Document changes
+- [ ] Communicate in the mailing list if needed
+- [ ] Pass `make installcheck`
+- [ ] Review a PR in return to support the community
+
+After enabling the global deadlock detector, we can support concurrent updates.
+When updating one tuple at the same time, the conflict and wait are moved from
+QD to QE. We need to make sure the implicated transaction order on the segments
+is also considered on the master when taking the distributed snapshots.
+
+This is reported: https://github.com/greenplum-db/gpdb/issues/9407
+
+## Here are some reminders before you submit the pull request
+- [x] Add tests for the change
+- [ ] Document changes
+- [ ] Communicate in the mailing list if needed
+- [ ] Pass `make installcheck`
+- [ ] Review a PR in return to support the community
+
+This patch performs a little cosmetic refactoring on how group_ids are
+computed. Also in test case `olap_plans`, I believe we meant to execute
+`analyze olap_test_single` as in this patch.
+
+## Here are some reminders before you submit the pull request
+- [ ] Add tests for the change
+- [ ] Document changes
+- [ ] Communicate in the mailing list if needed
+- [ ] Pass `make installcheck`
+- [ ] Review a PR in return to support the community
+
+### Greenplum version or build
+
+master branch (since this is introduced by upsert, from pg9.5)
+
+### Step to reproduce the behavior
+
+```sql
+create table t(a int, b int) distributed by (a);
+create unique index mud on t(a, b);
+insert into t select i, i from generate_series(1, 10)i;
+```
+
+Then `insert into t values (x, x) on conflict (a, b) do update set b = yyy` this kind of statement
+hold RowExclusiveLock on QD(means on QD they can run concurrently). But they may lock tuples in segment (when conflicts happen, it invokes ExecUpdate, even gdd is turned off).
+
+Locking tuples using xid in segments without gdd is dangerous, it will lead to global deadlock.
+
+The following code is using isolation2 framework syntax:
+```sql
+1: begin;
+1: insert into t values (9, 9) on conflict (a, b) do update set b = 999; 
+
+2: begin;
+2: insert into t values (3, 3) on conflict (a, b) do update set b = 888;
+
+1:  insert into t values (3, 3) on conflict (a, b) do update set b = 888;
+2:  insert into t values (9, 9) on conflict (a, b) do update set b = 999; 
+
+-- global deadlock happens, but no gdd is there.
+```
+
+-------------------------------
+
+## Proposal to fix
+
+Hold high lock if insert statement contains conflict of and do update.
+
+The tmid should be of the same value among the cluster.
+It increases only on gpdb cluster full restart.
+Tmid, gp_session_id, and gp_command_count are put together to
+uniquely identify a single query execution, monitoring agents
+such as gpperfmon relies on this uniqueness.
+
+In 34c1d3eee9871adeb914f680850bfe02d12678a7 introduced a different
+way for gpmon_gettmid(), it brings in a problem that on master
+and segments the tmid may be different.
+This commit fixes the problem.
+
+Reviewed-by: Ning Yu <nyu@pivotal.io>
+
+For prepared statements of update|delete the lock mode
+is determined by the function `CondUpgradeRelLock`, it
+forgot taking the GUC `gp_enable_global_deadlock_detector`
+into consideration. So before this commit, QD will first
+hold RowExclusiveLock and then hold ExclusiveLock on the
+table if `gp_enable_global_deadlock_detector` is set off,
+which might lead to local deadlock in QD.
+
+This commit fixes github issue 9446.
+
+=======================================
+
+This pr makes code in 6x more similar to master.
+
+It fixes the issue: https://github.com/greenplum-db/gpdb/issues/9446
+
+## Here are some reminders before you submit the pull request
+- [ ] Add tests for the change
+- [ ] Document changes
+- [ ] Communicate in the mailing list if needed
+- [ ] Pass `make installcheck`
+- [ ] Review a PR in return to support the community
+
+### Greenplum version or build
+
+gpdb 6 (master has fixed the issue)
+
+### Step to reproduce the behavior
+
+```sql
+create table t(c1 int, c2 int, c3 int);
+prepare haha as update t set c2 = $1;
+begin;
+execute haha (1); -- use gdb to step into this statement
+```
+
+The last statement will first hold rowexclusivelock and then exclusivelock, which leads to
+local deadlock in QD.
+
+This issue is fixed in master by a series of commits on lockmode.
+
+The fix is easy for 6, but we need to discuss whether to backport all related commits from master.
+
+### Greenplum version or build
+
+Master branch. Since upsert is introduced by Postgres9.5
+
+### Step to reproduce the behavior
+
+```sql
+create table t(a int, b int, c int) partition by list (b)
+(
+	partition t1 values (1),
+	partition t2 values (2)
+);
+psql:./b.sql:5: NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+psql:./b.sql:5: NOTICE:  CREATE TABLE will create partition "t_1_prt_t1" for table "t"
+psql:./b.sql:5: NOTICE:  CREATE TABLE will create partition "t_1_prt_t2" for table "t"
+CREATE TABLE
+create unique index mud on t(a, b);
+CREATE INDEX
+insert into t values (1, 1, 1);
+INSERT 0 1
+insert into t values (1, 1, 999) on conflict (a, b) do
+update set b = 2;
+psql:./b.sql:12: ERROR:  unexpected failure to find arbiter index (execIndexing.c:594)  (seg1 127.0.1.1:7003 pid=49866) (execIndexing.c:594)
+```
+
+The errmsg ` unexpected failure to find arbiter index ` is quite confusing.
+We should throw an error when we detect it is going to modify a partition key.

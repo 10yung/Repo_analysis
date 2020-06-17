@@ -1,0 +1,279 @@
+Currently I am using one instance of Db during all execution of my service, but every time the process is interrupted, my db gets corrupted. I understand the motivation, but it's too long the time for recovery, in the next start. 
+
+Is there an option to "safe save" the current data and, on the recovery moment, jump "to her"? 
+
+I have already tried the flush_every_ms and snapshot_after_ops config options, but without success.
+
+sled: 0.30.3
+rust: rustc 1.40.0 (73528e339 2019-12-16)
+os: raspbian armv7 32bits
+
+My related code:
+``` rust
+let db = sled::Config::default()
+	.path("/var/lib/tap/beerdb")
+	//.flush_every_ms(Some(100))
+	//.snapshot_after_ops(1)
+	.open()
+	.expect("Erro ao iniciar o banco de dados local");
+
+info!("Banco de dados local: size {:?}, was recovered {}", db.size_on_disk(), db.was_recovered());
+
+let db_rw = Arc::new(RwLock::new(db));
+thread::spawn(move || {
+	loop {
+		beerdb::sync(db_rw.clone());
+		thread::sleep(Duration::from_secs(3));
+	}
+});
+```
+
+When I write my data:
+``` rust
+let data = serde_json::to_string(&self)
+  .expect("Error on serialize!")
+  .to_string();
+
+tree.insert(self.uuid.as_bytes(), data.as_bytes().to_vec())
+  .expect("Error on store the serialized row!");
+
+tree.flush()
+  .expect("Error on flush the stored row");
+```
+This adds batch operations to `test_tree_failpoints`. I'm aware that batches will be overhauled in light of #897, so it's too early to merge this just yet.
+
+I've noticed two classes of failures from running this:
+
+* When the batch is applied, a FailPoint error bubbles up inside `<Reservation as Drop>::drop` and gets unwrapped. Should this use `global_error` instead of unwrapping?
+* Some test runs will report `failed to make_stable after 30 seconds.` I haven't dug into this much yet.
+Currently, [importing an exported sled database](https://github.com/spacejam/sled/blob/20745c9beda5174325a1058e1ed25361d346d4d6/src/db.rs#L273-L312) can panic is many ways, and at least one of them I would consider to be surprising (and undocumented). Here are the ways it can panic:
+
+1. Failed to open a tree with the given name
+2. Failed to pop a value from the key-value pair `Vec`
+3. Failed to pop a key from the key-value pair `Vec`
+4. Failed to insert this key-value pair into the open tree
+5. The value returned by this insert is not `None`. This is in an `assert` statement.
+6. The `CollectionType` value is anything other than `b"tree"`.
+
+To be fair, every panic on that list except for 5 should never happen if the export was performed correctly. Number 5, however, is pretty easy to get wrong, and it can happen *even if the user exported the previous database correctly*. It's not obvious that you can't import a database into one that has any overlap at all with the keys you're importing. At the very least, this should probably be mentioned in the documentation. Right now, the docs just state that `import` can panic if there are "IO problems". I'm also not sure I'd really consider any of this IO, so that could be misleading.
+
+Preferably, the `import` method would return a `Result` that informs the user why it failed. Ideally, all of these panics would be errors, but I think number 5 is the most important.
+
+I'd be happy to help write the PR if there's interest in making this change. Same thing with documentation.
+It would be nice to be able to impl `Transactional` for wrapper structs around multiple `Tree`s.
+
+I am not proposing exposing the contents of `TransactionalTrees` or any of its methods.
+
+Sample use case:
+
+```rust
+pub struct Table {
+    objects: sled::Tree,
+    metadata: sled::Tree,
+}
+
+pub struct TransactionalTable {
+    objects: sled::TransactionalTree,
+    metadata: sled::TransactionalTree,
+}
+
+impl sled::Transactional for Table {
+    type View = TransactionalTable;
+
+    fn make_overlay(&self) -> sled::TransactionalTrees {
+        sled::Transactional::make_overlay(&(&self.objects, &self.metadata))
+    }
+
+    fn view_overlay(overlay: &sled::TransactionalTrees) -> Self::View {
+        let (objects, metadata) =
+            <(&'_ sled::Tree, &'_ sled::Tree) as sled::Transactional>::view_overlay(overlay);
+
+        TransactionalTable { objects, metadata }
+    }
+}
+```
+
+Bug reports must include:
+1. sled version: 0.30.0
+2. rustc version: 1.39
+3. operating system: all
+4. logs: N/A
+
+The macro implementation of Transactional on tuples of trees is not generic over the error: https://github.com/spacejam/sled/blob/master/src/transaction.rs#L537
+
+The implementation for Tree is.
+
+This means that I can't return an error with the `abort` helper function when running a transaction over a tuple of `Tree`s like I can for a transaction on an individual `Tree`.
+
+This compiles:
+```rust
+use sled::{TransactionError, TransactionResult, Config, abort};
+
+#[derive(Debug, PartialEq)]
+struct MyBullshitError;
+
+fn main() -> TransactionResult<(), MyBullshitError> {
+    let config = Config::new().temporary(true);
+    let db = config.open().unwrap().open_tree("tree1").unwrap();
+
+    // Use write-only transactions as a writebatch:
+    let res = db.transaction(|db| {
+        db.insert(b"k1", b"cats")?;
+        db.insert(b"k2", b"dogs")?;
+        // aborting will cause all writes to roll-back.
+        if true {
+            abort(MyBullshitError)?;
+        }
+        Ok(42)
+    }).unwrap_err();
+
+    assert_eq!(res, TransactionError::Abort(MyBullshitError));
+    assert_eq!(db.get(b"k1")?, None);
+    assert_eq!(db.get(b"k2")?, None);
+
+    Ok(())
+}
+```
+
+This does not compile:
+```rust
+use sled::{Transactional, TransactionError, TransactionResult, Config, abort};
+
+#[derive(Debug, PartialEq)]
+struct MyBullshitError;
+
+fn main() -> TransactionResult<(), MyBullshitError> {
+    let config = Config::new().temporary(true);
+    let db = config.open().unwrap();
+    let tree1 = db.open_tree("tree1").unwrap();
+    let tree2 = db.open_tree("tree2").unwrap();
+
+    // Use write-only transactions as a writebatch:
+    let res = (tree1, tree2).transaction(|(tree1, tree2)| {
+        tree1.insert(b"k1", b"cats")?;
+        tree2.insert(b"k2", b"dogs")?;
+        // aborting will cause all writes to roll-back.
+        if true {
+            abort(MyBullshitError)?;
+        }
+        Ok(42)
+    }).unwrap_err();
+
+    assert_eq!(res, TransactionError::Abort(MyBullshitError));
+    assert_eq!(tree1.get(b"k1")?, None);
+    assert_eq!(tree2.get(b"k2")?, None);
+
+    Ok(())
+}
+```
+Here's the output of rustc for that particular piece of code
+```
+error[E0277]: `?` couldn't convert the error to `sled::ConflictableTransactionError<()>`
+  --> src/tree.rs:272:35
+   |
+20 |             abort(MyBullshitError)?;
+   |                                   ^ the trait `std::convert::From<sled::ConflictableTransactionError<MyBullshitError>>` is not implemented for `sled::ConflictableTransactionError<()>`
+   |
+```
+
+I tried fixing this, by changing line 537 to 
+```rust
+        impl<E> Transactional<E> for repeat_type!(&Tree, ($($indices),+)) {
+```
+This would fix it, but it breaks type inference for closures that do not abort, which judging by https://github.com/spacejam/sled/issues/810#issuecomment-542082720 is undesirable. The example showing a transaction on tuple of trees gives a compiler errors that a type annotation is needed after this change is applied.
+
+```
+error[E0282]: type annotations needed
+  --> src/tree.rs:308:6
+   |
+19 |     .transaction(|(unprocessed, processed)| {
+   |      ^^^^^^^^^^^ cannot infer type for `E`
+
+```
+
+(I can't say I fully understand why type inference works for `Transactable<E>` on a `Tree` but not on a tuple of `Tree`s)
+
+`io_uring_setup` syscall returns ENOMEM when code tries to allocate too much io_urings. Specifically, this test `cargo test --features=testing,io_uring log_chunky_iterator` allocates 100 threads and they start returning ENOMEM on `io_uring_setup` starting from ~20. This is very beginning of the io_uring setup and even fails before queues mmaps. I will trace kernel functions to understand better why it has this limit, but the fix anyway is to reduce the test parallelism for io_uring setup.
+
+It's clearly observed by
+
+```
+$ strace -f env cargo test --features=testing,io_uring log_chunky_iterator
+```
+
+Tracing notes: http://blog.vmsplice.net/2019/08/determining-why-linux-syscall-failed.html
+
+```
+$ sudo trace-cmd record -p function_graph -g __x64_sys_io_uring_setup
+$ sudo trace-cmd report --cpu 0
+```
+
+It is true, that execution return ENOMEM at:
+
+```
+log_chunky_iter-27409 [000] 40690.231487: funcgraph_exit:       ! 238.103 us |  } <-- good invocation
+ log_chunky_iter-27466 [000] 40690.232135: funcgraph_exit:       ! 459.701 us |  } <-- good invocation
+ log_chunky_iter-27387 [000] 40690.241284: funcgraph_exit:         2.434 us   |  } <-- bad invocation
+ log_chunky_iter-27394 [000] 40690.243183: funcgraph_exit:         2.269 us   |  }
+...
+ log_chunky_iter-27437 [000] 40690.250563: funcgraph_entry:                   |  __x64_sys_io_uring_setup() {
+ log_chunky_iter-27437 [000] 40690.250563: funcgraph_entry:                   |    io_uring_setup() {
+ log_chunky_iter-27437 [000] 40690.250564: funcgraph_entry:                   |      capable() {
+ log_chunky_iter-27437 [000] 40690.250564: funcgraph_entry:                   |        ns_capable_common() {
+ log_chunky_iter-27437 [000] 40690.250564: funcgraph_entry:                   |          security_capable() {
+ log_chunky_iter-27437 [000] 40690.250564: funcgraph_entry:                   |            cap_capable() {
+ log_chunky_iter-27437 [000] 40690.250564: funcgraph_exit:         0.152 us   |            }
+ log_chunky_iter-27437 [000] 40690.250564: funcgraph_exit:         0.489 us   |          }
+ log_chunky_iter-27437 [000] 40690.250565: funcgraph_exit:         0.747 us   |        }
+ log_chunky_iter-27437 [000] 40690.250565: funcgraph_exit:         0.984 us   |      }
+ log_chunky_iter-27437 [000] 40690.250565: funcgraph_entry:                   |      free_uid() {
+ log_chunky_iter-27437 [000] 40690.250565: funcgraph_exit:         0.143 us   |      }
+ log_chunky_iter-27437 [000] 40690.250565: funcgraph_exit:         1.618 us   |    }
+ log_chunky_iter-27437 [000] 40690.250565: funcgraph_exit:         2.215 us   |  }
+```
+
+from [5.3.0 kernel]( https://github.com/torvalds/linux/blob/4d856f72c10ecb060868ed10ff1b1453943fc6c8/fs/io_uring.c#L3344):
+
+```C
+	account_mem = !capable(CAP_IPC_LOCK);
+	if (account_mem) {
+		ret = io_account_mem(user,
+				ring_pages(p->sq_entries, p->cq_entries));
+		if (ret) {
+			free_uid(user);
+			return ret;
+		}
+	}
+
+	ctx = io_ring_ctx_alloc(p);
+	if (!ctx) {
+		if (account_mem)
+			io_unaccount_mem(user, ring_pages(p->sq_entries,
+								p->cq_entries));
+		free_uid(user);
+		return -ENOMEM;
+	}
+```
+
+So basically it fails due to the:
+
+```
+	/* Don't allow more pages than we can safely lock */
+	page_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+```
+
+Limit of allocated pages per process
+putting this in one issue because these issues are two sides of the same coin, and it helps me keep notes in one place
+
+concurrent transactions occurring on non-overlapping sets of trees can cause non-atomic recovery of transactions. we need to make transaction batching fully atomic by ditching the "plug" approach and just support multi-item logging (this also will reduce contention on the log).
+
+- [ ] add relative file offset to blob pointers
+- [ ] add batch log message that includes the expected batch length
+- [ ] add reserve_batch method to Log
+- [ ] recovery can be parallelized before the last batch header (after can also be done but is more complex and not likely to be as useful)
+- [ ] switch recovery over to new batch style
+- [ ] implement cicada-like page concurrency control
+- [ ] add page view local write cache and read ts maps
+calls to SA::next can often avoid coordination as long as we don't need to bump the file tip, in which case we might need to wait for some file truncation futures to resolve before extending the file again. 
+these operations are fully async, and would benefit from cache locality when batching anyway. we currently try to claim the SA mutex on many write operations, and this flat-combining approach, similar to what now is called in `Lru::accessed` may significantly reduce contention on this mutex for all write operations.
+in order to reduce special-casing in the PageCache, Meta and Counter can be folded into a special Tree

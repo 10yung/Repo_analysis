@@ -1,0 +1,151 @@
+Added --auto flag
+REPRO STEPS:
+
+1. Open up MSC
+2. Click "Install" on an optional install
+3. Watch ManagedInstallReport.plist
+
+ACTUAL BEHAVIOR:
+4. After the item is successfully installed, ManagedInstallReport.plist contains an `InstallResults` key that looks like this:
+```
+	<key>InstallResults</key>
+	<array>
+		<dict>
+			<key>applesus</key>
+			<false/>
+			<key>display_name</key>
+			<string>TextExpander 6</string>
+			<key>download_kbytes_per_sec</key>
+			<integer>0</integer>
+			<key>duration_seconds</key>
+			<integer>2</integer>
+			<key>name</key>
+			<string>TextExpander6</string>
+			<key>status</key>
+			<integer>0</integer>
+			<key>time</key>
+			<date>2020-01-13T02:44:29Z</date>
+			<key>unattended</key>
+			<false/>
+			<key>version</key>
+			<string>6.5.2</string>
+		</dict>
+	</array>
+```
+The `download_kbytes_per_sec` is always 0.
+
+EXPECTED BEHAVIOR:
+The `downloaded_kbytes_per_sec` should contain the average download speed from the download run, and generally be ignored for locally cached items. 
+
+WHAT I THINK IS HAPPENING:
+Downloading and installing an item from MSC is technically two Munki runs: one to do a manualcheck, and one to do an installwithnologout type run. However, when doing an install via MSC, the postflight script is not executed in between the download and install - but the calculation of download speed is done when the item is already cached. This is resulting in an erroneous value of 0 for any item downloaded this way.
+
+Normal automatic unattended updates don't seem to suffer this issue if the item is downloaded and installed successfully.
+`makecatalogslib` can cause AutoPkg's MakeCatalogsProcessor to choke on non-ASCII characters in file/folder names within the Munki repo. (Might be related to this downstream issue: https://github.com/autopkg/autopkg/issues/604)
+
+### Steps to reproduce
+
+- Munki tools 4.0.1
+- AutoPkg 1.4.1 or 2.0 RC1
+
+1. Create a pkginfo file at a path that contains a non-ASCII character. (I created one called Ümlaut-1.0.plist)
+2. Run `makecatalogs` and observe that catalogs are rebuilt successfully.
+3. Run an AutoPkg recipe that results in importing new software to the Munki repo, and observe that although catalogs are rebuilt successfully, the MakeCatalogs processor fails with a `UnicodeEncodeError`. See abridged output below:
+
+```
+...snip...
+The following recipes failed:
+    MakeCatalogs.munki
+        Error in local.munki.MakeCatalogs: Processor: MakeCatalogsProcessor: Error: makecatalogs failed: 
+        Traceback (most recent call last):
+          File "/usr/local/munki/makecatalogs", line 109, in <module>
+            main()
+          File "/usr/local/munki/makecatalogs", line 98, in main
+            errors = makecatalogslib.makecatalogs(repo, options, output_fn=print)
+          File "/usr/local/munki/munkilib/admin/makecatalogslib.py", line 258, in makecatalogs
+            repo, options, output_fn=output_fn)
+          File "/usr/local/munki/munkilib/admin/makecatalogslib.py", line 231, in process_pkgsinfo
+            output_fn("Adding %s to %s..." % (pkginfo_ref, catalogname))
+        UnicodeEncodeError: 'ascii' codec can't encode character u'\u0308' in position 22: ordinal not in range(128)
+
+The following new items were imported into Munki:
+    Name     Version  Catalogs  Pkginfo Path               Pkg Repo Path            
+    ----     -------  --------  ------------               -------------            
+    Firefox  72.0.1   testing   apps/Firefox-72.0.1.plist  apps/Firefox-72.0.1.dmg  
+```
+(Note that it doesn't matter which product is imported into Munki; Firefox is used here as an example.)
+
+### Verifying proposed change
+
+When the steps above are run on the modified makecatalogslib.py, here is the abridged AutoPkg output:
+
+```
+Processing MakeCatalogs.munki...
+MakeCatalogsProcessor
+{'Input': {'MUNKI_REPO': '~/munki_repo'}}
+MakeCatalogsProcessor: Munki catalogs rebuilt!
+{'Output': {}}
+Receipt written to ~/Library/AutoPkg/Cache/local.munki.MakeCatalogs/receipts/MakeCatalogs-receipt-20200111-193001.plist
+
+The following new items were imported into Munki:
+    Name     Version  Catalogs  Pkginfo Path               Pkg Repo Path            
+    ----     -------  --------  ------------               -------------            
+    Firefox  72.0.1   testing   apps/Firefox-72.0.1.plist  apps/Firefox-72.0.1.dmg  
+```
+Filing bug report based on munki-discuss thread (https://groups.google.com/forum/#!topic/munki-discuss/z-VKFlAuILE). 
+
+The basic gist is that a simple uninstallcheck_script proceeds with item removal on exit code 1, rather than skipping removal.
+
+Tested on macOS 10.13 running Munki v3.6.2.3776, and on macOS 10.14 running Munki v3.7.0.3855.
+
+________
+
+Update: this behavior appears to be caused by Munki using aspects of multiple pkginfo files, but the pkginfo file that governs the final behavior is the oldest version. Full details in the linked munki-discuss thread above.
+Running `makepkginfo --nopkg --uninstall_script=uninstall.sh --unattended_uninstall ...` does not set `uninstallable` to true in the resulting pkginfo plist.
+The result is that when the package is added to a manifest's `managed_uninstalls` section, uninstalling fails and `Library/Managed Installs/` shows:
+```
+**Checking for removals**
+Running installcheck_script for [pkg]
+WARNING: Could not find uninstall info for [pkg]
+```
+Manually setting the following property in the pkginfo results in a successful uninstall:
+```
+<key>uninstallable</key>
+<true/>
+```
+This should probably be done automatically when the `--unattended_uninstall` option is used, or another option `--uninstallable` should be added.
+launchd.plist man page describes the following for the `OnDemand` key:
+
+```
+OnDemand <boolean>
+     This key does nothing if set to true. If set to false, this key is equivalent to specifying a
+     true value for the KeepAlive key. This key should not be used. Please remove this key from
+     your launchd.plist.
+```
+
+given this key is set to `<true/>` then by the documentation it does nothing and can be removed.
+
+as it does nothing then leaving it in would not be considered a bug and so can be low priority. I can submit a PR for it at some point
+repoclean wants a file path to a repo.
+
+It does not work properly with anything other than the default FileRepo plugin.
+
+
+The Managedsoftwareupdate app should warn if there is a certificate problem like the command line version does. Now the app behaves like there is no problem but it can't get updates or install software.
+
+Backstory: I managed to send out a profile which removed the certificate needed to access our munki server (ouch). This resulted in people not being able to get the updated profile that would restore the certificate, because it wouldn't appear in the MSC app. There was also no error message indicating that there was a problem.
+
+I know the MSC app likes to hide the technicalities from unprepared users, but in the name of transparency, i don't think an app should behave like everything's alright when it can't function.
+The current method `logouthelper` uses to forcibly logout users was developed in mid-2011 and is a bit of a nasty hack.
+
+Investigate the use of macOS 10.11+ `launchctl` methods to do this "better":
+
+`launchctl reboot userspace`
+`launchctl bootout gui/<uidNumber>`
+`sudo -u <user> launchctl reboot logout`
+
+Clicking a text label for the toolbar item "buttons" (Software/Categories/My Items/Updates) does not cause any action to occur.
+
+Clicking a toolbar item label should switch to the appropriate view, just like clicking on the image does.
+
+I am reasonably certain I fixed this in the past by implementing custom MSCToolbarbarButton and MSCToolbarButtonCell classes, but even MSC.4.8.x shows this behavior.

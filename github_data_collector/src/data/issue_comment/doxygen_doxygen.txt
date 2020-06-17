@@ -1,0 +1,396 @@
+To be able to distinguish between explicit setting of callgraph / hidecallgraph (etc.) compared to the configuration setting it is necessary to record what has been used and handle this (otherwise duringe a combine of a definition and declaration .
+- entry.h, memberdef.h create possibility to record config / explicit setting
+- entry.cpp set initial value
+- memberdef.cpp, commentscan.l enable / disable functions have to "or" values to record the "history".
+- memberdef.cpp when checking for use check individual values
+- memberdef.cpp create functions to output "raw" value of call... / hide...
+- doxygen.cpp properly initialize the members
+- docparser.cpp warn in case use call... / hide... for the same member
+
+Extended example: [example.tar.gz](https://github.com/doxygen/doxygen/files/4082662/example.tar.gz)
+
+I have a fortran project that has same-named "twin" subroutines defined in different files (and different directories). Clicking on one of these subroutines in the source code browser will bring up the same subroutine regardless of which one is actually being used.
+
+This has been a known issue for quite awhile, but is yet to be fixed. There was a patch submitted with #4365, but it never even got feedback (note it was submitted before the move to GitHub). I'm not sure how relevant that patch is to the current source code, but the changes are very minimal. 
+
+Fixing this would not only resolve #4365, but also #3676, #5448, #979, and #3676. It may also fix #6251, but I'm not quite sure about that one.
+
+doxygen version: 1.8.16
+
+Handle #define so that the argument can have a link.
+When having a simple example like:
+```
+ #define siz1 7
+  
+ typedef struct {
+     int           var1;
+     int           var2[48+1];
+     int           var3[siz1 + 1];
+ } the_struct;
+```
+We see in the code a link to `siz1` in the size of `var3` but not in the define (the missing links for `var2` and `var3` are addressed in #7519).
+
+The problematic part in the code is here the recognition of the `define` and its "arguments" in `code.l`. The rule involved here is (currently at line 617):
+```
+<SkipCPP>[^\n\/\\]+                     {
+                                          yyextra->code->codify(yytext);
+                                        }
+```
+where its "state" `SkipCPP` is started by (currently at line 608):
+```
+<Body,Bases>^[ \t]*"#"                  {
+                                          startFontClass(yyscanner,"preprocessor");
+                                          yyextra->lastSkipCppContext = YY_START;
+                                          yyextra->code->codify(yytext);
+                                          BEGIN( SkipCPP ) ;
+                                        }
+```
+
+Probable solution would be that in case of a define the first argument is handled similar to the way `siz1` is handled in the size of `var3`.
+
+Example: [example.tar.gz](https://github.com/doxygen/doxygen/files/4077238/example.tar.gz)
+
+When having a simple example like:
+```
+ #define siz1 7
+  
+ typedef struct {
+     int           var1;
+     int           var2[48+1];
+     int           var3[siz1 + 1];
+ } the_struct;
+```
+
+We see in the code a link to `var1`  and `the_struct` but not to `var2` and `var3`. There is also a link to `siz1` in the size of `var3` but not in the define, the later will be handled in another issue.
+
+In the file `code.l` (currently starting at line 1183) we see:
+```
+<Body>{SCOPENAME}/{BN}*[:;,)\]]         { // "int var;" or "var, var2" or "debug(f) macro" , or int var : 5;
+                                          addType(yyscanner);
+                                          // changed this to generateFunctionLink, see bug 624514
+                                          //generateClassOrGlobalLink(yyscanner,*yyextra->code,yytext,FALSE,TRUE);
+                                          generateFunctionLink(yyscanner,*yyextra->code,yytext);
+                                          yyextra->name+=yytext;
+                                        }
+<Body>{SCOPENAME}/{B}*                  { // p->func()
+                                          addType(yyscanner);
+                                          generateClassOrGlobalLink(yyscanner,*yyextra->code,yytext);
+                                          yyextra->name+=yytext;
+                                        }
+```
+where `var1` uses the first rule and `var2` and `var3` use the second rule.
+I see the following possibilities to fix this:
+- extend tthe first rule from:
+  `<Body>{SCOPENAME}/{BN}*[:;,)\]]`
+  to
+  `<Body>{SCOPENAME}/{BN}*[:;,()\[\]]`
+- call different link functionfor the second rule, i.e. change:
+  `generateClassOrGlobalLink(yyscanner,*yyextra->code,yytext);`
+  to
+  `generateFunctionLink(yyscanner,*yyextra->code,yytext);`
+
+As I'm not sure about the side effects of these possible patches, I didn't create a patch.
+
+Example case (with html output): [example.tar.gz](https://github.com/doxygen/doxygen/files/4077186/example.tar.gz)
+
+Assume the following minimal test case and `doxygen 1.8.17` (or current `master`, does not matter):
+```
+/// @file
+/// @brief Declares stuff.
+///
+/// This header file declares some stuff.
+#ifndef FOO_H
+#define FOO_H
+
+/// @brief foo namespace
+///
+/// This is the foo namespace
+namespace foo
+{
+/// @brief Class in foo namespace
+///
+/// This is a class declared in the foo namespace.
+class Bar
+{
+};
+
+/// @brief Function in foo namespace
+///
+/// This is a free function declared in the foo namespace.
+void bar();
+}
+
+/// @brief Class in global namespace
+///
+/// This is a class declared in the global namespace.
+class Baz
+{
+};
+
+/// @brief Function in global namespace
+///
+/// This is a free function declared in the global namespace.
+void baz();
+
+#endif
+```
+
+While for both classes `Bar` and `Baz` separate HTML pages are generated which at the top list the header file has to be included to use them, the situation for the free functions and other non-class items is significantly different.
+
+Function `baz()` declared in the global namespace is documented in the page generated for `Foo.h`, and is also indexed and accessible via the `File members` index. Good. Function `bar()` declared in the `foo` namespace, however, is *only* documented on the page generated for the `foo` namespace and no longer on the `Foo.h` page. It also disappears from the `File members` index. With this, it is impossible to figure out from the documentation which header to include to get the `bar()` prototype definition.
+
+Therefore, I suggest that all non-class items (i.e., everything for which no dedicated page is generated) declared inside namespaces are at least *referenced* from the file documentation page, similar to classes/structs, and properly indexed via `File members`. In this case, the detailed description could stay on the namespace page. Alternatively, the detailed description could be placed on the file page and referenced from the namespace page (and likewise from custom group pages). This arrangement may actually make things less cluttered for large libraries where lots of stuff is within a single namespace but scattered across many files (see also #4812).
+
+### The problem
+
+Consider the following code:
+
+```
+/**
+  Lock coordinates.
+
+  Protects:
+  - @ref point_x
+  - @ref point_y
+*/
+pthread_mutex_t LOCK_coordinates;
+
+/**
+  X coordinate.
+
+  Protected by @ref LOCK_coordinates.
+*/
+int point_x;
+
+/**
+  Y coordinate.
+
+  Protected by @ref LOCK_coordinates.
+*/
+int point_y;
+```
+
+Here the author wants to document which lock cover which variable (a **_user defined_** relation) in the source.
+
+However:
+- Maintaining both sides of the relation:
+  - point_x refers to LOCK_coordinates
+  - LOCK_coordinates refers to point_x
+  is tedious and error prone.
+
+- when both sides are in different libraries / components,
+  modifying an existing doc just because it is referenced might
+  not be possible.
+
+- The result collection of links is embedded in the general text,
+  and is not available in an anchored sub section, that can be pointed to.
+  A reader has to scan the full text to find references about relations.
+
+For large code bases, at scale, maintaining documentation this way
+is not practical.
+
+### Use case
+
+Assume the following feature (to be described below)
+
+```
+ALIAS += "protects=@relxrefitem protects \"Protects\" protectedby \"Protected by\""
+ALIAS += "protectedby=@relxrefitem protectedby \"Protected by\"" protects \"Protects\"
+```
+
+With the following source:
+
+```
+/**
+  Lock coordinates.
+
+  @protects point_x
+*/
+pthread_mutex_t LOCK_coordinates;
+
+/**
+  X coordinate.
+*/
+int point_x;
+
+/**
+  Y coordinate.
+
+  @protectedby LOCK_coordinates
+*/
+int point_y;
+```
+
+The generated documentation could be as follows.
+
+Doc for LOCK_coordinates:
+- contains the item doc as usual
+- contains a section named "Protects", with
+  - a link to x.
+  - a link to y.
+
+Doc for x:
+- contains the item doc as usual
+- contains a section named "Protected by", with
+  - a link to LOCK_coordinates.
+
+Doc for y:
+- contains the item doc as usual
+- contains a section named "Protected by", with
+  - a link to LOCK_coordinates.
+
+That is, be specifying only **_once_** that two items are related, the tool generates documentation on **_both sides_**, to document the relationship.
+
+### FEATURE REQUEST
+
+
+Implement a new command of the form:
+
+`  @relxrefitem local_key \"(local title)\" remote_key \"(remote title)\" remote_reference`
+
+  The name `relxrefitem` means 'relation cross reference item'.
+
+  `local_key` and `remote_key` are identifiers.
+
+  "(local title)" and "(remote title)" are text,
+  to be displayed in the generated documentation,
+  as a section heading.
+
+  `remote_reference` is the name of a documented entity (similar to `@ref`).
+
+When documenting the following item:
+
+```
+/**
+  Item A.
+
+  @relxrefitem key_a "Role of A" key_b "Role of B" item_b
+*/
+int item_a;
+
+/**
+  Item B.
+*/
+int item_b;
+```
+
+The generated doc should look like:
+
+item_a:
+- doc for item_a
+- SECTION "Role of A" (using key_a)
+  - link to item_b
+
+item_b:
+ - doc for item_b
+ - SECTION "Role of B" (using key_b)
+   - link to item_a
+
+Note that adding a single `@relxrefitem` command to either side of (item_a, item_b)
+causes *both* items documentation to point to the other, with the proper section name.
+
+Also note, all `@relxrefitem` using the same key are grouped under the section for that key.
+
+As there can be other `@relxrefitem` present with other keys, an item can have multiple sections
+created by `@relxrefitem`.
+
+### Example of intended use
+
+  A typical usage is to document an arbitrary relation between entities,
+  for example, to document which components writes to which log files,
+  one can define aliases like:
+
+```
+  ALIAS += "logto=@relxrefitem component \"Writes to\" logfile \"Collects logs from\""
+  ALIAS += "logfrom=@relxrefitem logfile \"Collects logs from\"" component \"Writes to\"
+
+```
+
+```
+  /**
+    User application.
+  */
+  class UserApp;
+
+  /**
+    Admin application.
+    @logto DebugLog
+  */
+  class AdminApp;
+
+  /**
+    Debug log.
+    @logfrom UserApp
+  */
+  class DebugLog;
+```
+
+  The documentation for DebugLog:
+  - will point to UserApp
+  - will point to AdminApp
+  under a section named "Collects logs from" (url derived from key logfile)
+
+  The documentation for UserApp:
+  - will point to DebugLog
+  under a section named "Writes to" (url devived from key component)
+
+  The documentation for AdminApp:
+  - will point to DebugLog
+  under a section named "Writes to" (url devived from key component)
+
+Thanks for considering this feature request.
+Besides `\verbatim` and `\code` blocks also `<pre>` and `<code>` blocks should be excluded.
+This implementation is more consistent  with `\verbatim` and `\code` than the implementation in #7513
+
+Extended example: [example.tar.gz](https://github.com/doxygen/doxygen/files/4071791/example.tar.gz)
+
+If I in doxywizard try to open a doxyfile with
+`@INCLUDE = doxyfile.inc`
+and doxyfile.inc is not found doxywizard will just close, no error or warning. Not even when I run it from commandline.
+
+doxy Version: 1.8.15
+OS: windows 10
+
+Hello :)
+
+After **upgrading Doxygen from 1.8.16 to 1.8.17**, the building process of Weston's documentation
+stopped working because of the function bellow:
+
+```c
+// file weston-log.h
+// https://gitlab.freedesktop.org/wayland/weston/blob/master/include/libweston/weston-log.h
+
+/** weston_log_scope callback
+ *
+ * @param sub The subscription.
+ * @param user_data The \c user_data argument given to
+ * weston_compositor_add_log_scope()
+ *
+ * @memberof weston_log_scope
+ */
+typedef void (*weston_log_scope_cb)(struct weston_log_subscription *sub,
+				    void *user_data);
+```
+
+Looking at the xml files generated by Doxygen 1.8.17, **a missing parenthesis is
+noticeable** in structweston__log__scope.xml. Adding the parenthesis
+makes everything work as usual.
+
+#### in 1.8.17
+```
+<definition>typedef void(* weston_log_scope_cb(struct weston_log_subscription *sub, void *user_data)</definition>
+```
+
+##### in 1.8.16
+```
+<definition>typedef void(* weston_log_scope_cb) (struct weston_log_subscription *sub, void *user_data)</definition>
+```
+
+Here it is the zip to reproduce the error, containing a brand-new config file
+(only edited PROJECT_NAME, OUTPUT, INPUT and GENERATE_XML) and the source
+files.
+
+[reproduce-error.zip](https://github.com/doxygen/doxygen/files/4068212/reproduce-error.zip)
+
+If there's anything else that I can share to help, let me know.
+Thank you!

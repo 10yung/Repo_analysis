@@ -1,0 +1,148 @@
+Based on this [issue](https://github.com/gildor/kotlin-coroutines-retrofit/issues/34). If we're throwing exceptions inside interceptor, they should inherit IOException to be properly handled without crashing the app. But there's some situations in which you don't want to inherit IOException.
+One of this cases: we are handling errors of API. Not HTTP errors. API returns some templated entities with status-code which can be checked to detect some errors like invalid parameters that was passed. 
+And one of error handling solutions is to create interceptor that checks all of requests' responses and throwing domain exceptions if status code indicates error.
+I suggest to add some parameter to OkHttpClient.Builder that will allow us to disable canceling requests if some Non-IOException was thrown inside interceptor.
+
+
+2020-01-15 11:00:54.127 11279-11554 E/AndroidRuntime: FATAL EXCEPTION: OkHttp Dispatcher
+    kotlin.KotlinNullPointerException
+        at okhttp3.internal.http1.Http1ExchangeCodec$FixedLengthSource.read(Http1ExchangeCodec.kt:391)
+        at okhttp3.internal.Util.skipAll(Util.kt:336)
+        at okhttp3.internal.http1.Http1ExchangeCodec.skipConnectBody(Http1ExchangeCodec.kt:278)
+        at okhttp3.internal.connection.RealConnection.createTunnel(RealConnection.kt:431)
+        at okhttp3.internal.connection.RealConnection.connectTunnel(RealConnection.kt:233)
+        at okhttp3.internal.connection.RealConnection.connect(RealConnection.kt:174)
+        at okhttp3.internal.connection.ExchangeFinder.findConnection(ExchangeFinder.kt:238)
+        at okhttp3.internal.connection.ExchangeFinder.findHealthyConnection(ExchangeFinder.kt:111)
+        at okhttp3.internal.connection.ExchangeFinder.find(ExchangeFinder.kt:79)
+        at okhttp3.internal.connection.Transmitter.newExchange$okhttp(Transmitter.kt:163)
+        at okhttp3.internal.connection.ConnectInterceptor.intercept(ConnectInterceptor.kt:35)
+        at okhttp3.internal.http.RealInterceptorChain.proceed(RealInterceptorChain.kt:112)
+        at okhttp3.internal.http.RealInterceptorChain.proceed(RealInterceptorChain.kt:87)
+        at okhttp3.internal.cache.CacheInterceptor.intercept(CacheInterceptor.kt:82)
+        at okhttp3.internal.http.RealInterceptorChain.proceed(RealInterceptorChain.kt:112)
+        at okhttp3.internal.http.RealInterceptorChain.proceed(RealInterceptorChain.kt:87)
+        at okhttp3.internal.http.BridgeInterceptor.intercept(BridgeInterceptor.kt:84)
+        at okhttp3.internal.http.RealInterceptorChain.proceed(RealInterceptorChain.kt:112)
+        at okhttp3.internal.http.RetryAndFollowUpInterceptor.intercept(RetryAndFollowUpInterceptor.kt:71)
+        at okhttp3.internal.http.RealInterceptorChain.proceed(RealInterceptorChain.kt:112)
+        at okhttp3.internal.http.RealInterceptorChain.proceed(RealInterceptorChain.kt:87)
+        at okhttp3.RealCall.getResponseWithInterceptorChain(RealCall.kt:194)
+        at okhttp3.RealCall$AsyncCall.run(RealCall.kt:138)
+        at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1133)
+        at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:607)
+        at java.lang.Thread.run(Thread.java:762)
+
+
+Getting error because tunnel creating:        
+val tunnelCodec = Http1ExchangeCodec(null, **null**, source, sink)
+and in function Http1ExchangeCodec.read realConnection not nullable:
+        realConnection!!.noNewExchanges() // The server didn't supply the promised content length.
+
+
+
+`RetryAndFollowUpInterceptor` indefinitely retries `StreamResetException` with error code CANCEL. 
+
+It's possible that an HTTP/2 connection is established with server immediately sending back stream cancels upon receiving requests (that's how we encountered this issue).
+
+This can  be reproduce by a node+express server and within request handler do `res.connection.destroy();` 
+
+From examining code this appears to be obvious as CANCEL events [are intentionally kept out from renewing connections. ](https://github.com/square/okhttp/blob/ff0dee1c34fc06084357c93dc480f6ad89fef24a/okhttp/src/main/java/okhttp3/internal/connection/RealConnection.kt#L674)
+
+Should there be a global retry count of some sort as a final guard in the interceptor to avoid infinite retries as such?
+I'd like to be able to limit the retry count in Authenticator to 3. At the moment it appears to be 20. I don't see anything to do this and didn't get an answer in [StackOverflow](https://stackoverflow.com/questions/59680324/limit-retry-count-of-authenticator), so assuming it's not possible at the moment.
+https://app.circleci.com/jobs/github/square/okhttp/8416
+
+```
+> Task :samples:slack:testClasses UP-TO-DATE
+> Task :samples:slack:test NO-SOURCE
+> Task :samples:static-server:compileKotlin
+
+> Task :okhttp-tls:test
+
+okhttp3.tls.HandshakeCertificatesTest > platformTrustedCertificates FAILED
+    java.lang.StringIndexOutOfBoundsException: begin 0, end -1, length 28
+        at java.base/java.lang.String.checkBoundsBeginEnd(String.java:3319)
+        at java.base/java.lang.String.substring(String.java:1874)
+        at okhttp3.tls.HandshakeCertificatesTest.platformTrustedCertificates(HandshakeCertificatesTest.java:145)
+
+okhttp3.tls.HeldCertificateTest > decodeMalformed FAILED
+    java.util.NoSuchElementException
+        at java.base/java.util.ArrayList$Itr.next(ArrayList.java:999)
+        at okhttp3.tls.HeldCertificate$Companion.decodePem(HeldCertificate.kt:521)
+        at okhttp3.tls.HeldCertificate$Companion.decode(HeldCertificate.kt:493)
+        at okhttp3.tls.HeldCertificate$Companion.decode(HeldCertificate.kt:488)
+        at okhttp3.tls.HeldCertificate.decode(HeldCertificate.kt)
+        at okhttp3.tls.HeldCertificateTest.decodeMalformed(HeldCertificateTest.java:461)
+```
+https://circleci.com/gh/square/okhttp/8330?utm_campaign=vcs-integration-link&utm_medium=referral&utm_source=github-build-link
+
+closeReasonMaximumLength - okhttp3.internal.ws.WebSocketHttpTest
+```
+org.junit.ComparisonFailure: expected:<[0]> but was:<[1]>
+	at okhttp3.OkHttpClientTestRule.ensureAllConnectionsReleased(OkHttpClientTestRule.kt:91)
+	at okhttp3.OkHttpClientTestRule$apply$1.evaluate(OkHttpClientTestRule.kt:121)
+```
+
+serverCloseThenClientClose - okhttp3.internal.ws.RealWebSocketTest
+```
+java.lang.AssertionError: 
+Expecting empty but was:<[Closed[1000 Hello!]]>
+	at okhttp3.internal.ws.WebSocketRecorder.assertExhausted(WebSocketRecorder.java:163)
+	at okhttp3.internal.ws.RealWebSocketTest.tearDown(RealWebSocketTest.java:58)
+```
+Seeing the following crashes on Android with Okhttp v4.3.0, not happening on v4.2.2
+
+- Using http2 rest endpoints with retrofit and rxjava.
+
+```
+Fatal Exception: m0.a
+       at okio.Buffer.writableSegment$okio(Buffer.java:1812)
+       at okio.Buffer.writeByte(Buffer.java:1662)
+       at okio.RealBufferedSink.writeByte(RealBufferedSink.java:197)
+       at okhttp3.internal.Util.writeMedium(Util.java:309)
+       at okhttp3.internal.http2.Http2Writer.frameHeader(Http2Writer.java:261)
+       at okhttp3.internal.http2.Http2Writer.settings(Http2Writer.java:173)
+       at okhttp3.internal.http2.Http2Connection.start(Http2Connection.java:496)
+       at okhttp3.internal.http2.Http2Connection.start$default(Http2Connection.java:493)
+       at okhttp3.internal.connection.RealConnection.startHttp2(RealConnection.java:329)
+       at okhttp3.internal.connection.RealConnection.establishProtocol(RealConnection.java:312)
+       at okhttp3.internal.connection.RealConnection.connect(RealConnection.java:182)
+       at okhttp3.internal.connection.ExchangeFinder.findConnection(ExchangeFinder.java:238)
+       at okhttp3.internal.connection.ExchangeFinder.findHealthyConnection(ExchangeFinder.java:111)
+       at okhttp3.internal.connection.ExchangeFinder.find(ExchangeFinder.java:79)
+       at okhttp3.internal.connection.Transmitter.newExchange$okhttp(Transmitter.java:163)
+       at okhttp3.internal.connection.ConnectInterceptor.intercept(ConnectInterceptor.java:35)
+       at okhttp3.internal.http.RealInterceptorChain.proceed(RealInterceptorChain.java:112)
+       at okhttp3.internal.http.RealInterceptorChain.proceed(RealInterceptorChain.java:87)
+       at okhttp3.internal.cache.CacheInterceptor.intercept(CacheInterceptor.java:82)
+       at okhttp3.internal.http.RealInterceptorChain.proceed(RealInterceptorChain.java:112)
+       at okhttp3.internal.http.RealInterceptorChain.proceed(RealInterceptorChain.java:87)
+       at okhttp3.internal.http.BridgeInterceptor.intercept(BridgeInterceptor.java:84)
+       at okhttp3.internal.http.RealInterceptorChain.proceed(RealInterceptorChain.java:112)
+       at okhttp3.internal.http.RetryAndFollowUpInterceptor.intercept(RetryAndFollowUpInterceptor.java:71)
+       at okhttp3.internal.http.RealInterceptorChain.proceed(RealInterceptorChain.java:112)
+       at okhttp3.internal.http.RealInterceptorChain.proceed(RealInterceptorChain.java:87)
+       at okhttp3.RealCall.getResponseWithInterceptorChain(RealCall.java:194)
+       at okhttp3.RealCall$AsyncCall.run(RealCall.java:138)
+       at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1167)
+       at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:641)
+       at java.lang.Thread.run(Thread.java:919)
+```
+
+and 
+
+```
+Fatal Exception: m0.a
+       at okio.Segment.pop(Segment.java:89)
+       at okio.Buffer.skip(Buffer.java:1478)
+       at okio.RealBufferedSource.skip(RealBufferedSource.java:431)
+       at okhttp3.internal.http2.Http2Connection$ReaderRunnable.data(Http2Connection.java:643)
+       at okhttp3.internal.http2.Http2Reader.readData(Http2Reader.java:178)
+       at okhttp3.internal.http2.Http2Reader.nextFrame(Http2Reader.java:117)
+       at okhttp3.internal.http2.Http2Connection$ReaderRunnable.run(Http2Connection.java:614)
+       at java.lang.Thread.run(Thread.java:919)
+```
+
+Need to catch Android regressions due to code changes or new OS releases
+Forked from https://github.com/square/okhttp/pull/5699/files

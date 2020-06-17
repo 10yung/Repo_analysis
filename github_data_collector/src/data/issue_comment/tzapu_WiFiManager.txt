@@ -1,0 +1,559 @@
+This is relates to the ArduinoJson 5 / 6 changes.
+I took what @bigjohnson did in a502456 and just added a #define UseJsonV6 option that can be commented out if you want to use ArduinoJsonV5.
+Tested on ArduinoJson V 5.13 and ArduinoJson V 6.13 (Latest as at 14/01/2020)
+
+This also links to #654 and #812 
+- [x] update examples to be compatible with future arduinojson library
+- [x] Maybe add support in the example in question for both versioons somehow?
+- [x] Can also Close #945 
+### saveConfigCallback is not called in the scenario, where you configure STA but off-line (so you do not really connect, just pre-configure it and save). 
+
+#### Hardware
+**WiFimanager Branch/Release:**
+- [X ] Master
+- [ ] Development
+
+**Esp8266/Esp32:**
+- [ ] ESP8266
+- [ X] ESP32
+
+**Hardware:			ESP-12e, esp01, esp25**
+- [ ] ESP01
+- [ ] ESP12 E/F/S (nodemcu, wemos, feather)
+- [X ] Other
+
+
+**ESP Core Version:	2.4.0, staging**
+- [ ] 2.3.0
+- [X ] 2.4.0
+- [ ] staging (master/dev)
+
+### Description
+
+Assuming the manager starts in AP and exposes configuration portal, if you implement it the way presented in the AutoConnectWithFSParameters, then you enter blind configuration without being able to connect in STA to the configured infrastructure AP, the flag to trigger saveConfigCallback is never set thous won't let you save custom parameters. Meanwhile, saving of the SSID and password to the infrastructure AP is being saved thus it is inconsistent. 
+
+Steps to reproduce:
+- start in AP mode (expose configuration portal)
+- connect to it, configure data for non-existing (or offline) infrastructure AP you want to connect to,
+- click save
+
+### Code
+
+```
+#include <FS.h>
+#include <SPIFFS.h>
+#include <Arduino.h>
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
+#include <DHT_U.h>
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <ESPAsyncWiFiManager.h>
+#include <ArduinoJson.h>  //Warning - only versions prior 6 are compatible (5.11)
+
+//#define formatSPIFFS  //Force SPIFFS format
+
+//Local AP section
+#define APPASSWORD "alamakota"
+
+//DHT Sensor section
+
+#define DHTPIN 16
+#define DHTTYPE    DHT11
+#define MQTTTopicCommon "/itsilesia/showroom/"
+#define MQTTTopicTemperature "/temperature/"
+#define MQTTTopicHumidity "/Humidity/"
+DHT_Unified dht(DHTPIN, DHTTYPE);
+uint32_t delayMS = 10000; //10s
+// Extra config parameters
+char mqtt_server[40];
+char mqtt_port[6] = "1883";
+char customDeviceId[10] = "dev0";
+char mqtt_user[40];
+char mqtt_pass[40];
+//flag for saving data
+bool shouldSaveConfig = false;
+bool forceRestart = false;
+//services
+AsyncWebServer server(80);
+DNSServer dns;
+
+//Callbacks
+void saveConfigCallback () {
+  Serial.println("Should save config");
+  shouldSaveConfig = true;
+}
+
+void setup() {
+  Serial.begin(9600);
+  dht.begin();
+
+  Serial.println();
+  Serial.println();
+  if (SPIFFS.begin()) {
+    Serial.println("mounted file system");
+    if (SPIFFS.exists("/config.json")) {
+      //file exists, reading and loading
+      Serial.println("reading config file");
+      File configFile = SPIFFS.open("/config.json", "r");
+      if (configFile) {
+        Serial.println("opened config file");
+        size_t size = configFile.size();
+        // Allocate a buffer to store contents of the file.
+        std::unique_ptr<char[]> buf(new char[size]);
+
+        configFile.readBytes(buf.get(), size);
+        DynamicJsonBuffer jsonBuffer;
+        JsonObject& json = jsonBuffer.parseObject(buf.get());
+        json.printTo(Serial);
+        if (json.success()) {
+          Serial.println("\nparsed json");
+          strcpy(mqtt_server, json["mqtt_server"]);
+          strcpy(mqtt_port, json["mqtt_port"]);
+          strcpy(customDeviceId, json["custom_device_id"]);
+          strcpy(mqtt_user, json["mqtt_user"]);
+          strcpy(mqtt_pass, json["mqtt_pass"]);
+        } else {
+          Serial.println("failed to load json config");
+        }
+      }
+
+    }else
+    {
+      Serial.println("No config file");
+    }
+    
+  } else {
+    Serial.println("failed to mount FS");
+    SPIFFS.format();
+  }
+  //Serial.println(customDeviceId);
+  //Serial.println(mqtt_user);
+  //Serial.println(mqtt_pass);
+  // end reading config file
+
+  AsyncWiFiManagerParameter custom_mqtt_server("server", "mqtt server", mqtt_server, 40);
+  AsyncWiFiManagerParameter custom_mqtt_port("port", "mqtt port", mqtt_port, 5);
+  AsyncWiFiManagerParameter custom_device_id("deviceid", "device ID", customDeviceId, 10);
+  AsyncWiFiManagerParameter custom_mqtt_user("user", "mqtt user", mqtt_user,40);
+  AsyncWiFiManagerParameter custom_mqtt_pass("pass", "mqtt password", mqtt_pass,40);
+
+  AsyncWiFiManager wifiManager(&server,&dns);
+  wifiManager.setDebugOutput(false);
+  
+  wifiManager.setSaveConfigCallback(saveConfigCallback);
+
+  wifiManager.addParameter(&custom_mqtt_server);
+  wifiManager.addParameter(&custom_mqtt_port);
+  wifiManager.addParameter(&custom_device_id);
+  wifiManager.addParameter(&custom_mqtt_user);
+  wifiManager.addParameter(&custom_mqtt_pass);
+  wifiManager.setTimeout(180);
+  
+  if (!wifiManager.autoConnect("itSilesiaSensor", APPASSWORD)) {
+    Serial.println("failed to connect and hit timeout");
+    delay(3000);
+    //reset and try again, or maybe put it to deep sleep
+    forceRestart = true;
+  
+  }
+  strcpy(mqtt_server, custom_mqtt_server.getValue());
+  strcpy(mqtt_port, custom_mqtt_port.getValue());
+  strcpy(customDeviceId, custom_device_id.getValue());
+  strcpy(mqtt_user, custom_mqtt_user.getValue());
+  strcpy(mqtt_pass, custom_mqtt_pass.getValue());
+  
+  // Work save parameters otherwise if configuring off-line!!!!
+  shouldSaveConfig = true;
+  // save parameters
+  if (shouldSaveConfig) {
+    Serial.println("saving config");
+    DynamicJsonBuffer jsonBuffer;
+    JsonObject& json = jsonBuffer.createObject();
+    json["mqtt_server"] = mqtt_server;
+    json["mqtt_port"] = mqtt_port;
+    json["custom_device_id"] = customDeviceId;
+    json["mqtt_user"] = mqtt_user;
+    json["mqtt_pass"] = mqtt_pass;
+
+    File configFile = SPIFFS.open("/config.json", "w");
+    if (!configFile) {
+      Serial.println("failed to open config file for writing");
+    }
+
+    json.printTo(Serial);
+    json.printTo(configFile);
+    configFile.close();
+    //end save
+  }
+  if (forceRestart)
+  {
+    Serial.println("Restarting...");
+    ESP.restart();
+    delay(5000);
+  }
+  Serial.println("local ip");
+  Serial.println(WiFi.localIP());
+}
+
+
+void loop() {
+  delay(delayMS);
+  if (WiFi.status()!=WL_CONNECTED)
+  {
+    //reset and try again, or maybe put it to deep sleep
+    ESP.restart();
+  }
+
+
+  // Delay between measurements.
+  
+  // Get temperature event and print its value.
+  sensors_event_t event;
+  dht.temperature().getEvent(&event);
+  if (isnan(event.temperature)) {
+    Serial.println(F("Error reading temperature!"));
+  }
+  else {
+    Serial.print(F("Temperature: "));
+    Serial.print(event.temperature);
+    Serial.println(F("°C"));
+  }
+  // Get humidity event and print its value.
+  dht.humidity().getEvent(&event);
+  if (isnan(event.relative_humidity)) {
+    Serial.println(F("Error reading humidity!"));
+  }
+  else {
+    Serial.print(F("Humidity: "));
+    Serial.print(event.relative_humidity);
+    Serial.println(F("%"));
+  }
+}
+```
+
+Hi,
+
+Is it possible to add multiple Param Pages?
+
+Say I want to have two separate param pages:
+
+  wifiManager.addParameter(&updateFrequency);
+  wifiManager.setSaveParamsCallback(saveUpdateFrequencyParamCallback);
+
+  wifiManager.addParameter(&updateHumidityOffset);
+  wifiManager.setSaveParamsCallback(saveUpdateHumidityOffsetParamCallback);
+
+If I call param in the menu, it shows the first parameter (updateFrequency) in both pages when testing code:
+
+std::vector<const char *> menu = {"wifi","info", "sep", "param", "param", "sep","restart","exit"};
+
+Thank you
+### Basic Info
+
+#### Hardware
+**WiFimanager Branch/Release:** 0.15.0-Beta
+- [ ] Master
+- [x] Development
+
+**Esp8266/Esp32:**
+- [ ] ESP8266
+- [x] ESP32
+
+**Hardware:			ESP-12e, esp01, esp25**
+- [ ] ESP01
+- [ ] ESP12 E/F/S (nodemcu, wemos, feather)
+- [ ] Other
+- [x] ESP32-Wroom DevKit
+
+
+**ESP Core Version:	2.4.0, staging**
+- [ ] 2.3.0
+- [ ] 2.4.0
+- [ ] staging (master/dev)
+- [x] esp32 1.0.4 by Espressif
+
+### Description
+
+Hello,
+
+I'm trying to use WiFiManager with predefined WiFi credentials when I use ESP32 in my office and still be able to connect to WiFi when I'm somewhere else. Code below works when my office AP is ON (predefined credentials in my code):
+```
+15:27:57.419 -> *WM: [1] AutoConnect 
+15:27:57.419 -> *WM: [2] ESP32 event handler enabled 
+15:27:57.453 -> *WM: [1] AutoConnect: ESP Already Connected 
+15:27:57.453 -> *WM: [1] STA static IP:
+15:27:57.453 -> *WM: [2] setSTAConfig static ip not set 
+15:27:57.453 -> *WM: [1] AutoConnect: SUCCESS 
+15:27:57.453 -> *WM: [1] STA IP Address: 192.168.1.49
+15:27:57.453 -> connected...yeey :)
+```
+WiFiManager is not making it's own AP to configure credentials, so everything is fine. When my office AP is OFF when ESP32 restarts there is a bug: WiFiManager makes it's own AP as it should, I can go to Web interface, etc. But if I do nothing in Web interface, turn on my predefined office AP and restart ESP32 it won't connect to it but instead WiFiManager's AP is created again and again.
+To overcome the issues I need to go to WiFiManager's portal -> Info -> Remove WiFi credentials -> then after restart it successfully connects to the predefined office AP.
+
+
+### Settings in IDE
+
+Module:  		ESP32 Dev Module
+
+### Sketch
+
+```cpp
+
+#include <Arduino.h>
+#include "WiFi.h"
+#include <WiFiManager.h>
+
+#define WIFI_SSID "MYOFFICE_AP"
+#define WIFI_PASSWORD "MYOFFICE_AP_PASSWORD"
+
+void setup() {
+
+WiFiManager wm;
+WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+delay(500);
+bool res;
+res = wm.autoConnect("WiFiManagerAP","WiFiManagerAPPass"); // password protected ap
+
+if(!res) {
+        Serial.println("Failed to connect");
+        // ESP.restart();
+    } 
+    else {
+        //if you get here you have connected to the WiFi    
+        Serial.println("connected...yeey :)");
+    }
+
+void loop() {
+
+}
+```
+
+**Serial output during the issue:**
+```
+14:34:34.720 -> *WM: [1] AutoConnect 
+14:34:34.720 -> *WM: [2] ESP32 event handler enabled 
+14:34:34.720 -> *WM: [2] Connecting as wifi client... 
+14:34:34.720 -> *WM: [1] STA static IP:
+14:34:34.720 -> *WM: [2] setSTAConfig static ip not set 
+14:34:34.720 -> *WM: [3] WIFI station disconnect 
+14:34:35.047 -> *WM: [1] Connecting to SAVED AP: MYOFFICE_AP
+14:34:35.047 -> *WM: [3] Using Password: MYOFFICE_AP_PASSWORD
+14:34:35.094 -> *WM: *WM: [2] [EVENT] WIFI_REASON: 202
+14:34:35.094 -> [3] WiFi station enable 
+14:34:35.094 -> *WM: [1] connectTimeout not set, ESP waitForConnectResult... 
+14:34:35.141 -> *WM: [2] Connection result: WL_CONNECT_FAILED
+14:34:35.141 -> *WM: [3] lastconxresulttmp: WL_STATION_WRONG_PASSWORD
+14:34:35.141 -> *WM: [3] lastconxresult: WL_STATION_WRONG_PASSWORD
+14:34:35.141 -> *WM: [1] AutoConnect: FAILED 
+14:34:35.141 -> *WM: [2] Starting Config Portal 
+14:34:35.141 -> *WM: [2] AccessPoint set password is VALID 
+14:34:35.141 -> *WM: [1] XXXXXXX
+14:34:35.141 -> *WM: [3] WIFI station disconnect 
+14:34:35.141 -> *WM: [3] WiFi station enable 
+14:34:35.141 -> *WM: [2] Disabling STA 
+14:34:35.141 -> *WM: [2] Enabling AP 
+14:34:35.141 -> *WM: [1] StartAP with SSID:  WiFiManagerAP
+14:34:35.141 -> *WM: [1] SoftAP Configuration 
+14:34:35.141 -> *WM: [1] -------------------- 
+14:34:35.141 -> *WM: [1] ssid:             WiFiManagerAP
+14:34:35.188 -> *WM: [1] password:         WiFiManagerAPPass
+14:34:35.188 -> *WM: [1] ssid_len:         7
+14:34:35.188 -> *WM: [1] channel:          1
+14:34:35.188 -> *WM: [1] authmode:         3
+14:34:35.188 -> *WM: [1] ssid_hidden:     
+14:34:35.188 -> *WM: [1] max_connection:   4
+14:34:35.188 -> *WM: [1] country:          CN
+14:34:35.188 -> *WM: [1] beacon_interval:  100(ms)
+14:34:35.188 -> *WM: [1] -------------------- 
+14:34:35.656 -> *WM: [1] AP IP address: 192.168.4.1
+14:34:35.703 -> *WM: [3] setupConfigPortal 
+14:34:35.703 -> *WM: [1] Starting Web Portal 
+14:34:35.703 -> *WM: [3] dns server started with ip:  192.168.4.1
+14:34:35.703 -> *WM: [2] HTTP server started 
+14:34:38.604 -> *WM: [2] WiFi Scan ASYNC completed in 2901 ms
+14:34:38.604 -> *WM: [2] WiFi Scan ASYNC found: 9
+14:34:38.604 -> *WM: [2] WiFi Scan completed in 2902 ms
+14:34:38.604 -> *WM: [2] Config Portal Running, blocking, waiting for clients... 
+```
+
+
+The `enable` parameter is unused and if compiling where warnings are treated as errors this causes a failure.
+
+https://github.com/tzapu/WiFiManager/blob/c9665adfaf4ef604e1926ab9a672cce2f485627a/WiFiManager.cpp#L2386-L2390
+-added option to create standalone Access Points (AP) instead of joining an existing one.
+
+-merged options 'Configure WiFi' and 'Configure WiFi (no scan)' into 
+'Join network'. User can still configure custom wify entry, just 
+ignoring scanned ones and inserting SSID and password into respective 
+fields.
+Add security to endpoints, make sure things are not available, menu can be hidden but we do not disable the handles, users can still use all forms etc.
+
+Suggest implementing this in conjunction with secure api
+
+I just realized there is no issue for this PR feature
+https://github.com/tzapu/WiFiManager/pull/587
+
+**This is added to the OTA branch as a test for now.**
+
+I was going to abstract it out into an example, but I might just leave it in and fix it up.
+
+This is available by adding it to the menu, and is active in the DEV/ example
+
+It is available if you add it (token is `update`) to the menu
+```C++
+  std::vector<const char *> menu = {"wifi","info","param","update","close","sep","erase","restart","exit"};
+  wm.setMenu(menu); // custom menu, pass vector
+```
+- [ ] add permissions, make hook/route disabled not just menu!
+- [ ] find a good way to document this, as it does not work via captive portals! ( maybe even hide it )
+- [ ] Better handling of update success
+ 
+Master
+ESP8266
+ESP-12
+ESP Core Version:	2.4.0
+ 
+Hi tzapu,
+
+maybe this has already been in the forum but I couldn't find it. I am working on a project with the option to read data via the internet. now my question is that i want the entire wifi manager (wifi) to be switched off after a certain time if it is not cofigured by the user. the only thing I can find is a timeout for the config portal.
+
+in brief:
+
+I get stuck with the code if the WiFi is not set, here I want to give the user 5 minutes to configure the WiFi. after 5 minutes the device must simply execute its code without wifi.
+
+maybe you can help me.
+
+Code:
+void setup(void) {
+  Serial.begin(115200);
+  pinMode(LED_BUILTIN, OUTPUT);
+  Wire.begin(5,4); // change hardware I2C pins to (5,4) (D1,D2)
+  int chk = DHT.read(dht);
+  pinMode(RELAY, OUTPUT);
+  digitalWrite(RELAY, 1);// Turns Relay On
+  digitalWrite(LED_BUILTIN, LOW);
+  u8g2.begin(); // init display
+//-------------------------------------------  
+//Versie firmware 
+ u8g2.clearBuffer();         // clear the internal memory  
+ u8g2.setFont(u8g2_font_helvB08_tr);
+ u8g2.drawStr( 0, 10, "JDJ electronics");
+ u8g2.drawStr( 0, 30, "Model: DM");
+ u8g2.drawStr( 0, 40, "Firmware: v2.5"); 
+ u8g2.drawStr( 0, 50, "251019"); //firmware date  
+ u8g2.drawStr( 10, 60, "2019");
+ u8g2.setCursor(0, 60);
+ u8g2.setFont(u8g2_font_helvB08_tf);
+ u8g2.print(char(169)); // copyright karakter
+ u8g2.sendBuffer();          // transfer internal memory to the display 
+ delay(3000);
+   
+//Wifi setup + oled
+ u8g2.clearBuffer();         // clear the internal memory  
+ u8g2.setCursor(15, 36);
+ u8g2.setFont(u8g2_font_open_iconic_www_2x_t);
+ u8g2.print(char(81)); // WIFI icon
+ u8g2.setFont(u8g2_font_helvB08_tr);
+ u8g2.drawStr( 40, 32, "Connect to");
+ u8g2.drawStr( 40, 45, "JDJ-DM");
+ u8g2.sendBuffer();          // transfer internal memory to the display  
+ 
+  WiFiManager wifiManager;
+  wifiManager.autoConnect("JDJ-DM");
+  wifiManager.setConfigPortalTimeout(60);
+    if(!wifiManager.autoConnect()) {
+    Serial.println("failed to connect and hit timeout");
+    delay(3000);
+    //reset and try again, or maybe put it to deep sleep
+    ESP.reset();   
+  }
+  
+  Serial.println("Connected.");
+  digitalWrite(LED_BUILTIN, HIGH);
+  server.begin();
+
+ server.on("/", handle_OnConnect);
+ server.onNotFound(handle_NotFound);
+
+ server.begin();
+ Serial.println("HTTP server started");
+ Serial.println(WiFi.localIP());
+ 
+//Connected Succes 
+ u8g2.clearBuffer();         // clear the internal memory  
+ u8g2.setCursor(15, 36);
+ u8g2.setFont(u8g2_font_open_iconic_www_2x_t);
+ u8g2.print(char(81)); // WIFI icon
+ u8g2.setFont(u8g2_font_helvB08_tr);
+ u8g2.drawStr( 40, 32, "Connected");
+ u8g2.setCursor( 40, 45);
+ u8g2.print(WiFi.localIP());
+ u8g2.sendBuffer();          // transfer internal memory to the display 
+ delay(1000); 
+ 
+//Check up
+ u8g2.clearBuffer();         // clear the internal memory  
+ u8g2.setCursor(15, 36);
+ u8g2.setFont(u8g2_font_open_iconic_embedded_2x_t);
+ u8g2.print(char(66)); // tandwiel
+ u8g2.setFont(u8g2_font_helvB08_tr);
+ u8g2.drawStr( 40, 32, "DM-CHECK");
+ u8g2.drawStr( 40, 45, "WAIT...");
+ u8g2.sendBuffer();          // transfer internal memory to the display  
+ delay(1000);
+
+ //Volt check up
+ u8g2.clearBuffer();         // clear the internal memory  
+ u8g2.setCursor(15, 36);
+ u8g2.setFont(u8g2_font_open_iconic_embedded_2x_t);
+ u8g2.print(char(73)); // tandwiel
+ u8g2.setFont(u8g2_font_helvB08_tr);
+ u8g2.drawStr( 40, 32, "VOLTAGE");
+ u8g2.drawStr( 40, 45, "CHECK...");
+ u8g2.sendBuffer();          // transfer internal memory to the display  
+ delay(1000);
+
+//Check compleet
+ u8g2.clearBuffer();         // clear the internal memory 
+ u8g2.setCursor(45, 45);
+ u8g2.setFont(u8g2_font_open_iconic_check_4x_t);
+ u8g2.print(char(64)); // vinkje iccon
+ u8g2.sendBuffer();
+ delay(1000);
+
+
+```
+Yours sincerly,
+
+Jelmer de Jong
+```
+
+
+### Basic Infos
+
+#### Hardware
+**WiFimanager Branch/Release:**
+- [ ] Master
+- [x ] Development
+
+**Esp8266/Esp32:**
+- [ ] ESP8266
+- [x ] ESP32
+
+**Hardware:			ESP-12e, esp01, esp25**
+- [ ] ESP01
+- [ ] ESP12 E/F/S (nodemcu, wemos, feather)
+- [x ] Other
+
+
+**ESP32 Core Version:
+current
+
+### Description
+
+There is a problem with WiFi-Connections of ESP32 in combination with certain routers/APs.
+The issue is described here: [https://github.com/espressif/arduino-esp32/issues/2501#issue-413808401](https://github.com/espressif/arduino-esp32/issues/2501#issue-413808401)
+A WiFi connection can only be established on every second attempt. A far as I know, the reason for that bug is still unknown. There are some workarounds for that problem, but they are not perfect and they don't work using WiFiManager.
+WiFiManager (with saved credentials!) connects only every second time - the other times it starts the ESP32-AP with the captive portal.
+If you're facing this ESP32 issue, you can't use WifiManager. I know that this issue isn't caused by WifiManager itself, but I'd like to ask if a workaround for that issue could be implemented or how I could use WifiManager anyway.

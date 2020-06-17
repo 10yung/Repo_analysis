@@ -1,0 +1,208 @@
+This is a proposal to begin addressing #279 with the most minimal API necessary.
+
+## Background
+
+The most seemingly accurate and thorough research I could come across on this topic is Ross Bencina's excellent paper *PortAudio and Media Synchronisation - It's All in the Timing*. It contains an overview of the media synchronisation problem with example scenarios, visual diagrams, etc that make it more intuitive.
+
+http://www.portaudio.com/docs/portaudio_sync_acmc2003.pdf
+
+The first few sections of the paper describe some hypothetical scenarios and different techniques for synchronising audio with some other kind of media. A MIDI clock is the primary example used in the paper, but the same techniques apply to presenting frames of graphics and other forms of media sync.
+
+Section 6 describes the minimal set of information necessary in order to make these synchronisation techniques possible:
+
+- **Sample rate**. We already have this.
+- **Buffer start times**. We do not yet provide this. This refers to the most accurate form of monotonic clock time available on the system. It is also essential that users have access to the same source of time that provides this value in order to timestamp their media events. This means 1. describing the exact source for each host in the docs and possibly 2. providing a function for easily retrieving this value (portaudio do so via a `GetStreamTime(Stream* s)` function).
+
+PortAudio decided to provide this monotonic time in seconds using a double-precision floating-point data type:
+
+> The double   data   type   was   chosen   after   considerable deliberation because  it  provides  sufficient  resolution to   represent   time   with high-precision,   may   be manipulated   using   numerical   operators, and is   a standard  part  of  the  C  and  C++  languages.
+
+Section 7 also describes implementation issues. They can be roughly summed up as follows:
+
+- 7.1 **Sample rates**: Subtle variations between the nominal sample rate and the observed sample rate occur between sound card / chipsets, resulting in subtle inaccuracies occurring within the aforementioned synchronisation techniques. PortAudio provides an actual sample rate via its stream info parameters. Calculating this requires a high-resolution system clock, though this isn't always available.
+- 7.2 **One Shared Time-base**: The time source of timestamps provided via audio callbacks sometimes differ from the source used to provide timestamps for other media events (e.g. Windows' MIDI API). This is why PortAudio found it necessary to provide a function for easy access to the correct source (`GetStreamTime`).
+- 7.3 **Buffer playback times**: Exact buffer *playback* times are often unprovided or inaccurate. PortAudio takes on the initiative of trying to calculate this for the user in the case that it isn't provided by the platform. ASIO buffer timestamps have a best-case resolution of 1ms, significantly worse than necessary for sample-level synchronisation.
+
+
+## Proposal
+
+I propose that we add the following:
+
+- A `StreamInstant` struct representing a monotonic time instance retrieved from either 1. the stream's underlying audio data callback or 2. the same time source used to generate time stamps for a stream's underlying audio data callback. No guarantees are made about the duration that the value represents, only that it is monotonic and begins either before or equal to the moment the stream was started. Internally we could represent the instant in a similar manner to `std::time::Duration`, providing methods for easy access to more accessible representations e.g. `.as_secs_f64()`, etc.
+- The following timestamp structs:
+    - `InputStreamTimestamp`
+    - `OutputStreamTimestamp`
+  Both structs contain two fields of type `StreamInstant`:
+    1. `callback` indicating the instant at which the data callback was called.
+    2. `buffer_adc` and `buffer_dac` representing the instance of capture and playback from the audio device for the input and output streams respectively.
+  An instance of these structs would be provided to the respective user's data callback.
+- A `fn now(&self) -> StreamInstant` method for the `Stream` handle type, allowing users to produce an instant in time via the same source used to generate timestamps for the data callback, useful for media sync. It will be important to document exactly what system API is used for each host and to list any notable limitations (e.g. the 1ms best-case resolution on ASIO).
+
+I've been doing some research into the way that timing information is provided by each of the different hosts supported by CPAL. I'll add a follow-up comment soon with the relevant info for some more context for those interested and for myself to refer back to during implementation.
+
+The transport API discussed within #279 has been intentionally omitted in the hope that it can be implemented on top of the proposed timestamp API. In the case that it cannot, this is likely best left to be addressed in a future PR either way.
+This is an implementation of the planned changes described in #119.
+
+For a quick overview of how the API has changed, check out the updated
+examples.
+
+**TODO:**
+
+- [x] Update API.
+- [x] Update examples.
+- ~Remove `data_type` field from `Format`? See [here](https://github.com/RustAudio/cpal/issues/119#issuecomment-573788380).~
+- [x] Update docs.
+- Update backends:
+  - [x] null
+  - [x] ALSA
+  - [x] ASIO
+  - [x] WASAPI
+  - [x] CoreAudio
+  - [x] Emscripten
+
+Closes #119
+Closes #260
+When I (cross) compile the `enumerate` `CPAL` example and run it on the target device I get this list:
+
+```
+Supported hosts:
+  [Alsa]
+Available hosts:
+  [Alsa]
+ALSA
+  Default Input Device:
+    Some("default")
+  Default Output Device:
+    Some("default")
+  Devices:
+  1. "default:CARD=I2S"
+  2. "sysdefault:CARD=I2S"
+  3. "default:CARD=UAC20"
+  4. "sysdefault:CARD=UAC20"
+```
+
+If I do the same, but then using the `devices` `rust-portaudio` example I get this list:
+
+```
+Number of devices = 5
+Default input device: Ok(DeviceIndex(3))
+Default output device: Ok(DeviceIndex(3))
+All devices:
+--------------------------------------- DeviceIndex(0)
+DeviceInfo {
+    struct_version: 2,
+    name: "MTK APSoC I2S: - (hw:0,0)",
+    host_api: 0,
+}
+--------------------------------------- DeviceIndex(1)
+DeviceInfo {
+    struct_version: 2,
+    name: "ReSpeaker MicArray UAC2.0: USB Audio (hw:1,0)",
+    host_api: 0,
+}
+--------------------------------------- DeviceIndex(2)
+DeviceInfo {
+    struct_version: 2,
+    name: "sysdefault",
+    host_api: 0,
+}
+--------------------------------------- DeviceIndex(3)
+DeviceInfo {
+    struct_version: 2,
+    name: "default",
+    host_api: 0,
+}
+--------------------------------------- DeviceIndex(4)
+DeviceInfo {
+    struct_version: 2,
+    name: "dmix",
+    host_api: 0,
+}
+```
+
+_Stripped some output to make the lists easier to read_
+
+As you can see, I get one device less using `CPAL` (4 vs 5) and I get strange (and partly duplicate) names instead of the much nicer and clearer names `rust-portaudio` returns.
+
+Is this something that is expected and/or can I tweak something to improve/fix this? Thanks!
+I tried running `examples/beep.rs` but it seems to fail with the following messages:
+```
+Cannot connect to server socket err = No such file or directory
+Cannot connect to server request channel
+jack server is not running or cannot be started
+JackShmReadWritePtr::~JackShmReadWritePtr - Init not done for -1, skipping unlock
+JackShmReadWritePtr::~JackShmReadWritePtr - Init not done for -1, skipping unlock
+Error: The requested device is no longer available. For example, it has been unplugged.```
+This is a tracking issue for supporting duplex streams. Duplex streams are streams that have device-synchronised input and output, an essential requirement for many real-time and pro-audio applications.
+
+This is a follow-up to #116 but focused specifically on duplex support.
+As far as I can tell, cpal relies on no way on the COM mode being COINIT_MULTITHREADED.
+
+So let's survive even if COM was already initialized in apartment-threaded mode (there is no such thing as single-threaded mode).
+I’m investigating the use of cpal in `no_std` environment. I don’t have a particular goal (i.e. embedded device) in mind, but it would be cool to do something with audio in a bare metal environment. Is there a way `cpal` could help me here? Has `no_std` support been looked into before?
+Hi, I'm the maintainer of the alsa crate, and I'm wondering if it would make sense for CPAL to depend on the alsa crate rather than the alsa-sys crate?
+
+I'm not familiar with CPAL, but from a quick glance at the code in the hosts/alsa directory a lot of that code is just simple wrappers around alsa-lib object - which is exactly what the alsa crate already has, so probably the alsa backend in CPAL could be very much simplified if it were to use the alsa crate instead.
+
+That said, I probably won't have time (nor sufficient knowledge of CPAL) to make that code myself, but I still wanted to raise the issue.
+Is it time to switch to 2018 edition? A significant amount time has passed since the 2018 edition was introduced.
+All input samples are `0.0` on this mbp (15-inch, Mid 2015) running macOS 10.14.16
+
+Using this code https://github.com/mlsteele/cpal-input-demo, only zero samples come out of the input stream. Other audio stuff works like recording with quicktime.
+
+The same cpal-input-demo outputs non-zero ✅ samples on two other machines. One newer mbp (13-inch, 2016) also running macOS 10.14.6, and one laptop running Ubuntu 16.04.
+
+On the problem machine:
+```
+$ cd cpal-input-demo
+$ cargo run --release                                                                                                                                                                                                                    [130]
+    Finished release [optimized] target(s) in 0.03s
+     Running `target/release/cpal-input-demo`
+Default input device: Built-in Microphone
+Default input format: Format { channels: 2, sample_rate: SampleRate(44100), data_type: F32 }
+buffer f32 len=1024
+buffer f32 len=1024
+buffer f32 len=1024
+buffer f32 len=1024
+buffer f32 len=1024
+buffer f32 len=1024
+... etc
+```
+With no `non-zero sample` in sight.
+
+```
+$ cargo run --release --example enumerate                                                                                                                                                                                                [101]
+   Compiling cpal v0.10.0 (/Users/miles/code/vendor/cpal)
+    Finished release [optimized] target(s) in 0.56s
+     Running `target/release/examples/enumerate`
+Supported hosts:
+  [CoreAudio]
+Available hosts:
+  [CoreAudio]
+CoreAudio
+  Default Input Device:
+    Some("Built-in Microphone")
+  Default Output Device:
+    Some("Built-in Output")
+  Devices:
+  1. "Built-in Microphone"
+    Default input stream format:
+      Format { channels: 2, sample_rate: SampleRate(44100), data_type: F32 }
+    All supported input stream formats:
+      1.1. SupportedFormat { channels: 2, min_sample_rate: SampleRate(44100), max_sample_rate: SampleRate(44100), data_type: F32 }
+      1.2. SupportedFormat { channels: 2, min_sample_rate: SampleRate(48000), max_sample_rate: SampleRate(48000), data_type: F32 }
+      1.3. SupportedFormat { channels: 2, min_sample_rate: SampleRate(88200), max_sample_rate: SampleRate(88200), data_type: F32 }
+      1.4. SupportedFormat { channels: 2, min_sample_rate: SampleRate(96000), max_sample_rate: SampleRate(96000), data_type: F32 }
+  2. "Built-in Output"
+    Default output stream format:
+      Format { channels: 2, sample_rate: SampleRate(44100), data_type: F32 }
+    All supported output stream formats:
+      2.1. SupportedFormat { channels: 2, min_sample_rate: SampleRate(44100), max_sample_rate: SampleRate(44100), data_type: F32 }
+      2.2. SupportedFormat { channels: 2, min_sample_rate: SampleRate(48000), max_sample_rate: SampleRate(48000), data_type: F32 }
+      2.3. SupportedFormat { channels: 2, min_sample_rate: SampleRate(88200), max_sample_rate: SampleRate(88200), data_type: F32 }
+      2.4. SupportedFormat { channels: 2, min_sample_rate: SampleRate(96000), max_sample_rate: SampleRate(96000), data_type: F32 }
+```
+
+<img width="665" alt="image" src="https://user-images.githubusercontent.com/705646/64915276-75215980-d731-11e9-9a44-943f2840f55a.png">
+
+What can I do to get non-zero samples from the mic?

@@ -1,0 +1,152 @@
+I'm getting this error:
+
+```
+TASK [anxs.postgresql : PostgreSQL | Check binary version] ****************************************************
+fatal: [appserver]: FAILED! => {"msg": "Failed to set permissions on the temporary files Ansible needs to create when becoming an unprivileged user (rc: 1, err: chown: changing ownership of '/var/tmp/ansible-tmp-1578784826.169562-122218142055240/': Operation not permitted\nchown: changing ownership of '/var/tmp/ansible-tmp-1578784826.169562-122218142055240/AnsiballZ_command.py': Operation not permitted\n}). For information on working around this, see https://docs.ansible.com/ansible/become.html#becoming-an-unprivileged-user"}
+
+PLAY RECAP ****************************************************************************************************
+appserver                  : ok=29   changed=0    unreachable=0    failed=1    skipped=63   rescued=0    ignored=0 
+```
+
+for this playbook:
+
+```
+- hosts: appserver
+  become: yes
+  roles:
+    - { role: geerlingguy.nginx }
+    - { role: anxs.postgresql }
+    - { role: anxs.monit }
+```
+
+and when I check the version:
+```
+$ psql -V
+psql (PostgreSQL) 12.1 (Debian 12.1-1.pgdg100+1)
+```
+
+although the version in main.yml was 11:
+`postgresql_version: 11`
+
+
+
+
+In this file (I haven't checked all the others, except pg-10), the choose_sync var wasn't being specified.
+
+This copies the logic to render the string from the pg-10 template.
+
+Docs: https://www.postgresql.org/docs/12/runtime-config-replication.html#GUC-SYNCHRONOUS-STANDBY-NAMES
+Just writing to let you know that I have successfully used this role on ubuntu 19.04.
+
+What I observed:
+On a fresh ubuntu install **but** postgresql-client manually pre-installed, I ended up with two postgresql instances running. One was ubuntu's 11 and the other was this role's 12, set on port 5433 - presumably because 5432 was taken already. I am currently not sure whether the 11 was installed by this role or inadvertently by me.
+This in turn made the binary vs database check always fail.
+
+However, I only noticed this after the role kept telling me that there was a binary vs database version mismatch - restart needed. So I went into the VM, made an apt upgrade and THEN rebooted. Before the reboot, it was a 11.5 (bin) vs 11.6 (DB) mismatch, after the reboot it was 12 (bin) vs 11.6 (DB) mismatch.
+
+I ended up manually purging everyting postgresql-related and then the role set up everything just like I wanted it to.
+
+Just letting you know so you can add 19.04 to "works maybe list".
+I will retry with a "cleaner" and more closely inspected deploy next, then move to 18.04 to try there as well.
+
+Both of the above pending a successful pgbouncer install, so hopefully still today.
+
+However, two possible improvements seem to be suggested with this experience:
+1. It would be cool if the role could check the actual port the installed instance is using. Since there's a default listed in the configs, there should be a warning that it's already being used. An error would be even better since we can't ensure that our instance would be running on the desired port.
+2. There's no check that there's an existing postgresql instance running that is not using our repository.
+
+I am somewhat confident I could add both checks myself (make a PR), but I would appreciate pointers as to where they would be preferred. Please note that I am fresh to Ansible, but not to bash / ubuntu, so pointers should be relatively clear about the ansible part (which file, place within it).
+PostgreSQL =< 9.6 password_encryption is boolean
+https://www.postgresql.org/docs/9.6/runtime-config-connection.html
+PostgreSQL >= 10 password_encryption is enum - 'md5' (default) or 'scram-sha-256'.
+https://www.postgresql.org/docs/10/runtime-config-connection.html
+
+Duplicates PR https://github.com/ANXS/postgresql/pull/368, but retains backward compatibility with versions below 10.
+Setting the **postgresql_default_auth_method: "md5"** on a fresh install tells postgres that the default postgres user requires password authentication without first having set up an initial password before hand. This is a order of execution issue where:
+
+1. the configuration files are provisioned (essentially requiring passwords)
+2. users are attempting to be created but passwords are not set 
+
+Ideally the order should be 
+1. user creation should happen first
+2. the configurations applied afterwards locking up the database access.  
+
+Minimum test case for generating issue
+
+```
+  - role: ansible-role-postgres
+        postgresql_version: 12
+        postgresql_default_auth_method: "md5"
+        postgresql_users:
+          - name: postgres
+            pass: somegeneratedpassword123
+            encrypted: yes
+```
+
+
+current work around is to accept the default **postgresql_default_auth_method: "peer"**
+
+and after the posgres role has run,  edit the /etc/postgresql/12/main/pg_hba.conf file 
+
+from 
+```
+# local postgres without password
+local  all  postgres    peer
+```
+
+to
+
+```
+# local postgres without password
+local  all  postgres    md5
+```
+
+in another task. 
+I've got a very simple test setup, and I'm getting this error:
+
+> TASK [ANXS.postgresql : PostgreSQL | Make sure the PostgreSQL users are present] ***
+fatal: [default]: FAILED! => {"censored": "the output has been hidden due to the fact that 'no_log: true' was specified for this result"}
+
+This is on a vagrant debian stretch virtualbox
+
+The user and database in vars don't get created.
+
+Here's the playbook:
+```
+---
+- hosts: all
+  remote_user: root
+  become: yes
+  vars_files:
+  - ./vars.yml
+  roles:
+  - { role: ANXS.postgresql, no_log: False }
+```
+And here are the vars:
+```
+postgresql_version: 9.6
+postgresql_port: 5432
+
+postgresql_databases:
+  - name: testing
+    owner: test
+
+postgresql_users:
+  - name: test
+```
+I believe that default Ident mapping
+should be like this
+``` diff
+ # pg_ident.conf
+ postgresql_pg_ident:
+   - comment: "root is allowed to login as {{ postgresql_admin_user }}"
+     mapname: "root_as_{{ postgresql_admin_user }}"
+-    system_username: "{{ postgresql_admin_user }}"
++    system_username: root
+     pg_username: "{{ postgresql_admin_user }}"
+```
+The old package, postgresql-9.6-postgis-scripts is no more available.
+Fix PostGIS on PostgreSQL v12, as per #450.  @thbar , help out if you can... after #450 is merged.
+I was just hit by some surprising behavior due to the [Ansible variable precedence rules](https://docs.ansible.com/ansible/latest/user_guide/playbooks_variables.html#variable-precedence-where-should-i-put-a-variable) where the [`include_vars` block in `tasks/main.yml`](https://github.com/ANXS/postgresql/blob/master/tasks/main.yml#L3-L7) overrode my configuration that I had set in **"14. play vars_files"**. Since `include_vars` is at position **18** in that list there are very few options for overriding the configuration in [vars/RedHat.yml](https://github.com/ANXS/postgresql/blob/master/vars/RedHat.yml). Could the role be reworked to respect configuration set in at least step 12 and onwards?
+
+For reference a similar issue has been brought up in the past #49.

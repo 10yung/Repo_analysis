@@ -1,0 +1,95 @@
+I'm using the sucker_punch ActiveJob queue adapter in a Rails app. I've created a job that bulk-fetches pricing data from an API and loads it into postgres via ActiveRecord models. I'm also (ab)using the job within a rake task so I can run several of them in parallel, since it takes awhile. I'd say about half the time, this works flawlessly, and the other half, the rake task "hangs", with the last thing in the log being `Enqueued GetPricesJob (Job ID: 3a0197a2-71b9-49a7-a9d0-e1707d8de0f4) to SuckerPunch(default) with arguments:`.
+
+If I hit Ctrl-C in the rake task two times, then the rake task gets an Interrupt, and the jobs start to run and finish successfully. However, the main rake task db transaction gets rolled back due to the Interrupt.
+
+My rake task looks like this, I've tried with and without the `transaction` and `with_connection` wrapper blocks:
+
+```ruby
+task import: :environment do
+    SuckerPunch.shutdown_timeout = 90
+    ActiveRecord::Base.connection_pool.with_connection do
+      Import.transaction do
+      # do some database work
+      ImportPricesJob.perform_later(some_ids)
+    end
+  end
+end
+```
+
+Is this something that should be possible? Or am I breaking sucker_punch in an unsupported way?
+
+Thanks!
+In Readme it is written "ach job acts as its own queue".
+But when using Sucker Punch with Active Job, All jobs are executed in one queue. 
+
+# Cause
+
+I think that this is because the `perform_async` method of the `JobWrapper` class is called in the `SuckerPunchAdapter`.
+https://github.com/rails/rails/blob/b2eb1d1c55a59fee1e6c4cba7030d8ceb524267c/activejob/lib/active_job/queue_adapters/sucker_punch_adapter.rb#L24
+```rb
+JobWrapper.perform_async job.serialize
+```
+
+SuckerPunch retrieves job information from job class properties.
+https://github.com/brandonhilkert/sucker_punch/blob/master/lib/sucker_punch/job.rb#L37
+```rb
+SuckerPunch::Queue.find_or_create(self.to_s, num_workers, num_jobs_max)
+```
+
+# Hypothesis
+
+If this will be fixed like the following, it seems possible to run the job in a different queue.
+```rb
+job.class.perform_async job.arguments
+```
+
+However, this fix makes AcitveJob log incomplete.
+Job start log like the following will be lost.
+```
+[ActiveJob] [SearchJob] [2163535d-688d-494a-9433-5a8c9057f392] Performing SearchJob (Job ID: 2163535d-688d-494a-9433-5a8c9057f392) from SuckerPunch(SearchJob) with arguments: "b8f04e7e-69c9-4dc4-9ea6-955f00193512"
+```
+
+If you execute the job using ActiveJob :: Base.execute as follows, the start log is output.
+```rb
+Base.execute job.serialize
+```
+
+If you can separately specify the class calling perform_async and the block to be executed, you should be able to accomplish both to run the job in a different queue and to log ActiveJob.
+```rb
+job.class.perform_async { Base.execute job.serialize }
+```
+
+# Solution
+I think that the following modifications are necessary.
+`SuckerPunch::Job.perform_async` executes the block when called with block. When there is no block, it instantiates its own class and perform it.
+
+```rb
+def perform_async(*args, &block)
+  return unless SuckerPunch::RUNNING.true?
+  queue = SuckerPunch::Queue.find_or_create(self.to_s, num_workers, num_jobs_max)
+  if block
+    queue.post(args) { |job_args| __run_perform(&block)  }
+  else
+    queue.post(args) { |job_args| __run_perform { self.new.perform(*job_args) }  }
+  end
+end
+```
+
+And the `__run_perform` method executes the received block.
+```rb
+def __run_perform(&block)
+  SuckerPunch::Counter::Busy.new(self.to_s).increment
+  result = block.call
+  SuckerPunch::Counter::Processed.new(self.to_s).increment
+  result
+rescue => ex
+  SuckerPunch::Counter::Failed.new(self.to_s).increment
+  SuckerPunch.exception_handler.call(ex, self, args)
+ensure
+  SuckerPunch::Counter::Busy.new(self.to_s).decrement
+end
+```
+
+# Conclusions
+I think this is a good idea. Once you agree, we will make a pull request.
+Please let me know if you need anything such as tests.

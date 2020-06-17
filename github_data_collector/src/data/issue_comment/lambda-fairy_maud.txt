@@ -1,0 +1,93 @@
+[The HTML spec defines `<style>` and `<script>` as 'raw text elements'](https://html.spec.whatwg.org/multipage/syntax.html#elements-2), meaning that escapes in their bodies are not processed (hence, e.g., `span:before { content: "Hello!" }` cannot be escaped to `span:before { content: &quot;Hello!&quot; }` - try it in a browser if you don't believe me).
+
+This is a potential footgun with `maud`: the path of less resistance, letting `maud` do the escaping, means that the scripts and styles get mangled; however, naively using `PreEscaped` could theoretically introduce an XSS vulnerability because then there's no check for an errant `</`.
+
+This is related to #88. I'm afraid that the HTML syntax is so complicated that there's no way to avoid a certain amount of context-awareness here. I don't know what the ideal API looks like, or even if `maud` can do much better, but at the very least the docs should point out the footgun here.
+See #128.
+
+This was implemented a while ago, but there's no documentation for it.
+We use `maud` from a `no_std` + `alloc` crate. This does not work yet. My first step is to highlight the compatibility issue. Hopefully this leads to a simple fix. In the longer run, the best solution may be to switch `maud` over to being `no_std` + `alloc` itself. This is the natural solution, since `maud` is not dependent on OS specifics at all.
+
+- [x] Add test for `no_std` + `alloc` compat.
+- [x] Implement `no_std` + `alloc` compat for dependers.
+- [ ] Adopt `no_std` + `alloc` within `maud`.
+Would be an interesting direction to explore. The main use-case would be streaming HTML to the browsers without blocking on database calls.
+
+```rust
+let name = futures::future::ok("<p>Maud</p>");
+
+let stream = html_stream! {
+  h1 { "Greetings, " }
+  (name)
+  p { "How are you?" } 
+};
+```
+Signed-off-by: Igor Gnatenko <i.gnatenko.brain@gmail.com>
+Hi, this PR targets the feature requested in #90 
+
+It's based on your current work in the `better-lints` branch.
+
+It's now possible to write:
+```rust
+struct Css(&'static str);
+
+impl Render for Css {
+    fn render_to(&self, buffer: &mut String) {
+        // With a mutable reference
+        html_to! { buffer,
+            link rel="stylesheet" type="text/css" href=(self.0);
+        }
+    }
+}
+
+fn main() {
+    let mut s = String::with_capacity(100);
+
+    // With the owned string in scope
+    html_to!{ &mut s,
+        (DOCTYPE)
+        html {
+            head (Css("style.css"))
+            //…
+        }
+    };
+    println!("{}", s);
+}
+```
+
+All tests were rewritten to use html_test! instead of html! (a wrapper to test against html! and html_to! with its two forms)
+
+Please tell me if you see anything I should change, like moving the new functions in their own file etc, I wasn't sure if it was the right place to put them.
+So, I'm trying to use maud for nest.pijul.com. So far I like it, but nest.pijul.com runs on exactly four threads, forked in the beginning, and is entirely nonblocking. More specifically:
+
+- My async Postgres crate starts exactly *one* connection to the server *per thread*, i.e. currently four connections, independent from the number of clients or requests. It allocates two buffers per thread, once, and never reallocates or drops them.
+- My async HTTP server allocates two buffers per connection, and reuses them if you use HTTP keep-alive.
+- An SSH server allocating a constant number of buffers (like 8) per connection.
+
+At least one buffer per connection is not really avoidable if you don't want to mix requests between clients, but the internals of a server should not need that.
+
+So, in this context, Maud has the potential to allocate a single buffer per thread, and reuse it between clients, because it is never interrupted by IO. In a standard synchronous server, I agree with your comments on benchmarks (you would need some number of buffers *per client*), but async IO can allow you to have a constant memory use and constant number of allocations.
+Maud should check at compile-time that any produced HTML is syntactically valid, unless the `PreEscaped` filter is used.
+We can lint these things:
+
+* [x] Use `maud::DOCTYPE` instead of `PreEscaped("<!DOCTYPE html>")`
+
+* [ ] Rather than writing `output.push_str(&html! { ... }.into_string())`, just implement the [`render`](https://docs.rs/maud/0.14.0/maud/trait.Render.html#method.render) method instead
+
+* [ ] Use `format_args!` (or list the values individually) instead of `format!`
+
+The following lints inspect the structure of the template itself. It's not clear yet how they can be implemented under the current design. We'll probably need to do some refactoring before these can work.
+
+* [ ] Use `.foo` instead of `class="foo"`, and `#foo` instead of `id="foo"`
+
+    + [ ] Use `.foo[bar]` instead of `class=@if bar { "foo" }`
+
+* [ ] Warn against [`a target="..."` without `rel="noopener"`](https://www.jitbit.com/alexblog/256-targetblank---the-most-underestimated-vulnerability-ever/)
+
+* [ ] Warn against dynamic data in CSS and JS contexts, e.g. `script { "var name = '" (user.name) "'" }`
+
+* [ ] Warn about non-standard elements and attributes
+
+Further suggestions welcome!
+Well, I take a look about maud, so I thought could we reuse syntax for XML template support.
+> XML is a markup language much like HTML

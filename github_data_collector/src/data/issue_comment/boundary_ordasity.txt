@@ -1,0 +1,91 @@
+Bumps [jackson-databind](https://github.com/FasterXML/jackson) from 2.1.4 to 2.9.10.1.
+<details>
+<summary>Commits</summary>
+
+- See full diff in [compare view](https://github.com/FasterXML/jackson/commits)
+</details>
+<br />
+
+[![Dependabot compatibility score](https://dependabot-badges.githubapp.com/badges/compatibility_score?dependency-name=com.fasterxml.jackson.core:jackson-databind&package-manager=maven&previous-version=2.1.4&new-version=2.9.10.1)](https://help.github.com/articles/configuring-automated-security-fixes)
+
+Dependabot will resolve any conflicts with this PR as long as you don't alter it yourself. You can also trigger a rebase manually by commenting `@dependabot rebase`.
+
+[//]: # (dependabot-automerge-start)
+[//]: # (dependabot-automerge-end)
+
+---
+
+<details>
+<summary>Dependabot commands and options</summary>
+<br />
+
+You can trigger Dependabot actions by commenting on this PR:
+- `@dependabot rebase` will rebase this PR
+- `@dependabot recreate` will recreate this PR, overwriting any edits that have been made to it
+- `@dependabot merge` will merge this PR after your CI passes on it
+- `@dependabot squash and merge` will squash and merge this PR after your CI passes on it
+- `@dependabot cancel merge` will cancel a previously requested merge and block automerging
+- `@dependabot reopen` will reopen this PR if it is closed
+- `@dependabot ignore this [patch|minor|major] version` will close this PR and stop Dependabot creating any more for this minor/major version (unless you reopen the PR or upgrade to it yourself)
+- `@dependabot ignore this dependency` will close this PR and stop Dependabot creating any more for this dependency (unless you reopen the PR or upgrade to it yourself)
+- `@dependabot use these labels` will set the current labels as the default for future PRs for this repo and language
+- `@dependabot use these reviewers` will set the current reviewers as the default for future PRs for this repo and language
+- `@dependabot use these assignees` will set the current assignees as the default for future PRs for this repo and language
+- `@dependabot use this milestone` will set the current milestone as the default for future PRs for this repo and language
+
+You can disable automated security fix PRs for this repo from the [Security Alerts page](https://github.com/boundary/ordasity/network/alerts).
+
+</details>
+Hi, Do you still use this project? If not, what do you use instead? Thanks!
+`myLoad` gets a null `cluster.loadMap` if we haven't yet connected to the cluster, which throws a `NullPointerException` when we try to `.toString` it for the debug logging. I went ahead and made `myLoad` overly robust to null things, just so that it doesn't have to be concerned with which `Cluster` fields can be null and which can't.
+
+[This is a simple commit](https://github.com/jdanbrown/ordasity/commit/34d0495766d7a59653a46eb18ab479ca5f4af75a) in isolation, but I branched it off of the commits in #10 since it now lives in a different file. Let me know if you'd rather I branch it independently.
+
+I don't have hard evidence for this, but I think the following is possible:
+- [Receive `SyncConnected`](https://github.com/boundary/ordasity/blob/master/src/main/scala/com/boundary/ordasity/Cluster.scala#L136) for sessionid `"a"`
+- [Call `onConnect()`](https://github.com/boundary/ordasity/blob/master/src/main/scala/com/boundary/ordasity/Cluster.scala#L141)
+- zk session expires [here](https://github.com/boundary/ordasity/blob/master/src/main/scala/com/boundary/ordasity/Cluster.scala#L264), sessionid was `"a"`
+- [Call `joinCluster()`](https://github.com/boundary/ordasity/blob/master/src/main/scala/com/boundary/ordasity/Cluster.scala#L265)
+- [`zk.get().getSessionId` establishes new session](https://github.com/boundary/ordasity/blob/master/src/main/scala/com/boundary/ordasity/Cluster.scala#L327) with sessionid `"b"` and returns `"b"`
+- [`/<name>/nodes/<nodeID>` created](https://github.com/boundary/ordasity/blob/master/src/main/scala/com/boundary/ordasity/Cluster.scala#L328) with connectionID `"b"`, lifetime bound to sessionid `"b"`
+- Complete `joinCluster()`, `onConnect()`, `SyncConnected`
+- [Receive `SyncConnected`](https://github.com/boundary/ordasity/blob/master/src/main/scala/com/boundary/ordasity/Cluster.scala#L136) for sessionid `"b"`
+- [Call `onConnect()`](https://github.com/boundary/ordasity/blob/master/src/main/scala/com/boundary/ordasity/Cluster.scala#L141)
+- [Call `previousZKSessionStillActive()`](https://github.com/boundary/ordasity/blob/master/src/main/scala/com/boundary/ordasity/Cluster.scala#L253)
+- `previousZKSessionStillActive()` uses session `"b"` to [read `/<name>/nodes/<nodeID>`](https://github.com/boundary/ordasity/blob/master/src/main/scala/com/boundary/ordasity/Cluster.scala#L502), finds connectionID `"b"`, returns `true`
+- [`onConnect()` returns early](https://github.com/boundary/ordasity/blob/master/src/main/scala/com/boundary/ordasity/Cluster.scala#L255), skipping cluster setup
+
+And somewhere in there an `Expired` event for sessionid `"a"` shuts down the cluster (I'm not sure if it matters when), leaving the cluster in a shutdown state indefinitely because `onConnect()` for sessionid `"b"` was tricked into skipping cluster setup.
+
+After some (not all) expired zk sessions, I'm experiencing hangs when ordasity tries to set its ZooKeeperMaps back up. I've created a very basic repro here with more info in the README: https://github.com/jdanbrown/bug-ordasity-zk-expire
+- Code: https://github.com/jdanbrown/bug-ordasity-zk-expire/blob/master/src/main/scala/bug/Bug.scala
+- Example log: https://raw.github.com/jdanbrown/bug-ordasity-zk-expire/master/example.log
+
+In [Cluster.connectionWatcher](https://github.com/boundary/ordasity/blob/master/src/main/scala/com/boundary/ordasity/Cluster.scala#L133) a `KeeperState.Disconnected` doesn't trigger `forceShutdown`, which is responsible for calling `listener.shutdownWork` and `listener.onLeave`. My guess as to why this is is that it's waiting for a `KeeperState.Expired`, which does trigger `forceShutdown` and is otherwise identical (modulo logging).
+
+Based on my recent experience and the [zk session state-transition docs](http://zookeeper.apache.org/doc/r3.3.3/zookeeperProgrammers.html#ch_zkSessions), this allows the following behavior:
+1. Client partitions from zk cluster
+2. Client-side zk session timeout triggers, client receives `KeeperState.Disconnected`
+3. Clients stays partitioned from network for arbitrarily long, but ordasity continues running its previously-claimed work
+4. Client eventually rejoins network and regains route to zk cluster
+5. Client attempts to reconnect to the zk cluster, cluster says no, client receives `KeeperState.Expired`, ordasity finally shuts down work
+6. Client establishes new session, ordasity claims new work
+
+This is harmful in my application since I want work ownership to be best-effort exclusive, i.e. nodes should minimize their overlap in work.
+
+Is this a bug, or was ordasity intentionally designed to _maximize_ this kind of overlap when nodes partition? I can imagine that being a useful—or at least not harmful—behavior in some settings. If so, maybe I can elaborate this proposed change to include a config option to maximize vs. minimize oblivious work overlap?
+
+If the user supplies their own zk client to cluster.join (or cluster.connect), and their zk client has already established a session, then the cluster will register a watch for a SyncConnected event but never receive one, since it has already fired long ago, before the cluster started listening.
+
+This bug was introduced in my earlier #13, which was a simple change that quietly violated the assumption that the cluster's zk client would trigger a SyncConnected after cluster.join.
+
+This fix depends on (and includes) #14.
+
+
+I haven't actually caught any bugs with this yet, but I've been seeing some intermittent problems around expired zk sessions that I'm hoping to diagnose. (I'm coming to suspect that it's due to bugs in the twitter zk watcher logic.)
+
+And more generally, threads that die silently freak me out.
+
+Note that this [logging commit](https://github.com/jdanbrown/ordasity/commit/b6d9224ae35214ff17f277ad32a1c0569b628219) depends on and includes the [gauged balancing policy commit](https://github.com/jdanbrown/ordasity/commit/65b0e863e372af1bbb8e54e99cb65e8e1c8fecd0) from #10.
+
+A small generalization to allow clients to stuff their own metadata into work-unit znodes: `Json.parse[Map[String, String]](workUnitData)` -> `Json.parse[Map[String, Any]](workUnitData)`.

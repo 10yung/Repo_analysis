@@ -1,0 +1,304 @@
+Since upgrading to [bundler 2.1.3](https://github.com/bundler/bundler/releases/tag/v2.1.3), I cannot utilize Appraisal anymore.
+
+I get this error:
+```shell script
+bundle exec appraisal env rake --version
+>> BUNDLE_GEMFILE=/root/gemfiles/env.gemfile bundle exec rake --version
+bundler: failed to load command: rake (/usr/local/bundle/ruby/2.5.0/bin/rake)
+Gem::LoadError: You have already activated bundler 2.1.2, but your Gemfile requires bundler 2.1.4. Since bundler is a default gem, you can either remove your dependency on it or try updating to a newer version of bundler that supports bundler as a default gem.
+  /usr/local/bundle/gems/bundler-2.1.4/lib/bundler/runtime.rb:312:in `check_for_activated_spec!'
+  /usr/local/bundle/gems/bundler-2.1.4/lib/bundler/runtime.rb:31:in `block in setup'
+  /usr/local/bundle/gems/bundler-2.1.4/lib/bundler/spec_set.rb:147:in `each'
+  /usr/local/bundle/gems/bundler-2.1.4/lib/bundler/spec_set.rb:147:in `each'
+  /usr/local/bundle/gems/bundler-2.1.4/lib/bundler/runtime.rb:26:in `map'
+  /usr/local/bundle/gems/bundler-2.1.4/lib/bundler/runtime.rb:26:in `setup'
+  /usr/local/bundle/gems/bundler-2.1.4/lib/bundler.rb:149:in `setup'
+  /usr/local/bundle/gems/bundler-2.1.4/lib/bundler/setup.rb:10:in `block in <top (required)>'
+  /usr/local/bundle/gems/bundler-2.1.4/lib/bundler/ui/shell.rb:136:in `with_level'
+  /usr/local/bundle/gems/bundler-2.1.4/lib/bundler/ui/shell.rb:88:in `silence'
+  /usr/local/bundle/gems/bundler-2.1.4/lib/bundler/setup.rb:10:in `<top (required)>'
+root@b0d7eb745fe5:~# ```
+```
+
+This error does not happen if I upgrade to a version of bundler lower than `2.1.3`.
+
+The error persists even if I uninstall the default version of bundler `2.1.2`, which seems to be causing the loader confusion.
+
+The error persists regardless of what bundler version is set as the default.
+
+## Steps to reproduce
+
+Start a Ruby docker container (any Ruby version that supports `bundler` and `appraisal` will do):
+
+```shell script
+docker run -it ruby:2.5 bash
+```
+
+Then inside the container:
+
+```shell script
+cd # Go to HOME directory to avoid creating files under /
+
+# Update to newer bundler version
+gem update --system # Ensure RubyGems is up-to-date
+gem install bundler -v '> 2.1.2'
+
+echo "appraise 'env' do
+  gem 'rake' # Any gem will do
+end" > Appraisals
+
+echo "source 'https://rubygems.org'
+gem 'appraisal'" > Gemfile
+
+bundle install
+bundle exec appraisal install
+bundle exec appraisal env rake --version # I expect 'rake, version x.y.z'
+```
+
+One thing to note is that the error does **NOT** happen if I use the appraisal-generated gemfile manually:
+```shell script
+BUNDLE_GEMFILE=/root/gemfiles/env.gemfile bundle exec rake --version
+# rake, version 13.0.1
+```
+
+## Preliminary investigation
+
+Tweaking how Appraisal prepares the Bundler environment for the desired subcommand to execute, I was able to
+get my command to run properly if I removed `RUBYOPT` from the [list of environment variables unset](https://github.com/thoughtbot/appraisal/blob/c4af85912d26bd4a730d739c44a5070b6de4bd4b/lib/appraisal/command.rb#L6) during [`unset_bundler_env_vars`](https://github.com/thoughtbot/appraisal/blob/c4af85912d26bd4a730d739c44a5070b6de4bd4b/lib/appraisal/command.rb#L69).
+
+I wonder if it would be more correct to prepare the Bundler environment using logic similar to [Bundler.with_original_env](https://github.com/bundler/bundler/blob/bada03dd6d4d15828fb5b2cf7f744948e88a69a3/lib/bundler.rb#L363), or [Bundler.with_clean_env](https://github.com/bundler/bundler/blob/bada03dd6d4d15828fb5b2cf7f744948e88a69a3/lib/bundler.rb#L380).
+
+I seem to be getting this error when running `bundle exec appraisal rails-6-0 rake spec`, 
+
+```
+Failure/Error: super unless @initialized
+
+Sprockets::Railtie::ManifestNeededError:
+  Expected to find a manifest file in `app/assets/config/manifest.js`
+  But did not, please create this file and use it to link any assets that need
+  to be rendered by your app:
+
+  Example:
+    //= link_tree ../images
+    //= link_directory ../javascripts .js
+    //= link_directory ../stylesheets .css
+  and restart your server
+```
+
+
+my Appraisals file look like
+
+```
+
+appraise "rails-4-2" do
+  gem "rails", "4.2.11.1"
+  gem "rspec-rails", '~> 3.1'
+end
+
+appraise "rails-5-0" do
+  gem "rails", "5.0.7.2"
+  gem "rspec-rails", '~> 3.1'
+end
+
+
+appraise "rails-5-1" do
+  gem "rails", "5.1.7"
+  gem "rspec-rails", '~> 3.1'
+end
+
+
+appraise "rails-5-2" do
+  gem "rails", "5.2.4.rc1"
+  gem "rspec-rails", '~> 3.1'
+end
+
+
+appraise "rails-6-0" do
+  gem "rails", "6.0.1"
+  gem "rspec-rails", '~> 4.0.0.beta2'
+end
+```
+
+and I have a dummy app here in
+
+```
+spec/
+  dummy/
+     app/
+        assets/
+          config/
+            manifest.js
+        controllers/
+          abc_controller.rb
+          application_controller.rb
+```
+
+note that the dummy app itself has the app/assets/config/manifest.js, but it doesn't seem to be picked up when I run the specs
+
+I'm trying to follow the same pattern I see in clearance to implement the Appraisals 
+- Also make install spec less specific about generated option order.
+- Ignore .ruby-version and .ruby-gemset to ease local development.
+
+[Fixes #159]
+If you declare a `git_source` at the top level of your Gemfile or a spec in Appraisals, it will substitute the gem source in `gem` declarations. If you want to use those gem sources in nested groups declared with `group`, `platforms`, `platform`, `source`, `git`, or `path`, the `git_source` declarations from the top level aren't inherited, so they don't work like they do with bundler.
+
+Fortunately, in `BundlerDSL` there's a protected `git_sources` writer, and all the groups are also declared in that file. It should be easy enough to assign all of the group objects to a copy of the `git_sources`. That would make the substitutions work.
+These rubies are no longer maintained, and by dropping support we get inline with the range of rubies bundler supports, and get CI green.
+Using bundler 1.17.3 and Rails 6 (not sure which if either are relevant), after running `bundle exec appraisal install`, I have a directory at `./gemfiles/.bundle`. 
+
+It has one file in it, `config`, containing only `BUNDLE_RETRY: "1"`. 
+
+I guess current bundler somehow puts this there to store config... just for those gemfiles? Or something?
+
+Do you think this should be checked into source control, or .gitignored? I'm not really sure. I'm not sure why I don't end up with a `.bundle` dir at the _root_ of my project, when using bundler ordinarily, or why it shows up here. 
+
+Can the README offer advice?
+Question:
+
+I have a basic spec and am simply trying to debug it with byebug
+
+spec/setup_spec
+```
+require 'spec_helper'
+
+
+describe XYZObject do
+  it 'should allow me to set it up' do
+    byebug
+  end
+end
+```
+
+
+Gemfile
+```
+source "https://rubygems.org"
+
+gem "appraisal"
+gem "rdoc"
+gem "rails-controller-testing"
+
+
+group :test, :development do
+  gem 'byebug', require: true
+  gem 'rspec-rails'
+end
+
+platforms :ruby do
+
+end
+```
+
+
+Appraisals file
+```
+appraise "rails-5-0" do
+  gem "rails", "5.0.7.2"
+end
+
+appraise "rails-5-1" do
+  gem "rails", "5.1.7"
+end
+
+appraise "rails-5-2" do
+  gem "rails", "5.2.3"
+end
+```
+
+when I run appraisal rails-5-0 rake spec I get
+
+```
+XYZObject
+  should allow me to set it up (FAILED - 1)
+
+Failures:
+
+  1) XYZObject should allow me to set it up
+     Failure/Error: byebug
+     
+     NameError:
+       undefined local variable or method `byebug' for #<RSpec::ExampleGroups::XYZObject:0x00007fdfac1644a8>
+     # ./spec/settings_spec.rb:7:in `block (2 levels) in <top (required)>'
+
+```
+
+
+however, if I simply throw a `require 'byebug'` at the top of settings_spec.rb then it appears to drop into byebug correctly. 
+
+is that the expected behavior? the reason I'm asking is because I had thought the gems listed in Gemfile should be available during the appraisal run. Note that I tried this with my Gemfile as both `gem 'byebug'` and also `gem 'byebug', require: true`
+
+
+I should note that I am testing a GEM that has a `.gemspec` file at its root, as well as a `Gemfile` and also an `Appraisals` file
+`eval_gemfile` is not supported by appraisal.
+
+Error:
+
+```
+appraisal-2.2.0/lib/appraisal/gemfile.rb:30:in `run':
+undefined method `eval_gemfile' for #<Appraisal::Gemfile:0x000055dfb5f5bb18> (NoMethodError)
+```
+
+`eval_gemfile` is useful for sharing dependencies between multiple Gemfiles.
+
+E.g. I have a `rubocop.gemfile` that's included into the main `Gemfile` but also into a separate rubocop-only Gemfile for running as a separate task on CI.
+
+The README suggests not checking in the lockfiles. This means that when you update your local repo with latest remote master, your appraisal gemfiles may be updated, but the lockfiles contain different, incompatible versions, causing an error during `appraisal install`, e.g.:
+
+```
+You have requested:
+  nokogiri < 1.9.1
+
+The bundle currently has nokogiri locked at 1.10.2.
+Try running `bundle update nokogiri`
+```
+
+Is there any way to force appraisal to re-generate the lockfiles in such a case?
+I upgraded from the older paradigm of using Appraisal, in which I had specified Appraisal in a Gemfile that was in a folder at the same level of my ```gemfile/``` folder (was this a mistake?)
+
+In any event, I added to specifying in my ```.gemspec``` file to 
+
+```
+  s.add_development_dependency "appraisal"
+``` 
+
+and I removed the ```gem "appraisal"``` that was in my Gemfile.
+
+but unfortunately now I get ```File does not exist: minitest/rg```
+
+did I miss something? My specs are written in Minitest. and they are all in ```test/lib/``` since they are all testing ```lib/``` code, I have four specs and they all end in ```_test.rb```. 
+
+trying to figure out what I missed here.
+
+```
+$ bundle exec appraisal rake test
+>> BUNDLE_GEMFILE=/Users/jason/Projects/nondestructive_migrations/nondestructive_migrations/gemfiles/rails_4_0.gemfile bundle exec rake test
+
+File does not exist: minitest/rg
+
+Run options: --seed 62304
+
+# Running tests:
+
+
+
+Finished tests in 0.000345s, 0.0000 tests/s, 0.0000 assertions/s.
+
+0 tests, 0 assertions, 0 failures, 0 errors, 0 skips
+Coverage report generated for Unit Tests to /Users/jason/Projects/nondestructive_migrations/nondestructive_migrations/coverage. 0 / 253 LOC (0.0%) covered.
+rake aborted!
+Command failed with status (1)
+/Users/jason/.rvm/gems/ruby-2.2.5/gems/rake-12.3.2/exe/rake:27:in `<top (required)>'
+/Users/jason/.rvm/gems/ruby-2.2.5/bin/ruby_executable_hooks:24:in `eval'
+/Users/jason/.rvm/gems/ruby-2.2.5/bin/ruby_executable_hooks:24:in `<main>'
+Tasks: TOP => test
+(See full trace by running task with --trace)
+Run options: --seed 2877
+
+# Running tests:
+
+
+
+Finished tests in 0.000358s, 0.0000 tests/s, 0.0000 assertions/s.
+
+0 tests, 0 assertions, 0 failures, 0 errors, 0 skips
+```

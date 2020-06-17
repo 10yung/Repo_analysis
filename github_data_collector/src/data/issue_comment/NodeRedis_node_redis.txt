@@ -1,0 +1,205 @@
+Hi, in the past few years, I find a critical bug in my production env. My production env use node-redis : 2.7.1. When the network disconnect , the node-redis will run the retry_strategy that I specified，and then the node-redis connection closed.But node-redis will not reconnect to the redis server again when  the network is ok. So my production env always throw  an error: **The connection is already closed** in the error log, always. Then I have to restart my node server to fix this. In my production env , the retry_strategy is:
+``` js
+retry_strategy: function (options) {
+        // console.log('retry_strategy', options);
+        if (options.error && options.error.code === 'ECONNREFUSED') {
+            // End reconnecting on a specific error and flush all commands with
+            // a individual error
+            return new Error('The server refused the connection');
+        }
+        if (options.total_retry_time > 1000 * 60 * 60) {
+            // End reconnecting after a specific timeout and flush all commands
+            // with a individual error
+            return new Error('Retry time exhausted');
+        }
+        if (options.attempt > 10) {
+            // End reconnecting with built in error
+            return new Error('Attempt time exhausted');
+        }
+        // reconnect after
+        return Math.min(options.attempt * 100, 3000);
+    }
+```
+
+I doubt a very long time, why this would happended. So I dig into the source codes , the node-redis version is  2.8.0. It has this bug too. Then I find the reason:
+``` js
+function handle_offline_command (self, command_obj) {
+    var command = command_obj.command;
+    var err, msg;
+    if (self.closing || !self.enable_offline_queue) {
+        command = command.toUpperCase();
+        if (!self.closing) {
+            if (self.stream.writable) {
+                msg = 'The connection is not yet established and the offline queue is deactivated.';
+            } else {
+                msg = 'Stream not writeable.';
+            }
+        } else {
+            msg = 'The connection is already closed.';
+        }
+        err = new errorClasses.AbortError({
+            message: command + " can't be processed. " + msg,
+            code: 'NR_CLOSED',
+            command: command
+        });
+        if (command_obj.args.length) {
+            err.args = command_obj.args;
+        }
+        utils.reply_in_order(self, command_obj.callback, err);
+    } else {
+        debug('Queueing ' + command + ' for next server connection.');
+        self.offline_queue.push(command_obj);
+    }
+    self.should_buffer = true;
+}
+```
+![image](https://user-images.githubusercontent.com/4386639/72500399-54981600-386f-11ea-80f3-3ea3e17125fb.png)
+![image](https://user-images.githubusercontent.com/4386639/72500309-29adc200-386f-11ea-89c4-dce0922315b0.png)
+When the connection is down, then the ready is false and stream is not writable. And handle_offline_command will handle this .At this time the closing is always true, so it will throw an AbortError. So I donot know why retry connection to de redis server in this scope. 
+
+I fix this code like this, and it works: 
+``` js 
+function handle_offline_command (self, command_obj) {
+    var command = command_obj.command;
+    var err, msg;
+    if (self.closing || !self.enable_offline_queue) {
+        if(self.stream == null || self.stream.destroyed){
+          retry_connection(self, null);
+        }else{
+          self.offline_queue.push(command_obj);
+        }
+        // command = command.toUpperCase();
+        // if (!self.closing) {
+        //     if (self.stream.writable) {
+        //         msg = 'The connection is not yet established and the offline queue is deactivated.';
+        //     } else {
+        //         msg = 'Stream not writeable.';
+        //     }
+        // } else {
+        //     msg = 'The connection is already closed.';
+        // }
+        // err = new errorClasses.AbortError({
+        //     message: command + " can't be processed. " + msg,
+        //     code: 'NR_CLOSED',
+        //     command: command
+        // });
+        // if (command_obj.args.length) {
+        //     err.args = command_obj.args;
+        // }
+        // utils.reply_in_order(self, command_obj.callback, err);
+    } else {
+        debug('Queueing ' + command + ' for next server connection.');
+        self.offline_queue.push(command_obj);
+    }
+    self.should_buffer = true;
+}
+```
+ I donot know it will has any other logic code relatively, although I fix it and it work well . So I hope you give me  a  reliable solution, thks.The code is a little bit messy, so I very want to rewrite your node-redis using asyn await. But I have no time in this year.
+
+
+
+Version 2.8.0 is released in 2017, why not release the latest commit。
+getting 'ReplyError: ERR syntax error' error even though data is getting set,
+await this.msetAsync(['key', 'data']);
+can someone help?
+I notice that there hasn't been a release in more than two years on https://npmjs.com/package/redis - is that intentional? [This recent issue](https://github.com/NodeRedis/node_redis/issues/1476) was closed with the response that the library is still active, so maybe there's something missing in the docs.
+
+For example, [this PR](https://github.com/NodeRedis/node_redis/pull/1425) was merged in 2019 but there's no release for it on npm. Should we be installing with something like `npm install NodeRedis/node_redis` to get from github directly? Or should we do something else, like install `redis-commands` separately? If so, can the right process be documented?
+* **Version**: What node_redis and what redis version is the issue happening on?
+node-redis : 2.8.0
+redis : Redis server v=3.2.12
+
+* **Platform**: What platform / version? 
+Node version : v10.18.0
+NPM version : 6.13.4
+Centos 7, Linux localhost 3.10.0-1062.9.1.el7.x86_64
+
+* **Description**: Description of your issue, stack traces from errors and code that reproduces the issue
+I have redis server installed on 2 systems. 127.0.0.1 and 192.168.0.21. I have configured the node project on local machine(127.0.01) and trying to connect to the other system.
+When the redis service is running on my machine, I can connect to other system. There is a failure when redis-server on my machine is down.
+I can access the redis on the other machine and there are no selinux or firewall related issues.
+Below mentioned is the stack trace:
+`{ Error: Redis connection to 127.0.0.1:6379 failed - connect ECONNREFUSED 127.0.0.1:6379
+    at TCPConnectWrap.afterConnect [as oncomplete] (net.js:1107:14)
+  errno: 'ECONNREFUSED',
+  code: 'ECONNREFUSED',
+  syscall: 'connect',
+  address: '127.0.0.1',
+  port: 6379 }`
+
+
+[gitter]: https://gitter.im/NodeRedis/node_redis?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge
+* **Version**: 2.8.0
+* **Platform**: Node JS 12.8.0 on MacOS Mojave 10.14.5
+* **Description**:
+as the title said, I expect when the db option is provided, it will fire select command on connect using the db option provided regardless whether url provides db number or not.
+
+How to reproduce:
+```
+const redis = require('redis')
+const url = 'redis://127.0.0.1:6379/0'
+const client = redis.createClient({db: 3, url: url})
+client.selected_db // this will return 0, instead of 3 which I expect
+client.set('foo', 'bar') // upon checking on redis-cli this is written to db 0, not on db 3
+```
+
+[gitter]: https://gitter.im/NodeRedis/node_redis?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge
+* **Version**:
+Redis version: `3.0.504`
+Node Redis: `2.8.0`
+* **Platform**:
+NodeJS `v10.15.2` on WSL 2(`Ubuntu 19.10 on Windows 10 x86_64` / `4.19.43-microsoft-standard`)
+Redis on Windows 10 (`Microsoft Windows [Version 10.0.18936.1000]`)
+* **Description**:
+If I connect to the redis server on Windows 10 from node redis on WSL using the IP (WSL Interface) of the host, everything works fine.
+Also, it works if I connect from WSL 1 to the server using the domain(`.local` is not needed here) or when I connect to the redis server running on WSL2(without `.local`/see Note).
+But, if I connect to the redis server using the hostname(`<hostname of the (real) machine>.local`), I get the following error:
+```js
+Error: Redis connection to <hostname of the (real) machine>.local:6379 failed - getaddrinfo ENOTFOUND <hostname of the (real) machine>.l
+ocal <hostname of the (real) machine>.local:6379
+    at GetAddrInfoReqWrap.onlookup [as oncomplete] (dns.js:57:26)
+Emitted 'error' event at:
+    at RedisClient.on_error (/home/dan/daydream/node_modules/redis/index.js:406:14)
+    at Socket.<anonymous> (/home/dan/daydream/node_modules/redis/index.js:279:14)
+    at Socket.emit (events.js:189:13)
+    at emitErrorNT (internal/streams/destroy.js:82:8)
+    at emitErrorAndCloseNT (internal/streams/destroy.js:50:3)
+    at process._tickCallback (internal/process/next_tick.js:63:19)
+```
+
+**[Notes]**:
+If you do not include the `.local` in WSL2, the hostname will resolve to the WSL2 VM and not the host.
+I can also connect to the redis server and enter commands using the Command `telnet <hostname of the (real) machine>.local 6379`.
+Hello,
+
+Is there a way to have a callback for xadd something like:
+
+```
+redisClient.xadd(streamName, '*',....,function(err,resp){
+console.log(resp);
+});
+```
+
+I tried and had errors.
+
+Thanks! 
+Mike
+### Pull Request check-list
+
+_Please make sure to review and check all of these items:_
+
+- [x] Does `npm test` pass with this change (including linting)?
+- [x] Is the new or changed code fully tested?
+- [x] Is a documentation update included (if this change modifies existing APIs, or introduces new ones)?
+
+_NOTE: these things are not required to open a PR and can be done
+afterwards / while the PR is open._
+
+### Description of change
+
+- update `redis-parser` to `3.0.0` for removing `hiredis` to support node 12+.
+- fix eslint errors.
+- fix some of existing errors.
+- add nodejs 12 to travis ci.
+- add nodejs 12 to appveyor ci.
+I think we could do without the bluebird now. 

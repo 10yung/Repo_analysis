@@ -1,0 +1,291 @@
+https://stackoverflow.com/questions/57304922/crash-when-adopting-nssecureunarchivefromdatatransformer-for-a-transformable-pro
+I was using `ListMonitor` delegate to update the tables
+
+```swift
+func listMonitorWillChange(_ monitor: ListMonitor<KargoCD>) {
+   tableView.beginUpdates()
+}
+    
+    func listMonitorDidChange(_ monitor: ListMonitor<KargoCD>) {
+        let limit = UserService.sharedInstance.userTotalLimit
+        let kargos = Storage.userParcels(limit:limit)
+        WatchSessionManager.sharedManager.send(kargos: kargos)
+        tableView.endUpdates()
+    }
+    
+    
+    func listMonitorDidRefetch(_ monitor: ListMonitor<KargoCD>) {
+        tableView.reloadData(effect: .roll)
+    }
+    
+    func listMonitor(_ monitor: ListMonitor<KargoCD>, didInsertObject object: KargoCD, toIndexPath indexPath: IndexPath) {
+        SpotlightDataManager.addToSpotlight(object)
+        tableView.insertRows(at: [indexPath], with: .automatic)
+    }
+    
+    func listMonitor(_ monitor: ListMonitor<KargoCD>, didMoveObject object: KargoCD, fromIndexPath: IndexPath, toIndexPath: IndexPath) {
+        tableView.deleteRows(at: [fromIndexPath], with: .automatic)
+        tableView.insertRows(at: [toIndexPath], with: .automatic)
+    }
+    
+    func listMonitor(_ monitor: ListMonitor<KargoCD>, didUpdateObject object: KargoCD, atIndexPath indexPath: IndexPath) {
+        
+        if let cell = tableView.cellForRow(at: indexPath) as? KargoListCell {
+            configure(cell, with: object)
+            SpotlightDataManager.addToSpotlight(object)
+        }
+    }
+    
+    func listMonitor(_ monitor: ListMonitor<KargoCD>, didDeleteObject object: KargoCD, fromIndexPath indexPath: IndexPath) {
+        SpotlightDataManager.removeFromSpotlight(identifier: object.trackingID)
+        tableView.deleteRows(at: [indexPath], with: .automatic)
+    }
+
+```
+
+Starting with iOS 13, I started to get following warning on the console. When I put a symbolic breakpoint as the warning says I see that it's generated in `didInsertObject` delegate call.
+
+ 
+
+> [TableView] Warning once only: UITableView was told to layout its visible cells and other contents without being in the view hierarchy (the table view or one of its superviews has not been added to a window). This may cause bugs by forcing views inside the table view to load and perform layout without accurate information (e.g. table view bounds, trait collection, layout margins, safe area insets, etc), and will also cause unnecessary performance overhead due to extra layout passes. Make a symbolic breakpoint at UITableViewAlertForLayoutOutsideViewHierarchy to catch this in the debugger and see what caused this to occur, so you can avoid this action altogether if possible, or defer it until the table view has been added to a window. Table view: <UITableView: 0x11e100600; frame = (0 0; 375 603); clipsToBounds = YES; autoresize = RM+BM; gestureRecognizers = <NSArray: 0x2819ed5f0>; layer = <CALayer: 0x2817776a0>; contentOffset: {0, 0}; contentSize: {375, 0}; adjustedContentInset: {0, 0, 0, 0}; dataSource: <App.MyList: 0x11dd67520>>
+In a future update, these `CoreStoreObject` properties
+- `Value.Required`, `Value.Optional`
+- `Transformable.Required`, `Transformable.Optional`
+- `Relationship.ToOne`, `Relationship.ToManyOrdered`, `Relationship.ToManyUnordered`
+
+will be deprecated in favor of these `@propertyWrapper` implementations:
+- `Field.Stored` (replacement for `Value.Required` and`Value.Optional`)
+- `Field.Computed` (new, equivalent to `transient` versions of `Value.Required` and`Value.Optional`)
+- `Field.Coded` (replacement for `Transformable.Required` and`Transformable.Optional`, with additional support for custom encoders such as JSON)
+- `Field.Identifier` (new)
+- `Field.ToOne` (replacement for `Relationship.ToOne`)
+- `Field.ToManyOrdered` (replacement for `Relationship.ToManyOrdered`)
+- `Field.ToManyUnordered` (replacement for `Relationship.ToManyUnordered`)
+
+`Field` types that are marked above as "replacement"s will be able to migrate directly from their old counterparts. So if you have a property declared now as 
+```swift
+let title = Value.Optional<String?>("title", initial: "Mr.")
+```
+you can directly convert it to 
+```swift
+@Field.Stored("title")
+var title: String? = "Mr."
+```
+when you are ready. They will be effectively equal to Core Data and your `VersionLock`s will remain intact.
+
+Note that this effectively forces you to use a different syntax for queries, which is a lot intuitive than the current:
+- Before: `From<Person>.where(\.title == "Mr.")`
+- After: `From<Person>.where(\.$title == "Mr.")`
+
+
+Also a couple of Pro's:
+- The `@propertyWrapper` versions will be magnitudes performant and efficient than their current implementations. Currently `Mirror` reflection is used a lot to inject the `NSManagedObject` reference into the properties. With `@propertyWrapper`s this will be synthesized by the compiler for us. (See https://github.com/apple/swift/pull/25884)
+- The `@propertyWrapper` versions, being `struct`s, will give the compiler a lot more room for optimizations which were not possible before due to the need for mutable classes.
+
+The only Con will be
+- You need to update your code by hand to migrate to the new `@propertyWrapper`s
+(But the legacy ones will remain available for quite a while, so no need to panic)
+
+
+Post implementation ideas:
+- Blob support (background fetched)
+- Compound keys
+- Traits (ReadOnly, etc.)
+I will try to save records with type:
+
+Here is model:
+
+import UIKit
+import CoreData
+
+class WindEntity: NSManagedObject {
+    @NSManaged var wind_id:String
+    @NSManaged var latitude:Double
+    @NSManaged var longitude:Double
+    
+    
+    func setInitialValues() {
+        self.latitude = Double(arc4random_uniform(180)) - 90
+        self.longitude = Double(arc4random_uniform(360)) - 180
+        self.wind_id = NSUUID().uuidString.lowercased()
+    }
+    
+    var coordinate: CLLocationCoordinate2D {
+        get {
+            
+            return CLLocationCoordinate2DMake(
+                self.latitude,
+                self.longitude
+            )
+        }
+        set {
+            
+            self.latitude = newValue.latitude
+            self.longitude = newValue.longitude
+        }
+    }
+}
+
+Save code:
+
+class DBManager: NSObject {
+
+    static let sharedManager = DBManager()
+    
+    let dataStack = DataStack(xcodeModelName: "Hunt")
+    
+    private override init() {
+        super.init()
+        let migrationProgress = dataStack.addStorage(
+            SQLiteStore(
+                fileName: "Hunt.sqlite",
+                configuration: "Default",
+                localStorageOptions: .recreateStoreOnModelMismatch // optional. Provides settings that tells the DataStack how to setup the persistent store
+            ),
+            completion: { (result) -> Void in
+                switch result {
+                case .success(let storage):
+                    print("Successfully added sqlite store: \(storage)")
+                case .failure(let error):
+                    print("Failed adding sqlite store with error: \(error)")
+                }
+            }
+        )
+        CoreStoreDefaults.dataStack = dataStack
+      }
+    
+    func saveWindModel(weather:WeatherModel) {
+        dataStack.perform(
+            asynchronous: { (transaction) -> Void in
+                let wind = transaction.create(Into<WindEntity>())
+                wind.setInitialValues()
+                wind.coordinate = weather.location!.coordinate
+                
+                print("wind: \(wind) isUpdated \(wind.isUpdated)")
+            },
+            completion: { (result) -> Void in
+                switch result {
+
+                case .success:
+                    let people = try! self.dataStack.fetchAll(From<WindEntity>())
+                    print("people \(people)")
+                    
+                case .failure(let error): print(error)
+                    
+                }
+            }
+        )
+    }
+}
+
+After saving I will try to fetch items and have  data: <fault>)
+
+wind: <Hunt.WindEntity: 0x600001f047d0> (entity: WindEntity; id: 0x600003f9c840 <x-coredata://E6238499-1013-4BAC-A8A9-460447C25A79/WindEntity/tC3C3F593-3CF5-4E41-B791-9C652B8CFDD42>; data: {
+    latitude = "50.48147854721918";
+    longitude = "43.66070977143403";
+    "wind_id" = "3f6562d4-d92a-4f05-af28-6953a8eaaf21";
+}) isUpdated false
+people [<Hunt.WindEntity: 0x600001f3c820> (entity: WindEntity; id: 0x865fe1853c3e059b <x-coredata://E6238499-1013-4BAC-A8A9-460447C25A79/WindEntity/p7>; data: <fault>), <Hunt.WindEntity: 0x600001f3ca50> (entity: WindEntity; id: 0x865fe1853c02059b <x-coredata://E6238499-1013-4BAC-A8A9-460447C25A79/WindEntity/p8>; data: <fault>), <Hunt.WindEntity: 0x600001f3cdc0> (entity: WindEntity; id: 0x865fe1853c06059b <x-coredata://E6238499-1013-4BAC-A8A9-460447C25A79/WindEntity/p9>; data: <fault>), <Hunt.WindEntity: 0x600001f3cd20> (entity: WindEntity; id: 0x865fe1853c0a059b <x-coredata://E6238499-1013-4BAC-A8A9-460447C25A79/WindEntity/p10>; data: <fault>), <Hunt.WindEntity: 0x600001f3cbe0> (entity: WindEntity; id: 0x865fe1853c0e059b <x-coredata://E6238499-1013-4BAC-A8A9-460447C25A79/WindEntity/p11>; data: <fault>), <Hunt.WindEntity: 0x600001f3ceb0> (entity: WindEntity; id: 0x865fe1853c12059b <x-coredata://E6238499-1013-4BAC-A8A9-460447C25A79/WindEntity/p12>; data: <fault>), <Hunt.WindEntity: 0x600001f3cf00> (entity: WindEntity; id: 0x865fe1853c16059b <x-coredata://E6238499-1013-4BAC-A8A9-460447C25A79/WindEntity/p13>; data: <fault>), <Hunt.WindEntity: 0x600001f3cf50> (entity: WindEntity; id: 0x865fe1853c1a059b <x-coredata://E6238499-1013-4BAC-A8A9-460447C25A79/WindEntity/p14>; data: <fault>), <Hunt.WindEntity: 0x600001f3cfa0> (entity: WindEntity; id: 0x865fe1853c1e059b <x-coredata://E6238499-1013-4BAC-A8A9-460447C25A79/WindEntity/p15>; data: <fault>), <Hunt.WindEntity: 0x600001f3cff0> (entity: WindEntity; id: 0x865fe1853c62059b <x-coredata://E6238499-1013-4BAC-A8A9-460447C25A79/WindEntity/p16>; data: <fault>), <Hunt.WindEntity: 0x600001f3d040> (entity: WindEntity; id: 0x865fe1853c66059b <x-coredata://E6238499-1013-4BAC-A8A9-460447C25A79/WindEntity/p17>; data: <fault>), <Hunt.WindEntity: 0x600001f3d090> (entity: WindEntity; id: 0x865fe1853c6a059b <x-coredata://E6238499-1013-4BAC-A8A9-460447C25A79/WindEntity/p18>; data: <fault>), <Hunt.WindEntity: 0x600001f3d0e0> (entity: WindEntity; id: 0x865fe1853c6e059b <x-coredata://E6238499-1013-4BAC-A8A9-460447C25A79/WindEntity/p19>; data: <fault>), <Hunt.WindEntity: 0x600001f3d130> (entity: WindEntity; id: 0x865fe1853c72059b <x-coredata://E6238499-1013-4BAC-A8A9-460447C25A79/WindEntity/p20>; data: <fault>), <Hunt.WindEntity: 0x600001f3d180> (entity: WindEntity; id: 0x865fe1853c76059b <x-coredata://E6238499-1013-4BAC-A8A9-460447C25A79/WindEntity/p21>; data: <fault>), <Hunt.WindEntity: 0x600001f3d1d0> (entity: WindEntity; id: 0x865fe1853c7a059b <x-coredata://E6238499-1013-4BAC-A8A9-460447C25A79/WindEntity/p22>; data: <fault>), <Hunt.WindEntity: 0x600001f3d220> (entity: WindEntity; id: 0x865fe1853c7e059b <x-coredata://E6238499-1013-4BAC-A8A9-460447C25A79/WindEntity/p23>; data: <fault>), <Hunt.WindEntity: 0x600001f3d270> (entity: WindEntity; id: 0x865fe1853c42059b <x-coredata://E6238499-1013-4BAC-A8A9-460447C25A79/WindEntity/p24>; data: <fault>)]
+
+What I do wrong?
+We are experiencing this crash, would love your help to figure out what's going on. 
+```
+Crashed: Updater
+0  libobjc.A.dylib                0x182fb0fb0 objc_msgSend + 16
+1  CoreData                       0x187d10dd8 _PFFaultHandlerLookupRow + 1064
+2  CoreData                       0x187d12ac4 _PF_FulfillDeferredFault + 248
+3  CoreData                       0x187d26d38 _pvfk_header + 120
+4  CoreData                       0x187d26b78 _sharedIMPL_pvfk_core_q + 32
+5  CoreData                       0x187d26e40 __generateAccessor_block_invoke + 28
+```
+
+Here is what we are doing 
+
+```
+dataStack.perform(asynchronous: { (transaction) in  
+  let objects = try transaction.fetchAll()
+  backgroundQueue.async {
+    URLSession.shared.dataTask(){
+      dataStack.perform(asynchronous: {(transaction) in
+        let item =  try transaction.fetchOne()
+         // update item fetched object 
+        }, completion: { _ in
+     })
+    }
+   }
+}, completion: { (result) in {
+
+})
+
+```
+Thanks for your help. 
+
+
+Hi, Team
+
+Can I use the code below to get objects from my background queue and using those objects within the main queue?. Because sometimes I got some crash "EXE_BAD_ACCESS" when reading object properties.
+
+<img width="720" alt="Screen Shot 2019-12-26 at 5 44 05 PM" src="https://user-images.githubusercontent.com/5183190/71472937-89342700-2807-11ea-84d5-59942c5ce901.png">
+
+I'm changing local data and they aren't updating. I have to kill app and after opening again they are updated.
+
+ ```
+ dataStack.perform(
+            asynchronous: { (transaction) -> Void in
+                let newOffline = transaction.create(Into<CDOffline>())
+                newOffline.setValues(data: data)
+                
+                let stored = transaction.fetchOne(
+                    From<CDUserData>()
+                        .where(\.id == Int32(id))
+                )
+        
+                if let local= stored {
+                    local.used = newOffline.used
+                }
+        },completion: { (result) -> Void in
+            completion()
+        })
+```
+I'm using async callbacks and after completion needs to be updated. 
+
+ ```
+  func userData(id: Int) -> UserData! {
+        let storedUserData = self.dataStack.fetchOne(
+            From<CDUserData >()
+                .where(\.id == Int32(id))
+        )
+        return storedUserData.map{ UserData(fromCoreData: $0) }
+    }
+```
+the last func doesnt getting updated local datas.
+
+P.S. In SquelLite browser shows changed data
+- if `YES`, post a `+1` or 👍 
+- if `NO`, post a `-1` or 👎 
+
+If you answered `YES`, please do share a short comment on particular use-cases you need them for.
+
+I am considering deprecating the Objective-C API if there is not much use for it. Your feedback is appreciated!
+Would it be possible to rename `LogLevel` to something like `CoreStoreLogLevel` to avoid conflicts with other libraries?
+
+Can you please comment on this [question](https://stackoverflow.com/questions/57429039/corestore-how-to-observe-changes-in-database) 
+
+I have prepared workaround by getting values from list monitor but not sure if it's correct. I would like to call fetchAll after listMonitorDidChange actually when core data records are updated.
+
+```
+func listMonitorDidChange(_ monitor: ListMonitor<ExerciseEntity>) {
+        
+        var exerciseFromMonitor = [ExerciseEntity]()
+        
+        for index in (0...monitor.numberOfObjects() - 1) {
+            exerciseFromMonitor.append(monitor[index])
+        }
+        
+        print(exerciseFromMonitor)
+        
+        if exerciseFromMonitor.count > 0 {
+            //updateData(with: routinesFromMonitor)
+        }
+    }
+```

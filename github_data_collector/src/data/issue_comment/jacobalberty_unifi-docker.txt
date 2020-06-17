@@ -1,0 +1,245 @@
+It is documented but not exposed. 
+This has been driving me up the wall for a few days now. I want to do some advanced configuration of the USG and unifi-docker, but I can not for the life of me figure out where to put this file.
+
+Everything I read tells me that I should put it into a folder called "sites" followed by my site ID. There is no such folder. Or do I need to create the whole directory structure here?
+
+The folder structure is:
+/unifi/data:
+```
+drwxrwxr-x 3 unifi unifi  4096 Nov 23 00:25 backup                                                                            
+drwxrwxr-x 4 unifi unifi 24576 Jan 11 16:31 db                                                                                
+-rwxrwxr-x 1 unifi unifi 23147 Jan 11 08:20 firmware.json                                                                     
+-rwxrwxr-x 1 unifi unifi  2747 Nov 30 13:21 keystore                                                                          
+-rwxrwxr-x 1 unifi unifi  1339 Jan 10 08:19 system.properties                                                                 
+-rwxrwxr-x 1 unifi unifi  1339 Jan 10 08:19 system.properties.bk                                                              
+drwxrwxr-x 3 unifi unifi  4096 Nov 12 11:25 webrtc
+```
+Do I need to create a folder here called "sites/<site_ID>/config.gateway.json
+Hi, since I'm using Raspberry Pi 3B+ with UEFI and Debian 10 (arm64) I needed to create version that support this arch.
+
+Simply updated gosu to 1.11 and changed base image.
+I am trying to configure your docker image to utilize letsencrypt.  Somehow I'm missing a step.  The unifi controller is running with the default unifi cert via port 8443.  I can see the letsencrypt certs in unifi/certs.  But I can't figure out how to force them to be used in place of the unifi cert.  Could you look at my docker-compose and tell me where I went astray?
+
+```
+version: '2'
+ 
+services:
+    mongo:
+      image: mongo:3.4
+      container_name: ui_mongo
+      networks:
+        - unifi
+      restart: always
+      volumes:
+        - db:/data/db
+
+    unifi:
+      image: "jacobalberty/unifi"
+      container_name: ui_controller
+      depends_on:
+        - mongo
+          #      init: true
+      networks:
+        - unifi
+        - subnet
+      restart: always
+      volumes:
+        - ../unifi/data:/unifi/data
+        - ../unifi/log:/unifi/log
+        - ../unifi/certs:/unifi/cert
+        - ../unifi/init:/unifi/init.d
+      environment:
+        DB_URI: mongodb://mongo/unifi
+        STATDB_URI: mongodb://mongo/unifi_stat
+        DB_NAME: unifi
+        RUNAS_UID0: "false"
+        TZ: "America/Los_Angeles"
+        MEM_LIMIT: "1024M"
+        VIRTUALHOST: "subdomain.example.com"
+        LETSENCRYPT_HOST: "subdomain.example.com"
+        LETSENCRYPT_EMAIL: "webmaster@example.com"
+        CERTNAME: "cert.pem"
+        CERT_PRIVATE_NAME: "privkey.pem"
+      ports:
+        - "3478:3478/udp" # STUN
+        - "6789:6789/tcp" # Speed test
+        - "8080:8080/tcp" # Device/ controller comm.
+        - "8443:8443/tcp" # Controller GUI/API as seen in a web browser
+        - "8880:8880/tcp" # HTTP portal redirection
+        - "8843:8843/tcp" # HTTPS portal redirection
+        - "10001:10001/udp" # AP discovery
+
+    logs:
+      image: bash
+      container_name: logs
+      depends_on:
+        - unifi 
+      command: bash -c 'tail -F /unifi/log/*.log'
+      restart: always
+      volumes:
+        - log:/unifi/log
+
+    proxy:
+      image: jwilder/nginx-proxy
+      container_name: proxy
+      restart: unless-stopped
+      labels:
+        com.github.jrcs.letsencrypt_nginx_proxy_companion.nginx_proxy: "true"
+      volumes:
+        - /var/run/docker.sock:/tmp/docker.sock:ro
+        - ../unifi/certs:/etc/nginx/certs:ro
+        - vhost:/etc/nginx/vhost.d
+        - html:/usr/share/nginx/html
+        - conf:/etc/nginx/conf.d
+        - dhparam:/etc/nginx/dhparam
+        - ./uploadsize.conf:/etc/nginx/conf.d/uploadsize.conf:ro
+      ports:
+        - "80:80"
+        - "443:443"
+      networks:
+        - "default"
+        - "subnet"
+
+    proxy-letsencrypt:
+      image: jrcs/letsencrypt-nginx-proxy-companion
+      container_name: letsencrypt
+      restart: unless-stopped
+      environment:
+        - NGINX_PROXY_CONTAINER=proxy
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock:ro
+        - ../unifi/certs:/etc/nginx/certs:rw
+      volumes_from:
+        - "proxy"
+      depends_on:
+        - "proxy"
+      networks:
+        - "default"
+        - "subnet"
+
+volumes:
+  vhost:
+  html:
+  conf:
+  dhparam:
+  db:
+  data:
+  log:
+  init:
+
+networks:
+  subnet:
+  unifi:
+### Host operating system
+
+Ubuntu 18.04
+
+### What tag are you using
+
+Example: `5.7`
+
+### What complete docker command or docker-compose.yml do you use to launch the container (omitting sensitive values)?
+
+```
+docker run --rm --init -p 8080:8080 -p 8443:8443 -p 3478:3478/udp -p 10001:10001/udp -e TZ='Europe/Stockholm' --name unifi jacobalberty/unifi:5.7
+```
+
+### Problem description
+The Web GUI setup wizard should automatically detect my AP AC device, but it does not.
+
+I struggled today with getting this to work. I started a container based on tag `stable` but could not get my AP to detect/be adopted. I tried resetting it, SSH to it and trigger resend of the inform packet (`set-inform http://192.168.0.10:8080/inform`), but nothing helped. I inspected my network traffic, and saw that the inform POST request got a 404 response from the controller. Then I checked with the `info` command on my AP, and it said `Server reject` as its status. So then I started experimenting with different tagged versions from Dockerhub, and found that it worked in 5.6.12. **However – ** the manual inform-messages that I sent still got 404 even when it was automatically detected. So I'm thinking the 404 is a red herring, but it got me on the right track.
+
+
+tag | detection works 
+-----|------------
+5.12 | No
+5.7 |  No
+5.6.12 | Yes
+
+I've got a Ubiquiti AP AC with firmware version `3.7.5.4969` on it. Will try to narrow this down further when I have the time.
+### Host operating system
+
+Ubuntu 18.04
+
+### What tag are you using
+stable arm 
+
+### What complete docker command or docker-compose.yml do you use to launch the container (omitting sensitive values)?
+Used docker compose file to "sudo docker-compose up"
+
+Note: A screenshot of your configuration page if using a gui is acceptable
+
+### What do you expect to happen?
+Unifi Controller runs and visualizes devices as adopted.
+
+### What actually happens?
+After using my backup from my Windows unifi controller instances to restore on the docker unifi controller I can log in. When I log in I see my configuration etc but all devices have a greyed out botton saying Adopt. Also there is some connected/disconnected fluctuation. When I start again my Windows Unifi Controller instances, everything looks normal.
+Synology NAS 218+
+Working UniFi Controller inside Docker that can be accessed locally.
+I can connect to the NAS interface from a remote location using QuickConnect (synology technology)
+I cannot figure out how to access the UniFi Controller page when I am remote
+(when I am local I just use/append the port 8443 and all works fine)
+### Host operating system
+Synology DS
+Example: `Debian stretch` or `Open Media Vault 3`
+
+### What tag are you using
+
+Example: `latest`
+
+
+hi have done was on this side is:
+http://www.bu4.eu/unifi-controller-und-synology-nas-das-docker-dream-team/
+download latest version. stop controller, delete files, start controller, restore from backup.
+version 5.11.50 again :(
+
+
+
+
+
+### What complete docker command or docker-compose.yml do you use to launch the container (omitting sensitive values)?
+
+Example: `docker run --rm --init -p 8080:8080 -p 8443:8443 -p 3478:3478/udp -p 10001:10001/udp -e TZ='Africa/Johannesburg' -v ~/unifi/data:/var/lib/unifi -v ~/unifi/logs:/var/log/unifi --name unifi jacobalberty/unifi:unifi5`
+
+Note: A screenshot of your configuration page if using a gui is acceptable
+
+### What do you expect to happen?
+
+### What actually happens?
+
+### Host operating system
+
+Synology
+
+### What tag are you using
+
+latest
+
+### What complete docker command or docker-compose.yml do you use to launch the container (omitting sensitive values)?
+
+defaults
+
+### What do you expect to happen?
+A screen should pop up that allows the user to search for a picture for their client devices
+
+### What actually happens?
+Error: 
+Failed to load
+Some data requirements failed to load. Please try again later.
+
+I am using the Container station on QNAP and have just downloaded your latest unifi controller container (15.12.35).
+
+I would like to upgrade this controller to the latest beta build which is 15.12.42 and also be in a position to upgrade whenever a new version is released by Ubiquiti
+
+I have tried to SSH to the controller and use the documented method to do this (using the wget <controller url> then installing from there.
+
+This does not appear to be working as the wget command is not available in the container that you have made.
+- Is there another way to do this upgrade?
+- Do you provide containers with the beta versions?
+
+If there is no easy way to do this I may end up just sticking with the stable releases, assuming that you do create new containers with each stable release?
+- On that topic, how soon after the stable versions are released do you publish the new containers?
+
+Sorry for all the questions, I am pretty new to both the unifi equipment and relatively new to using containers as well.
+
+Cheers

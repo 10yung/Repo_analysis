@@ -1,0 +1,146 @@
+Return `int` from all the functions that aren't `dispose` or `free` functions.  This allows us to gracefully fail on bad inputs (instead of an `assert` or crashing with a segmentation fault).
+
+Only functions that cannot fail will remain void.  This includes:
+
+* `*_dispose` and `*_free`: which should gracefully take `NULL` pointers, ignore them, and continue.
+* `giterr_clear`: which cannot fail (since it just updates pointers in global state)
+* `giterr_set_oom`: which cannot fail (since it just updates pointers in global state)
+
+libgit2 does not use `type_t` suffixes as it's redundant; thus, rename some internal types to remove `type` from the name.
+
+* `git_http_authtype_t` -> `git_http_auth_t`
+* `git_iterator_type_t` -> `git_iterator_t`
+* `git_rebase_type_t` -> `git_rebase_t`
+* `git_merge_diff_type_t` -> `git_merge_diff_t`
+# Reproduction steps
+Use Repository.RetrieveStatus from libgit2sharp from inside Unity3D editor script.
+1) download this: 
+[libgit2-git_diff_tree_to_index-Crash.zip](https://github.com/libgit2/libgit2/files/4079301/libgit2-git_diff_tree_to_index-Crash.zip)
+2) download Unity 2019.3.0f5 (other versions crash as well)
+3) open the above project
+4) select menu item "Git Error/RetrieveStatus - CRASH"
+5) note native crash, with the log below
+
+### Expected behavior
+No crash, instead returns RepositoryStatus
+
+### Actual behavior
+
+```
+git2-106a5f2.dll caused an Access Violation (0xc0000005)
+  in module git2-106a5f2.dll at 0033:7cb4ae65.
+
+Stack Trace of Crashed Thread 9380:
+0x00007FFC7CB4AE65 (git2-106a5f2) git_diff_tree_to_index
+0x00007FFC7CBB4B09 (git2-106a5f2) git_status_list_new
+0x0000028C392EADBF (LibGit2Sharp) LibGit2Sharp.Core.NativeMethods.git_status_list_new()
+0x0000028C392EAB9B (LibGit2Sharp) LibGit2Sharp.Core.Proxy.git_status_list_new()
+0x0000028C392E57FB (LibGit2Sharp) LibGit2Sharp.RepositoryStatus..ctor()
+0x0000028C392E49FB (LibGit2Sharp) LibGit2Sharp.Repository.RetrieveStatus()
+```
+
+### Version of libgit2 (release number or SHA1)
+git2-106a5f2, but also happens with e.g. git2-7ce88e6 (happened with all versions I tried).
+
+### Operating system(s) tested
+Windows 10
+
+The function `git_path_resolve_relative` is not only used for paths, but
+also for URLs. As a result, it needs to detect certain URL prefixes like
+for example schemata ("http://") which are not to be removed during any
+directory traversals.
+
+We already handle the schemata part correctly, but we are missing the
+special case of SSH. In contrast to most other protocols, SSH uses a
+colon instead of a slash after the host part, like for example in
+"git@example.com:foo". As a result, `git_path_resolve_relative` would've
+treated the complete "git@example.com:foo" part as a single directory
+part and thus remove it during upwards-traversal.
+
+This problem is relatively easy to hit when having submodules with a
+relative URL. As `git_submodule_resolve_url` calls out to
+`git_path_resolve_relative`, it mis-treated SSH URLs and thus didn't
+compute them correctly.
+
+Fix the issue by special-casing the SSH protocol. Detection makes use
+either of the "ssh://" prefix or with a heuristic that tries to detect
+whether there's a colon before a slash. Note that especially the second
+heuristic is error prone, but it is in fact what git uses right now.
+
+Add some tests to verify behaviour.
+
+---
+
+Fixes #5346 
+### Reproduction steps
+
+1. Mount a CIFS share.
+1. Initialize a Git repo with `core.fsyncObjectFiles`.
+1. Attempt to write a commit.
+
+### Expected behavior
+
+Write success with no errors
+
+### Actual behavior
+
+An error is generated: `failed to fsync directory '/tmp/my-test': Invalid argument`
+
+CIFS does not support `fsync` to a directory. It seems `git_futils_fsync_dir`  attempts to detect if the system supports an `fsync` on a directory, but Windows is the only check: https://github.com/libgit2/libgit2/blob/0e5243b78ff699709d9e4ec48141a44692618f42/src/futils.c#L1156-L1175
+
+We may need to call `statfs()` and check `f_type`.
+
+### Version of libgit2 (release number or SHA1)
+
+v0.28.3
+
+### Operating system(s) tested
+
+Linux mounting CIFS share
+See also https://github.com/libgit2/libgit2/pull/4981#issuecomment-463621023
+
+I have written a mostly complete implementation of reftable as a standalone library that depends only on zlib.
+
+It is here: https://github.com/google/reftable (subdirectory c/  for the C code).
+
+I have some alpha-quality code that integrates it into git-core, and am currently discussing how to proceed, both with the git-core team and the open-source lawyers at Google. I had intended this library to also be used in libgit2.
+
+There are a couple of questions:
+
+* Do you want this in libgit2 as well (I think so, given the earlier comment)
+
+* How can we structure this? We could keep reftable as a standalone-separate library, or it can be integrated into some other project (eg. libgit2). If it is in libgit2, could patches move from libgit2 to git-core, license-wise? If we keep it as a separate library, do you see licensing problems with leaving the library under Apache2?
+
+@mhagger , @ethomson 
+Previously, we were using `umask(mask = umask(0))` to fetch the current
+umask in order to apply it to the desired mode, but this is broken in
+the presence of threads. There is no portable way to directly fetch
+umask without mutating it.
+
+Instead, create the file with 0777 permissions, and fstat it to reverse
+engineer what umask was when the file was created, and then apply that
+as a mask on the mode.
+
+Fixes: jmgao/pore#46
+Initial test run at supporting paths > `260` on Windows (#3053). Works as far as I can tell (clone, commit, checkout, etc.) but definitely needs more testing.
+
+TODO:
+- [x] ~~Do we need to respect `core.longpaths`, or can we simply always support long paths? I'm assuming we need to respect it (https://xkcd.com/1172/), but AFAIK this exists because CLI Git for Windows doesn't support long paths across all commands/internal scripts, and is seen as experimental.~~
+- [x] ~~Potentially keep static buffers at `260`, dynamically allocate past that. Is an increase in path static buffer size from `532`/`778` bytes to `8204`/`12286` bytes too much for Win32? Static is nice here since there is no allocation performance penalty regardless of whether short or long paths are used. Do we support variants of Windows with small stack sizes (e.g. Windows CE)?~~
+- [ ] Tests tests tests tests tests
+- [x] Test cleanup fails (`DeleteFileW(buffer)`)
+
+### Reproduction steps
+Open a repo with ssh url like `git@github.com:libgit2/libgit2.git`
+use git_submodule_resolve_url with relative url like `../../libuv/libuv.git`
+### Expected behavior
+get result `git@github.com:libuv/libuv.git`
+### Actual behavior
+get wrong result `libuv/libuv.git`
+### Version of libgit2 (release number or SHA1)
+commit id 6777db8e8343014d57c41b335e0c60af44d4e9f2
+### Operating system(s) tested
+macos 10.15.2
+This takes a different approach than #4400 as there are hardly any changes to existing code. A separate transport is added for emscripten, and the built-in examples are used for calling from js (added an extra example for commit). Instead of adding a workaround for emscripten mmap, I've submitted a PR for handling offset https://github.com/emscripten-core/emscripten/pull/10095.
+
+Would be great with some feedback on this approach compared to my previous pull-request (#4400).

@@ -1,0 +1,307 @@
+Some people asked for maybe a more windows-friendly version of the sync projects script. Couldn't hash out a .bat version off hand quickly, but this should work on any currently supported windows OS (powershell 4.0+)
+
+As a PATCH because work is still figuring out how this whole "github" thing works. Got OK to continue publishing as PATCH for now though even though it is un-fun for all of  us.
+
+```
+From f7c4fc68923e2cde1c89fc45073a1a2d31665c6f
+Author: Eric Driggers <EricDriggers@toppanmerrill.com>
+Subject: [PATCH] powershell version of sync_unity_projects.ps1
+
+
+---
+diff --git a/src/sync_unity_projects.ps1 b/src/sync_unity_projects.ps1
+--- /dev/null
++++ b/src/sync_unity_projects.ps1
+```
+```powershell
+
+#Quick and dirty port of `rsync_unity_projects.sh` to powershell
+# Thus keep some/most of the semantics of that instead of more native posh style/formatting
+# means updates/sync is easier if the other script changes.
+
+# `echo`, `rm`, `mkdir` are all powershell aliases (ish) or wrappers built in to modern posh hosts
+#  For this I am assuming "reasonably" up to date powershell of 4+, since win7/win8 usage is so low or no longer supported.
+#  They do require better quoting though on spacing.
+
+$BASE_DIR="$PSScriptRoot"
+
+# -- DO NOT CHANGE ORDER OTHERWISE WE RISK COPY OVERS...
+
+echo "Cleaning..."
+echo "... Unity4"
+rm -R $BASE_DIR/Unity/MoonSharp/Assets/Tests
+rm -R $BASE_DIR/Unity/MoonSharp/Assets/Plugins/MoonSharp/Interpreter
+rm -R $BASE_DIR/Unity/MoonSharp/Assets/Plugins/MoonSharp/Debugger
+mkdir $BASE_DIR/Unity/MoonSharp/Assets/Tests
+mkdir $BASE_DIR/Unity/MoonSharp/Assets/Plugins/MoonSharp/Interpreter
+mkdir $BASE_DIR/Unity/MoonSharp/Assets/Plugins/MoonSharp/Debugger
+
+
+echo "Copying files..."
+
+
+#NB: the biggest diff from shell, no rsync so we use posh-native Copy-Item stuff.
+# Reminder that order of files/copies is important for reasons.
+function betterCopy ($RootPath, $DestPath) {
+    #Ignore generated files under `obj/`, per old rsync only .cs files were copied so simplifies the search
+    $srcFiles = get-childitem -Recurse -Path $RootPath -Include "*.cs" | ? {$_.FullName -notmatch "\\obj\\"}
+    #powershell's copy-item does NOT like doing a destination file-tree without effort.
+    #  So instead use a pipeline object and convert/mask the destination output path param.
+    #  KB: https://devblogs.microsoft.com/scripting/learn-about-using-powershell-value-binding-by-property-name/
+    #  KB: https://docs.microsoft.com/en-us/powershell/module/microsoft.powershell.management/copy-item
+    $srcFiles | % {
+        $copyOper = [pscustomobject]@{ Path=$_.FullName; Destination=$($_.FullName.Replace($RootPath,$DestPath))}
+        $null = New-Item -Path  $copyOper.Destination -Type File -Force #Forces file tree creation at least.
+        $copyOper | Copy-Item -Force
+    }
+}
+
+
+echo "... Unity - interpreter"
+betterCopy "$BASE_DIR\MoonSharp.Interpreter" "$BASE_DIR\Unity\MoonSharp\Assets\Plugins\MoonSharp\Interpreter"
+
+echo "... Unity - vscode debugger..."
+betterCopy "$BASE_DIR\MoonSharp.VsCodeDebugger" "$BASE_DIR\Unity\MoonSharp\Assets\Plugins\MoonSharp\Debugger"
+
+echo "... Unity - unit tests..."
+betterCopy "$BASE_DIR\MoonSharp.Interpreter.Tests" "$BASE_DIR\Unity\MoonSharp\Assets\Tests"
+
+```
+lua code
+
+`for k,v in pairs{1} do
+local my;
+return my;
+end`
+
+Expected result:
+my == nil
+Actual result
+my is a table
+
+(I am using MoonSharp for Unity)
+For our uses of moonsharp, we have some strong controls forcing sandboxing and total execution cycles/wall time constraints. These include and require us to attach a debugger to every script instance we create (and to create thousands of new script instances, loading our whole lua library each time). As one might guess, this means we strain some odd hot-paths that normally aren't much of a concern. 
+
+This specific patch has the `Script.SignalByteCodeChange()` private function check if the debugger actually even *cares* about bytecode at that point in time via `GetDebuggerCaps()`.
+
+I am willing to discuss other options, since this does mean there isn't a simple way for the debugger to change its mind after everything has already loaded. We employ either two work arounds to this issue:
+
+1. Simply load any no-op Lua source such that a new Signal (and thus new Caps() check) is sent which then does feed the debugger. This is our method when we know ahead of time (eg when developer debugging not just part of our sandboxing constraints)
+2. In our case we can simply re-initialize the entire M# Script instance at a higher level that is giving us problems and re-wind and re-run with a more capable tracing/logging debugger for post-mortem analysis. This is our preferred method when in-production SREs are thrown to add more detail for logging.
+
+Note: Still having work figure out how to OK publishing our full fork and internal patches such that proper PRs could be submitted since we don't use github (or any public git service). For now going through our older `.PATCH` process for the smaller things that were real nice to haves.
+
+
+    From 92e6257512828b1a195d9060e5799c2fa6899484
+    From: Eric Driggers <EricDriggers@toppanmerrill.com>
+    Subject: [PATCH] Debugger: Only signal byte/source changes if DebuggerCaps says to.
+
+    Performance numbers via ORE at 32 cores: 80% of total CPU vs now of 17% of total CPU.
+    ---
+     src/MoonSharp.Interpreter/Script.cs | 4 ++--
+     1 file changed, 2 insertions(+), 2 deletions(-)
+
+    diff --git a/src/MoonSharp.Interpreter/Script.cs b/src/MoonSharp.Interpreter/Script.cs
+    index 6e3bb11..faf42d2 100755
+    --- a/src/MoonSharp.Interpreter/Script.cs
+    +++ b/src/MoonSharp.Interpreter/Script.cs
+    @@ -137,7 +137,7 @@ namespace MoonSharp.Interpreter
+     
+            private void SignalByteCodeChange()
+            {
+    -           if (m_Debugger != null)
+    +           if (m_Debugger != null && (m_Debugger.GetDebuggerCaps() & DebuggerCaps.CanDebugByteCode) != 0)
+                {
+                    m_Debugger.SetByteCode(m_ByteCode.Code.Select(s => s.ToString()).ToArray());
+                }
+    @@ -145,7 +145,7 @@ namespace MoonSharp.Interpreter
+     
+            private void SignalSourceCodeChange(SourceCode source)
+            {
+    -           if (m_Debugger != null)
+    +           if (m_Debugger != null && (m_Debugger.GetDebuggerCaps() & DebuggerCaps.CanDebugSourceCode) != 0)
+                {
+                    m_Debugger.SetSourceCode(source);
+                }
+    -- 
+
+
+If you do the following in lua:
+
+```lua
+function f() end
+i = f()
+print(type(i))
+```
+
+it prints 'nil' in both normal lua and Moonsharp. However, if you do:
+
+```lua
+function f() end
+local i = f()
+print(type(i))
+```
+
+It still works in normal lua but with Moonsharp it throws the error "bad argument #1 to 'type' (value expected)"
+
+Using Moonsharp version 2.0 inside Visual Studio.
+seems like any json containing 2 "[" fails with an unexpected token error however jsonlinter says it is valid json...the string in question 
+
+```
+{"draw":1,"recordsFiltered":398,"recordsTotal":398,"data":[["1","Private %s","Private %s","1","0"],["1","Private %s","Private %s","1","0"]]}
+```
+
+and here is the error
+
+```
+03:01:45 PM]   chunk_1:(4,0-32): Unexpected token : '"1","Private %s","Private %s","1","0"],["1","Private %s","Private %s","1","0"'
+```
+I have two functions:
+
+```lua
+-- @usage
+-- string.toHex("\1\2\3") -> "010203" 3
+-- string.toHex("123abc") -> "313233616263" 6
+-- string.toHex("123abc"," ") -> "31 32 33 61 62 63 " 6
+function string.toHex(str, separator)
+    return str:gsub('.', function(c)
+        return string.format("%02X" .. (separator or ""), string.byte(c))
+    end)
+end
+
+-- @usage
+-- string.fromHex("010203")       ->  "\1\2\3"
+-- string.fromHex("313233616263:) ->  "123abc"
+function string.fromHex(hex)
+    local hex = hex:gsub("[%s%p]", ""):upper()
+    return hex:gsub("%x%x", function(c)
+        return string.char(tonumber(c, 16))
+    end)
+end
+```
+
+when I used in nlua or some other such as elua, I got right results:
+```lua
+local bytes = ("0002405060ffff"):fromHex()
+print(bytes:toHex())
+--result: 0002405060FFFF	7
+```
+
+but when I use those code in moonsharp, it's wrong:
+```lua
+local bytes = ("0002405060ffff"):fromHex()
+print(bytes:toHex())
+--result: 00024050603F3F	7
+```
+The autogenerated code from hardwiring throws errors under Unity 2018.3.0f2 and C# 7.3.
+
+I'm not sure if I'm doing something wrong or if this is just a bug.
+
+It's 2 errors in my case:
+
+![](https://i.imgur.com/lkIaFhP.png)
+
+(This seems to be easily fixable)
+
+and 
+
+![](https://i.imgur.com/RKpP98f.png)
+
+(This seems to be trying to hardwire an implicit operator, and failing)
+I have some problems with a line:
+
+`         script.Globals["newscript"] = (Func<string, string, string, scripting>)newscript;`
+
+I get somewhere the error:
+
+ScriptRuntimeException: cannot convert clr type execute+scripting
+
+I rewrote it now to remove scripting as return value. I dont really know how it would look otherwise.
+
+It would be great to have a frequently found errors page where you describe how to deal with such errors.
+MoonSharp already has an extension for executing scripts asynchronously. However, that extension allows pretty much no control over the script's execution. Currently, the only way to do so is through coroutines, which involves writing a bunch of boilerplate every time, and which also makes it more difficult to implement, say, a C#-land binding that needs to pause the script thread (imagine a 'sleep' function). Coroutines also don't really allow scripts to be run in the background. They are still run in the foreground, but pause every once in a while. In order to actually run them in the background AND be able to control their execution, one has to add more control code (Lua thread running coroutine and checking every x instructions for abort, main thread creating that separate Lua thread and controlling it via a reset event).
+
+Right now, we want to:
+1. be able to stop the script without forcing an abort
+2. be able to pause the script without a Thread.Sleep, which makes the script thread unresponsive to any kind of abort code
+3. run a Lua script in the background and continue with the normal flow of the program
+
+Additional functionality could obviously be added, like pausing & then resuming execution from within the main flow of the program.
+
+Having support for this in the library makes sense considering it already has async methods. It is also better because it makes everyone else's code cleaner and requires less boilerplate to be written.
+
+This is implemented as follows:
+
+```csharp
+namespace MoonSharp.Interpreter
+{
+    public class ExecutionControlToken
+    {
+        public ExecutionControlToken();
+
+        public void Terminate();
+
+        // ...
+    }
+}
+```
+
+'ExecutionControlToken' provides control of the execution of a script.
+
+Calling 'Terminate' will raise a ScriptTerminationRequestedException from the thread that is running the Lua script. All exceptions can be caught in the same way as with the existing async methods.
+
+
+```csharp
+namespace MoonSharp.Interpreter
+{
+    public class Script
+    {
+        // ...
+
+        public Task<DynValue> DoStringAsync(ExecutionControlToken ecToken, string code, ...);
+
+        public Task<DynValue> DoStreamAsync(ExecutionControlToken ecToken, ...);
+
+        public Task<DynValue> DoFileAsync(ExecutionControlToken ecToken, ...);
+
+        // ... other existing async methods
+
+        public Task<DynValue> CallAsync(ExecutionControlToken ecToken, ...);
+
+        // ...
+    }
+}
+```
+
+The first three methods are modified from the original MoonSharp. They have an additional parameter in the 1st position, which is an 'ExecutionControlToken'. This 'ExecutionControlToken' becomes associated with the execution of the code specified, and it can be associated with multiple scripts.
+
+... is parameters from the non-async methods.
+
+Because 'ecToken' is added as a first parameter to these async methods, this will break compatibility with current 2.x version.
+
+
+```csharp
+namespace MoonSharp.Interpreter
+{
+    public class ScriptExecutionContext
+    {
+        // ...
+    
+        public void PauseExecution(TimeSpan timeSpan);
+    
+        // ...
+    }
+}
+```
+
+'PauseExecution' is added to 'ScriptExecutionContext' so that C#-land bindings can pause the script thread. This function responds to abort requests, so any call to 'PauseExecution' won't block the normal flow of the program.
+
+Although async extensions are only supported on .NET 4.0+, 'PauseExecution' works on .NET 3.5 as well. On that platform, it simply calls Thread.Sleep. That is because there is no async support anyway, so the script execution is already blocking the thread. This is simply for uniformity.
+
+Update as of 18/05/2019: I still have some doubts regarding this pull request, particularly about how the following:
+    - I have to pass the token around everywhere in internal code.
+    - Pausing execution of a script from outside a CLR function binding did not seem useful to me at the time I did this. I'm now reconsidering.
+    - Calling Script.Load/LoadAsync on the same Script instance being used by a script running asynchronously might fail since there is an attempt to access the processor from multiple threads, meaning loading code has to be done before executing the script. I'm not completely sure this is a problem, haven't looked at the code in a while, but probably is.
+It doesn't look like moonsharp has an equivalent of this
+
+<https://www.lua.org/source/5.3/ltm.c.html#luaT_objtypename>

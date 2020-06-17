@@ -1,0 +1,275 @@
+https://github.com/AssetSync/asset_sync/blob/91573bedb6bcbdfb878bee4744971b68dd94c25e/lib/asset_sync/config.rb#L230-L238
+
+needs:
+
+```
+if aws_iam?
+    options.merge!({
+        :use_iam_profile => true
+    })
+end
+
+options.merge!({
+    :aws_access_key_id => aws_access_key_id,
+    :aws_secret_access_key => aws_secret_access_key
+})
+
+...
+```
+
+There was a hidden character that messed up the formatting for a block of code in the README.
+
+Also, this removes some trailing whitespace - my editor does that automatically.
+With Webpacker being builtin and enabled by default in current rails - does it make sense to transparently default to supporting Webpacker assets if it's being used? 
+
+Would a PR adding this to the default value of `add_local_file_paths` be welcome?
+I am deploying a rails 5.0 app with webpacker on elasticbeanstalk.  We use asset_sync so I followed the instructions in the readme for[webpacker setup](https://github.com/AssetSync/asset_sync#webpacker--20-support). I added this to the config/initializers/asset_sync file that was generated automatically and then created the asset_sync.rake file as described.  Now I get an error when I try to deploy: 
+`rake aborted!
+ AssetSync::Config::Invalid: Existing remote files is not included in the list
+ /var/app/ondeck/lib/tasks/asset_sync.rake:3:in `block in <top (required)>'
+ /opt/rubies/ruby-2.5.3/bin/bundle:23:in `load'
+ /opt/rubies/ruby-2.5.3/bin/bundle:23:in `<main>'
+ Tasks: TOP => assets:sync
+ (See full trace by running task with --trace) (Executor::NonZeroExitStatus)`
+When I try to async assets with s3 using command `AssetSync.sync` or ` rake assets:precompile`
+
+This throw an error
+
+```
+Excon::Error::Forbidden: Expected(200) <=> Actual(403 Forbidden)
+excon.error.response
+```
+
+`:body          => "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>SignatureDoesNotMatch</Code><Message>The request signature we calculated does not match the signature you provided. Check your key and signing method.</Message>`
+
+S3 bucket policy is 
+```
+{
+"Id": "xxx",
+"Version": "2012-10-17",
+"Statement": [
+    {
+        "Sid": "xxx",
+        "Action": [
+            "s3:ListBucket"
+        ],
+        "Effect": "Allow",
+        "Resource": "arn:aws:s3:::static-assets",
+        "Principal": "*"
+    },
+    {
+        "Sid": "xxx",
+        "Action": [
+            "s3:GetObject",
+            "s3:GetObjectAcl",
+            "s3:PutObject",
+            "s3:PutObjectAcl"
+        ],
+        "Effect": "Allow",
+        "Resource": "arn:aws:s3:::static-assets/*",
+        "Principal": "*"
+    }
+]
+}
+```
+
+How to fix this issue?
+I experimented with the Webpacker configuration and `add_local_files` but our circumstances required a bit of tweaking. In particular, we have multiple web servers and want to avoid multiple asset compilation jobs, and we need to work with an existing CDN configuration that looks for everything under the pathname '/assets'.
+
+This Capistrano task assumes there is a single server with the `assets` role and one or more with the `web` role. After asset compilation, this task downloads the Sprockets manifest `.sprockets-<fingerprint>.json` and the Webpacker manifest `manifest.json`, and uploads them to all the web servers.
+
+```
+# config/deploy.rb
+
+set :manifest_dir_sprockets, -> { File.join(current_path, 'public', 'assets') }
+set :manifest_dir_webpacker, -> { File.join(current_path, 'public', 'packs') }
+set :manifest_location_sprockets, -> { File.join(fetch(:manifest_dir_sprockets), '.sprockets-*.json') }
+set :manifest_location_webpacker, -> { File.join(fetch(:manifest_dir_webpacker), 'manifest.json') }
+
+after :compile_assets, :copy_manifests
+
+desc 'Download manifest files from asset compilation server and upload them to other web servers'
+  task :copy_manifests do
+    on roles(:assets) do
+      within(shared_path) do
+        %i[sprockets webpacker].each do |type|
+          execute(:rm, '-f', fetch(:"manifest_path_#{type}"))
+          set(:"manifest_path_#{type}", capture(:ls, '-t', fetch(:"manifest_location_#{type}"), '|', 'head', '-n1'))
+          set(:"manifest_filename_#{type}", fetch(:"manifest_path_#{type}").split('/').last)
+          download!(fetch(:"manifest_path_#{type}"), "tmp/#{fetch(:"manifest_filename_#{type}")}")
+        end
+      end
+      within(current_path) do
+        rake('webpacker:upload')
+      end
+    end
+    on roles(:all) do
+      within(shared_path) do
+        %i[sprockets webpacker].each do |type|
+          execute(:rm, '-rf', File.join(fetch(:"manifest_dir_#{type}"), '*'))
+          upload!("tmp/#{fetch(:"manifest_filename_#{type}")}", fetch(:"manifest_path_#{type}"))
+        end
+      end
+    end
+  end
+```
+
+The Rake task we invoke here is used to upload the transpiled asset packs to our desired location on S3. We also need to modify the manifest itself so that it prepends the `assets/` string to the filename.
+
+```
+# lib/tasks/webpacker.rake
+
+namespace :webpacker do
+  desc 'Upload webpacker files to S3 asset host'
+  task :upload do
+    s3 = Aws::S3::Client.new
+    file = Rails.root.join('public', 'packs', 'manifest.json')
+    payload = JSON.parse(File.read(file))
+    payload.each do |key, filename|
+      filename.gsub!(%r{\A\/}, '')
+      target = "assets/#{filename}"
+      payload[key] = target
+      next if s3.list_objects(bucket: S3_ASSETS_BUCKET, prefix: target).contents.any?
+      body = File.read(Rails.root.join('public', filename.gsub('_/', '../')))
+      s3.put_object(acl: 'public-read', body: body, bucket: S3_ASSETS_BUCKET, key: target)
+    end
+    File.open(file, 'w') { |f| f.puts(payload.to_json) }
+  end
+end
+```
+
+It's a bit brittle and I'd like it to be more configurable and transparent, but it does what's required.
+Hi,
+
+I don't see any proper way to upload files with encryption enabled ?
+
+Cf. http://docs.aws.amazon.com/AmazonS3/latest/dev/UsingServerSideEncryption.html
+
+We **monkeypatched** our app for now with (notice the `:encryption => 'AES256'`):
+
+```ruby
+# Enable S3 encryption AES256
+
+module AssetSync
+  class Storage
+    def upload_file(f)
+      # TODO output files in debug logs as asset filename only.
+      one_year = 31557600
+      ext = File.extname(f)[1..-1]
+      mime = MultiMime.lookup(ext)
+      gzip_file_handle = nil
+      file_handle = File.open("#{path}/#{f}")
+      file = {
+        :key => f,
+        :body => file_handle,
+        :public => true,
+        :content_type => mime,
+        :encryption => 'AES256'
+      }
+
+      uncompressed_filename = f.sub(/\.gz\z/, '')
+      basename = File.basename(uncompressed_filename, File.extname(uncompressed_filename))
+
+      assets_to_cache_control = Regexp.union([REGEXP_ASSETS_TO_CACHE_CONTROL] | config.cache_asset_regexps).source
+      if basename.match(Regexp.new(assets_to_cache_control)).present?
+        file.merge!({
+          :cache_control => "public, max-age=#{one_year}",
+          :expires => CGI.rfc1123_date(Time.now + one_year)
+        })
+      end
+
+      # overwrite headers if applicable, you probably shouldn't specific key/body, but cache-control headers etc.
+
+      if files_with_custom_headers.has_key? f
+        file.merge! files_with_custom_headers[f]
+        log "Overwriting #{f} with custom headers #{files_with_custom_headers[f].to_s}"
+      elsif key = self.config.custom_headers.keys.detect {|k| f.match(Regexp.new(k))}
+        headers = {}
+        self.config.custom_headers[key].each do |k, value|
+          headers[k.to_sym] = value
+        end
+        file.merge! headers
+        log "Overwriting matching file #{f} with custom headers #{headers.to_s}"
+      end
+
+
+      gzipped = "#{path}/#{f}.gz"
+      ignore = false
+
+      if config.gzip? && File.extname(f) == ".gz"
+        # Don't bother uploading gzipped assets if we are in gzip_compression mode
+        # as we will overwrite file.css with file.css.gz if it exists.
+        log "Ignoring: #{f}"
+        ignore = true
+      elsif config.gzip? && File.exist?(gzipped)
+        original_size = File.size("#{path}/#{f}")
+        gzipped_size = File.size(gzipped)
+
+        if gzipped_size < original_size
+          percentage = ((gzipped_size.to_f/original_size.to_f)*100).round(2)
+          gzip_file_handle = File.open(gzipped)
+          file.merge!({
+                        :key => f,
+                        :body => gzip_file_handle,
+                        :content_encoding => 'gzip'
+                      })
+          log "Uploading: #{gzipped} in place of #{f} saving #{percentage}%"
+        else
+          percentage = ((original_size.to_f/gzipped_size.to_f)*100).round(2)
+          log "Uploading: #{f} instead of #{gzipped} (compression increases this file by #{percentage}%)"
+        end
+      else
+        if !config.gzip? && File.extname(f) == ".gz"
+          # set content encoding for gzipped files this allows cloudfront to properly handle requests with Accept-Encoding
+          # http://docs.amazonwebservices.com/AmazonCloudFront/latest/DeveloperGuide/ServingCompressedFiles.html
+          uncompressed_filename = f[0..-4]
+          ext = File.extname(uncompressed_filename)[1..-1]
+          mime = MultiMime.lookup(ext)
+          file.merge!({
+            :content_type     => mime,
+            :content_encoding => 'gzip'
+          })
+        end
+        log "Uploading: #{f}"
+      end
+
+      if config.aws? && config.aws_rrs?
+        file.merge!({
+          :storage_class => 'REDUCED_REDUNDANCY'
+        })
+      end
+
+      bucket.files.create( file ) unless ignore
+      file_handle.close
+      gzip_file_handle.close if gzip_file_handle
+    end
+  end
+end
+```
+
+Regards
+In some environments, lookup of mime type fails with one library, but succeeds with another library.
+For instance, in my Rails app, lookup of `'svg'` succeeds only when `::Rack::Mime` is used.
+
+```ruby
+[1] pry(main)> ext = "svg"
+=> "svg"
+[3] pry(main)> defined?(::Mime::Types)
+=> nil
+[2] pry(main)> ::Mime::Type.lookup_by_extension(ext)
+=> nil
+[4] pry(main)> ::Rack::Mime.mime_type(".#{ext}")
+=> "image/svg+xml"
+```
+
+I think we should check all libraries until lookup succeeds.
+This patch will introduce such a checking.
+
+Related to https://github.com/AssetSync/asset_sync/pull/322 https://github.com/AssetSync/asset_sync/issues/323
+
+
+I am getting Expected(200) <=> Actual(400 Bad Request) error while precompilation. 
+
+I have posted all the details on the stackoverflow. Please have a look
+https://stackoverflow.com/questions/44743922/getting-expected200-actual400-bad-request-error-for-asset-sync-gem
+I have gotten IAM working, but the permissions in the example (https://github.com/AssetSync/asset_sync#amazon-aws-iam-users) are quite expansive. Is there a more restricted list of policies that can be implemented?

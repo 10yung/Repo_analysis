@@ -1,0 +1,242 @@
+e.g. unix:///var/run/docker.sock
+Tested on Linux and MacOS and manifests on both.
+
+Below is the reproduction pattern. Just copy/paste to SocketsTests.swift and run tests.
+
+`
+
+
+        func testReadX4096BytesIssue() {
+		
+		var data = Data()
+		
+		do {
+			
+			// Launch the server helper...
+			launchServerHelper(family: .unix)
+			
+			// Need to wait for the server to come up...
+			#if os(Linux)
+				_ = Glibc.sleep(2)
+			#else
+				_ = Darwin.sleep(2)
+			#endif
+			
+			// Create the signature...
+			let signature = try Socket.Signature(socketType: .stream, proto: .unix, path: path)!
+			
+			// Create the socket...
+			let socket = try createHelper(family: .unix)
+			
+			// Defer cleanup...
+			defer {
+				// Close the socket...
+				socket.close()
+				XCTAssertFalse(socket.isActive)
+			}
+			
+			// Connect to the server helper...
+			try socket.connect(using: signature)
+			if !socket.isConnected {
+				
+				fatalError("Failed to connect to the server...")
+			}
+			
+			print("\nConnected to path: \(path)")
+			print("\tSocket signature: \(socket.signature!.description)\n")
+			
+			_ = try readAndPrint(socket: socket, data: &data)
+			
+			for count in [4095, 4097, 4096]
+			{
+				let hello = String(repeating: "a", count: count)
+				let bytesWritten = try socket.write(from: hello)
+				
+				print("Wrote '\(bytesWritten)' bytes to socket...")
+				
+				let response = try readAndPrint(socket: socket, data: &data)
+
+				XCTAssertNotNil(response)
+				XCTAssertEqual(response!, "Server response: \n\(hello)\n")
+			}			
+			try socket.write(from: "QUIT")
+			
+			print("Sent quit to server...")
+			
+			// Need to wait for the server to go down before continuing...
+			#if os(Linux)
+				_ = Glibc.sleep(1)
+			#else
+				_ = Darwin.sleep(1)
+			#endif
+			
+		} catch let error {
+			
+			// See if it's a socket error or something else...
+			guard let socketError = error as? Socket.Error else {
+				
+				print("Unexpected error...")
+				XCTFail()
+				return
+			}
+			
+			print("testReadWriteUnix Error reported: \(socketError.description)")
+			XCTFail()
+		}
+	}
+    
+	static var allTests = [
+		("testDefaultCreate", testDefaultCreate),
+		("testCreateIPV6", testCreateIPV6),
+		("testCreateUnix", testCreateUnix),
+		("testCreateUDP", testCreateUDP),
+		("testListen", testListen),
+		("testListenPort0", testListenPort0),
+		("testListenUnix", testListenUnix),
+		("testListenUDP", testListenUDP),
+		("testListenPort0UDP", testListenPort0UDP),
+		("testConnect", testConnect),
+		("testConnectTo", testConnectTo),
+		("testConnectToWithTimeout", testConnectToWithTimeout),
+		("testConnectToPath", testConnectToPath),
+		("testConnectPort0", testConnectPort0),
+		("testHostnameAndPort", testHostnameAndPort),
+		("testBlocking", testBlocking),
+		("testSetReadTimeout", testSetReadTimeout),
+		("testSetWriteTimeout", testSetWriteTimeout),
+		("testIsReadableWritableFail", testIsReadableWritableFail),
+		("testIsReadableWritable", testIsReadableWritable),
+		("testFDSetBitFields", testFDSetBitFields),
+		("testDomainSocketPath", testDomainSocketPath),
+		("testReadWrite", testReadWrite),
+		("testTruncateTCP", testTruncateTCP),
+		("testReadWriteUDP", testReadWriteUDP),
+		("testReadWriteUnix", testReadWriteUnix),
+		("testReadWriteUnix", testReadX4096BytesIssue),
+	]
+}
+`
+
+Hi all,
+
+Currently i am working on two applications which will installed on same device and communicate over socket. So for that we need a local socket server and local socket client.
+
+So i have created server which has signature: 
+Optional(Signature: family: inet6, type: stream, protocol: tcp, address: Optional(Socket.Socket.Address.ipv6(__C.sockaddr_in6(sin6_len: 28, sin6_family: 30, sin6_port: 34084, sin6_flowinfo: 0, sin6_addr: __C.in6_addr(__u6_addr: __C.in6_addr.__Unnamed_union___u6_addr()), sin6_scope_id: 0))), hostname: Optional("::"), port: 9349, path: nil, bound: true, secure: false)
+
+it start listening on port 9349. After some time it received client connection and it accept the connection.
+client signature is: 
+(Signature: family: inet6, type: stream, protocol: tcp, address: Optional(Socket.Socket.Address.ipv6(__C.sockaddr_in6(sin6_len: 28, sin6_family: 30, sin6_port: 61890, sin6_flowinfo: 0, sin6_addr: __C.in6_addr(__u6_addr: __C.in6_addr.__Unnamed_union___u6_addr()), sin6_scope_id: 0))), hostname: Optional("::1"), port: 49905, path: nil, bound: false, secure: false)
+
+Now when i start reading the data/string i received nothing. we have implemented the same architecture on android which is working fine. 
+
+My reading code is:
+
+func addNewConnection(socket: Socket) {
+        
+        self.connectedSockets[socket.socketfd] = socket
+        try? socket.setReadTimeout(value: 10000)
+        try? socket.setWriteTimeout(value: 10000)
+        let queue = DispatchQueue.global(qos: .default)
+        
+        DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + 1, execute: {
+            print("sending message ")
+            do{
+                let reply = "Server from response"
+                let written = try socket.write(from: reply)
+                print("sent to client is: \(written)")
+            }catch let error{
+                print("error in replying for connection \(error) and \(error.localizedDescription)")
+            }
+        })
+        
+        func readNewData(){
+            print("reading once again")
+            var readData = Data()
+            do{
+                //let stringRead = try socket.readString()
+                let bytesRead = try listenSocket?.read(into: &readData) ?? 0//socket.read(into: &readData)
+                if bytesRead  > 0 {
+                    guard let response = String(data: readData, encoding: .utf8) else {
+                        print("Error decoding response...")
+                        return
+                        //break
+                    }
+                    print("data string read in socket are \(response)")
+                }
+                
+            }catch let error{
+                print("error reading data in socket \(error) and \(error.localizedDescription)")
+            }
+        }
+        
+        timer.eventHandler = {
+            readNewData()
+        }
+        timer.resume()
+    }
+
+
+am i doing anything wrong here or my implementation itself is wrong? please help.
+
+
+First of all: Thanks for writing a library that works with an FTP server and is easy to use!
+
+I created a new app in Xcode 10 with Swift 5 and the latest version of BlueSocket (installed via CocoaPod) to test it and I've come across a problem:
+
+I can open a normal and a data socket to the FTP server and log in using `cmdsocket.write(from: "USER \(username)\r\n")` just fine (you can find a list of ftp codes [here](http://www.nsftools.com/tips/RawFTP.htm)) but
+```
+try cmdSocket.write(from: "LIST\r\n")
+let answer = try dataSocket.readString(true)
+print(\(answer))
+```
+which should list the files and folders at the root only prints the very first one. It's working with a different server (e.g. "speedtest.tele2.net" is free to use for testing), so it looks like "my" server is too slow and/or the library is too fast (and possibly not waiting until the server is done?).
+
+Is there a way to set some kind of timeout for that, e.g. if you don't get a result for the third time, stop reading, instead of stopping after the first try?
+I want to connect to stunnel server on windows by using this BlueSSLService client.
+But I get an error when I create Socket with SSLService Delegate and connect to stunnel.
+This is my function for creating client tls socket.
+-------------------------------------------------------------------------------------------------------------------
+func createStealthSocket() -> Socket?{
+        
+        var myConfig = SSLService.Configuration(withChainFilePath: self.cert, withPassword: "wjfeoqlalf1912", usingSelfSignedCerts: true, clientAllowsSelfSignedCertificates: true)
+        myConfig.cipherSuite = "ALL"
+        do {
+            let socket = try Socket.create(family: .inet)
+            socket.delegate = try SSLService(usingConfiguration: myConfig)
+            try socket.connect(to: self.tunnelHost, port: Int32(self.tunnelPort))
+            return socket
+        } catch let error {
+            guard error is Socket.Error else {
+                print("Unexpected error...")
+                return nil
+            }
+        }
+        return nil
+    }
+---------------------------------------------------------------------------------------------------------------
+When i run this function, i get a normal return value without error.
+But if i capture a network packet with wireshark, i get an encrypted alert (21).
+Below is the log taken from wireshark.
+![err](https://user-images.githubusercontent.com/49852695/59851537-dbebdc80-93a7-11e9-8a6c-62002c1b209c.png)
+
+I tried TCP using simulator and try sending string to my NIO server but in my server it wont go inside my function channelRead.
+It would be very convenient to have the BlueSocket EchoServer from the [README Complete Example](https://github.com/IBM-Swift/BlueSocket#complete-example) available as a separate repository. 
+
+I’m aware that maintaining a separate repository can be a bit of a pain, but, in the end, this would make getting started with BlueSocket a great deal easier.
+The [example](https://github.com/IBM-Swift/BlueSocket#complete-example) uses `unowned self` in an asynchronous queue. This is a bad idea for reasons outlined here: 
+
+https://stackoverflow.com/a/42543070
+When does deinit get called ?
+I'm using BlueSocket on a Mac running as a server and on a iPhone as a client.
+The server runs some apple scripts when the client sends some keywords.
+I noticed that I get memory leaks every time scripts are being executed.
+I noticed that deinit is never called. 
+Any advice is much appreciated.
+I can't find the way to bind to a specific interface/IP using the UDP socket.
+I tried with something similar to:
+```
+try socket.listen(on: self.port, maxBacklogSize: Socket.SOCKET_DEFAULT_MAX_BACKLOG, allowPortReuse: false, node: "my IP address")
+let (bytes, address) = try socket.readDatagram(into: &data)
+```
+But that way I don't receive any data. What am I doing wrong?

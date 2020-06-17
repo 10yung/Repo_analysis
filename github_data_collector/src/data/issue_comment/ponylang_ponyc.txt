@@ -1,0 +1,144 @@
+I followed the instructions on this page: https://github.com/ponylang/ponyc/blob/master/INSTALL.md#windows
+
+But instead of installing visual studio I installed `Visual C++ Build Tools 2019` since I use VSCode as my main editor and don't want to waste disk space.
+
+The Visual C++ compiler and linker is properly installed on my machine and is located in:
+
+`C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Tools\MSVC\14.24.28314\bin\Hostx86\x64\link.exe`
+
+Any ideas on how I can fix it on my end or is this something that has to be fixed in ponyc?
+This addresses #2828
+
+Declaring a variable at the end of a function which expects a return value or having generally a variable declaration where the compiler expects to use the return value caused in most cases an error stating that the variable is undefined but its value is used:
+
+```
+actor Main
+  new create(env:Env) =>
+    confusing_error_msg()
+    
+  fun confusing_error_msg(): String =>
+    var s = "A string."
+```
+
+This bit of code triggers the following error on 0.33.1:
+
+```
+Error:
+main.pony:26:9: the left side is undefined but its value is used
+    var s = "A string."
+        ^
+Error:
+main.pony:26:11: left side must be something that can be assigned to
+    var s = "A string."
+          ^
+```
+
+The presence of the second error was also considered to be erroneous.
+
+This patch discriminates in the `is_lvalue` function from `pass/refer.c` cases where the left-hand side of the assignment is not an `lvalue` and cases where it triggers an error. This way, the compiler can tell between the left side not being something that can be assigned to or it having triggered an error.
+
+Additionally, an *Info* message is triggered when the left side's old value is needed in a declaration.
+
+This is what the error message now looks like:
+
+```
+Error:
+main.pony:6:9: the left side is undefined but its value is used
+    var s = "A string."
+        ^
+    Info:
+    main.pony:6:5: the previous value of 's' is used because you are trying to use the return value of this var declaration
+        var s = "A string."
+        ^
+```
+This pull request fixes issue #2988, where `not if`, `not for` and `not while` resulted in a parse error, even though these should technically be valid.
+
+Tests have been included to prevent this issue from happening again in the future.
+The following code causes the compiler to segfault during the "Functions" step:
+
+```pony
+actor Main
+  new create(env: Env) =>
+    Dealer.from[U8](0)
+    // Dealer(0) // -- does not cause any segfault
+
+class Dealer
+  new from[U: (U8 | Dealer val)](u: U val) =>
+    // Note: commenting out this match fixes the issue
+    match u
+    | let u': U8 => None
+    | let u': Dealer val => None
+    end
+
+  new create(u: (U8 | Dealer val)) =>
+    // this function is harmless
+    match u
+    | let u': U8 => None
+    | let u': Dealer val => None
+    end
+```
+
+This happens when a function with generics containing in a union the class itself tries to match a variable of that generic type. This function has to be covered in order for this segfault to occur.
+
+Occurs on Arch Linux x86_64, `ponyc` 0.33.0 [release] (installed through the `community/ponyc` package), compiled with llvm 7.1.0 with GCC.
+When working on Windows builds for ponyup, I found that it wouldn't
+link due to an error with the FFI call in `symlink`. This commit
+adds a test to verify that `symlink` works.
+
+This PR contains a test that I verified fails on Windows and then adds a change to FilePath.symlink that then allows the failing test to pass.
+
+riscv support. mostly works. main issue seems to be with error unwinding. maybe the lsda or personality stuff needs tweaking. hopefully someone with more time/knowledge can figure out what the issue is.
+
+-------------------------------------------
+
+tested in docker via:
+
+```
+sudo docker run --privileged -it --rm -v $(pwd):$(pwd) -w $(pwd) ubuntu:19.10
+```
+
+In docker:
+
+```
+# install compiler/git/etc
+apt-get update
+apt-get install -y gdb-multiarch qemu-user gcc-9-riscv64-linux-gnu g++-9-riscv64-linux-gnu cmake git build-essential python
+
+# soft link riscv libs to the right path for qemu based execution to work
+ln -s /usr/riscv64-linux-gnu/lib/* /lib
+
+# clean old build artifacts/state
+make -f Makefile-lib-llvm llvm_archs_to_target="X86;RISCV" config=release default_pic=true verbose=1 -j`nproc` clean-all
+
+# compile ponyc and vendored llvm with support for X86/RISCV
+make -f Makefile-lib-llvm llvm_archs_to_target="X86;RISCV" config=release default_pic=true verbose=1 -j`nproc` all
+
+# run tests for normal X86 ponyc
+make -f Makefile-lib-llvm llvm_archs_to_target="X86;RISCV" config=release default_pic=true verbose=1 test-ci
+
+# cross compile libponyrt-pic for RISCV
+make -f Makefile-lib-llvm llvm_archs_to_target="X86;RISCV" config=release default_pic=true verbose=1 CC=riscv64-linux-gnu-gcc-9 CXX=riscv64-linux-gnu-g++-9 arch=rv64gc tune=rocket bits=64 cpu=generic-rv64 cross_llc_args="--march riscv64 -target-abi lp64d --mattr=+m,+a,+f,+d,+c" CFLAGS="-idirafter /usr/cross/include/" CXXFLAGS="-idirafter /usr/cross/include/" LDFLAGS="-idirafter /usr/cross/include/" PONYPATH=/usr/cross/lib -j`nproc` libponyrt-pic
+
+# compile ponyc again just in case (should be a no-op)
+make -f Makefile-lib-llvm llvm_archs_to_target="X86;RISCV" config=release default_pic=true verbose=1 PONYPATH=/usr/cross/lib cross_triple=riscv64-unknown-linux-gnu cross_arch=rv64gc cross_cpu=generic-rv64 cross_linker=riscv64-linux-gnu-gcc-9 cross_ponyc_args="--abi=lp64d --features=+m,+a,+f,+d,+c --link-ldcmd=bfd" QEMU_RUNNER="qemu-riscv64" -j`nproc` all
+
+# cross compile stdlib and run it in qemu
+make -f Makefile-lib-llvm llvm_archs_to_target="X86;RISCV" config=release default_pic=true verbose=1 PONYPATH=/usr/cross/lib cross_triple=riscv64-unknown-linux-gnu cross_arch=rv64gc cross_cpu=generic-rv64 cross_linker=riscv64-linux-gnu-gcc-9 cross_ponyc_args="--abi=lp64d --features=+m,+a,+f,+d,+c --link-ldcmd=bfd" QEMU_RUNNER="qemu-riscv64" test-cross-ci
+```
+
+This the cross compiled `stdlib` will get stuck on `builtin/String.u8` due to the error unwinding issue on the `"300".u8()?` test case that should raise an error.
+We are disabling the `CodegenTest.TryBlockCantCatchCppExcept`  for LLVM 9 and above for now (see #3320), as there is an LLVM bug that is breaking it (see https://reviews.llvm.org/rG9f4f237e29e7150dfcf04ae78fa287d2dc8d48e2).
+
+As part of the CMake build system work (#3234), we will implement a system to patch our vendored LLVM, and include this patch until the LLVM patch is in their source, then re-enable the failing test.
+
+We should also test this on Windows to see if LLVM has fixed Windows support for exceptions.
+Alpine Linux doesn't support `-e` for readlink. However, we are using it in lib/llvm/Makefile on line 143.
+
+https://github.com/ponylang/ponyc/blob/master/lib/llvm/Makefile#L143
+
+readlink on osx also doesn't support `-e` and so we require `greadlink`.
+
+We should be looking for how we can support the proper flags on a per-platform basis without such hackery. A "configure" script is the tried and true approach here with all its usual trade-offs.
+
+/cc @kulibali so you are thinking about issues like this in relation to #3234 and our transition to cmake.
+Target release date is February 1st.

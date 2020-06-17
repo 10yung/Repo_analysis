@@ -1,0 +1,125 @@
+Just added `Control()->GetObservation();` in `AgentControlImp::Restart()`
+The Update() will still return false thus breaks the main loop, although it have called AgentControl()->Restart() in OnGameEnd().  
+In single player game with a computer, it works fine.
+And maybe that is what caused the problem:
+```cpp
+static void CallOnStep(Agent* a) {              // 0. Update()->StepAgents()->RunParallel()->[]step_agent()->CallOnStep() 
+    ControlInterface* control = a->Control();
+    if (!control->IsInGame()) {
+        a->OnGameEnd();                         // 1. Ok, it calls OnGameEnd() and my AgentControl()->Restart() will be called soon!
+        control->RequestLeaveGame();            // 2. ...OK...That's it
+        return;
+    }
+
+    ActionInterface* action = a->Actions();
+    control->IssueEvents(action->Commands());
+    if (action) {
+        action->SendActions();
+    }
+
+    ActionFeatureLayerInterface* action_feature_layer = a->ActionsFeatureLayer();
+    if (action_feature_layer) {
+        action_feature_layer->SendActions();
+    }
+}                                               // 4. Then it will return to Update() and return false, then the main loop breaks and my program exits
+}
+```
+I guess the problem comes from here
+Just see the comments
+```cpp
+void CoordinatorImp::StepAgents() {
+    auto step_agent = [this](Agent* a) {
+        ControlInterface* control = a->Control();
+
+        if (control->GetAppState() != AppState::normal) {
+            return;
+        }
+
+        if (control->PollLeaveGame()) {
+            return;
+        }
+
+        if (control->IsFinishedGame()) {
+            return;
+        }
+
+        control->Step(process_settings_.step_size);
+        control->WaitStep();                        //1. from here we know the game has been end.
+        if (process_settings_.multi_threaded) {
+            CallOnStep(a);                          //2. The first chance to call the CallOnStep() is missing (This function will call OnGameEnd() based on whether the Agent is in game or not) since it is not a multi_threaded game according to my settings.
+        }
+    };
+
+    if (agents_.size() == 1) {
+        step_agent(agents_.front()); 
+    }
+    else {
+        RunParallel(step_agent, agents_);           // 0. Normal opeartion as usual
+    }
+
+    if (!process_settings_.multi_threaded) {
+        for (auto a : agents_) {
+            if (a->Control()->GetAppState() != AppState::normal) {
+                continue;
+            }
+
+            // It is possible to have a pending leave game request here.
+            if (a->Control()->PollLeaveGame()) {    // 3. In PollLeaveGame() it checks if the Agent is in game, is not, return true and continue
+                continue;
+            }
+
+            CallOnStep(a);                          // 4. Because of step 3, the last precious call of CallOnStep (that is, the call of OnGameEnd() as I have mentioned in step 2) is missing again
+        }
+    }
+
+}
+```
+
+
+Forgot to say this is the headless version on Linux I am using.
+
+Edit: I think I got to the bottom of this. I will post some code when I get to eventually solving my own problem.
+Followed the steps for compiling this.
+https://github.com/Blizzard/s2client-api/blob/master/docs/building.md
+
+Only command i changed is
+cmake ../ -G "Visual Studio 15 2017 Win64"
+
+cmake ../ -G "Visual Studio 16 2019"
+
+Could that be issue?
+
+Builds on @piroxiljin changes to fixes issue #315 (and probably a bunch of other Observation issues)
+
+A number of issue were introduced by the most recent major balance changes.
+This pull request attempts to fix:
+- Mishandling of the cloak state.
+- Remapping of some ability id's
+
+Additionally, unit tests have been updated to reflect:
+- bigger bunkers
+- gateways automatically building as warpgates.
+Issue
+-----
+Test_Snapshot raises assertion error on line 52 of `test_snapshot.cc` during the test class `TestSnapshot3`.
+
+Setup
+------
+Visual Studio 2019. 
+Latest client (74741).
+Latest master branch of s2client-api (including new protocols)
+
+Comments
+-----------
+I'm attempting to fix the sc2api for the latest client. 
+
+I'm pretty sure the problem is in how the raw observation data is piped in and then used to update the unit-pool (lines 582--595 of `sc2-client.cc`).
+For some reason, after the first two test cases have passed (where `ObservationImp->unit_pool_ member` is populated with a total of 5 neutral and allied units), during the update prior to calling TestSnapshop3, only one unit is put into that pool.
+
+For reference, the observation unit test class `Test_observation_interface.cc` pass just fine (though there are problems transitioning between test suites, but that's for another day).
+Code something like this (not actual tested code), fails assertion because weapons is empty. 
+```
+const UnitTypes& data = client->getObservation()->GetUnitTypeData();
+assert(!data[UnitTypeID(UNIT_TYPEID::TERRAN_BATTLECRUISER)].weapons.empty());
+```
+This was called in OnGameStart(). Many other units have their weapons data set properly. Here I've used game version Base74741.

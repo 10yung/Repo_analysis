@@ -1,0 +1,388 @@
+This is important to justify the use of `unsafe` when reading `StringRecord`s. Theoretically, if there were no performance difference between doing two UTF-8 validity checks versus doing only one, then `unsafe` could be avoided. It's quite unlikely that this difference cannot be observed, but I've been wrong before.
+
+See #186 for more discussion.
+When reading CSV files without a special header row , the line number of each record is inaccurate.
+
+(As a sidenote, the documentation for `Position::line` is a bit unclear whether line numbers are counted relative to the first line in the file/input stream or relative to the first valid record or to some other reference frame. Regardless of the interpretation, the reported line number is still inaccurate.)
+
+
+#### What version of the `csv` crate are you using?
+
+1.1.2; however, this problem occurs in version 1.0.0.
+
+Rust: Stable - 1.40.0
+OS: Windows 10 1803 (if that information is useful)
+
+
+#### Briefly describe the question, bug or feature request.
+
+When reading a CSV file without a special header row (i.e. using `ReaderBuilder::has_headers` set to `false`), the line number reported by `Position::line` of each record after the first one is off by one, as if the first record failed to get counted.
+
+#### Include a complete program demonstrating a problem.
+
+main.rs:
+```rust
+fn main() {
+    let mut rb = csv::ReaderBuilder::new()
+                 .has_headers(false)
+                 .from_path("csv.csv")
+                 .unwrap();
+    
+    for entry in rb.records() {
+        let record = entry.unwrap();
+        println!("{}", record.position().unwrap().line());
+    }
+}
+```
+
+csv.csv:
+```
+expect,line,1
+expect,line,2
+expect,line,3
+expect,line,4
+expect,line,5
+```
+
+#### What is the observed behavior of the code above?
+
+Output:
+```
+1
+1
+2
+3
+4
+```
+
+#### What is the expected or desired behavior of the code above?
+
+Expected output:
+```
+1
+2
+3
+4
+5
+```
+
+
+#### What version of the `csv` crate are you using?
+1.1.1
+
+#### Briefly describe the question, bug or feature request.
+When writing a program that does validations on deserialized data, I would like to be able to access position information after deserialization.
+
+#### Include a complete program demonstrating a problem.
+
+```rust
+struct Positioned<T> {
+    pub position: csv::Position,
+    pub value: T,
+}
+
+impl<T> Positioned<T> {
+    pub fn map<U>(self, f: impl (FnOnce(T) -> U)) -> Positioned<U> {
+        Positioned {
+            position: self.position,
+            value: f(self.value),
+        }
+    }
+}
+
+#[derive(StructOpt)]
+struct Options {
+    /// TSV files of simple rules, with one rule per line
+    #[structopt(name = "FILES", parse(from_os_str))]
+    files: Vec<PathBuf>,
+}
+
+fn main() -> anyhow::Result<()> {
+    let opts: Options = Options::from_args();
+    let mut rules = vec![];
+
+    for path in &opts.files {
+        let mut reader = csv::ReaderBuilder::new().delimiter(b'\t').from_path(path)?;
+        let headers = reader.headers()?.clone();
+        for record in reader.records() {
+            let record = record?;
+            let position = record.position().expect("Lost CSV position").clone();
+            let value = record.deserialize::<Rule>(Some(&headers))?;
+            rules.push(Positioned { value, position });
+        }
+    }
+
+    // I WOULD LIKE TO DO VALIDATIONS HERE, AND SURFACE POSITIONS ON THE ERRORS
+
+    let compiled = rules
+        .into_iter()
+        .map(|v| v.map(rule::CompiledRule::from))
+        .collect::<Vec<_>>();
+
+    let mut writer = csv::WriterBuilder::default()
+        .has_headers(true)
+        .from_writer(std::io::stdout());
+
+    for rule in compiled {
+        writer.serialize(rule.value)?;
+    }
+
+    Ok(())
+}
+```
+
+#### What is the observed behavior of the code above?
+Not relevant in this case.
+
+#### What is the expected or desired behavior of the code above?
+In the validation code, I'd like to write something that runs validations and returns a `Vec<Diagnostic>`, where each `Diagnostic` has a message and a `position` property. (A span-like thing would also work well).
+
+#### Other Notes
+I created something similar for `darling` [here](https://github.com/TedDriggs/darling/blob/master/core/src/util/spanned_value.rs). However, in that case I controlled the traits, so I'm not sure how much of that is relevant here. I also saw that dtolnay did something like this for toml, but after reading his example I struggled to understand how I'd apply it to CSV.
+More sketching around https://github.com/BurntSushi/rust-csv/issues/176#issuecomment-543547885
+
+I found out that once `only_complete` is there, a method to get a mutable reference to the inner reader _will_ be helpful: it allows one to implement a feeder pattern demonstrated by `test_chunks_2` of `tests/test_chunks.rs`. This will allow incremental parsing without having to scrap and rebuild `Reader` for every chunk.
+
+With these changes, incremental parsing would be, if not easy, at least a lot easier than before.
+I sketched a bit with the `complete_only` API idea I presented here: https://github.com/BurntSushi/rust-csv/issues/176#issuecomment-543547885. What do you think?
+#### What version of the `csv` crate are you using?
+
+name = "csv"
+version = "1.1.1"
+
+#### Briefly describe the question, bug or feature request.
+
+Hi, this is not a bug request, but just a question about the usage patterns.
+I'm dealing with streaming IO, and I've got my CSV parsing logic in a function
+that is repeatedly called with new chunks of data. I've encountered the following problems:
+
+1) Repeatedly constructing new Readers from the input slices "resets" the parsing: all info about headers etc. is lost.
+2) On exhausting the end of the input slice, I'd rather revert parsing to last complete record and return the unparsed input to be `chained` as a reader with the next chunk instead of trying to parse the final record and possibly missing the end of it.
+
+So my question is: are the current API's intended to accomodate for this "chunked, incremental" use case, and I'm just failing to find the correct knobs and patterns or I'm I trying to use the csv crate for something it wasn't originally meant for? Would it be possible to add APIs or documentation that made this easier?
+
+#### Include a complete program demonstrating a problem.
+
+https://play.rust-lang.org/?version=stable&mode=debug&edition=2018&gist=0b76f5fd956649247bdc99d471ba8b1b
+
+#### What is the observed behavior of the code above?
+
+```
+Parse chunk: Chain { t: [], u: [99, 111, 108, 95, 97, 44, 99, 111, 108, 95, 98, 44, 99, 111, 108, 95, 99, 10, 48, 97, 97, 97, 97, 44, 48, 98, 98, 98, 98, 44, 48, 99, 99, 99, 99, 10, 49, 97, 97, 97, 97, 44, 49, 98, 98, 98, 98, 44, 49, 99, 99] }
+Got record: ByteRecord(["0aaaa", "0bbbb", "0cccc"])
+Got record: ByteRecord(["1aaaa", "1bbbb", "1cc"])
+Done. Unparsed: []
+Parse chunk: Chain { t: [], u: [99, 99, 10] }
+Done. Unparsed: []
+Parse chunk: Chain { t: [], u: [50, 97, 97, 97, 97, 44, 50, 98, 98, 98, 98] }
+Done. Unparsed: []
+Parse chunk: Chain { t: [], u: [44, 50, 99, 99, 99, 99, 10] }
+Done. Unparsed: []
+Parse chunk: Chain { t: [], u: [51, 97, 97, 97, 97, 44, 51, 98, 98, 98, 98, 44, 51, 99, 99, 99, 99, 10, 52, 97, 97, 97, 97, 44, 52, 98, 98, 98, 98, 44, 52, 99, 99, 99, 99, 10, 53, 97, 97, 97, 97, 44, 53, 98, 98] }
+Got record: ByteRecord(["4aaaa", "4bbbb", "4cccc"])
+thread 'main' panicked at 'called `Result::unwrap()` on an `Err` value: Error(UnequalLengths { pos: Some(Position { byte: 36, line: 3, record: 2 }), expected_len: 3, len: 2 })', src/libcore/result.rs:1084:5
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace.
+```
+#### What is the expected or desired behavior of the code above?
+```
+Parse chunk: Chain { t: [], u: [99, 111, 108, 95, 97, 44, 99, 111, 108, 95, 98, 44, 99, 111, 108, 95, 99, 10, 48, 97, 97, 97, 97, 44, 48, 98, 98, 98, 98, 44, 48, 99, 99, 99, 99, 10, 49, 97, 97, 97, 97, 44, 49, 98, 98, 98, 98, 44, 49, 99, 99] }
+Got record: ByteRecord(["0aaaa", "0bbbb", "0cccc"])
+Done. Unparsed: [49, 97, 97, 97, 97, 44, 49, 98, 98, 98, 98, 44, 49, 99, 99]
+Parse chunk: Chain { t: [49, 97, 97, 97, 97, 44, 49, 98, 98, 98, 98, 44, 49, 99, 99], u: [99, 99, 10] }
+Got record: ByteRecord(["1aaaa", "1bbbb", "1cccc"])
+Done. Unparsed: []
+Parse chunk: Chain { t: [], u: [50, 97, 97, 97, 97, 44, 50, 98, 98, 98, 98] }
+Done. Unparsed: [50, 97, 97, 97, 97, 44, 50, 98, 98, 98, 98]
+Parse chunk: Chain { t: [50, 97, 97, 97, 97, 44, 50, 98, 98, 98, 98], u: [44, 50, 99, 99, 99, 99, 10] }
+Got record: ByteRecord(["2aaaa", "2bbbb", "2cccc"])
+Done. Unparsed: []
+Parse chunk: Chain { t: [], u: [51, 97, 97, 97, 97, 44, 51, 98, 98, 98, 98, 44, 51, 99, 99, 99, 99, 10, 52, 97, 97, 97, 97, 44, 52, 98, 98, 98, 98, 44, 52, 99, 99, 99, 99, 10, 53, 97, 97, 97, 97, 44, 53, 98, 98] }
+Got record: ByteRecord(["3aaaa", "3bbbb", "3cccc"])
+Got record: ByteRecord(["4aaaa", "4bbbb", "4cccc"])
+Done. Unparsed: [53, 97, 97, 97, 97, 44, 53, 98, 98]
+Parse chunk: Chain { t: [53, 97, 97, 97, 97, 44, 53, 98, 98], u: [98, 98, 44, 53, 99, 99, 99, 99, 10] }
+Got record: ByteRecord(["5aaaa", "5bbbb", "5cccc"])
+Done. Unparsed: []
+```
+See title! Closes #126.
+
+My concerns:
+
+1. `Cargo.toml` took a beating with required features.
+2. Doc comments with serde are ugly.
+
+I think 2 is fine, but 1 feels awful.
+#### What version of the `csv` crate are you using?
+
+1.1.1
+
+#### Briefly describe your feature request.
+
+I have a program that parses a CSV file with many columns, only some of which are relevant to any given run of the program.  Here is a cut-down example CSV file: the real thing has many more rows and also many more columns labeled with uppercase three-character codes.
+
+```csv
+addr,id,longitude,latitude,ABW,AFG,AGO,AIA,ALA
+2.58.52.152,1716,8.6821267,50.1109221,8138590,4481900,6051510,7167090,1309850
+3.17.51.141,1545,-82.9987942,39.9611755,3284140,10847630,10792390,3021880,6873370
+3.121.238.252,1546,8.6821267,50.1109221,8138590,4481900,6051510,7167090,1309850
+```
+
+On each run of the program, it wants to deserialize `addr`, `longitude`, `latitude`, and _one_ of the columns labeled with a three-character code, into this structure:
+
+```rust
+struct HostRecord {
+    addr: IpAddr,
+    longitude: f64,
+    latitude: f64,
+    distance: f64
+}
+```
+
+The catch is that _which_ of the three-character-code columns should be deserialized into the `distance` field varies at runtime.  There doesn't seem to be any way to make Serde do that.  There also doesn't seem to be any way to extract a subset of the fields from a `StringRecord` or `BytesRecord` _by name_.  The best I have managed to do is scan the headers record manually for each relevant field, make note of their indices, and then manually extract each field by index, as shown below.  It's tedious to write and easy to screw up.
+
+#### Include a complete program demonstrating a problem.
+
+``` rust
+struct CSVColumns {
+    addr: usize,
+    longitude: usize,
+    latitude: usize,
+    distance: usize,
+}
+
+/// Error type for select_columns.
+#[derive(Debug, Fail)]
+#[fail(display="missing columns: {}", _0)]
+struct MissingColumnsError(String);
+
+fn select_columns(header: &csv::StringRecord, loc: &str)
+    -> Result<CSVColumns, MissingColumnsError> {
+
+    let mut addr: Option<usize> = None;
+    let mut longitude: Option<usize> = None;
+    let mut latitude: Option<usize> = None;
+    let mut distance: Option<usize> = None;
+    let mut wanted = 4;
+
+    for (index, field) in header.iter().enumerate() {
+        match field {
+            "addr"        => { addr      = Some(index); wanted -= 1; },
+            "longitude"   => { longitude = Some(index); wanted -= 1; },
+            "latitude"    => { latitude  = Some(index); wanted -= 1; },
+            f if f == loc => { distance  = Some(index); wanted -= 1; },
+            _             => {},
+        }
+        if wanted == 0 { break }
+    }
+
+    if wanted == 0 {
+        Ok(CSVColumns {
+            addr: addr.unwrap(),
+            longitude: longitude.unwrap(),
+            latitude: latitude.unwrap(),
+            distance: distance.unwrap(),
+        })
+
+    } else {
+        let mut missing: Vec<&str> = Vec::with_capacity(4);
+        if addr.is_none()      { missing.push("addr"); }
+        if longitude.is_none() { missing.push("longitude"); }
+        if latitude.is_none()  { missing.push("latitude"); }
+        if distance.is_none()  { missing.push(loc); }
+
+        Err(MissingColumnsError(missing.join(", ")))
+    }
+}
+
+fn load_hosts(fname: &Path, loc: &str) -> Result<Vec<HostRecord>, Error> {
+    use std::str::from_utf8;
+
+    let mut fp = File::open(fname)?;
+    let mut rd = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .trim(csv::Trim::All)
+        .from_reader(fp);
+    let cols = select_columns(rd.headers()?, loc)?;
+
+    // Don't bother doing UTF-8 validation on the columns we're not
+    // interested in.
+    let mut row = csv::ByteRecord::new();
+    let mut v: Vec<HostRecord> = Vec::new();
+    while rd.read_byte_record(&mut row)? {
+        v.push(HostRecord {
+            addr: from_utf8(&row[cols.addr])?.parse()?,
+            longitude: from_utf8(&row[cols.longitude])?.parse()?,
+            latitude: from_utf8(&row[cols.latitude])?.parse()?,
+            distance: from_utf8(&row[cols.distance])?.parse()?
+        });
+    }
+    Ok(v)
+}
+```
+
+#### What is the expected or desired behavior of the code above?
+
+The above code does work, it's just that there should be a better way to write it.  Off the top of my head, a plausible "better way" would be a Reader method `find_columns` that tells you the indices for a set of column names, allowing me to dispense with `select_columns` and write something like this instead:
+
+``` rust
+fn load_hosts(fname: &Path, loc: &str) -> Result<Vec<HostRecord>, Error> {
+    use std::str::from_utf8;
+
+    let mut fp = File::open(fname)?;
+    let mut rd = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .trim(csv::Trim::All)
+        .from_reader(fp);
+
+    // find_columns fails if any columns are missing, or produces a
+    // HashMap<&'a str, usize> mapping column names to indices
+    let cols = rd.find_columns(&["addr", "latitude", "longitude", loc])?;
+
+    // Don't bother doing UTF-8 validation on the columns we're not
+    // interested in.
+    let mut row = csv::ByteRecord::new();
+    let mut v: Vec<HostRecord> = Vec::new();
+    while rd.read_byte_record(&mut row)? {
+        v.push(HostRecord {
+            addr: from_utf8(&row[cols["addr"]])?.parse()?,
+            longitude: from_utf8(&row[cols["longitude"]])?.parse()?,
+            latitude: from_utf8(&row[cols["latitude"]])?.parse()?,
+            distance: from_utf8(&row[cols[loc]])?.parse()?
+        });
+    }
+    Ok(v)
+}
+```
+
+A further improvement would be a way to ask the reader to return only the desired columns from each row, which would both speed up parsing (since only those columns would need to be copied and UTF-8 validated), and enable use of serde again:
+
+``` rust
+fn load_hosts(fname: &Path, loc: &str) -> Result<Vec<HostRecord>, Error> {
+
+    use std::str::from_utf8;
+
+    let mut fp = File::open(fname)?;
+
+    // csv does its own buffering, no need for a BufReader
+    let mut rd = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .trim(csv::Trim::All)
+        .from_reader(fp);
+
+    // find_columns fails if any columns are missing, or produces a
+    // HashMap<&'a str, usize> mapping column names to indices
+    let cols = rd.find_columns(&["addr", "latitude", "longitude", loc])?;
+
+    let mut row = csv::StringRecord::new();
+    let mut v: Vec<HostRecord> = Vec::new();
+    while rd.read_columns(&mut row, &cols)? {
+        v.push(row.deserialize::<HostRecord>()?);
+    }
+    Ok(v)
+}
+```
+Currently, the Serde deserializer in this crate hardcodes specific nullable semantics. Namely, only fields with an empty value are considered missing. But, it is fairly common in CSV formats to use other sentinels, such as "null," even for otherwise non-String fields. It should be possible to augment `ReaderBuilder` to permit the caller to provide a predicate that determines whether a field value is missing or not.
+
+Once we have the predicate, it should be as simple as plumbing it through and calling it in [`deserialize_option`](https://github.com/BurntSushi/rust-csv/blob/fcdbea357739348b9eed2a0239e180213be78af9/src/deserializer.rs#L453-L465).
+
+See also https://users.rust-lang.org/t/serde-csv-empty-fields-are-the-string-null/31260 for motivation.

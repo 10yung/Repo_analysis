@@ -1,0 +1,168 @@
+Hi,
+
+I had problem packing a project that uses Sigil 5.0.0, got an error: "The DateTimeOffset specified cannot be converted into a Zip file timestamp"
+
+This is a [known issue in Nuget ](https://github.com/NuGet/Home/issues/7001) that prevents packing files with no modification/creation timestamps.
+After a little digging, I figured that Sigil 5.0.0 contains few files with incorrect timestamp,
+After downgrading to previous version the problem solved.
+
+Repro is to deploy a console application that does an `Assembly.Load("Sigil")` and publish it as self contained. It will fail stating it can't find the `PInvoke` assembly.
+
+It happened for us when benchmarking a change in ASP.NET MVC on a scenario that uses Jil.
+
+While working with Sigil I noticed that LoadConstant is missing a overload that takes a ConstructorInfo, I used to do this using the raw ILGenerator and it work.
+So I added the overload and all tests, basically they are just copied from the LoadConstant(MethodInfo) overload.
+
+I also noticed that the documentation of OpCodes.Ldtoken [here](https://docs.microsoft.com/de-de/dotnet/api/system.reflection.emit.opcodes.ldtoken?view=netframework-4.7.1) does not mention ConstructorInfo so this might also be outside the specs. 
+
+I was hitting an issue where dynamic methods created with `doVerify` set to true work, while the same emitted instructions throw an `InvalidProgramException` when `doVerify` is set to false.
+
+After checking the generated instructions I noticed that the readonly. prefixes are added to the wrong instructions!
+
+Example:
+```C#
+emit.LoadLocal(myLocal);
+emit.LoadConstant(0);
+emit.LoadElement<DateTime?>();
+```
+```CIL
+ldloc.0
+readonly.ldc.i4.0
+ldelema System.Nullable`1[System.DateTime]
+```
+
+or 
+
+```C#
+emit.LoadLocal(myLocal);
+emit.BranchIfTrue(myLabel);
+```
+```CIL
+ldloc.3
+readonly.brtrue.s _label8
+```
+
+or 
+
+```C#
+emit.StoreElement<DateTime?>()
+```
+```CIL
+readonly.stelem System.Nullable`1[System.DateTime]
+```
+
+I will debug further and hopefully will be able to submit a pull request once I have some more time available.
+This fixes #53. The `IsAssignableFrom` method wasn't accounting for the fact that you can assign a (boxed) struct to an interface.
+
+I'm not very familiar with the codebase, so I don't know if this is the most effective way of fixing the bug, although the tests do all pass. Have a look at my code, feedback very welcome 😉 
+Found this while debugging https://github.com/kevin-montrose/Jil/issues/257. (Jil emits virtual calls to `IEnumerable<T>.GetEnumerator`.)
+
+```csharp
+public struct MyStruct { }
+string Example(MyStruct s) => s.ToString();
+```
+
+Looking at the above method in dotPeek, I see a `constrained` `callvirt` on the address of the `MyStruct` argument:
+
+```
+IL_0000: ldarga.s     s
+IL_0002: constrained. MyStruct
+IL_0008: callvirt     instance string [mscorlib]System.Object::ToString()
+IL_000d: ret
+```
+
+Here's (what I think is) the equivalent Sigil:
+
+```csharp
+var obj = typeof(object);
+var myStruct = typeof(MyStruct);
+var myDelegate = Emit<Func<MyStruct, string>>.NewDynamicMethod()
+    .LoadArgumentAddress(0)
+    .CallVirtual(obj.GetMethod("ToString"), myStruct)
+    .Return()
+    .CreateDelegate();
+```
+
+This fails with a `SigilVerificationException`.
+
+```
+Sigil.SigilVerificationException: CallVirtual expected a System.Object; found MyStruct*
+   at Sigil.Emit`1.UpdateStackAndInstrStream(Nullable`1 instr, TransitionWrapper transitions, Boolean firstParamIsThis)
+   at Sigil.Emit`1.UpdateState(OpCode instr, MethodInfo method, IEnumerable`1 parameterTypes, TransitionWrapper transitions, Boolean firstParamIsThis, Type[] arglist)
+   at Sigil.Emit`1.CallVirtual(MethodInfo method, Type constrained, Type[] arglist)
+   at Program.Main(String[] args) in Program.cs:line 18
+```
+Hi,
+
+The function Sigil.NonGeneric.Emit.Call ends up calling this overload of Emit<NonGenericPlaceholderDelegate>.Call:
+ `public Emit<DelegateType> Call(MethodInfo method, Type[] arglist = null)`
+
+That overload is for already builded types and, in fact, the inner MethodBuilder object does not seems to like the call to GetParameters() (NotSupportedException -> Type has not beed created).
+
+Is it possible to fix this calling the other overload of Emit<NonGenericPlaceholderDelegate>.Call?
+
+Thanks!
+Hi,
+
+I am using Sigil to generate, runtime types. initially it was running under CLR2 but when I started running the code under CLR4.0 I started getting IndexOutOfRange exception. It seems to be due to an issue with the ToString method in the SignatureHelper class which is being called due to logging in BufferedIlGenerator. Can this be fixed in Sigil/is there a way to suppress logging so the ToString method on the signature helper is not called at all so that the exception is not thrown
+
+thank you
+
+Test included below to isolate the behaviour
+
+using System;
+using System.Reflection;
+using System.Reflection.Emit;
+using Sigil.NonGeneric;
+using System.Linq;
+using NUnit.Framework;
+
+namespace UnitTestProject1
+{
+    [TestFixture]
+    public class UnitTest1
+    {
+        [Test]
+        public void WhyThrowOn29Parameters()
+        {
+            for (var i = 0; i < 5; i++)
+            {
+                var failCount = 32 * (int)Math.Pow(2, i) - 3;
+
+                Assert.DoesNotThrow(() => CreateEmit(failCount - 1).CreateMethod());
+                Assert.Throws<IndexOutOfRangeException>(() => CreateEmit(failCount).CreateMethod());
+                Assert.DoesNotThrow(() => CreateEmit(failCount + 1).CreateMethod());
+            }
+        }
+
+        private static Emit CreateEmit(int count)
+        {
+            var asm = AppDomain.CurrentDomain.DefineDynamicAssembly(new AssemblyName("Foo"), AssemblyBuilderAccess.Run);
+            var mod = asm.DefineDynamicModule("Bar");
+            var t = mod.DefineType("T");
+
+            var foo = t.DefineField("Foo", typeof(double), FieldAttributes.Public);
+            var types = Enumerable.Range(0, count).Select(Xunit => typeof(double)).ToArray();
+
+            var c = Emit.BuildConstructor(types, t, MethodAttributes.Public);
+            c.LoadArgument(0);
+            c.LoadArgument(1);
+            c.LoadArgument(2);
+            c.Add();
+            for (ushort i = 3; i <= count; i++)
+            {
+                c.LoadArgument(i);
+                c.Add();
+            }
+            c.StoreField(foo);
+            c.Return();
+            var cons = c.CreateConstructor();
+
+            var cp = Emit.BuildStaticMethod(typeof(object), types, t, "Create", MethodAttributes.Public | MethodAttributes.Static, true, false);
+            cp.NewObject(cons, types);
+            cp.Return();
+            return cp;
+        }
+    }
+}
+These are essential for consumers to know.  For instance, in order to spill the stack.  Without IsReachable, it is impossible for an emitter to know whether to emit instructions such as a return, without doing their own redundant reachability tracking.

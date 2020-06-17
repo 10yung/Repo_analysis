@@ -1,0 +1,263 @@
+### Problem Description
+I am trying to set up my Nitrokey Storage 2 to connect to remote hosts with ECC. I am using NIST P-384 curve. I have no problems at listing all the keys:
+
+```
+pkcs15-tool --list-keys
+Using reader with a card: Nitrokey Nitrokey Storage (0000000000000) 00 00
+Private EC Key [Signature key]
+	Object Flags   : [0x03], private, modifiable
+	Usage          : [0x20C], sign, signRecover, nonRepudiation
+	Access Flags   : [0x1D], sensitive, alwaysSensitive, neverExtract, local
+	FieldLength    : 0
+	Key ref        : 0 (0x00)
+	Native         : yes
+	Auth ID        : 01
+	ID             : 01
+	MD:guid        : 017a9f15-2c68-ad5e-12d1-00407af06829
+
+Private EC Key [Encryption key]
+	Object Flags   : [0x03], private, modifiable
+	Usage          : [0x22], decrypt, unwrap
+	Access Flags   : [0x1D], sensitive, alwaysSensitive, neverExtract, local
+	FieldLength    : 0
+	Key ref        : 1 (0x01)
+	Native         : yes
+	Auth ID        : 02
+	ID             : 02
+	MD:guid        : 250550b6-fb76-8e76-294e-a44fc8d0e445
+
+Private EC Key [Authentication key]
+	Object Flags   : [0x03], private, modifiable
+	Usage          : [0x222], decrypt, unwrap, nonRepudiation
+	Access Flags   : [0x1D], sensitive, alwaysSensitive, neverExtract, local
+	FieldLength    : 0
+	Key ref        : 2 (0x02)
+	Native         : yes
+	Auth ID        : 02
+	ID             : 03
+	MD:guid        : 3281a6a6-167a-76eb-33c7-c000af63b6e3
+```
+
+But then, there is a problem on exporting the third (auth) key in SSH form:
+
+```
+pkcs15-tool --read-ssh-key 3
+Using reader with a card: Nitrokey Nitrokey Storage (0000000000000) 00 00
+Unsupported curve
+```
+
+NIST P-384 should be supported by both this token and OpenSSH. Of course, this problem persists for two other keyslots.
+
+ssh-keygen returns similar problems:
+
+```
+ssh-keygen -D /usr/lib/opensc-pkcs11.so 
+C_GetAttributeValue failed: 18
+failed to fetch key
+C_GetAttributeValue failed: 18
+failed to fetch key
+Enter PIN for 'OpenPGP card (User PIN)': 
+C_GetAttributeValue failed: 18
+failed to fetch key
+C_GetAttributeValue failed: 18
+failed to fetch key
+C_GetAttributeValue failed: 18
+failed to fetch key
+Enter PIN for 'OpenPGP card (User PIN (sig))': 
+C_GetAttributeValue failed: 18
+failed to fetch key
+cannot read public key from pkcs11
+```
+Of course, I have no problems just reading any of those keys:
+
+```
+pkcs15-tool --read-public-key 3
+Using reader with a card: Nitrokey Nitrokey Storage (0000000000000) 00 00
+-----BEGIN PUBLIC KEY-----
+MHEwCwYHKoZIzj0CAQUAA2IABE+dm3v2tYPaS2jfosey7Kc+6MiUmYu40vdRU84c
+CurIla87/3hIkaCvvn+UhU1SChsggtgyrZP1V/9A6k/CrdwBOh8g3B90FhWvOuDF
+pEJJkUQYs/mqY4k8ry9FhWsBlg==
+-----END PUBLIC KEY-----
+```
+I also have another Nitrokey with RSA keys from my work, it looks like it works perfectly with ssh and opensc_pkcs11 module.
+
+<!--
+Please read about [reporting bugs](https://github.com/OpenSC/OpenSC/wiki/How-to-report-bugs-so-that-they-can-be-fixed) before opening an issue.
+-->
+
+### Steps to reproduce
+1. Install OpenSC 0.20 and OpenSSH 8.1
+2. Set up an OpenPGP card with NIST-P384 keys
+3. Try to generate SSH key
+
+<!--
+Debug output is essential to identify the problem. You can enable debugging by editing the file `opensc.conf`:
+```
+    # A debug level of 3 catches most problems
+    # Some sensitive data may be logged, too, (e.g. PIN codes)
+    debug = 3;
+
+    # Where to write the debug output (default: `stdout`)
+    #debug_file = opensc-debug.log
+```
+
+Please use [Gist](https://gist.github.com/) or a similar code paster for longer logs. Before pasting here, remove your sensitive data from your log (e.g. PIN code or certificates).
+
+```
+Paste Log output with less than 10 lines here (between the backticks)
+```
+-->
+
+### Problem Description
+
+I think we need to have a closer look at `sc_decompress_zlib_alloc()` It looks like there's are multiple problems with:
+- calling realloc with size 0 (possible double free)
+- missing length checks when calculating the buffer sizes
+- possible misconception of realloc (afaik, "shrinking down" a buffer is not possible)
+### Problem Description
+While playing with the `opensc-notify`, I noticed it ends up in infinite loop in case I plug out my yubikey and start the daemon (first log).
+
+Similarly, there is an issue when the daemon is started while yubikey connected. The disconnect of yubikey causes the `opensc-notify` deamon to exit (the `SCardGetStatusChange` returns `SCARD_E_UNKNOWN_READER`). The reader is not removed from the reader list when the removal is detected and in the next round it is failing as it does not know this reader.
+
+### Proposed Resolution
+The inifinite loop should be probably solved with the following patch:
+```
+diff --git a/src/libopensc/reader-pcsc.c b/src/libopensc/reader-pcsc.c
+index c2dac30c..96524656 100644
+--- a/src/libopensc/reader-pcsc.c
++++ b/src/libopensc/reader-pcsc.c
+@@ -1553,7 +1553,7 @@ static int pcsc_wait_for_event(sc_context_t *ctx, unsigned int event_mask, sc_re
+ 		}
+ #ifndef __APPLE__
+ 	   	/* OS X 10.6.2 - 10.12.6 do not support PnP notification */
+-		if (event_mask & SC_EVENT_READER_ATTACHED) {
++		if (event_mask & (SC_EVENT_READER_ATTACHED | SC_EVENT_CARD_INSERTED)) {
+ 			rgReaderStates[i].szReader = "\\\\?PnP?\\Notification";
+ 			rgReaderStates[i].dwCurrentState = SCARD_STATE_UNAWARE;
+ 			rgReaderStates[i].dwEventState = SCARD_STATE_UNAWARE;
+```
+but I am not sure about the other issue. I tried to put something together, but it did not work so far. 
+
+### Steps to reproduce
+1. Remove any readers from the system and run `opensc-notify` daemon. It will end in infinite loop
+2. Connect a reader to the system start `opensc-notify` and then disconnect the reader. It will exit with errors.
+
+### Logs
+```
+P:1843207; T:0x140071392825600 10:42:49.915 [opensc-notify] ctx.c:720:process_config_file: Used configuration file '/etc/opensc.conf'
+P:1843207; T:0x140071392825600 10:42:49.915 [opensc-notify] ctx.c:851:sc_context_create: ===================================
+P:1843207; T:0x140071392825600 10:42:49.915 [opensc-notify] ctx.c:852:sc_context_create: opensc version: 0.20.0
+P:1843207; T:0x140071392825600 10:42:49.915 [opensc-notify] reader-pcsc.c:858:pcsc_init: PC/SC options: connect_exclusive=0 disconnect_action=0 transaction_end_action=0 reconnect_action=0 enable_pinpad=0 enable_pace=1
+P:1843207; T:0x140071392825600 10:42:49.916 [opensc-notify] reader-pcsc.c:1347:pcsc_detect_readers: called
+P:1843207; T:0x140071392825600 10:42:49.916 [opensc-notify] reader-pcsc.c:1360:pcsc_detect_readers: Probing PC/SC readers
+P:1843207; T:0x140071392825600 10:42:49.916 [opensc-notify] reader-pcsc.c:1411:pcsc_detect_readers: Establish PC/SC context
+P:1843207; T:0x140071392825600 10:42:49.952 [opensc-notify] reader-pcsc.c:1406:pcsc_detect_readers: SCardListReaders failed: 0x8010002e
+P:1843207; T:0x140071392825600 10:42:49.952 [opensc-notify] reader-pcsc.c:1515:pcsc_detect_readers: returning with: -1101 (No readers found)
+P:1843207; T:0x140071392825600 10:42:49.952 [opensc-notify] ctx.c:912:sc_wait_for_event: called
+P:1843207; T:0x140071392825600 10:42:49.952 [opensc-notify] reader-pcsc.c:1532:pcsc_wait_for_event: called
+P:1843207; T:0x140071392825600 10:42:49.952 [opensc-notify] reader-pcsc.c:1548:pcsc_wait_for_event: Trying to watch 0 readers
+P:1843207; T:0x140071392825600 10:42:49.970 [opensc-notify] reader-pcsc.c:1610:pcsc_wait_for_event: Looping...
+P:1843207; T:0x140071392825600 10:42:49.970 [opensc-notify] reader-pcsc.c:1610:pcsc_wait_for_event: Looping...
+P:1843207; T:0x140071392825600 10:42:49.970 [opensc-notify] reader-pcsc.c:1610:pcsc_wait_for_event: Looping...
+P:1843207; T:0x140071392825600 10:42:49.970 [opensc-notify] reader-pcsc.c:1610:pcsc_wait_for_event: Looping...
+P:1843207; T:0x140071392825600 10:42:49.970 [opensc-notify] reader-pcsc.c:1610:pcsc_wait_for_event: Looping...
+...
+```
+Removal:
+```
+P:57288; T:0x140430039920896 11:36:52.939 [opensc-notify] reader-pcsc.c:1617:pcsc_wait_for_event: 'Yubico YubiKey OTP+FIDO+CCID 00 00' before=0x00000120 now=0x0000000E
+P:57288; T:0x140430039920896 11:36:52.939 [opensc-notify] reader-pcsc.c:1639:pcsc_wait_for_event: card removed event
+P:57288; T:0x140430039920896 11:36:52.939 [opensc-notify] reader-pcsc.c:1644:pcsc_wait_for_event: reader detached event
+P:57288; T:0x140430039920896 11:36:52.939 [opensc-notify] reader-pcsc.c:1654:pcsc_wait_for_event: Matching event 0x0A in reader Yubico YubiKey OTP+FIDO+CCID 00 00
+P:57288; T:0x140430039920896 11:36:52.940 [opensc-notify] reader-pcsc.c:1707:pcsc_wait_for_event: returning with: 0 (Success)
+P:57288; T:0x140430039920896 11:36:52.940 [opensc-notify] card.c:1147:match_atr_table: ATR     : 3b:f8:13:00:00:81:31:fe:15:59:75:62:69:6b:65:79:34:d4
+P:57288; T:0x140430039920896 11:36:52.940 [opensc-notify] card.c:1158:match_atr_table: ATR try : 3b:f5:00:00:02:10:80:4f:73:45:49:44
+P:57288; T:0x140430039920896 11:36:52.941 [opensc-notify] card.c:1161:match_atr_table: ignored - wrong length
+P:57288; T:0x140430039920896 11:36:52.941 [opensc-notify] card.c:1147:match_atr_table: ATR     : 3b:f8:13:00:00:81:31:fe:15:59:75:62:69:6b:65:79:34:d4
+P:57288; T:0x140430039920896 11:36:52.941 [opensc-notify] card.c:1158:match_atr_table: ATR try : 3b:f5:00:00:02:10:80:4f:73:45:49:44
+P:57288; T:0x140430039920896 11:36:52.941 [opensc-notify] card.c:1161:match_atr_table: ignored - wrong length
+P:57288; T:0x140430039920896 11:36:52.942 [opensc-notify] ctx.c:912:sc_wait_for_event: called
+P:57288; T:0x140430039920896 11:36:52.942 [opensc-notify] reader-pcsc.c:1532:pcsc_wait_for_event: called
+P:57288; T:0x140430039920896 11:36:52.942 [opensc-notify] reader-pcsc.c:1567:pcsc_wait_for_event: re-use reader 'Yubico YubiKey OTP+FIDO+CCID 00 00'
+P:57288; T:0x140430039920896 11:36:52.943 [opensc-notify] reader-pcsc.c:1567:pcsc_wait_for_event: re-use reader '\\?PnP?\Notification'
+P:57288; T:0x140430039920896 11:36:52.943 [opensc-notify] reader-pcsc.c:1600:pcsc_wait_for_event: SCardGetStatusChange(1) failed: 0x80100009
+P:57288; T:0x140430039920896 11:36:52.943 [opensc-notify] reader-pcsc.c:1707:pcsc_wait_for_event: returning with: -1900 (Unknown error)
+P:57288; T:0x140430039920896 11:36:52.944 [opensc-notify] ctx.c:912:sc_wait_for_event: called
+...
+```
+
+`opensc-tool` segfaults when trying to read a card that doesn’t populate the name field. This commit adds a null check before calling `strcmp()`.
+
+The card in question is unknown and subject to research. This is probably quite easy to reproduce, though.
+Fixes #1898
+
+##### Checklist
+
+No applicable items
+### Problem Description
+
+When using the `opensc-uninstall` script, I noted the following:
+
+```shell
+$ sudo /usr/local/bin/opensc-uninstall
+No receipt for 'org.opensc-project.tokend' found at '/'.
+OpenSC has been removed from your system. See you again!
+
+$ pkgutil --pkgs / | grep opensc
+org.opensc-project.mac.opensctoken
+org.opensc-project.startup
+
+$ launchctl list | grep -Ee '(opensc-notify|pkcs11-register)'
+-	0	opensc-notify
+-	0	pkcs11-register
+```
+
+### Proposed Resolution
+
+* Unload the launchagents on uninstall
+* Update the pkgutil cleaning steps
+
+### Steps to reproduce
+
+* Install OpenSC 0.20.0 on macOS Catalina
+* Use the `/usr/local/bin/opensc-uninstall` script to uninstall
+
+(Found via https://travis-ci.com/Homebrew/homebrew-cask/jobs/271966033 )
+Make opensc-explorer a bit more user friendly by treating the question mark
+given as argument to option '--card-driver' special: list all available
+drivers instead of stupidly bailing out.
+
+##### Checklist
+- [x] Documentation is added or updated
+
+
+This is not a bug and I am unsure if this is the correct to ask questions or not?
+
+I followed the directions to compile on cygwin here, https://github.com/OpenSC/OpenSC/wiki/Compiling-on-Cygwin The good news is that it works perfectly. My question is how do I transfer  this solution to another system? I am guessing that I do not have to follow the same process of compiling on every system?  Or do I? I am unsure if I have to create some sort of package or copy some specific files. I appreciate any assistance on how to proceed. 
+### Problem Description
+I have a digital signature token - ACS ECR39U SC reader with a Oberthur ID-one Cosmo V7 smartcard.  
+Whenever I try to log into the device using OpenSC , it resets. No matter if I enter correct or a wrong PIN. 
+
+### Steps to reproduce
+$ pkcs11-tool --test --login On such device.
+### Logs
+[Verbose log, Login at line 4346](https://gist.github.com/slaviber/8ee54ed548770a52dc9da6736601b936)   
+  
+[pcsc_scan](https://gist.github.com/slaviber/f1e53575d5dda69e632af1215969b9a4)  
+  
+Is my hardware supported? Am I doing something wrong?
+In regards of #1854, I would like to bump version of PKCS #11 library to 3.0 and implement the new required interfaces in coming months.
+
+The public review drafts are already available on OASIS website and I assume there will be no significant changes before the final version:
+
+https://docs.oasis-open.org/pkcs11/pkcs11-base/v3.0/pkcs11-base-v3.0.html
+
+So far, these are my thoughts about advantages of 3.0:
+ * Support for new key types (ed25519 -- see #1854)
+ * It is backward compatible -- new functions are available through `C_GetInterfaceList` and `C_GetInterface`
+ * Profile objects can resolve the issues with NSS and its handling of OpenSC as non-friendly by announcing the `CKP_PUBLIC_CERTIFICATES_TOKEN` profile (from https://docs.oasis-open.org/pkcs11/pkcs11-profiles/v3.0/pkcs11-profiles-v3.0.html )
+ * SHA3 support
+ 
+I will probably go through the draft and try to create issues for particular tasks if it will be easy to separate them so anyone can help. I would probably like to create it as a project, but it looks like I do not have appropriate permissions to do that.
+
+Any thoughts?

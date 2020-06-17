@@ -1,0 +1,120 @@
+This adds a new cache, `cache_fixed_size`, which wraps another cache (by default `cache_memory`), and which drops a key/value pair when the size limit is exceeded. I think this is useful in long running programs such as shiny apps where you want to limit memory usage.
+
+By default the cache evicts keys according to a first-in, first-out (FIFO) strategy, with a least-recently-used (LRU) eviction strategy also available. Eviction strategies follow an API so a user could implement their own. (It's not here, but I guess one could make a similar cache that has a maximum memory size rather than a maximum number of items. In that case the same eviction strategies could be used.)
+
+Happy to mess with the nomenclature if desired, for instance by calling an eviction strategy a [cache replacement policy](https://en.wikipedia.org/wiki/Cache_replacement_policies) instead.
+
+Is this fixed size cache of interest as an addition to this package? This could alternatively be moved to an extensions package if it's considered too niche. My personal view is that limiting the cache size is good programming practice to avoid memory leaks, so I think it's a good candidate for this package.
+See https://stackoverflow.com/a/59461292/2554330.  
+
+Having srcrefs in a function causes weird behaviour when it is memoised in the source to a package.  The hash seems to come out different every time, so memoisation doesn't work. Yes, the docs recommend against that, but why not be resilient?
+The qs package is much faster at serialising R objects to file, therefore adding as an optional addition, selectable via the `compress` argument.
+
+- [x] Create `cache_set_fs` and `cache_get_fs` to be shared by `cache_filesystem`, `cache_gcs` and `cache_s3`
+- [x] Added tests for all compression options (including these new ones)
+- [X] Update documentation
+internally, should simplify the caching logic a lot.
+I am using memoise to perform long and painful scraping, so I put the task into the job. Here's content of my job:
+```r
+my_sum <- function(x){
+  cat("Adding", paste(x, collapse = ", "), "and result is ")
+  sum(x)
+}
+mem_sum <- memoise::memoise(my_sum, cache=memoise::cache_filesystem("~/.rcache"))
+
+x<-list(1:3, 2:6)
+lapply(x,mem_sum)
+```
+If I run the job, two cache files are produced, (as expected). If I rerun the same job, no new caches are created (as expected).
+
+Now, I remembered that I have one more address to scrape, I come into my job script and modify it
+```r
+# everything above is unchanged
+x<-list(1:3, 2:6, 3:7)
+lapply(x,mem_sum)
+```
+Three new files are created! Wait a second! `memoise` disregarded the previously created cache because the environment has changed.
+
+I realize I've done something wrong, I come in and restore things as they were hoping `memoise` would pick old cache objects
+```r
+# everything above is unchanged
+x<-list(1:3, 2:6)
+lapply(x,mem_sum)
+```
+Alas, `memoise` creates yet another two objects, disregarding everything that happened above. Now I have at least three duplicate calls to the same function with same arguments.
+Funny part is that my local environment, of course, is completely unaware of any of that and there's no way to get to those cached versions.
+```r
+memoise::has_cache(mem_sum)(1:3)
+#> FALSE
+```
+Not only that, but there's also no way to "forget" or "clean" those caches, now, as far as I understand, since the "Jobs" environment is impossible to reproduce.
+
+*Questions*:
+1) Do we *have* to `memoise` **with** the environment signature, given that we have an assumption that the function is "pure"? ref #57 
+ 2) How do I recover caches that are related to the same function, but created in a different environment. Shouldn't there be a way to decrypt the content of cache from my GlobEnv even though the cache has been created in the "job"? Maybe this is for `{memoisetools}` by @coolbutuseless?
+
+Hi guys, would you be interested in a PR that implements a `cache_azure` function? Basically the Azure storage equivalent to S3 and GCS.
+- Change cache_memory function to allow for relative paths in the cache location
+When returning a data.table from a memoised function, the stored memoised result is also modified by data.table operations such as `:=` that [subassign values by reference](https://stackoverflow.com/questions/10225098/understanding-exactly-when-a-data-table-is-a-reference-to-vs-a-copy-of-another#). While this data.table attribute of modification-by-reference is somewhat common knowledge with data.table users, I wouldn't have expected this behavior for data.tables returned by memoise, perhaps naively assuming that the results stored via memoise would be compartmentalized from any resulting operations. 
+
+Copying the function output fixes the issue, as does using the filesystem instead of memory cache (see below for an example). However, I worry that new users may not realize that the memoized results, if they output data.tables or other objects that can be modified by reference, can modify the actual memoized results after they have already been produced. Additionally, this causes a discrepancy between results depending on the caching method used (memory vs. filesystem)
+
+Is there any way to tweak the memoise function or the in-memory environment for cache_memory to allow memoise to keep data.table results fixed rather than subject to accidental modification by reference later on in a script?
+
+```
+library(data.table)
+library(memoise)
+
+base_function <- function() {
+  return(data.table(x = 1:2, y = 2:3))
+}
+
+## Base memoise that returns modified data.table rather than function output
+memoised_function <- memoise::memoise(base_function)
+data <- memoised_function()
+print(data)
+data[, z := 2]
+data2 <- memoised_function()
+
+## Using copy to avoid in-place modification issues
+forget(memoised_function)
+data3 <- copy(memoised_function())
+data3[, z := 2]
+data4 <- memoised_function()
+
+## Filesystem cache returns different result than in-memory cache
+memoised_filesystem <- memoise::memoise(base_function, cache = cache_filesystem(tempdir()))
+data5 <- memoised_filesystem()
+data5[, z := 2]
+data6 <- memoised_filesystem()
+```
+```
+> print(data2)
+   x y z
+1: 1 2 2
+2: 2 3 2
+> print(data4)
+   x y
+1: 1 2
+2: 2 3
+> print(data6)
+   x y
+1: 1 2
+2: 2 3
+```
+
+Addendum: I did notice this closed issue: https://github.com/r-lib/memoise/issues/21 but that issue related to using a memoised function within a data.table, while this one is referring to behavior when memoise returns a data.table.
+when the function has multiple default arguments or the default argument is not defined at the end of formal list, whether the default values are passed explicitly (by call) or implicitly (by default mechanism) may matter
+
+```
+fn <- function(x = 1, y = 1)
+fm <- memoise(fn)
+
+fm(x = 1)
+fm(y = 1)
+```
+
+the last 2 call are essentially same, but would have called `fn` twice. that is because default values are attached to `args` ignoring their order in formals. sort them in original order would solve this.
+each default arguments not called is assigned to a dedicated environment as promise, just like how R initialize evaluation frame of function call, and the enclosure of the environment is set to the enclosure of the function. then values of default arguments are retrieved from the environment.
+
+would fix #64 

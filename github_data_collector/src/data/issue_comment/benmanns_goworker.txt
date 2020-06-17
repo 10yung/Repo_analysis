@@ -1,0 +1,93 @@
+There were major changes in [see history](https://github.com/vitessio/vitess/commits/65cbfaf4c57b60c2af3ae6d573365c1b0f39f11c/go/pools). The changes on May 25th, 2019 broken [goworker](https://github.com/benmanns/goworker/blob/master/redis.go#L35) package. Added required parameter with default value ( default value 0 as defined in struct ) to fix the issue
+
+This PR will fix an open issue #76
+interval will be overwrite by 
+workerSettings.Interval.SetFloat(workerSettings.IntervalFloat) in flag.go
+```
+go/src/github.com/benmanns/goworker/redis.go:35:30: not enough arguments in call to pools.NewResourcePool
+```
+
+In vitess.io/vitess/go/pools the NewResourcePool is defined as 
+```
+NewResourcePool(factory Factory, capacity, maxCap int, idleTimeout time.Duration, prefillParallelism int) *ResourcePool
+```
+
+Is missing the argument prefillParallelism in redis.go?
+
+```
+return pools.NewResourcePool(newRedisFactory(uri), capacity, maxCapacity, idleTimout, 0)
+or
+return pools.NewResourcePool(newRedisFactory(uri), capacity, maxCapacity, idleTimout, 1)
+```
+It seems like `vitess.io/vitess/go/pool` has changed their function signature and it requires more arguments.  
+```
+
+func newRedisPool(uri string, capacity int, maxCapacity int, idleTimout time.Duration) *pools.ResourcePool {
+	return pools.NewResourcePool(newRedisFactory(uri), capacity, maxCapacity, idleTimout)
+}
+```
+
+Above lines are source of this problem and must be changed to accept 5 arguments as needed by 
+```NewResourcePool(factory Factory, capacity int, maxCap int, idleTimeout time.Duration, prefillParallelism int) *ResourcePool```
+This PR adds a new feature: **(optional) queue priorities**.
+
+Starting now queue's priority could be defined, meaning that jobs from a queue with higher priority will be pulled before jobs from a queue with lower priority.
+
+### How to define priorities:
+
+```go
+settings := goworker.WorkerSettings{
+		URI:            "redis://localhost:6379/",
+		Connections:    100,
+		Queues:         []string{"med-priority", "low-priority", "high-priority"},
+		QueuesPriority: map[string]int{
+			"high-priority": 10,
+			"med-priority": 100,
+                        "low-priority": 200,
+		},
+		UseNumber:      true,
+		ExitOnComplete: false,
+		Concurrency:    2,
+		Namespace:      "resque:",
+		Interval:       5.0,
+	}
+
+goworker.SetSettings(settings)
+```
+
+### Values
+Priorities could be defined from 0 to the max int value. Smaller values mean higher priority. Zero is the highest priority.
+
+Those queues with no defined priority will automatically get the highest priority (zero).
+
+### How optional is this?
+
+All the following scenarios are valid:
+
+ - No priorities are defined
+ - All queues have priorities
+ - Some queues have priorities
+
+### Compatibility
+
+This new feature does not introduce any compatibility issue with code bases using previous versions.
+
+### Other PRs
+
+This PR includes #71 
+It will be great if it can support Resque scheduler or delayed job based on https://github.com/resque/resque-scheduler
+On May 25th a 5th parameter was added to function vitess.pools.NewResourcePool ([see the commit](https://github.com/vitessio/vitess/commit/9cebb4079b7beee9f327a6a470d310a03ed9538d#diff-0f7dd748d05e2a8a4b9295ff9bfc3c3aR86)). This function is invoked as part of [newRedisPool](https://github.com/benmanns/goworker/blob/master/redis.go#L35) and the goworker package doesn't work without this new parameter.
+
+This PR adds **0** as the 5th parameter, [meaning the pool won't be pre-filled](https://godoc.org/github.com/youtube/vitess/go/pools#NewResourcePool).
+
+go-redis support Redis Cluster,redigo not support Redis Cluster
+It can happen that workers get stuck silently. We were using `node-resque` worker before, which handled this scenario very well. With `goworker`, jobs just keep shown as running in `resque-web`.
+Also, the worker count in `resque-web` keeps increasing (should be 4).
+
+<img width="921" alt="screen shot 2018-08-29 at 13 26 38" src="https://user-images.githubusercontent.com/1145196/44784833-2ee17280-ab8f-11e8-9f7e-86c9c8560da1.png">
+
+Currently, when `goworker` workers fail due to an uncaught error, tracking down the root cause of the problem is rather difficult. Only the contents of the error message itself is passed to the Resque failure queue, unlike other languages (e.g. Ruby), which pass the entire stack trace.
+
+Golang's errors do not support stack traces out of the box. The [go-errors](github.com/go-errors/errors) package makes it possible to attach stack trace information to the errors either at creation-time, or at wrapping-time.
+
+This pull request takes advantage of the idempotency of `go-errors`'s `Wrap()` function, allowing a worker to either raise a `go-errors` `error` object themselves, or automatically wrapping a standard Golang error when the failure is observed by `goworker`. A worker that throws a standard error will see the same information currently provided to the failure queue, with a stack trace pointing them to `goworker/worker.go` as the investigation point. A worker that wraps their standard error with `go-errors` will see that same information, plus a full stack trace to the point that the user instantiated/wrapped the `go-errors` error object.

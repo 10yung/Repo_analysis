@@ -1,0 +1,152 @@
+
+The same idea with #1073.
+
+In 1073, there is some performance concern, I used a more simple logic to implement this in this PR, every time only need to do a `small loop` and just `reset reference`. I did some basic benchmark.
+It will only cost `0.000022ms` every time `unload/reload` all the patches, so I think basically `no cost` 
+
+With this PR, we can run `zone.js` only inside `Angular Elements`, and don't impact outside of `Angular Elements`.
+
+@mhevery, @robwormald, please review. Thank you!
+fix #740, #795.
+
+I think I may find a way to resolve `native async/await` issue.
+The test code below works well.
+```ts
+  async function test() {
+            console.log('test');
+            return 1;
+        }
+
+        async function test1() {
+            console.log('before await test', Zone.current.name);
+            const result = await test();
+            // should keep zone context test
+            console.log('after await test', result, Zone.current.name);
+        }
+
+        async function test2() {
+            console.log('before await test1', Zone.current.name);
+            const result = await test1();
+            // should keep zone context test
+            console.log('after await test1', result, Zone.current.name);
+        }
+        console.log('begin test');
+        Zone.current.fork({name: 'test'}).run(test1);
+        // here should be <root> zone.
+        console.log('outside test', Zone.current.name);
+        Zone.current.fork({name: 'test1'}).run(() => {
+            // should be test1 zone.
+            console.log('another test', Zone.current.name);
+        });
+```
+
+@mhevery, I will continue to add test cases, hope it can work.
+This is a new way to improve `root zone` performance and reduce `monkey-patch` impact inspired by @mhevery.
+
+1. If `Zone.current` is `rootZone(Zone.root)`, we will use `native delegate (with a very small wrap)` instead of `monkey patched version`.
+
+For example: 
+After loading `zone.js`, we call some `async operations`. For example, in web page, we have `Angular Elements` and `Jquery`, the following code will be the `jquery part`.
+```
+import `zone.js/dist/zone.js`; // loaded by `Angular Elements`.
+setTimeout(() => { // this will use `native window.setTimeout`
+   // the callback will totally outside of Zone.
+});
+```
+
+2. We can use `Zone.root.run` in other zone to use the `native delegate` version.
+
+```
+testZone.run(() => {
+  Zone.root.run(() => { 
+      setTimeout(() => { // will use native delegate
+         // will outside zone
+     });
+  });
+});
+```
+
+Now the `monkey-patch` method will look like this.
+For example, for `setTimeout`.
+```
+const nativeSetTimeout = window.setTimeout;
+window.setTimeout = function() {
+  if (Zone.current === Zone.root) {
+    return nativeSetTimeout.apply(this, arguments); // this is the native one.
+  }
+  return patchedSetTimeout.apply(this, arguments); // this is the patched version.
+}
+```
+
+@mhevery, @robwormald, please review, thank you!
+fix #589. #1128.
+
+In `IE`, the `pointer` event will use the `MS` version, such as `pointerup` will become `MSPointerUp`. So we need to do the `mapping` to handle this case.
+let `zone-testing` can handle `mocha/jasmine/jest` test cases without difference (almost).
+
+1. when load `zone-testing`, will auto check if using `jasmine` or `mocha`, and `zone-testing` will load `patch` accordingly. 
+
+2. Expose `async/fakeAsync/tick/flush/discardPeriodicTasks/flushMicrotasks/resetFakeAsyncZone` APIs to `global`, so user can use those APIs directly.
+
+And add `clearAllMacrotasks`, `flushAndDiscardPeriodicTasks` helper methods.
+
+3. add `jasmine/jest` mapping in `Mocha` patch, so user can write case in `jasmine` style and API and can still use `Mocha` as runner to test.
+  - support `jasmine expect`
+  - support `jasmine spy`
+  - support `jasmine clock`
+  - add `BDD mapping` such as (beforeAll/afterAll/fdescribe/fit/pending...)
+  - support `jest expect`
+  - support `jest mockFn`
+  - suport `jest TimerMock`
+
+4. **Refactoring** `test/build/doc` folder, current there are too many `test/karma/ci` file in `root` folder or in `test` folder, so re-organize the folder. 
+
+5. Add `zone-testing.typing.d.ts`, https://github.com/JiaLiPassion/zone.js/blob/26a2b611aa07e71d4af734f620f29a802b61ebc3/lib/testing/zone-testing.typing.ts, it defines all supported `jasmine/mocha/jest` APIs.
+
+User can still use `jasmine` or `mocha` or `jest` type definition if they don't want to use this `zone-testing mix`.  
+
+Because this `zone-testing.typing.d.ts` will have conflict (duplicate declaration) with `jasmine` or `mocha` or `jest` type definition, so maybe we should `publish` this `zone-testing.typing.d.ts` to `@types` repo?
+fix #1024, #513, #995 
+Add a help lib to configure root zone. It is a monkey-patch to zone (some kind of hack). And it is a lib need to be loaded by user themselves, so `zone public API` will not be damaged. 
+
+- this is not a public api or formal feature of zone.js
+- it will not be included in future tc39 proposal,
+- and it is not by design, it is just a helper method to let you customize rootZone for some test and suppose to change in the future, please use it on your own risk
+
+@mhevery , please review the idea is ok or not, I know it is not correct according to the design of Zone, but there a some use cases that user want to do that, so with or without this lib, user can still monkey-patch `Zone` to customize root zone, so I just provide the helper tool for them. thank you.
+fix #740, use new  [async_hooks]( https://github.com/nodejs/node/blob/master/lib/async_hooks.js) to wrap nodejs instead of monkey-patch all native APIs.
+
+The basic idea is in `async_hooks`, there are 4 hook apis.
+
+```
+init
+before
+after
+destroy
+```
+
+in this PR, the API will do those work.
+
+1.  init 
+
+`init` will call `Zone.scheduleTask` to schedule a ZoneTask
+
+2. before 
+
+`before` will call `Zone.beforeRunTask` to create a new ZoneFrame and other work just like `Zone.runTask`
+
+3. after
+
+`after` will call `Zone.afterRunTask` to go back to `parent` ZoneFrame and do other work just like `Zone.runTask`
+
+4. destroy
+
+try to `cancelTask` if not cancelled.
+
+5. Error
+
+use `process.unCaughtException` to redirect to `ZoneDelegate.handleError`.
+
+this PR still need a lot of work to do, so I post the PR here just ask for review.
+
+@mhevery , could you review that [node_asynchooks.ts](https://github.com/JiaLiPassion/zone.js/blob/8d64c10c41c87872e6a2c499acdb0c689b7a3f80/lib/node/node_asynchooks.ts) the whether the idea is ok or not? Thank you!

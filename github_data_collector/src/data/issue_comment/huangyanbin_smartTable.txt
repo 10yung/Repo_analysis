@@ -1,0 +1,196 @@
+目前可以滑动，但是滚动条没有显示出来？请问如何显示？
+因为第一行一般是列名，那y序列从1开始就无法统计实际数据数量
+如题，我已经建立了相应的类，反射字段的值跟类里面私有成员的值是一样的，而且也看到了用的也是getDeclaredField()这个方法，为什么还是会报NoSuchFieldException的错？
+左滑或右滑，比如滑到最前面到头了，再滑出现一个侧面的布局
+
+现在只有 tableData.setOnRowClickListener，看源码也没找到源头，有人知道怎么设置行的长点击事件吗？
+查看源码得知测量单元格的宽高是由IDrawFormat来进行的，因此实现该接口修改就行了。
+` class MaxColumnWidthDrawFormat<T>(private val limitWidth: Boolean, private val maxWidth: Int) : IDrawFormat<T> {
+
+    private val valueMap: MutableMap<String, SoftReference<Array<String>>> //避免产生大量对象
+
+    init {
+        valueMap = HashMap()
+    }
+
+    override fun measureWidth(column: Column<T>, position: Int, config: TableConfig): Int {
+        val paint = config.paint
+        config.contentStyle.fillPaint(paint)
+
+        val value = column.format(position)
+        var width = paint.measureText(value).toInt()
+        val maxWidth = maxWidth + config.getHorizontalPadding() * 2
+
+        if (limitWidth && width > maxWidth && value.length > 1) {
+            val stringBuilder = StringBuilder(value)
+            var start = 0
+            var end = 0
+            while (end < stringBuilder.length) {
+                //由于需要测量value.length那么多次，如果字符串很长耗时也会很长的
+                width = paint.measureText(stringBuilder, start, end).toInt()
+                if (width > maxWidth) {
+                    stringBuilder.insert(end - 1, "\n")
+                    start = end
+                }
+                end++
+            }
+            if (valueMap[value] == null) {
+                valueMap[value] = SoftReference(stringBuilder.toString().split("\n").toTypedArray())
+            }
+            return maxWidth
+        } else if (valueMap[value] == null) {
+            valueMap[value] = SoftReference(value.split("\n").toTypedArray())
+        }
+        return width
+    }
+
+    override fun measureHeight(column: Column<T>, position: Int, config: TableConfig): Int {
+        val paint = config.paint
+        config.contentStyle.fillPaint(paint)
+        return DrawUtils.getMultiTextHeight(paint, getSplitString(column.format(position)))
+    }
+
+    override fun draw(c: Canvas, rect: Rect, cellInfo: CellInfo<T>, config: TableConfig) {
+        val paint = config.paint
+        setTextPaint(config, cellInfo, paint)
+        if (cellInfo.column.textAlign != null) {
+            paint.textAlign = cellInfo.column.textAlign
+        }
+        drawText(c, cellInfo.value, rect, paint)
+    }
+
+    private fun drawText(c: Canvas, value: String, rect: Rect, paint: Paint) {
+        DrawUtils.drawMultiText(c, paint, rect, getSplitString(value))
+    }
+
+    private fun setTextPaint(config: TableConfig, cellInfo: CellInfo<T>, paint: Paint) {
+        config.contentStyle.fillPaint(paint)
+        val backgroundFormat = config.contentCellBackgroundFormat
+        if (backgroundFormat != null && backgroundFormat.getTextColor(cellInfo) != TableConfig.INVALID_COLOR) {
+            paint.color = backgroundFormat.getTextColor(cellInfo)
+        }
+        paint.textSize = paint.textSize * config.zoom
+    }
+
+    private fun getSplitString(`val`: String): Array<String> {
+        var values: Array<String>? = null
+        if (valueMap[`val`] != null) {
+            values = valueMap[`val`]!!.get()
+        }
+        if (values == null) {
+            values = `val`.split("\n").toTypedArray()
+            valueMap[`val`] = SoftReference(values)
+        }
+        return values
+    }
+
+}`
+
+
+创建TableData的时候使用的是FormTableData的方法，但是该类的createTableData方法并没有开放访问权限，所以我们自己实现一个FormTableData，并把MaxColumnWidthDrawFormat设置进去就行。
+
+`public class MyFormTableData<T extends IForm> extends ArrayTableData<T> {
+
+    /**
+     * 二维数组的构造方法
+     *
+     * @param tableName 表名
+     * @param t         数据
+     * @param columns   列
+     */
+    protected MyFormTableData(String tableName, List<T> t, List<Column<T>> columns) {
+        super(tableName, t, columns);
+    }
+
+    public static <T extends IForm> MyFormTableData<T> create(SmartTable table,
+                                                              String tableName,
+                                                              int spanSize,
+                                                              T[][] data,
+                                                              IDrawFormat<T> drawFormat) {
+        T[][] newArray = (T[][]) Array.newInstance(data.getClass().getComponentType(), data.length);
+        int[][] exitArray = new int[data.length][spanSize];
+        List<CellRange> cellRanges = new ArrayList<>();
+        for (int i = 0; i < data.length; i++) {
+            T[] rowData = data[i];
+            int spanWidthSize = 0;
+            for (int j = 0; j < rowData.length; j++) {
+                T t = rowData[j];
+                createArrayRow(spanSize, newArray, i, rowData);
+                while (exitArray[i][spanWidthSize] == 1) {
+                    spanWidthSize++;
+                }
+                newArray[i][spanWidthSize] = t;
+                if (t.getSpanHeightSize() > 1) {
+                    for (int row = i; row < i + t.getSpanHeightSize(); row++) { //行
+                        for (int col = spanWidthSize; col < spanWidthSize + t.getSpanWidthSize(); col++) { //列
+                            exitArray[row][col] = 1;
+                        }
+                    }
+                }
+                if (t.getSpanWidthSize() > 1 || t.getSpanHeightSize() > 1) {
+                    cellRanges.add(new CellRange(i, i + t.getSpanHeightSize() - 1,
+                            spanWidthSize, spanWidthSize + t.getSpanWidthSize() - 1));
+                }
+                spanWidthSize += t.getSpanWidthSize();
+            }
+        }
+        newArray = ArrayTableData.transformColumnArray(newArray);
+        MyFormTableData tableData = createTableData(table, tableName, newArray, drawFormat);
+        tableData.setUserCellRange(cellRanges);
+        return tableData;
+    }
+
+
+    private static <T extends IForm> void createArrayRow(int spanSize, T[][] newArray, int i, T[] rowData) {
+        if (newArray[i] == null) {
+            newArray[i] = (T[]) Array.newInstance(rowData.getClass().getComponentType(), spanSize);
+        }
+    }
+
+
+    private static <T extends IForm> MyFormTableData<T> createTableData(SmartTable table, String tableName, T[][] data, IDrawFormat<T> drawFormat) {
+        table.getConfig().setShowColumnTitle(false);
+        List<Column<T>> columns = new ArrayList<>();
+        for (T[] dataArray : data) {
+            Column<T> column = new Column<>("", null, drawFormat);
+            column.setDatas(Arrays.asList(dataArray));
+            columns.add(column);
+        }
+        ArrayList<T> arrayList = new ArrayList<>(Arrays.asList(data[0]));
+        MyFormTableData<T> tableData = new MyFormTableData<>(tableName, arrayList, columns);
+        tableData.setData(data);
+        return tableData;
+    }
+
+}`
+
+最后生成表格数据的时候调用自己的类：
+`val tableData = MyFormTableData.create(table, "", forms[0].size, forms,MaxColumnWidthDrawFormat<Form>(limitWidth, viewWith / 2))`
+
+强烈建议有加动态列的功能
+ if (tableData != null) {
+            setTableData(tableData);
+        }
+        return tableData;
+能否像Listview这样写查询语句？
+private void findViews() {
+    main_searchview = (SearchView) findViewById(R.id.main_searchview);
+    main_listview = (ListView) findViewById(R.id.main_listview);
+    main_listview.setAdapter(new ArrayAdapter<String>(this, android.R.layout.simple_list_item_1, searcoh));
+    main_listview.setTextFilterEnabled(true);
+    main_searchview.setOnQueryTextListener(new SearchView.OnQueryTextListener() // 设置搜索文本监听{
+        @Override
+        public boolean onQueryTextSubmit(String query) {//搜索时触发事件
+            return false;
+        }
+        @Override
+        public boolean onQueryTextChange(String newText) {//搜索时根据文本框动态改变搜索内容
+            if (!TextUtils.isEmpty(newText)){
+
+            }   else {
+                main_listview.clearChoices();
+            }
+            return false;
+        }
+    });
+}

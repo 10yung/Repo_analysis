@@ -1,0 +1,286 @@
+Compilation speed could be reduced significantly with the addition of extern template declaration in non-header mode.
+
+Compilation times for the following snippet (with cmake release build):
+- with extern template: ~ 0.6s
+- without extern template: ~ 2.5s
+```c++
+#include <fmt/format.h>
+
+namespace fmt{
+extern template FMT_API format_context::iterator internal::vformat_to(
+    internal::buffer<char>&, string_view, basic_format_args<format_context>);
+// ... all templates from fmt/src/format.cc
+}
+
+int main(){
+    fmt::memory_buffer b;
+    fmt::format_to(b, "Hello, {}!", "world");
+    return 0;
+}
+
+```
+{fmt} is now ~10% faster than double-conversion and 15x faster than libc++ `std::ostringstream` on floating-point formatting according to the dtoa-benchmark but there is still a lot of room for improvement.
+
+<img width="248" alt="Screen Shot 2019-11-27 at 7 53 15 AM" src="https://user-images.githubusercontent.com/576385/69738490-0d04d180-10eb-11ea-9683-18f11f597375.png">
+
+#1097 gives some optimization ideas.
+
+Floating numbers should have thousand separator with specifier 'n' like python.
+
+Python:
+```python
+>>> from locale import setlocale, LC_ALL
+>>> setlocale(LC_ALL, 'en_US')
+'en_US'
+>>> '{:n}'.format(1234)
+'1,234'
+>>> '{:n}'.format(1234.56)
+'1,234.56'
+```
+C++
+```cpp
+setlocale(LC_ALL, "en-US");
+fmt::format("{:n} {:n}", 1234, 1234.56);
+// gives 1,234 1234.56
+```
+As discussed in #1372 and elsewhere, consider adding a locale modifier to floating-point format specs, e.g.
+
+```c++
+auto s = fmt::format("{:.2Lf}\n", 7975.3569);
+// s == 7975.36 - decimal point taken from locale
+```
+I've been trying out compiling format strings and run into a few issues when using custom types with examples at the end (I know it's still experimental):
+
+* `get` function fails to compile when using multiple type arguments in `fmt::compile`
+https://github.com/fmtlib/fmt/blob/758446c80d64cd03fe04bb12b028c992ed7bb063/include/fmt/compile.h#L332-L339
+
+It should look like:
+```c++
+// Returns a reference to the argument at index N from [first, rest...].
+template <int N, typename T, typename... Args>
+const auto& get(const T& first, const Args&... rest) {
+  static_assert(N < 1 + sizeof...(Args), "");
+  if constexpr (N == 0)
+    return first;
+  else
+    return get<N - 1>(rest...);
+}
+```
+
+* In header-only mode:
+https://github.com/fmtlib/fmt/blob/758446c80d64cd03fe04bb12b028c992ed7bb063/include/fmt/compile.h#L416
+clashes with
+https://github.com/fmtlib/fmt/blob/758446c80d64cd03fe04bb12b028c992ed7bb063/include/fmt/format-inl.h#L553
+
+* Type safety can be violated quite easily:
+```c++
+constexpr auto f1 = fmt::compile<double>(FMT_STRING("{}\n"));
+std::cout << fmt::format(f1, formattable{2});
+```
+Maybe the compiled format should contain template arguments that could later be used to enforce type safety at compile time but still allowing implicit conversions?
+
+* Format specifiers don't work with custom types:
+```c++
+constexpr auto f2 = fmt::compile<formattable>(FMT_STRING("{:05}\n"));
+std::cout << fmt::format(f2, formattable{2});
+```
+crashes at runtime with
+```
+terminate called after throwing an instance of 'fmt::v6::format_error'
+  what():  format specifier requires numeric argument
+```
+Stack:
+```
+__GI_raise 0x00007fd078350ed7
+__GI_abort 0x00007fd078332535
+<unknown> 0x00007fd0785ab672
+<unknown> 0x00007fd0785b72b6
+std::terminate() 0x00007fd0785b7301
+__cxa_throw 0x00007fd0785b7535
+fmt::v6::internal::error_handler::on_error(char const*) [clone .cold.573] 0x0000555efd7d2400
+fmt::v6::internal::numeric_specs_checker<fmt::v6::internal::error_handler>::require_numeric_argument format.h:2020
+fmt::v6::internal::cf::vformat_to<fmt::v6::basic_format_context<std::back_insert_iterator<fmt::v6::internal::buffer<char> >, char>, fmt::v6::buffer_range<char>, const fmt::v6::internal::compiled_format<main()::<lambda()>::str, formattable> >(fmt::v6::buffer_range<char>, const fmt::v6::internal::compiled_format<main()::<lambda()>::str, formattable> &, fmt::v6::basic_format_args<fmt::v6::basic_format_context<std::back_insert_iterator<fmt::v6::internal::buffer<char> >, char> >) compile.h:219
+fmt::v6::format<fmt::v6::internal::compiled_format<main()::<lambda()>::str, formattable>, formattable>(const fmt::v6::internal::compiled_format<main()::<lambda()>::str, formattable> &, const formattable &) compile.h:542
+main main.cpp:52
+__libc_start_main 0x00007fd078333b6b
+_start 0x0000555efd7d25ba
+```
+
+* Format parsing seems to be ignored:
+```std::cout << fmt::format(FMT_STRING("{:!}\n"), 5.3);``` fails to compile while
+```constexpr auto f4 = fmt::compile<double>(FMT_STRING("{:!}\n"));``` compiles fine.
+```std::cout << fmt::format(f4, 42.0);``` crashes at runtime with:
+```
+terminate called after throwing an instance of 'fmt::v6::format_error'
+  what():  invalid type specifier
+```
+Stack:
+```
+__GI_raise 0x00007f303e781ed7
+__GI_abort 0x00007f303e763535
+<unknown> 0x00007f303e9dc672
+<unknown> 0x00007f303e9e82b6
+std::terminate() 0x00007f303e9e8301
+__cxa_throw 0x00007f303e9e8535
+fmt::v6::float_spec_handler::on_error format.h:2755
+fmt::v6::internal::handle_float_type_spec<fmt::v6::float_spec_handler&> format.h:1190
+fmt::v6::internal::basic_writer<fmt::v6::buffer_range<char> >::write_double<double, true> format.h:2765
+fmt::v6::internal::arg_formatter_base<fmt::v6::buffer_range<char>, fmt::v6::internal::error_handler>::operator()<double, 0> format.h:1825
+fmt::v6::visit_format_arg<fmt::v6::arg_formatter<fmt::v6::buffer_range<char> >, fmt::v6::basic_format_context<std::back_insert_iterator<fmt::v6::internal::buffer<char> >, char> > core.h:977
+fmt::v6::internal::cf::vformat_to<fmt::v6::basic_format_context<std::back_insert_iterator<fmt::v6::internal::buffer<char> >, char>, fmt::v6::buffer_range<char>, const fmt::v6::internal::compiled_format<main()::<lambda()>::str, double> >(fmt::v6::buffer_range<char>, const fmt::v6::internal::compiled_format<main()::<lambda()>::str, double> &, fmt::v6::basic_format_args<fmt::v6::basic_format_context<std::back_insert_iterator<fmt::v6::internal::buffer<char> >, char> >) compile.h:225
+fmt::v6::format<fmt::v6::internal::compiled_format<main()::<lambda()>::str, double>, double>(const fmt::v6::internal::compiled_format<main()::<lambda()>::str, double> &, const double &) compile.h:542
+main main.cpp:62
+__libc_start_main 0x00007f303e764b6b
+_start 0x0000561b876865ba
+```
+
+* Custom format specifiers crash with SIGSEGV:
+```c++
+constexpr auto f3 = fmt::compile<formattable>(FMT_STRING("{:!}\n"));
+std::cout << fmt::format(f3, formattable{2});
+```
+This is from https://github.com/fmtlib/fmt/blob/758446c80d64cd03fe04bb12b028c992ed7bb063/include/fmt/compile.h#L225-L226 when the `arg_formatter` tries to dereference `nullptr`. Stack:
+```
+fmt::v6::basic_string_view<char>::begin core.h:309
+fmt::v6::basic_parse_context<char, fmt::v6::internal::error_handler>::begin core.h:463
+fmt::v6::formatter<formattable, char, void>::parse<fmt::v6::basic_parse_context<char, fmt::v6::internal::error_handler> > main.cpp:15
+fmt::v6::internal::value<fmt::v6::basic_format_context<std::back_insert_iterator<fmt::v6::internal::buffer<char> >, char> >::format_custom_arg<formattable, fmt::v6::formatter<formattable, char, void> > core.h:772
+fmt::v6::basic_format_arg<fmt::v6::basic_format_context<std::back_insert_iterator<fmt::v6::internal::buffer<char> >, char> >::handle::format core.h:917
+fmt::v6::arg_formatter<fmt::v6::buffer_range<char> >::operator() format.h:2650
+fmt::v6::visit_format_arg<fmt::v6::arg_formatter<fmt::v6::buffer_range<char> >, fmt::v6::basic_format_context<std::back_insert_iterator<fmt::v6::internal::buffer<char> >, char> > core.h:988
+fmt::v6::internal::cf::vformat_to<fmt::v6::basic_format_context<std::back_insert_iterator<fmt::v6::internal::buffer<char> >, char>, fmt::v6::buffer_range<char>, const fmt::v6::internal::compiled_format<main()::<lambda()>::str, formattable> >(fmt::v6::buffer_range<char>, const fmt::v6::internal::compiled_format<main()::<lambda()>::str, formattable> &, fmt::v6::basic_format_args<fmt::v6::basic_format_context<std::back_insert_iterator<fmt::v6::internal::buffer<char> >, char> >) compile.h:225
+fmt::v6::format<fmt::v6::internal::compiled_format<main()::<lambda()>::str, formattable>, formattable>(const fmt::v6::internal::compiled_format<main()::<lambda()>::str, formattable> &, const formattable &) compile.h:542
+main main.cpp:56
+__libc_start_main 0x00007fe92238db6b
+_start 0x00005568559cc5ba
+```
+
+* Longer custom format specifiers fail to compile but only if the compiled format is used in `fmt::format` or similar:
+```c++
+  constexpr auto f5 = fmt::compile<formattable>(FMT_STRING("{:!N}\n"));
+  std::cout << fmt::format(f5, formattable{42});
+```
+Compiler output:
+```
+In file included from ../main.cpp:1:
+/usr/local/include/fmt/compile.h: In instantiation of ?const fmt::v6::internal::format_part<typename fmt::v6::internal::char_t_impl<S>::type> (& fmt::v6::internal::compiled_format_base<S, typename std::enable_if<fmt::v6::is_compile_string<S>::value, void>::type>::parts() const)[fmt::v6::internal::compiled_format_base<S, typename std::enable_if<fmt::v6::is_compile_string<S>::value, void>::type>::num_format_parts] [with S = main()::<lambda()>::str; typename std::enable_if<fmt::v6::is_compile_string<S>::value, void>::type = void; fmt::v6::internal::compiled_format_base<S, typename std::enable_if<fmt::v6::is_compile_string<S>::value, void>::type>::parts_container = fmt::v6::internal::format_part<char> [2]; typename fmt::v6::internal::char_t_impl<S>::type = char]?:
+/usr/local/include/fmt/compile.h:178:15:   required from ?typename Context::iterator fmt::v6::internal::cf::vformat_to(Range, CompiledFormat&, fmt::v6::basic_format_args<Context>) [with Context = fmt::v6::basic_format_context<std::back_insert_iterator<fmt::v6::internal::buffer<char> >, char>; Range = fmt::v6::buffer_range<char>; CompiledFormat = const fmt::v6::internal::compiled_format<main()::<lambda()>::str, formattable>; typename Context::iterator = std::back_insert_iterator<fmt::v6::internal::buffer<char> >]?
+/usr/local/include/fmt/compile.h:542:36:   required from ?std::__cxx11::basic_string<Char> fmt::v6::format(const CompiledFormat&, const Args& ...) [with CompiledFormat = fmt::v6::internal::compiled_format<main()::<lambda()>::str, formattable>; Args = {formattable}; Char = char; typename std::enable_if<std::is_base_of<fmt::v6::internal::basic_compiled_format, CompiledFormat>::value, int>::type <anonymous> = 0]?
+../main.cpp:71:47:   required from here
+/usr/local/include/fmt/compile.h:304:54:   in ?constexpr? expansion of ?fmt::v6::internal::compile_to_parts<char, 2>(fmt::v6::to_string_view<main()::<lambda()>::str>(main()::<lambda()>::str{fmt::v6::compile_string()}))?
+/usr/local/include/fmt/compile.h:272:30:   in ?constexpr? expansion of ?fmt::v6::internal::compile_format_string<true, char, fmt::v6::internal::compile_to_parts(fmt::v6::basic_string_view<Char>) [with Char = char; unsigned int N = 2]::<unnamed struct> >(format_str, collector)?
+/usr/local/include/fmt/compile.h:157:36:   in ?constexpr? expansion of ?fmt::v6::internal::parse_format_string<true, char, fmt::v6::internal::format_string_compiler<char, fmt::v6::internal::compile_to_parts(fmt::v6::basic_string_view<Char>) [with Char = char; unsigned int N = 2]::<unnamed struct> > >(format_str, fmt::v6::internal::format_string_compiler<char, fmt::v6::internal::compile_to_parts(fmt::v6::basic_string_view<Char>) [with Char = char; unsigned int N = 2]::<unnamed struct> >(format_str, handler))?
+/usr/local/include/fmt/format.h:2496:11:   in ?constexpr? expansion of ?(& handler)->fmt::v6::internal::format_string_compiler<char, fmt::v6::internal::compile_to_parts(fmt::v6::basic_string_view<Char>) [with Char = char; unsigned int N = 2]::<unnamed struct> >::on_format_specs((p + 1), end)?
+/usr/local/include/fmt/compile.h:142:29: error: call to non-?constexpr? function ?void fmt::v6::internal::error_handler::on_error(const char*)?
+     if (*it != '}') on_error("missing '}' in format string");
+                     ~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+```
+
+Example source file compiled with GCC 9.2 C++17:
+
+```c++
+#include <fmt/compile.h>
+#include <fmt/format.h>
+#include <iostream>
+
+struct formattable {
+  int i;
+};
+
+FMT_BEGIN_NAMESPACE
+template <> struct formatter<formattable> : formatter<int> {
+  bool special{false};
+
+  template <typename ParseContext>
+  constexpr auto parse(ParseContext &ctx) -> decltype(ctx.begin()) {
+    if (*(ctx.begin()) == '!') {
+      special = true;
+      ctx.advance_to(ctx.begin() + 1);
+      if (*(ctx.begin()) == 'N')
+        ctx.advance_to(ctx.begin() + 1);
+    }
+    return formatter<int>::parse(ctx);
+  }
+
+  template <typename FormatContext>
+  auto format(formattable f, FormatContext &ctx) -> decltype(ctx.out()) {
+    if (special)
+      ctx.out() = '~';
+    return formatter<int>::format(f.i, ctx);
+  }
+};
+FMT_END_NAMESPACE
+
+int main() {
+  // prints "00002" as expected
+  std::cout << fmt::format(FMT_STRING("{:05}\n"), formattable{2});
+
+  // prints "~2" as expected
+  std::cout << fmt::format(FMT_STRING("{:!}\n"), formattable{2});
+
+  // fails to compile because of get
+  //  constexpr auto f0 =
+  //      fmt::compile<formattable, formattable>(FMT_STRING("{}-{}\n"));
+  //  std::cout << fmt::format(f0, formattable{2}, formattable{42});
+
+  // prints "2", violates type safety
+  constexpr auto f1 = fmt::compile<double>(FMT_STRING("{}\n"));
+  std::cout << fmt::format(f1, formattable{2});
+
+  // terminate called after throwing an instance of 'fmt::v6::format_error'
+  //  what():  format specifier requires numeric argument
+  //  constexpr auto f2 = fmt::compile<formattable>(FMT_STRING("{:05}\n"));
+  //  std::cout << fmt::format(f2, formattable{2});
+
+  // dereferencing a nullptr (fmt/compile.h:226)
+  //  constexpr auto f3 = fmt::compile<formattable>(FMT_STRING("{:!}\n"));
+  //  std::cout << fmt::format(f3, formattable{2});
+
+  // fails to compile:
+  //  std::cout << fmt::format(FMT_STRING("{:!}\n"), 5.3);
+  // compiles:
+  //  constexpr auto f4 = fmt::compile<double>(FMT_STRING("{:!}\n"));
+  //  std::cout << fmt::format(f4, 42.0);
+
+  // crashes at compile time only if both lines are uncommented
+  //  constexpr auto f5 = fmt::compile<formattable>(FMT_STRING("{:!N}\n"));
+  //  std::cout << fmt::format(f5, formattable{42});
+
+  return 0;
+}
+```
+This will make {fmt} work with llfio.
+
+From https://github.com/ned14/llfio/issues/32:
+
+> While I have you as the author of {fmt}, can I persuade you to add support for raw gather buffer formatting to {fmt}? Then one can do cool stuff like:
+> ```
+> llfio::file_handle &fh;
+> fh.write(offset, fmt::out("System error code = {}\n", errno));
+> ```
+>
+> Here out(...) simply emits an iterable which iterates something smelling like span<const byte>.
+>
+> I appreciate your print() i/o function et al, but we can go much lower level without programmer inconvenience. Plus out() works immediately with Networking, LLFIO, anything which consumes gather buffers etc, no extra work.
+Compile time validation of named arguments is currently disallowed:
+
+https://github.com/fmtlib/fmt/blob/f5f3ffac5908d167d2352ff1881753fa92e5bc34/include/fmt/format.h#L2210
+
+That is a somewhat unfortunate restriction. I haven't dug into the internals of fmtlib enough to know whether this is due to the impossibility of making it work, or due to an implementation challenge. If the latter, I think it is probably worth figuring out how to make it work.
+
+Is there some background on why it is currently disallowed? Any thoughts on whether an implementation is possible?
+
+Currently the number and types (but not values) of formatting arguments has to be known at compile time. Consider adding an API to allow fully dynamic construction of argument lists to support use cases like the one mentioned in #1168:
+
+> I have a few use cases, but they all boil down to wanting to externalize the format of whatever needs to be produced from the C++ code. So, for example, a config file might have a format string in it and that format string wants to extract zero or more named values from some data dictionary in the program.
+If you use unicode symbols as fill character for alignment, you get runtime error
+for example, for:
+`print(u8" {:─<5}─{}\n", i, str);`
+there supposed to be outputs like this
+```
+ 0─────2019 March 27 06:32:41                                                                                                                                                 
+ 1─────2019 March 27 14:43:20                                                                                                                                                 
+```
+but there is runtime error:
+`missing '}' in format string `
+http://fmtlib.net/dev/api.html doesn't list public methods inherited from fmt::internal::basic_buffer. Is it intentional and users are not supposed to call those methods?

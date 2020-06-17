@@ -1,0 +1,102 @@
+`cargo audit --color=never` doesn't respect the `color` setting since colors are still being printed.
+
+This might be because the [`warning_color`](https://github.com/RustSec/cargo-audit/blob/c255b3481f97929037fc11a992df0defa6da07ac/src/presenter.rs#L224:L231) function doesn't take that config flag into account.
+While reading `Cargo.lock` is straightforward, one could easily have a `Cargo.toml` file that would allow semver resolution to pick a vulnerable version of a crate even if `cargo` didn't happen to pick that version in practice. It'd be cool if `cargo audit` could consume `Cargo.toml` and enumerate the set of every possibly valid choice of crate versions and emit a warning if any of them have known vulnerabilities. In response to this, the author could tighten the specification of which crate version is required.
+Seems to hang indefinitely when running behind a proxy
+
+```
+➜  seidhe git:(master) ✗ echo $http_proxy
+http://localhost:3128/
+➜  seidhe git:(master) ✗ echo $https_proxy
+http://localhost:3128/
+➜  seidhe git:(master) ✗ cargo audit
+    Fetching advisory database from `https://github.com/RustSec/advisory-db.git`
+^C
+```
+
+Network monitor show it makes a request directly to the host instead of to the proxy.
+Despite suggesting using `cache: cargo` to cache `cargo-audit` the script force-reinstalls it every time. Until `-Z install-upgrade` is stabilized I have been using a script like this for installing tools using the cache:
+
+```yaml
+install:
+- >
+  [[ "$(wasm-bindgen --version)" == "wasm-bindgen 0.2.51" ]]
+  || cargo install --force wasm-bindgen-cli --version 0.2.51
+```
+
+(I may open a PR to update this if I get around to setting up `cargo-audit` on any of my projects CI).
+The latest `rustsec` crate releases added a notion of advisory collections, which are presently:
+
+- [Collection::Crates](https://docs.rs/rustsec/latest/rustsec/collection/enum.Collection.html#variant.Crates): for crates published through [crates.io](https://crates.io)
+- [Collection::Rust](https://docs.rs/rustsec/latest/rustsec/collection/enum.Collection.html#variant.Rust): for rust-lang components distributed as part of Rust itself
+
+The [RustSec Advisory Database](https://rustsec.org) now contains the following advisories filed in `Collection::Rust`:
+
+- [CVE-2018-1000622: rustdoc: Uncontrolled search path element vulnerability in rustdoc plugins](https://rustsec.org/advisories/CVE-2018-1000622.html)
+- [CVE-2018-1000657: std: Buffer overflow vulnenrability in `VecDeque::reserve()`](https://rustsec.org/advisories/CVE-2018-1000657.html)
+- [CVE-2018-1000810: std: Buffer overflow vulnerability in `str::repeat()`](https://rustsec.org/advisories/CVE-2018-1000810.html)
+- [CVE-2019-12083: std: Memory safety vulnerabilities arising from `Error::type_id`](https://rustsec.org/advisories/CVE-2019-12083.html)
+- [CVE-2019-16760: cargo: Cargo prior to Rust 1.26.0 may download the wrong dependency](https://rustsec.org/advisories/CVE-2019-16760.html)
+
+Presently these advisories are ignored by `cargo-audit`, however it might make sense to add features for at least warning if the currently active Rust toolchain is vulnerable.
+
+This issue is for discussing what might make sense in that regard.
+Running `cargo audit --target-os linux` on https://github.com/slog-rs/term suggests that it's vulnerable to `RUSTSEC-2019-0011` on Linux.
+
+```
+# cargo audit --target-os linux
+error: Vulnerable crates found!
+
+ID:      RUSTSEC-2019-0011
+Crate:   memoffset
+Version: 0.2.1
+Date:    2019-07-16
+URL:     https://github.com/Gilnaa/memoffset/issues/9#issuecomment-505461490
+Title:   Flaw in offset_of and span_of causes SIGILL, drops uninitialized memory of arbitrary type on panic in client code
+Solution: upgrade to: >= 0.5.0
+
+error: 1 vulnerability found!
+```
+
+Running `cargo tree --all-targets -p memoffset:0.2.1 -i` shows that the only path is as follows:
+
+```
+memoffset v0.2.1
+└── crossbeam-epoch v0.6.1
+    └── crossbeam v0.5.0
+        └── rust-argon2 v0.5.0
+            └── redox_users v0.3.1
+                └── dirs v1.0.5
+                    └── term v0.5.2
+                        └── slog-term v2.4.1 (/src/term)
+```
+
+`dirs` only uses `redox_users` when `cfg(target_os = "redox")` - see https://github.com/soc/dirs-rs/blob/3c3b61ff9611762bece3fc66fd6612b125819e3f/Cargo.toml#L15-L16 
+
+It looks like `--target-os linux` isn't stripping this dependency, despite being specified on the command line.
+Siderophile is a utility for locating unsafe hotspots in Rust programs and fuzzing them:
+
+- Blog post: https://blog.trailofbits.com/2019/07/01/siderophile-expose-your-crates-unsafety/
+- GitHub: https://github.com/trailofbits/siderophile
+
+One of the things it does is a call graph analysis, somewhat similar to the ones performed by tools like [cargo-geiger](https://github.com/anderejd/cargo-geiger) and [RustPräzi](https://github.com/praezi/rust) (see also: https://github.com/RustSec/advisory-db/issues/68).
+
+The RustSec Advisory DB already contains metadata about the paths to impacted functions in an advisory as they relate to versions. It would be nice to use Siderophile to compute the call graph across `--all-features` of the parent crate, then use it to (perhaps optionally) test whether or not impacted/functions exist in the call graph.
+
+## Case study: `memoffset`
+
+The following is a real-world RustSec case story where this sort of call graph analysis may have been helpful.
+
+[RUSTSEC-2019-0011](https://rustsec.org/advisories/RUSTSEC-2019-0011.html) filed against the [memoffset](https://github.com/Gilnaa/memoffset) crate was an interesting vulnerability for several reasons:
+
+- *High severity*: memory exposure and potential RCE. Furthermore, its initial severity was underestimated, and the impacted versions also retroactively expanded. 
+- *Low exploitability*: whether or not a particular project is impacted or not depended entirely on how the parent dependency which depends on `memoffset` was using it. This means that a low number of users received an important advisory about a high severity vulnerability, but for many others it was a false positive.
+- *Unclear resolutions*: `memoffset` is used by many high-profile ecosystem crates including `crossbeam`. At the time we published the advisory there was no upgrade path available for many users, so they got an alert, but it was not actionable.
+
+This combination of factors is exactly the sort of situation where it would be nice to eliminate false positives via call graph analysis. For users who were truly impacted by this advisory, it was RCE and they should absolutely be notified, but for most users it was just noise, and without a call graph analysis tool it was completely unclear which of these buckets a particular program fit into.
+
+Eliminating false positives is something that *must* be done correctly: we don't want to fail to alert impacted users just to spare non-impacted users from annoying false positives. However, I think this sort of call graph analysis can be done precisely to where that is the case.
+It would be nice to have pre-built binaries of the tool available here. This is mostly for CI usage as building the tool in CI inflates build times. This is less an issue with caching, but is still a concern. 
+Shall cargo-audit, like [cargo-geiger](https://crates.io/crates/cargo-geiger), track which functions are used and which are unused by the target crate and filter out vulnerabilities in unreferenced functions?
+
+Otherwise there will be a stream of vulns in seldom used functions in deep dependencies, which would train users to shovel them away without much consideration, as most of then are not to the point. Or, if there would be little advisory traffic, will "penalize" crates or authors by figurating in a report even though the vulnerability is just in a tiny experimental doc-hidden non-default-feature-cfg function which almost nobody knows about (or be a reason against filing such advisories as insignificant).

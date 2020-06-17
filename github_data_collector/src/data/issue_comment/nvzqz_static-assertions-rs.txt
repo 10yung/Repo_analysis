@@ -1,0 +1,285 @@
+This currently doesn't work outside of this crate since it seems that macro-internal lints aren't exposed across crate boundaries.
+`serde::Deserialize` takes the lifetime parameter `<'de>`. How should I check that a class derives serde::Deserialize?
+
+One of the working solutions is `assert_impl_all!(MyType : serde::Deserialize<'static>);`, using the trick that `'static` is available everywhere. However, is this the best practice?
+
+Please consider adding this note to the documentation.
+It is possible to implement a macro that returns a const boolean that indicates if a type implements a certain trait. This might be useful to implement more complex static assertions when used together with [`static_assertions::const_assert`](https://docs.rs/static_assertions/1.1.0/static_assertions/macro.const_assert.html). I took the macro's name from the [`static_assertions::assert_impl_all`](https://docs.rs/static_assertions/1.1.0/static_assertions/macro.assert_impl_all.html) macro and then change the `assert` to `is` since it takes the same arguments but returns a boolean instead of causing a compiler error. 
+
+The macro I came up with looks like this:
+
+```rust
+macro_rules! is_impl_all {
+    ($x:ty: $($t:path),+ $(,)?) => {{
+            struct __Wrapper<T: ?Sized>([*const T; 0]);
+            // This impl has a trait bound on $x so the type can only be accessed if $x implements $t.
+            impl<T: ?Sized $(+ $t)+> __Wrapper<T> where  {
+                #[allow(non_upper_case_globals)]
+                const __static_assert__is_impl_all: bool = true;
+            }
+            {
+                // This trait provides an associated const for all types but the inherent implementation's const has a higher priority.
+                trait __Blanket {
+                    #[allow(non_upper_case_globals)]
+                    const __static_assert__is_impl_all: bool = false;
+                }
+                impl<T: ?Sized> __Blanket for T {}
+
+                // If a blanket trait by the user is in scope that conflicts with the above blanket trait then this will fail to compile but it won't return incorrect values:
+                __Wrapper::<$x>::__static_assert__is_impl_all
+            }
+    }};
+}
+```
+
+### Alternative macro implementation
+
+I also made a different version of the macro that ensures that the `__static_assert__is_impl_all` lookup won't fail if a blanket trait is in scope that conflicts:
+
+```rust
+macro_rules! is_impl_all {
+    ($x:ty: $($t:path),+ $(,)?) => {{
+            pub struct __Wrapper<T: ?Sized>([*const T; 0]);
+            // This impl has a trait bound on $x so the type can only be accessed if $x implements $t.
+            impl<T: ?Sized $(+ $t)+> __Wrapper<T> where  {
+                #[allow(non_upper_case_globals)]
+                const __static_assert__is_impl_all: bool = true;
+            }
+            {
+                // Resolve the type without the inner module being in scope.
+                type __AType = __Wrapper<$x>;
+                {
+                    // This module is private to this scope and won't affect path resolution for the paths provided by the user.
+                    mod inner {
+                        // Used to reference the type in this new module.
+                        pub trait GetType {
+                            type Type;
+                        }
+
+                        // This trait provides an associated const for all types but the inherent implementation's const has a higher priority.
+                        trait __Blanket {
+                            #[allow(non_upper_case_globals)]
+                            const __static_assert__is_impl_all: bool = false;
+                        }
+                        impl<T: ?Sized> __Blanket for T {}
+                        
+                        pub const VALUE: bool = <() as GetType>::Type::__static_assert__is_impl_all;
+                    }
+                    impl inner::GetType for () {
+                        type Type = __AType;
+                    }
+
+                    inner::VALUE
+                }
+            }
+    }};
+}
+```
+
+- Pro: The constants can't have name collision, but the types and traits might still have them.
+- Con: Probably won't work with type parameters while the previous version should.
+
+Since the `__Wrapper` struct and the `__AType` type alias can still cause name conflicts with the paths provided to the macro it doesn't really help that constants name can't cause name conflicts so this version of the macro isn't really better then the previous one and its definitely longer and more complex so it should probably not be used.
+
+### Some Tests
+
+Here is some tests I used to see if my macro worked:
+
+```rust
+#[test]
+fn it_works() {
+    macro_rules! as_const {
+        ($value:expr) => {{
+            const VALUE: bool = {
+                $value
+            };
+            VALUE
+        }};
+    }
+
+    // Test macro:
+    assert_eq!(as_const!(is_impl_all!((): Send, Sync)), true);
+    assert_eq!(as_const!(is_impl_all!((): Send, From<u8>)), false);
+    assert_eq!(as_const!(is_impl_all!((): From<u8>, From<u16>, Send)), false);
+
+    // Boolean logic:
+    assert_eq!(as_const!({
+        is_impl_all!((): Send, std::panic::UnwindSafe)
+        ||
+        is_impl_all!((): Sync, std::panic::RefUnwindSafe)
+    }), true);
+
+    // Counting implemented traits:
+    assert_eq!(as_const!({
+        let mut count = 0;
+        count += is_impl_all!((): Send) as usize;
+        count += is_impl_all!((): Sync) as usize;
+        count += is_impl_all!((): From<u8>) as usize;
+        count += is_impl_all!((): Into<u8>) as usize;
+        
+        count > 2
+    }), false);
+    assert_eq!(as_const!({
+        let mut count = 0;
+        count += is_impl_all!((): Send) as usize;
+        count += is_impl_all!((): Sync) as usize;
+        count += is_impl_all!((): From<u8>) as usize;
+        count += is_impl_all!((): Into<u8>) as usize;
+        
+        count >= 2
+    }), true);
+}
+
+/// The macro isn't perfect and a trait with the correct method name can interfere with the macro.
+/// 
+/// Currently this only causes the macro to not compile and not to return an incorrect value.
+/// 
+/// ```compile_fail
+/// use playground::is_impl_all;
+/// 
+/// trait Interfere {
+///     #[allow(non_upper_case_globals)]
+///     const __static_assert__is_impl_all: bool = true;
+/// }
+/// impl<T> Interfere for T {}
+///
+/// // These should return false but the above trait might interferes and causes them to return true.
+/// is_impl_all!((): From<u8>);
+/// is_impl_all!((): From<u8>, From<u16>);
+/// ```
+#[allow(dead_code)]
+fn interference_with_macro() {}
+```
+By using [`on_unimplemented`](https://doc.rust-lang.org/unstable-book/language-features/on-unimplemented.html) (tracking issue: https://github.com/rust-lang/rust/issues/29628), custom error messages like the following can be emitted on assertion failure:
+
+```
+error[E0277]: static assertion failed
+  --> tests/messages.rs:14:1
+   |
+14 | assert_impl_one!(Foo: A, B, C);
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   | |
+   | `Foo` must implement exactly one of the given traits
+   | required by `_::{{closure}}#0::AmbiguousIfMoreThanOne::some_item`
+   |
+   = help: the trait `_::{{closure}}#0::AmbiguousIfMoreThanOne<_>` is not implemented for `Foo`
+   = note: this error originates in a macro outside of the current crate (in Nightly builds, run with -Z external-macro-backtrace for more info)
+```
+
+This can be done like so (behind a `nightly` feature flag):
+
+```rust
+macro_rules! assert_impl_one {
+    ($x:ty: $($t:path),+ $(,)?) => {
+        const _: fn() = || {
+            #[cfg_attr(
+                feature = "nightly",
+                rustc_on_unimplemented(
+                    message = "static assertion failed",
+                    label = "`{Self}` must implement exactly one of the given traits",
+                )
+            )]
+            trait AmbiguousIfMoreThanOne<A> {
+                // ...
+            }
+            // ...
+        }
+    };
+}
+```
+This introduces `assert_field_offsets!` for ensuring that given `struct` fields are at specific offsets.
+
+This current implementation works in Rust 1.37 and 1.38. However, the current beta and nightly compilers fail to perform the constant evaluation. This is not unexpected since the current code creates a reference at `mem::align_of::<T>()`, where there is no initialized memory. Even though the reference is non-null, dereferencing those addresses is definitely undefined behavior.
+
+I won't be merging this PR as-is. However, I'm interested to learn how this macro could be implemented in a sound way.
+
+See also: https://github.com/Gilnaa/memoffset/issues/24.
+
+(cc @oli-obk @RalfJung)
+In version 0.3 it was possible to have a `assert_eq_size!()` inside a function, and refer to the type parameters of that function.
+
+In version 1.0.0 that is no longer possible:
+
+```rust
+fn foo<T>() {
+    static_assertions::assert_eq_size!(Rc<T>, Arc<T>);
+}
+```
+
+```text
+error[E0401]: can't use generic parameters from outer function
+   |
+   | fn foo<T>() {
+   |    --- - type parameter from outer function
+   |    |
+   |    try adding a local generic parameter in this method instead
+   |     static_assertions::assert_eq_size!(Rc<T>, Arc<T>);
+   |                                           ^ use of generic parameter from outer function
+```
+This would be handy for example to ensure struct sizes don't grow beyond some limit.
+
+It can be implemented like this:
+```rust
+macro_rules! assert_le_size {
+    ($a:ty, $b:ty) => {
+        const _: MaybeUninit<[u8; size_of::<$b>() - size_of::<$a>()]> = MaybeUninit::uninit();
+    }
+}
+```
+Assertion that the supplied type must be one of multiple listed types.
+
+One possible (although not so elegant) implementation is like this:
+
+```rust
+macro_rules! assert_type_in {
+    ($label:ident; $type:ty, $($in:ty),*) => {
+        mod $label {
+            $(fn mux(_: $in) {})*
+            fn _(v: $type) {
+                mux(v);
+            }
+        }
+    };
+}
+Over on the rust internals board, [`betamos` noted](https://internals.rust-lang.org/t/how-often-do-you-want-non-send-futures/10360/15) that it would be nice to be able to annotate a type or value as sendable, and get a compile-time error if it is not. I thought this should be achievable using a macro, and that it would be a good fit for this crate. Maybe someone here can take a crack at it?
+
+Edit: updated request to `assert_expr_impl!`
+As per @robinkrahl's request (https://github.com/nvzqz/static-assertions-rs/issues/2#issuecomment-465547413), I made an attempt at this but it doesn't necessarily work. The only limited working form is if `$v` is an `ident` or `$(tt)+` where only `assert_variant!(Thing, A);` works and neither of the others does. And even then, it still requires the [`#![feature(type_alias_enum_variants)]`](https://github.com/rust-lang/rust/issues/49683) attribute for some reason on nightly.
+
+Below is my current (failing) attempt at a solution:
+
+```rust
+#![feature(underscore_const_names)]
+#![feature(type_alias_enum_variants)]
+
+enum Thing {
+    A,
+    B { x: () },
+    C(()),
+}
+
+macro_rules! assert_variant {
+    ($e:ty, $v:pat) => {
+        const _: fn($e) -> () = |e| match e {
+            <$e>::$v => {},
+            _ => {},
+        };
+    }
+}
+
+assert_variant!(Thing, A);
+assert_variant!(Thing, B { .. });
+assert_variant!(Thing, C(_));
+
+fn main() {}
+```
+
+Ideally, the best solution would allow for:
+
+```rust
+assert_variant!(Thing, A);
+assert_variant!(Thing, B);
+assert_variant!(Thing, C);
+
+assert_variant!(Thing, A, B, C);
+```

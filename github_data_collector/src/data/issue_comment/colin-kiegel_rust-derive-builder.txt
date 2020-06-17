@@ -1,0 +1,121 @@
+Taking a quick look at this crate, it generates a separate `FooBuilder` for the `Foo` struct you've derived. However that does not fit my use case, where I don't want to build to a structure. I'd like to add the setters onto the structure I am deriving directly.
+
+My use case is creating a builder that implements `amethyst::core::bundle::SystemBundle`, where the build method does not create a new object but rather registers a bunch of things with an existing World object. I see the `#[builder(build_fn(skip))]` attribute for making my own build function, but it still generates an extra useless structure.
+
+Other use cases could be generating a builder for a structure in a foreign crate, or for an FFI object.
+```rust
+#[macro_use]
+extern crate derive_builder;
+
+mod channel {
+    #[derive(Default, Builder, Debug)]
+    #[builder(setter(into))]
+    struct Channel {
+        token: i32,
+        special_info: i32,
+        // .. a whole bunch of other fields ..
+    }
+}
+
+fn main() {
+    // builder pattern, go, go, go!...
+    let ch = channel::ChannelBuilder::default()
+        .special_info(42u8)
+        .token(19124)
+        .build()
+        .unwrap();
+    println!("{:?}", ch);
+}
+```
+
+```
+error[E0603]: struct `ChannelBuilder` is private
+   --> src/main.rs:216:23
+    |
+216 |     let ch = channel::ChannelBuilder::default()
+    |                       ^^^^^^^^^^^^^^
+error[E0624]: method `build` is private
+   --> src/main.rs:219:10
+    |
+219 |         .build()
+    |          ^^^^^
+```
+The current implementation of `derive_builder` exposes too much of the crate's internal behavior across the boundary between `derive_builder` and `derive_builder_core`. This results in unnecessary minor version bumps, as seen in #154.
+```rust
+error[E0599]: no method named `unwrap` found for type `()` in the current scope
+   --> ~/.cargo/registry/src/github.com-1ecc6299db9ec823/derive_builder-0.7.0/src/lib.rs:561:28
+    |
+561 |         env_logger::init().unwrap();
+    |                            ^^^^^^
+```
+
+Looks like `env_logger::init()` just panics and doesn't need to be unwrapped manually anymore, starting from v0.5.0: https://github.com/sebasmagri/env_logger/releases/tag/v0.5.0
+I'd like the builder to be instantiated by a custom method (that requires some initial arguments), and I'd like it to be impossible to start with `FooBuilder::default()`.
+
+Is this currently possible?
+Currently, the crate has a fairly scattershot feature list in `README.md`, but no reference for each setting, its compatibility, and its function.
+
+# Questions
+1. How should we explain to newcomers the value of the crate? Is a usage example best for that, or do we need to explain why people shouldn't make structs with all public fields?
+1. Is [`serde.rs`](https://serde.rs/container-attrs.html) a model for best practices around proc-macro documentation?
+1. What level of documentation should be included in `README.md`?
+
+@misdreavus or @steveklabnik, are there prior discussions on this that we can/should reference?
+Would it be possible to have special setter methods for `Vec` fields? That is, instead of just a field for setting the whole vec at once, the user could opt-in to also generating setters that `.push` an element of type `T` onto a field with type `Vec<T>`?
+
+The generated code could look something like
+
+```
+struct FooBuilder {
+    bars: Option<Vec<Bar>>
+}
+
+impl FooBuilder {
+    ...
+    pub fn bars<VALUE: Into<Vec<Bar>>>(&mut self, value: VALUE) -> &mut Self {
+        self.bars = Some(value.into());
+        self
+    }
+    pub fn bar<VALUE: Into<Bar>>(&mut self, value: VALUE) -> &mut Self {
+        if let Some(ref mut bars) = self.bars {
+            bars.push(value.into());
+        } else {
+            self.bars = Some(vec![value.into()]);
+        }
+        self
+    }
+    ...
+}
+```
+
+Ideally I'd like to have this for any `.push`-able type, but until we have collections traits I think having it just for `Vec` could be helpful.
+I would like to use, in my code, the useful `#[builder(setter(skip))]` option to write a custom setter for a struct field.
+
+Expanding macros I noticed though that such field is marked in the builder as `std::marker::PhantomData<...>`, and I don't know how to deal with it.
+Other generated setters assign actual value to common `Option<...>`: how can the same be done with `PhantomData<...>`?
+It's been a while since I worked on this crate. And I have to admit that right now I'm focusing on other things. At the end of the day, there's not enough time for me to maintain and improve this crate right now.
+
+If anyone is interested to pick up the crate maintenance and can prove to be trustworthy, I'd be ready to hand it over (including crates.io ownership).
+
+cc @TedDriggs 
+
+PS: It took me some time to reach this conclusion, but as they say: You can't have the cake _and_ eat it. ;-)
+```rust
+#[derive(Builder)]
+struct Generic<T> {
+    #[builder(setter(skip))] // <-- implicit default
+    pub ipsum: T,
+    #[builder(default)] // <-- explicit default
+    pub dolor: T,
+}
+```
+
+fails with
+```
+error[E0277]: the trait bound `T: std::default::Default` is not satisfied
+|
+| #[derive(Builder)]
+|          ^^^^^^^ the trait `std::default::Default` is not implemented for `T` 
+= help: consider adding a `where T: std::default::Default` bound
+= note: required by `std::default::Default::default`
+```

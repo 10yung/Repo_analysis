@@ -1,0 +1,97 @@
+Hi there, thanks for the awesome library! We are having some issues compressing normal maps, here's an example:
+
+Input normal map
+![original](https://user-images.githubusercontent.com/54840231/72422578-060d4d80-3783-11ea-875f-abbb145756b0.png)
+
+Compressed normal map
+![example_unpacked_rgb_BC7_M5_RGBA_0_0000](https://user-images.githubusercontent.com/54840231/72422605-0efe1f00-3783-11ea-95cf-a67625ff7c59.png)
+
+We tried some different parameters but could not manage to make the results significantly better. Then we found the following snippet in the readme:
+
+"For tangent space normal maps, you should separate X into RGB and Y into Alpha, and provide the compressor with 32-bit/pixel input images. Or use the "-separate_rg_to_color_alpha" command line option which does this for you. The internal texture format that Basis Universal uses (ETC1S) doesn't handle tangent space normal maps encoded into RGB well. You need to separate the channels and recover Z in the pixel shader using z=sqrt(1-x^2-y^2)."
+
+For reasons beyond our control this is likely not something we are capable of doing in the near future. But we thought it might still be worthwhile to ask and get confirmation.
+
+1. Is it possible to improve the quality of the compressed normal map without splitting and shader reconstruction (i.e., are we missing some parameter or using the library the wrong way)?
+2. Or do we have to adapt our pipeline to split and reconstruct (if using basis for normal maps)?
+
+We are thankful for answers, have a pleasant day. :)
+
+## Reproducing:
+
+Using latest basisu from git (895ee8ee7e, 2020-01-04), built with latest Visual Studio 2019 (16.4.3), release build.
+
+Compress the original normal map using:
+
+`basisu original.png -q 128 -normal_map -comp_level 5 -mipmap -mip_renorm`
+
+Then decompress using:
+
+`basisu original.basis`
+Here's a snippet of the code;
+
+```
+case transcoder_texture_format::cTFRGBA32:
+	return sizeof(uint32_t) * 16;
+case transcoder_texture_format::cTFRGB565:
+case transcoder_texture_format::cTFBGR565:
+case transcoder_texture_format::cTFRGBA4444:
+	return sizeof(uint16_t) * 16;
+```
+
+The `* 16` is bogus. The reason this is apparently not causing any problems is because `lowlevel_transcoder::transcode_slice` ignores its `output_block_or_pixel_stride` parameter, which was set from the output of the subject function, for all of the uncompressed formats, using instead sizeof(uint32_t) or sizeof(uint16_t).
+
+We would like to pack normal maps using GGGR which is more standard than the currently supported RRRG (using -separate_rg_to_color_alpha flag).
+
+Added a general swizzle operator for maximum happiness.
+The 3DFS file signature is initialized by `const uint32_t OUT_FILE_MAGIC = 'TEXC';` for which gcc flags "warning: multichar character constant". I have no idea in what order the compiler would place the characters when initializing OUT_FILE_MAGIC, which is possibly the point of the warning. Whether the T becomes the high-order or low-order byte, who knows?
+
+The value is written out to the file as little endian. What byte sequence is meant to appear in a 3DFS file - TEXC or CXET? Is there any documentation for this file format?
+
+
+This means that we now support all formats supported by stb_image for
+the purpose of transcoding. This is mostly valuable for JPEG data since
+glTF content can have PNG or JPG images, and TGA data since this is a
+common image interchange format for real-time graphics.
+
+While it was technically possible to keep lodepng for saving images it
+didn't seem like there's a strong reason to do so.
+
+Note that stb libraries are compiled as part of stb_image.cpp to reduce
+compile-time impact on basisu_enc.cpp.
+
+For projects implementing support for Basis Universal data without relying on a `.basis` wrapper file, e.g. via KTX2, it will be necessary to expose additional features of the low-level transcoder. Currently the WASM transcoder only accepts a `.basis` file as input, for example.
+
+In https://github.com/BinomialLLC/basis_universal/pull/51 some comparable changes are proposed to enable libktx to access the low-level decoder. The PR is specific to libktx, and doesn't expose anything new on the WASM transcoder yet, but is similar in its goals.
+
+I would like to eventually reach a state where multiple libraries can use the low-level transcoder: libktx for complete KTX2 support, a lightweight JS implementation for the web, and perhaps a lightweight native implementation like [tiny_ktx](https://github.com/DeanoC/tiny_ktx). 
+
+@richgel999 would you be open to exposing additional APIs? Or am I asking for the wrong thing, and I should be considering a different high-level API rather than direct access to the low-level transcoder? Open to feedback on how to approach this, thanks.
+On Windows `basisu.h` does `#define ITERATOR_DEBUG_LEVEL 1` when compiling for debug. Since VC++'s default level is 2 this leads to a large number of errors from the compiler about an ITERATOR_DEBUG_LEVEL mismatch when you try to use basisu alongside other code.
+
+The comment where this is set says you need to disable iterator debugging or the encoder is unusable. What exactly are the problems it causes? I have defined `BASISU_NO_ITERATOR_DEBUG_LEVEL`  to prevent changing the level and in my very limited experiments the encoder seems to be working okay.
+Lines 1130 & 1131 in `basisu_enc.cpp` use `std::min`.  `basis_enc.cpp` includes `windows.h`, prepended by a `#define WINDOWS_LEAN_AND_MEAN`, which somewhere includes `minwindef.h`. This defines a macro `min` with which the c preprocessor helpfully replaces the `min` in `std::min` causing the compile to fail.
+
+How can you compile it? Are you using a different version of Windows Kit?
+Hi,
+
+In order to compress images in browser, we compile the encoder utility wholesale to wasm and invoke the application's main function from Javascript. Thanks to emscripten we can write the input files to the wasm in-memory filesystem and then read back results once compression is complete. This is surprisingly simple to accomplish:
+```
+// write the input file
+basisu.FS.writeFile('input.png', new Int8Array(buf));
+
+// perform compression
+basisu.callMain(['input.png', '-no_multithreading', '-mipmap', '-y_flip']);
+
+// read back the compressed data
+var result = basisu.FS.readFile('input.basis', { encoding: 'binary' }).buffer;
+```
+
+This solution is likely just a stop-gap till the planned basis_universal code reshuffle is released which will expose the compression code as a library.
+
+Please note the following about this makefile:
+- it has only been tested on Macos
+- multithreading should be disabled (which doesn't work out of the box and we haven't investigated further)
+- trap mode 'clamp' was required and we haven't investigated potential consequences (though resulting compressed files are binary identical to natively compressed files)
+
+Thanks!

@@ -1,0 +1,163 @@
+Upon merging  #5690, I noticed I left an unfortunate error buried in the testing logic. It felt wrong to leave it there without a fix! Here's the patch.
+This change refactors the vstream functionality into a separate file, along with its own manager.
+With this change, we introduce a new special Gtid value "current", which will start the streams at the current position. If no keyspace is specified, then all keyspaces are included. If a keyspace has not shard specified, then all shards are included.
+
+We reserve the empty Gtid value for the future to request all data, including existing rows.
+COM_PREPARE
+
+Signed-off-by: Jacques Grove <aquarapid@gmail.com>
+Scenario:
+
+ * Cluster with unsharded keyspace and vschema:
+```
+{
+  "tables": {
+    "schema_migrations": {}
+  }
+}
+```
+
+ * SQL schema:
+```
+CREATE TABLE `schema_migrations` (`version` bigint(20) NOT NULL, `inserted_at` datetime DEFAULT NULL, PRIMARY KEY (`version`)) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+```
+
+  * Run a program that prepares a statement with a syntax error, e.g. (This uses the official MySQL python connector):
+```
+import mysql.connector
+from mysql.connector.cursor import MySQLCursorPrepared
+
+cnx = mysql.connector.Connect(host='localhost', port=15306,
+        database='commerce', user='root', charset='utf8', get_warnings=True)
+
+curprep = cnx.cursor(cursor_class=MySQLCursorPrepared)
+cur = cnx.cursor()
+
+prepstmt = "delete s0 from schema_migrations as s0 where (s0.version = convert(?, unsigned)) limit ?"
+
+curprep.execute(prepstmt)
+cnx.commit()
+```
+
+  * Running this will fail with a lost connection:
+```
+$ python3 ~/prep.py 
+Traceback (most recent call last):
+  File "/home/jacques/prep.py", line 12, in <module>
+    curprep.execute(prepstmt)
+  File "/home/jacques/.local/lib/python3.7/site-packages/mysql/connector/cursor.py", line 1140, in execute
+    self._prepared = self._connection.cmd_stmt_prepare(operation)
+  File "/home/jacques/.local/lib/python3.7/site-packages/mysql/connector/connection.py", line 940, in cmd_stmt_prepare
+    packet = self._send_cmd(ServerCmd.STMT_PREPARE, statement)
+  File "/home/jacques/.local/lib/python3.7/site-packages/mysql/connector/connection.py", line 267, in _send_cmd
+    return self._socket.recv()
+  File "/home/jacques/.local/lib/python3.7/site-packages/mysql/connector/network.py", line 243, in recv_plain
+    raise errors.InterfaceError(errno=2013)
+mysql.connector.errors.InterfaceError: 2013: Lost connection to MySQL server during query
+```
+
+  * No errors in the vtgate info/error logs, and the prepared statement does not show up in the vtgate query logs.
+  * Inspecting a tcpdump of the connection, vtgate seems to shut down the connection after the client sends the COM_PREPARE staetment (see attached image)
+
+
+Looking through the code, it seems that we return a bare error at https://github.com/vitessio/vitess/blob/f7205b8a67a60fd493ba67611e02e23d8ef70bd2/go/mysql/conn.go#L856 after parsing the prepared statement, instead of forming and writing a MySQL error packet to the client.
+
+I'll generate a PR to fix.
+
+This allows using vtctl ApplySchema to execute ALTER DATABASE across all shards of a keyspace.
+
+The main problem was just that `ALTER DATABASE` had never been added to the sqlparser at all.
+This continues adding MySQL functions that are implemented and rewritten at the vtgate level. It builds on, and contains the some of the same commits as exist in #5611 (only commits after 
+9ecef87 are new to this branch)
+
+can vitess be configured as non-sharding？
+
+can vitess be configured as direct send to mysql so the sql can be 100% Compatible with mysql？
+
+
+
+- [Vitess User Guide](https://vitess.io/user-guide/introduction/)
+- Any other questions can be asked in the community [Slack workspace](https://vitess.io/slack)
+
+Allow LD_PRELOAD to be added to the execution environment
+
+Fixes #5466 
+
+
+Scenario:
+  * Sharded keyspace
+  * Use a vschema like this with a reference table:
+```
+{
+  "sharded": true,
+  "vindexes": {
+    "hash": {
+      "type": "hash"
+    }
+  },
+  "tables": {
+    "testing": {
+       "type" : "reference"
+    }
+  }
+}
+```
+  * Create a table via vtgate:
+```
+mysql> create table testing (`version` bigint, `inserted_at` datetime, PRIMARY KEY (`version`)) ENGINE = INNODB;
+Query OK, 0 rows affected (0.13 sec)
+```
+
+  * Now, try to insert to the keyspace (not a shard-specific one):
+```
+mysql> insert into testing (`version`,`inserted_at`) VALUES (20200108224539, "2020-01-16 23:31:51");
+ERROR 2013 (HY000): Lost connection to MySQL server during query
+mysql>
+```
+
+The panic from the vtgate log file:
+
+```
+E0116 15:59:08.786825 1163644 server.go:278] mysql_server caught panic:
+runtime error: index out of range [0] with length 0
+/usr/lib/golang/src/runtime/panic.go:75 (0x42f482)
+        goPanicIndex: panic(boundsError{x: int64(x), signed: true, y: y, code: boundsIndex})
+/home/jacques/go/src/vitess.io/vitess/go/vt/vtgate/engine/insert.go:397 (0xaca2df)
+        io/vitess/go/vt/vtgate/engine.(*Insert).getInsertShardedRoute: keyspaceIDs, err := ins.processPrimary(vcursor, vindexRowsValues[0], ins.Table.ColumnVindexes[0])
+/home/jacques/go/src/vitess.io/vitess/go/vt/vtgate/engine/insert.go:275 (0xac7878)
+        io/vitess/go/vt/vtgate/engine.(*Insert).execInsertSharded: rss, queries, err := ins.getInsertShardedRoute(vcursor, bindVars)
+/home/jacques/go/src/vitess.io/vitess/go/vt/vtgate/engine/insert.go:225 (0xac6de2)
+        io/vitess/go/vt/vtgate/engine.(*Insert).Execute: return ins.execInsertSharded(vcursor, bindVars)
+/home/jacques/go/src/vitess.io/vitess/go/vt/vtgate/executor.go:321 (0xb39257)
+        io/vitess/go/vt/vtgate.(*Executor).handleExec: qr, err := plan.Instructions.Execute(vcursor, bindVars, true)
+/home/jacques/go/src/vitess.io/vitess/go/vt/vtgate/executor.go:215 (0xb37adc)
+        io/vitess/go/vt/vtgate.(*Executor).execute: qr, err := e.handleExec(ctx, safeSession, sql, bindVars, destKeyspace, destTabletType, dest, logStats, stmtType)
+/home/jacques/go/src/vitess.io/vitess/go/vt/vtgate/executor.go:139 (0xb3766b)
+        io/vitess/go/vt/vtgate.(*Executor).Execute: result, err = e.execute(ctx, safeSession, sql, bindVars, logStats)
+/home/jacques/go/src/vitess.io/vitess/go/vt/vtgate/vtgate.go:280 (0xb5d0c1)
+        io/vitess/go/vt/vtgate.(*VTGate).Execute: qr, err = vtg.executor.Execute(ctx, "Execute", NewSafeSession(session), sql, bindVariables)
+/home/jacques/go/src/vitess.io/vitess/go/vt/vtgate/plugin_mysql_server.go:211 (0xb4ac41)
+        io/vitess/go/vt/vtgate.(*vtgateHandler).ComQuery: session, result, err := vh.vtg.Execute(ctx, session, query, make(map[string]*querypb.BindVariable))
+/home/jacques/go/src/vitess.io/vitess/go/mysql/conn.go:1070 (0x86c0b7)
+        io/vitess/go/mysql.(*Conn).execQuery: err := handler.ComQuery(c, query, func(qr *sqltypes.Result) error {
+/home/jacques/go/src/vitess.io/vitess/go/mysql/conn.go:771 (0x86b92d)
+        io/vitess/go/mysql.(*Conn).handleNextCommand: if err := c.execQuery(sql, handler, more); err != nil {
+/home/jacques/go/src/vitess.io/vitess/go/mysql/server.go:463 (0x8876ae)
+        io/vitess/go/mysql.(*Listener).handle: err := c.handleNextCommand(l.handler)
+/usr/lib/golang/src/runtime/asm_amd64.s:1357 (0x460930)
+        goexit: BYTE    $0x90   // NOP
+```
+
+vtgate -version:
+```
+$ vtgate -version
+Version: 2152b55aa (Git branch 'master') built on Wed Jan 15 18:09:04 PST 2020 .........
+```
+
+Obviously, reference tables don't work this way, and you should insert on a per-shard level, or use vreplication to populate the tables.  However, inserting to it should not cause a vtgate panic and kill the connection.
+Currently, the vttablet currently only exposes resource pool wait count and aggregated wait times. Adding timing histogram metrics to the resource pool would provide information on the distribution of the wait time latencies. This is specially useful to in determining tail latencies.
+
+Example output from `/debug/vars` (look for `TransactionPoolResourceWaitTime`):
+```
+"Waits": {"TotalCount":186,"TotalTime":1559667140,"Histograms":{"Consolidations":{"500000":51,"1000000":96,"5000000":159,"10000000":163,"50000000":163,"100000000":163,"500000000":163,"1000000000":163,"5000000000":163,"10000000000":163,"inf":163,"Count":163,"Time":200226919},"TransactionPoolResourceWaitTime":{"500000":0,"1000000":0,"5000000":0,"10000000":1,"50000000":11,"100000000":20,"500000000":23,"1000000000":23,"5000000000":23,"10000000000":23,"inf":23,"Count":23,"Time":1359440221}}}
+```

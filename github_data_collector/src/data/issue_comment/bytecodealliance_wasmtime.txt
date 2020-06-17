@@ -1,0 +1,296 @@
+This commit extends the `Func` type in the `wasmtime` crate with static
+`wrap*` constructors. The goal of these constructors is to create a
+`Func` type which has zero shims associated with it, creating as small
+of a layer as possible between wasm code and calling imported Rust code.
+
+This is achieved by creating an `extern "C"` shim function which matches
+the ABI of what Cranelift will generate, and then the host function is
+passed directly into an `InstanceHandle` to get called later. This also
+enables enough inlining opportunities that LLVM will be able to see all
+functions and inline everything to the point where your function is
+called immediately from wasm, no questions asked.
+
+There's a few items which I think need some more discussion on this PR before we land it, and I'm also just curious how others think of an API like this for embedding!
+
+* Figuring out how traps work. Right now `Result<T, Trap>` is intended to be supported as a return from a Rust closure, but without generating a function shim it's not trivial to generate a trap. Currently the code sort of cops out by manually doing a segfault via `write_volatile`, but that feels pretty brittle. I'm curious if others have a good idea of how to trigger a trap from Rust code?
+
+* Dealing with multi-value isn't supported yet. I talked with @fitzgen briefly but it sounds like we may not have a native ABI in Rust that matches up with multi-value returns. I'd ideally like to support Rust closures returning, for example, `(i32, i32)` to automatically get wired up to a multi-value return import, but the ABI of that Rust function I don't think matches what Cranelift currently does. I suspect that this will require some work in Cranelift to (maybe?) add a new ABI that matches the `extern "C"` abi for the native platform.
+
+* I'm also curious to largely just get some more eyes on this. I'm shooting for an extremely low overhead `Func` wrapper, but naturally there's a lot of possible unsafety here if things don't line up precisely. Close review would definitely be appreciated!
+
+I've wanted to do this for some time but recently I've been thinking that the `wasmtime-wasi` crate should move over to the `wasmtime` API, but to preserve the current functional semantics where it has zero shims at runtime I felt was important, so I wanted to try to pursue this style of creating a low-overhead `Func`.
+# Issue description
+
+`lightbeam` will try to calculate the remainder even if an overflow occurs in the function `rem_s`. 
+
+``` sh
+$ ./debug_diff_compile panic_remainder_overflow_868_2.wasm 
+thread 'main' panicked at 'attempt to calculate the remainder with overflow', XXX/wasmtime/crates/lightbeam/src/backend.rs:868:56
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace.
+```
+
+This issue is related to the function `rem_s` when dealing with the `i32.rem_s` opcode:
+
+https://github.com/bytecodealliance/wasmtime/blob/420dcd76fd0d684291901c7a6afeb481481dea7e/crates/lightbeam/src/backend.rs#L867-L869
+
+I suspect this issue can also occurs in `rem_u`:
+
+https://github.com/bytecodealliance/wasmtime/blob/420dcd76fd0d684291901c7a6afeb481481dea7e/crates/lightbeam/src/backend.rs#L826-L829
+
+# Reproduction
+
+Download 
+[panic_remainder_overflow_868.zip](https://github.com/bytecodealliance/wasmtime/files/4077577/panic_remainder_overflow_868.zip)
+
+``` wat
+(module
+  (type (;0;) (func (result i32)))
+  (func (;0;) (type 0) (result i32)
+    i32.const -2147483648
+    i32.const -1
+    i32.rem_s
+    unreachable))
+```
+
+wasmtime commit: 7890fa670547578f549a5e4e5d0f69788bed96cf
+Hi, 
+
+During fuzzing i found the following module that is consider as valid for `wasmparser` but reject by `wasmtime` ( both cranelift & lightbeam backend).
+
+[valid_wasmparser_but_reject_wasmtime.zip](https://github.com/bytecodealliance/wasmtime/files/4077379/valid_wasmparser_but_reject_wasmtime.zip)
+
+Return error by `wasmtime`:
+``` sh
+$ wasmtime valid_wasmparser_but_reject_wasmtime.wasm 
+Error: failed to run main module `valid_wasmparser_but_reject_wasmtime.wasm`
+
+Caused by:
+    0: WebAssembly failed to compile
+    1: WebAssembly translation error
+    2: Invalid input WebAssembly code at offset 518: Invalid var_u7
+Error Cranelift: Compile(Wasm(InvalidWebAssembly { message: "Invalid var_u7", offset: 518 }))
+```
+
+Part of #611
+On [master for me currently](https://github.com/bytecodealliance/wasmtime/tree/b2bfb98f1ffbd10209aa2510ce5e5a2dbdafdd25) I get:
+
+```
+$ cargo test --test wast_testsuites misc_traps
+    Finished test [unoptimized + debuginfo] target(s) in 0.09s
+     Running target/debug/deps/wast_testsuites-073f46d5a7733a1a
+
+running 1 test
+error: test failed, to rerun pass '--test wast_testsuites'
+
+Caused by:
+  process didn't exit successfully: `/home/alex/code/wasmtime/target/debug/deps/wast_testsuites-073f46d5a7733a1a misc_traps` (signal: 11, SIGSEGV: invalid memory reference)
+```
+
+The stack trace of the segfault looks like this:
+
+<details>
+
+```
+Thread 1 "wast_testsuites" received signal SIGSEGV, Segmentation fault.
+do_lookup_x (undef_name=undef_name@entry=0x7ffff7593c7b "_Unwind_Find_FDE", new_hash=new_hash@entry=997813959, old_hash=old_hash@entry=0x7ffff7ff50c0, ref=0x7ffff7592f70, result=result@entry=0x7ffff7ff50d0, scope=0x7ffff7ffe428, i=0, version=0x7ffff7fd5680, flags=5, skip=0x0, type_class=1, undef_map=0x7ffff7fd7f00) at dl-lookup.c:338
+338     dl-lookup.c: No such file or directory.
+(gdb) bt
+#0  do_lookup_x (undef_name=undef_name@entry=0x7ffff7593c7b "_Unwind_Find_FDE", new_hash=new_hash@entry=997813959, old_hash=old_hash@entry=0x7ffff7ff50c0, ref=0x7ffff7592f70, result=result@entry=0x7ffff7ff50d0, scope=0x7ffff7ffe428, i=0, version=0x7ffff7fd5680, flags=5, skip=0x0, type_class=1, undef_map=0x7ffff7fd7f00) at dl-lookup.c:338
+#1  0x00007ffff7de01ef in _dl_lookup_symbol_x (undef_name=0x7ffff7593c7b "_Unwind_Find_FDE", undef_map=0x7ffff7fd7f00, ref=ref@entry=0x7ffff7ff5168, symbol_scope=0x7ffff7fd8258, version=0x7ffff7fd5680, type_class=type_class@entry=1, flags=5, skip_map=<optimized out>) at dl-lookup.c:813
+#2  0x00007ffff7de4ec3 in _dl_fixup (l=<optimized out>, reloc_arg=<optimized out>) at ../elf/dl-runtime.c:112
+#3  0x00007ffff7dec7ca in _dl_runtime_resolve_xsavec () at ../sysdeps/x86_64/dl-trampoline.h:125
+#4  0x00007ffff75a1223 in ?? () from /lib/x86_64-linux-gnu/libgcc_s.so.1
+#5  0x00007ffff75a2400 in ?? () from /lib/x86_64-linux-gnu/libgcc_s.so.1
+#6  0x00007ffff75a3108 in _Unwind_Backtrace () from /lib/x86_64-linux-gnu/libgcc_s.so.1
+#7  0x0000555555bccf0d in backtrace::backtrace::libunwind::trace (cb=...) at /home/alex/.cargo/registry/src/github.com-1ecc6299db9ec823/backtrace-0.3.42/src/backtrace/libunwind.rs:86
+#8  backtrace::backtrace::trace_unsynchronized (cb=...) at /home/alex/.cargo/registry/src/github.com-1ecc6299db9ec823/backtrace-0.3.42/src/backtrace/mod.rs:66
+#9  0x0000555555bcce8e in backtrace::backtrace::trace (cb=...) at /home/alex/.cargo/registry/src/github.com-1ecc6299db9ec823/backtrace-0.3.42/src/backtrace/mod.rs:53
+#10 0x0000555555bc530d in backtrace::capture::Backtrace::create (ip=93824998986352) at /home/alex/.cargo/registry/src/github.com-1ecc6299db9ec823/backtrace-0.3.42/src/capture.rs:164
+#11 0x0000555555bc5284 in backtrace::capture::Backtrace::new_unresolved () at /home/alex/.cargo/registry/src/github.com-1ecc6299db9ec823/backtrace-0.3.42/src/capture.rs:158
+#12 0x0000555555b5a16c in RecordTrap (pc=0x7ffff7f29015 "@\213\001@", <incomplete sequence \303>, reset_guard_page=false) at crates/runtime/src/traphandlers.rs:55
+#13 0x0000555555bb2cba in HandleTrap (context=0x7ffff7ff6380, reset_guard_page=false) at signalhandlers/SignalHandlers.cpp:415
+#14 0x0000555555bb2d93 in WasmTrapHandler (signum=11, info=0x7ffff7ff64b0, context=0x7ffff7ff6380) at signalhandlers/SignalHandlers.cpp:645
+#15 <signal handler called>
+#16 0x00007ffff7f29015 in ?? ()
+#17 0x00007fffffff99c0 in ?? ()
+#18 0x00007ffff7f18012 in ?? ()
+#19 0x00007fffffff9ad0 in ?? ()
+#20 0x0000555555bb30b0 in WasmtimeCallTrampoline (vmctx=0x555555bb404e <std::thread::local::LocalKey<T>::try_with+286>, body=0x7ffff7fd2828, args=0x7fffffff99b8) at signalhandlers/Trampolines.cpp:14
+Backtrace stopped: previous frame inner to this frame (corrupt stack?)
+```
+
+</details>
+
+where the faulting instruction looks like this:
+
+<details>
+
+```
+Dump of assembler code for function do_lookup_x:
+   0x00007ffff7ddf240 <+0>:     push   %r15
+   0x00007ffff7ddf242 <+2>:     push   %r14
+   0x00007ffff7ddf244 <+4>:     push   %r13
+   0x00007ffff7ddf246 <+6>:     push   %r12
+   0x00007ffff7ddf248 <+8>:     push   %rbp
+   0x00007ffff7ddf249 <+9>:     push   %rbx
+   0x00007ffff7ddf24a <+10>:    sub    $0x98,%rsp
+   0x00007ffff7ddf251 <+17>:    mov    0x8(%r9),%eax
+=> 0x00007ffff7ddf255 <+21>:    mov    %rdi,0x28(%rsp)
+   0x00007ffff7ddf25a <+26>:    mov    %rsi,(%rsp)
+   0x00007ffff7ddf25e <+30>:    mov    %rdx,0x60(%rsp)
+   0x00007ffff7ddf263 <+35>:    mov    %rcx,0x30(%rsp)
+```
+
+</details>
+
+where I can read `%rsp+0x28` in gdb, but I can't write to it.
+
+I believe what's happening here looks like this:
+
+* [Wasmtime registers signal handlers with `SA_ONSTACK`](https://github.com/bytecodealliance/wasmtime/blob/b2bfb98f1ffbd10209aa2510ce5e5a2dbdafdd25/crates/runtime/signalhandlers/SignalHandlers.cpp#L721-L738)
+* The Rust standard library [configures an alternate stack](https://github.com/rust-lang/rust/blob/117ceeba400e69aa7b8ba5155acd1c8c0cdf7f7f/src/libstd/sys/unix/stack_overflow.rs#L154-L165) if one isn't already configured per-thread. The stack defaults to [`SIGSTKSZ`](https://github.com/rust-lang/rust/blob/117ceeba400e69aa7b8ba5155acd1c8c0cdf7f7f/src/libstd/sys/unix/stack_overflow.rs#L130) bytes, which [is 8192 bytes](https://docs.rs/libc/0.2.66/src/libc/unix/linux_like/linux/gnu/b64/x86_64/mod.rs.html#724) on x86_64 linux.
+* When a wasm trap happens, [we call `Backtrace::new_unresolved`](https://github.com/bytecodealliance/wasmtime/blob/b2bfb98f1ffbd10209aa2510ce5e5a2dbdafdd25/crates/runtime/src/traphandlers.rs#L55). This ends up consuming enough stack space that we blow the stack, hitting presumably some sort of guard page.
+
+This doesn't appear to be happening on CI, and from what I can guess it's relatively localized and dependent on stack sizes here and there. This may also be glibc related because the actual fault itself is in the dynamic loader (presumably since this was the first time I generated a backtrace). I believe, though, that 2 pages (at most) apparently isn't enough to generate a full stack trace (note that we're also hitting things like malloc which we "pray works"). 
+
+I'm not really sure what best to do about this. I can actually "fix" this locally by calling `Backtrace::new_unresolved()` somewhere randomly in the program before it hits a fault, since that way the dynamic loader isn't triggered during the trap handler. Unfortunately it's not really easy for us to set our own stack to handle faults on since that would involve poking with `sigaltstack` on all threads wasmtime is called on, which may lead to excessive overhead. 
+
+The stack pointer of the various frames are, for one trace in a debug build:
+
+| function | `$rsp` | diff from previous |
+|------------|-------|-------------------|
+| `WasmTrapHandler` | 0x7ffff7ff6320 | |
+| `HandleTrap` | 0x7ffff7ff62f0 | 48 |
+| `RecordTrap` | 0x7ffff7ff61f0 | 256 |
+| `backtrace::capture::Backtrace::new_unresolved` | 0x7ffff7ff61e0 | 16 |
+| `backtrace::capture::Backtrace::create` | 0x7ffff7ff6140 | 160 |
+| `backtrace::backtrace::trace` | 0x7ffff7ff60d0 | 112 |
+| `backtrace::backtrace::trace_unsynchronized` | 0x7ffff7ff60a0 | 48 |
+| `backtrace::backtrace::libunwind::trace` | 0x7ffff7ff60a0 | 0 |
+| `_Unwind_Backtrace` | 0x7ffff7ff5df0 | 688 |
+| `??` | 0x7ffff7ff5c30 | 448 |
+| `??` | 0x7ffff7ff5bc0 | 112 |
+| `_dl_runtime_resolve_xsavec` | 0x7ffff7ff5180 | 2624 |
+| `_dl_fixup` | 0x7ffff7ff5150 | 48 |
+| `_dl_lookup_symbol_x` | 0x7ffff7ff5050 | 256 |
+| `do_lookup_x` | 0x7ffff7ff4f80 | 208 |
+
+Since libstd allocates 2 pages for the stack handler, I'm assuming that the stack was from 0x7ffff7ff5000  to 0x7ffff7ff7000, which is why `do_lookup_x` faulted. I'm not sure why `WasmTrapHandler` started so low, but maybe there's a bunch of kernel data structures or signal information on the stack? Unsure.
+
+In any case it looks like we definitely can't run the dynamic loader in SIGSTKSZ, but we presumably can run backtraces because that's what's already happening on CI. I wanted to get this all written down in an issue somewhere because I'm about to send a PR for a pretty bad hack which doesn't truly fix the issue but should patch over the problem for now (hopefully)
+I think the `wasm2obj` binary should be removed.
+This patch adds initial support for ittapi which is an open
+source profiling api for instrumentation and tracing and profiling
+of jitted code.
+
+Build:
+    cargo build --features=profiling
+Profile: // Using amplxe-cl from VTune
+    amplxe-cl -v -collect hostpost target/debug/wasmtime --jitprofile test.wasm
+
+Note, Vtune is a free open source profiling tool for identifying performance bottlenecks. This patch which brings in ittapi-rs when the profiling feature is enabled, currently only supports the profiling of jitted code but I am investigating using ittapi for profiling of wasmtime itself with a future patch that builds on this one.
+# Issue description
+
+An addition with overflow make lightbeam to panic when compiled in debug mode.
+
+Note: This issue is similar to https://github.com/bytecodealliance/wasmtime/issues/738. I suspect other overflows like those ones to be in the code. 
+
+Overflowed values are then provided to dynasm, meaning that in release mode, Lightbeam will generate Assembly code that will try to access invalid memory address (like 0x0, kernel address,  etc.) leading to different errors/panics.
+
+
+``` sh
+$ ./target/debug/debug_lightbeam load_add_overflow_lightbeam.wasm 
+thread 'main' panicked at 'attempt to add with overflow', XXX/wasmtime/crates/lightbeam/src/backend.rs:1934:106
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace.
+```
+
+This issue is related to the macro `load!` when dealing with the `i32.load16_s` opcode:
+
+https://github.com/bytecodealliance/wasmtime/blob/420dcd76fd0d684291901c7a6afeb481481dea7e/crates/lightbeam/src/backend.rs#L1932-L1935
+
+# Reproduction
+
+Download: 
+[load_add_overflow_lightbeam.zip](https://github.com/bytecodealliance/wasmtime/files/4058251/load_add_overflow_lightbeam.zip)
+
+or `wasm2wat load_add_overflow_lightbeam.wasm
+`:
+``` wat
+(module
+  (type (;0;) (func))
+  (func (;0;) (type 0)
+    i32.const 2
+    i32.const 1
+    i32.load16_s offset=2147483647 align=1
+    unreachable)
+  (memory (;0;) 1)
+  (export "_start" (func 0))
+)
+```
+
+Testing program (need to be compiled in debug mode i.e. `RUSTFLAGS=-g cargo build`):
+
+``` rust
+use std::env;
+use std::fs::{File};
+use std::io;
+use std::io::Read;
+use std::path::PathBuf;
+
+use wasmtime_fuzzing::oracles;
+use wasmtime_jit::CompilationStrategy;
+
+/// Read the contents of a file
+fn read_contents(path: &PathBuf) -> Result<Vec<u8>, io::Error> {
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut file = File::open(path)?;
+    file.read_to_end(&mut buffer)?;
+    drop(file);
+    Ok(buffer)
+}
+
+fn main() {
+	let args: Vec<String> = env::args().collect();
+	let wasm_path = std::path::PathBuf::from(&args[1]);
+	let wasm_binary: Vec<u8> = read_contents(&wasm_path).unwrap();
+
+    let _res_compile = oracles::compile(&wasm_binary[..], CompilationStrategy::Lightbeam);
+}
+```
+
+wasmtime commit: 420dcd76fd0d684291901c7a6afeb481481dea7e
+
+This commit adds support to the `wasmtime::Module` type to parse the
+text format. This is often quite convenient to support in testing or
+tinkering with the runtime. Additionally the `wat` parser is pretty
+lightweight and easy to add to builds, so it's relatively easy for us to
+support as well!
+
+The exact manner that this is now supported comes with a few updates to
+the existing API:
+
+* A new optional feature of the `wasmtime` crate, `wat`, has been added.
+  This is enabled by default.
+* The `Module::new` API now takes `impl AsRef<[u8]>` instead of just
+  `&[u8]`, and when the `wat` feature is enabled it will attempt to
+  interpret it either as a wasm binary or as the text format. Note that
+  this check is quite cheap since you just check the first byte.
+* A `Module::from_file` API was added as a convenience to parse a file
+  from disk, allowing error messages for `*.wat` files on disk to be a
+  bit nicer.
+* APIs like `Module::new_unchecked` and `Module::validate` remain
+  unchanged, they require the binary format to be called.
+
+The intention here is to make this as convenient as possible for new
+developers of the `wasmtime` crate. By changing the default behavior
+though this has ramifications such as, for example, supporting the text
+format implicitly through the C API now.
+
+I'm curious to get others' feedback here on this change, there's naturally a number of variations this could take beyond the one I'm proposing here:
+
+* We could not add support at all, the `wat` crate is "just one `Cargo.toml` line away" anyway
+* We could make `wat` an off-by-default feature
+* We could add explicit functions to parse `*.wat` files
+
+I would personally advocate that this proposal, as-is, is the best of all worlds though. @sunfishcode's suggestion of a `wat::parse_bytes` function which takes either `*.wasm` or `*.wat` is perhaps the single-most convenient thing I've seen in a long time, so I think we can get a lot of mileage from enabling this by default in all the typical APIs. If an environment doesn't want the `wat` parser to be supported, then it's always optional and can be easily disabled without affecting clients too much, since `*.wat` parsing is likely only used as a convenience.
+If you build with https://github.com/PyO3/maturin rather than setuptools-rust I hear it's less picky about which python version the result binds to. Might help simplify your build a bit maybe?

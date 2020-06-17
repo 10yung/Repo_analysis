@@ -1,0 +1,168 @@
+Where do you use the automatic face tracker, whose usage you explain in the paper. It is critical and important for most applications but I cannot find any.
+Hi!
+
+First of all thank you for your contribution to the field!
+
+I have concerns about the input video format (.mp4) as these typically apply some compression to the images. It would be more faithful if for example the input video data also would be in `.mat` (uncompressed raw data). Of course a general large benchmark dataset could be constructed in this way to benchmark the different algorithms that is in line with your codes.
+
+It would be also nice to include Wang's FVP algo.:
+
+```
+function H = FVP(frames, Fs)
+    %FVP Full Video Pulse extraction
+    %   frames: sequence of RGB images (N, h, w, c)
+    %   Fs: Frame rate
+    
+    N = size(frames, 1);
+    K = 6; 
+    L1 = Fs; 
+    u0 = 1; 
+    L2 = 128; 
+    B = [6, 24];            % pulse band (calculated for L2!)
+    Jt = zeros(4*K, N, 3);
+    
+    Pt = zeros(4 * K, N);
+    Zt = zeros(4*K, N); 
+    H = zeros(1, N);
+    
+    for i=1:N
+        % Generate weighting masks
+        Id = imresize(squeeze(frames(i,:,:,:)), [20, 20], 'box'); % downsize
+        D = reshape(bsxfun(@rdivide, Id, sum(Id, 3)), [size(Id, 1)*size(Id, 2), 3]);
+        
+        A = pdist2(D, D, 'euclidean');
+        
+        [u, ~, ~] = svds(A, K);
+        
+        % correct the eigenvector signs
+        u = bsxfun(@times, u, sign(sum(u0.*u, 1))); 
+        u0 = u; 
+        
+        w = [u(:,1:K), -u(:, 1 : K)]'; 
+        w = bsxfun(@minus, w, min(w, [], 2));
+        w = bsxfun(@rdivide, w, sum(w, 2));
+        
+        % Weight and combine spatial pixel values
+        J = bsxfun(@times, reshape(Id, [1, size(Id, 1) * size(Id, 2), 3]), w);
+        Jt(:, i, :) = [mean(J, 2); var(J, [], 2)];
+        
+        % Extract rPPg-signals (with POS)
+        if(i >= L1)
+            C = Jt(:, i - L1 + 1 : i, :); 
+            Cn = bsxfun(@rdivide, C, mean(C, 2)) - 1;
+            X = Cn(:, :, 2) - Cn(:, :, 3); Y = Cn(:, :, 2) + Cn(:, :, 3) - 2 * Cn(:, :, 1);
+            P = X + bsxfun(@times, std(X, [], 2)./std(Y, [], 2), Y); 
+            Z = Cn(:, :, 1) + Cn(:, :, 2) + Cn(:, :, 3);
+            
+            Pt(:, i - L1 + 1 : i) = Pt(:, i - L1 + 1 : i) + bsxfun(@rdivide, bsxfun(@minus, P, mean(P, 2)), std(P, [], 2));
+            Zt(:, i - L1 + 1 : i) = Zt(:, i - L1 + 1 : i) + bsxfun(@rdivide, bsxfun(@minus, Z, mean(Z, 2)), std(Z, [], 2));
+        end
+        
+        % Combine rPPG signals into pulse
+        if(i >= L2)
+            P = Pt(:, i - L2 + 1 : i); 
+            Z = Zt(:, i - L2 + 1 : i);
+            
+            Fp = fft(bsxfun(@rdivide, bsxfun(@minus, P, mean(P, 2)), std(P, [], 2)), [], 2)/L2;
+            Fz = fft(bsxfun(@rdivide, bsxfun(@minus, Z, mean(Z, 2)), std(Z, [], 2)), [], 2)/L2;
+            
+            W = abs(Fp.* conj(Fp))./(1 + abs(Fz.* conj(Fz)));
+            
+            W(:, 1 : B(1) - 1) = 0;
+            W(:, B(2) + 1 : end) = 0;
+            h = real(ifft(sum(W.* Fp, 1), [], 2));
+
+            H(:, i - L2 + 1 : i) = H(:, i - L2 + 1 : i) + (h - mean(h))/std(h);
+        end
+    end
+end
+```
+
+And an example for the usage of the code:
+
+```
+addpath('~/CODES/MATLAB/algorithms');
+
+N = 6000;                             % Num of frames in the directory
+Fs = 20;
+L2 = 256;
+stride = 128;
+
+result = zeros(1, N);
+frames = zeros(1, 500, 500, 3);
+
+dur = 0;
+fi = 1;
+for i=1:N
+    fname = sprintf('../PIC_12bit_191111/%06d.png', i-1);
+    frames(fi, :,:,:) = imread(fname);
+    fi = fi+1;
+    %imshow(squeeze(frames(i, :,:,:))/max(frames(i, :,:,:), [], 'all'));
+    
+    if size(frames, 1) == L2
+       disp('Calculating POS')
+       result(i-L2+1:i) = result(i-L2+1:i) + FVP(frames, Fs);
+
+       
+       frames(1:stride,:,:,:) = [];
+       fi = fi - stride; % change frame indexing according deletion
+    end
+    
+    disp(i);
+end
+```
+
+This is the original code he submitted in his PHD thesis, but I would apply some modifications on it. To be more specific, it is not advisable to zero out frequencies in the Fourier domain and then transform back, that part could be changed to zero phase filtering (the way you do generally on the implemented algos):
+
+```
+% W(:, 1 : B(1) - 1) = 0; 
+%  W(:, B(2) + 1 : end) = 0; 
+h = real(ifft(sum(W.* Fp, 1), [], 2));
+
+%% Parameters
+LPF = 0.7; %low cutoff frequency (Hz) - 0.8 Hz in reference
+HPF = 2.5; %high cutoff frequency (Hz) - both 6.0 Hz and 2.0 Hz used in reference
+%% Filter, Normalize
+NyquistF = 1/2*FS;
+[B,A] = butter(3,[LPF/NyquistF HPF/NyquistF]);%Butterworth 3rd order filter - originally specified in reference with a 4th order butterworth using filtfilt function
+BVP_F = filtfilt(B,A,(double(h)-mean(h)));
+```
+
+
+Thank you for sharing, it is a good open source project. However, I found that the cut-off frequency of the band pass filter seems to be inconsistent with the corresponding comment, leading to wrong cut-off frequency of the filter. This problem exist for several methods including CHROM, ICA, GREEN, POS.
+
+![image](https://user-images.githubusercontent.com/11822621/53710223-1f612000-3e77-11e9-8eb6-2f28ba497895.png)
+
+Here is the corresponding frequency respond of the filter using filtfilt and the code how I get it.
+
+
+`````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````
+fps = 20;
+LPF = 0.5;   % low cutoff frequency (Hz)  - specified as 30 bpm (~0.667 Hz) in reference
+HPF = 2.5;   % high cutoff frequency (Hz) - specified as 240 bpm (~4.0 Hz) in reference
+
+n = -511:512;
+n0 = 0;
+imp = (n==n0);
+
+NyquistF = 1/2*fps;
+[B,A] = butter(3,[LPF/NyquistF HPF/NyquistF]);
+
+imp_rep = filtfilt(B,A,double(imp));
+
+N = 2^nextpow2(length(imp_rep));
+F = fft(imp_rep,N);
+freq_step = fps/N;
+freq = -fps/2:freq_step:fps/2-freq_step;
+freq = freq.*60; %Hz to bpm
+freq = freq(N/2+1:end)';
+
+plot(freq,abs(F(1:N/2)));
+xlabel('freq(bpm)');
+ylabel('mag');
+`````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````
+
+![image](https://user-images.githubusercontent.com/11822621/53710270-5e8f7100-3e77-11e9-9fcf-8ba52e64c62b.png)
+
+
+Thank you for sharing, it is a good open source project. But when I was executing the POS_WANG.m file, there was a problem on line 109 of it. Cn = (RGB(m:n,:) ./ mean(RGB(m:n,:)) )) The matrix dimensions are inconsistent.

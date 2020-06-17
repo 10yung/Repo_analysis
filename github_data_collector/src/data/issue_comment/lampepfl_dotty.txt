@@ -1,0 +1,404 @@
+Not sure what's going on here, but we definitely need to tune our heuristics:
+```scala
+val x: 1 | 2 = 3
+```
+```scala
+-- [E007] Type Mismatch Error: try/res.scala:6:15 ------------------------------
+6 |val x: 1 | 2 = 3
+  |               ^
+  |Found:    (3 : Int)
+  |Required: (1 : Int) | (2 : Int)
+  |
+  |One of the following imports might make progress towards fixing the problem:
+  |
+  |  import Int.int2double
+  |  import Int.int2float
+  |  import Int.int2long
+  |  import math.BigDecimal.int2bigDecimal
+  |  import math.BigInt.int2bigInt
+  |  import math.Numeric.IntIsIntegral.mkNumericOps
+  |  import math.Numeric.BigIntIsIntegral.mkNumericOps
+  |  import math.Numeric.IntIsIntegral.mkOrderingOps
+  |  import math.Ordering.Int.mkOrderingOps
+  |  import Long.long2double
+  |  import Long.long2float
+  |  import math.BigDecimal.long2bigDecimal
+  |  import math.BigInt.long2bigInt
+  |  import math.Numeric.LongIsIntegral.mkNumericOps
+  |  import math.Numeric.FloatIsFractional.mkNumericOps
+  |  import math.Ordering.Long.mkOrderingOps
+  |  import Float.float2double
+  |  import math.BigDecimal.double2bigDecimal
+  |  import math.Numeric.DoubleIsFractional.mkNumericOps
+  |  import math.Numeric.BigDecimalAsIfIntegral.mkNumericOps
+  |  import math.Numeric.BigDecimalIsFractional.mkNumericOps
+  |  import math.Numeric.LongIsIntegral.mkOrderingOps
+  |  import math.Numeric.BigDecimalAsIfIntegral.mkOrderingOps
+  |  import math.Numeric.BigDecimalIsFractional.mkOrderingOps
+  |  import math.Numeric.BigIntIsIntegral.mkOrderingOps
+  |  import math.Numeric.FloatIsFractional.mkOrderingOps
+  |  import math.Numeric.DoubleIsFractional.mkOrderingOps
+  |  import math.Ordering.BigDecimal.mkOrderingOps
+  |  import math.Ordering.BigInt.mkOrderingOps
+  |  import math.Ordering.DeprecatedFloatOrdering.mkOrderingOps
+  |  import math.Ordering.Float.IeeeOrdering.mkOrderingOps
+  |  import math.Ordering.Float.TotalOrdering.mkOrderingOps
+  |  import math.Ordering.DeprecatedDoubleOrdering.mkOrderingOps
+  |  import math.Ordering.Double.IeeeOrdering.mkOrderingOps
+  |  import math.Ordering.Double.TotalOrdering.mkOrderingOps
+  |  import collection.Searching.search
+  |  import math.Fractional.Implicits.infixFractionalOps
+  |  import math.Integral.Implicits.infixIntegralOps
+  |  import math.Numeric.Implicits.infixNumericOps
+  |  import math.Ordered.orderingToOrdered
+  |  import math.Ordering.Implicits.infixOrderingOps
+  |  import reflect.Selectable.reflectiveSelectable
+  |  import util.chaining.scalaUtilChainingOps
+  |  import implicits.Not.amb1
+  |  import implicits.Not.amb2
+  |
+1 error found
+```
+
+(by the way, the error message doesn't mention the concept of implicit/given at all, so it might be hard for a user to understand why adding an implicit would make a difference at all)
+Following up on #7965 we resolved the assertion error but are still seeing some regressions in type inference versus Scala 2. Relatively minimized example below.
+## minimized code
+
+```Scala
+object Example extends App {
+
+  trait Has[A]
+
+  trait ZIO[-R] {
+    def provideLayer[R0, R1 <: Has[_]](
+        layer: ZLayer[R0, R1]
+    )(implicit ev: R1 <:< R): ZIO[R0] =
+      ???
+  }
+
+  trait ZLayer[-RIn, +ROut <: Has[_]] {
+    def ++[RIn2, ROut1 >: ROut <: Has[_], ROut2 <: Has[_]](
+        that: ZLayer[RIn2, ROut2]
+    ): ZLayer[RIn with RIn2, ROut1 with ROut2] = ???
+  }
+
+  trait RandomService
+  trait SizedService
+
+  type Random = Has[RandomService]
+  type Sized = Has[SizedService]
+
+  def random: ZLayer[Random, Random] = ???
+  def sized: ZLayer[Any, Sized] = ???
+
+  lazy val zio: ZIO[Random with Sized] = ???
+
+  // Okay on Scala 2, does not compile on Dotty
+  lazy val eliminated: ZIO[Random] =
+    zio.provideLayer(random ++ sized)
+
+  // Compiles on Dotty with an explicit type annotation
+  lazy val eliminated2: ZIO[Random] =
+    zio.provideLayer[Random, Random with Sized](random ++ sized)
+
+  println("It compiles!")
+}
+```
+
+https://scastie.scala-lang.org/q88sfaKXTmiTJ6Iu1umiqw
+
+<details>
+<summary>Compilation output</summary>
+
+```scala
+Cannot prove that Example.Has[?
+   >: Example.RandomService & Example.SizedService <: Example.RandomService | 
+    Example.SizedService
+] <:< Example.Random & Example.Sized..
+I found:
+
+    <:<.refl[Nothing]
+
+But method refl in object <:< does not match type Example.Has[?
+   >: Example.RandomService & Example.SizedService <: Example.RandomService | 
+    Example.SizedService
+] <:< (Example.Random & Example.Sized).
+```
+</details>
+
+## expectation
+
+I would have expected this to compile without an explicit type annotation as it does on Scala 2.
+
+Copying @jdegoes.
+## minimized code
+
+(note, that ready to run project is attached.  Also it's situated in  dotty-break-while-00 branch on github  https://github.com/rssh/dotty-cps-async/tree/dotty-break-while-00 
+
+let we have next macro definitions:
+```Scala
+package c
+  
+import scala.quoted._
+import scala.quoted.matching._
+
+trait CB[T]
+
+object CBF {
+   def pure[T](value:T): CB[T] = ???
+   def map[A,B](fa:CB[A])(f: A=>B):CB[B] = ???
+   def flatMap[A,B](fa:CB[A])(f: A=>CB[B]):CB[B] = ???
+}
+
+
+case class CpsChunk[T](prev: Seq[Expr[_]], last:Expr[CB[T]])
+
+    def toExpr(given QuoteContext): Expr[CB[T]] =
+      if (prev.isEmpty)
+        last
+      else
+        Expr.block(prev.toList,last)
+
+trait CpsChunkBuilder[T:Type]
+
+  def isAsync: Boolean
+
+  def create(): CpsChunk[T]
+
+  def append[A:Type](chunk: CpsChunk[A]): CpsChunk[A]
+
+  protected def fromFExpr(f: Expr[CB[T]]): CpsChunk[T] =
+          CpsChunk(Seq(),f)
+
+  def flatMap[A:Type](t: Expr[T => CB[A]])(given QuoteContext): CpsChunk[A] =
+                 CpsChunk[A](Seq(),
+                      '{ CBF.flatMap(${create().toExpr})(${t}) }
+                 )
+
+  def flatMapIgnore[A:Type](t: Expr[CB[A]])(given QuoteContext): CpsChunk[A] =
+           CpsChunk[A](Seq(),
+                 '{ CBF.flatMap(${create().toExpr})(_ => ${t}) }
+           )
+
+  def transformed(given QuoteContext): Expr[CB[T]] = create().toExpr
+
+
+object CpsChunkBuilder
+
+   def sync[T:Type](f:Expr[T])(given QuoteContext):CpsChunkBuilder[T] =
+     new CpsChunkBuilder[T] {
+        override def isAsync = false
+        override def create() = fromFExpr('{ CBF.pure($f) })
+        override def append[A:Type](e: CpsChunk[A]) =
+            CpsChunk(f +: e.prev, e.last)
+     }
+
+   def async[T:Type](f:Expr[CB[T]])(given QuoteContext):CpsChunkBuilder[T] =
+     new CpsChunkBuilder[T] {
+        override def isAsync = true
+        override def create() = fromFExpr(f)
+        override def append[A:Type](e: CpsChunk[A]) = flatMapIgnore(e.toExpr)
+     }
+
+
+erased def await[T](f: CB[T]):T = ???
+
+
+object Async {
+
+  inline def transform[T](expr: =>T): CB[T] =
+    ${ Async.transformImpl[T]('expr) }
+
+ def transformImpl[T:Type](f: Expr[T])(given qctx: QuoteContext): Expr[CB[T]] =
+    rootTransform[T](f).transformed
+  def rootTransform[T:Type](f: Expr[T])(given qctx: QuoteContext): CpsChunkBuilder[T] =
+     import qctx.tasty.{_, given}
+     import util._
+     f match
+         case Const(c) =>
+                        CpsChunkBuilder.sync(f)
+         case '{ _root_.c.await[$fType]($ft) } =>
+                        val awBuild = CpsChunkBuilder.async(ft)
+                        awBuild.asInstanceOf[CpsChunkBuilder[T]]
+         case '{ while ($cond) { $repeat }  } =>
+                        val cpsCond = Async.rootTransform(cond)
+                        val cpsRepeat = Async.rootTransform(repeat)
+                        val isAsync = cpsCond.isAsync || cpsRepeat.isAsync
+                        CpsChunkBuilder.async(
+                          '{
+                             def _whilefun(): CB[T] = {
+                               ${cpsCond.flatMap[T]( '{ c =>
+                                 if (c) {
+                                   ${cpsRepeat.flatMapIgnore(
+                                       '{ _whilefun() }
+                                  ).toExpr}
+                                 } else {
+                                  CBF.pure(()).asInstanceOf[CB[T]]
+                                 }
+                               }).toExpr
+                               }
+                             }
+                             _whilefun()
+                          })
+        case _ =>
+             val fTree = f.unseal.underlyingArgument
+             fTree match {
+                case Apply(fun,args) =>
+                   CpsChunkBuilder.sync(f)
+                case Block(prevs,last) =>
+                   val rPrevs = prevs.map{
+                     case d: Definition =>
+                       ???
+                     case t: Term =>
+                       t.seal match
+                          case '{ $p:$tp } =>
+                             Async.rootTransform(p)
+                          case other =>
+                             ???
+                   }
+                   val rLast = Async.rootTransform[T](last.seal.asInstanceOf[Expr[T]])
+                   val lastChunk = rLast.create()
+                   val blockResult = rPrevs.foldRight(lastChunk)((e,s) => e.append(s))
+                   val isAsync = rLast.isAsync || rPrevs.exists(_.isAsync)
+                   CpsChunkBuilder.async[T](blockResult.toExpr)
+                case Ident(name) =>
+                   CpsChunkBuilder.sync(f)
+                case _ =>
+                   printf("fTree:"+fTree)
+                   ???
+             }
+
+}
+```
+And try to eval macro in other compilation unit:
+
+```Scala
+package c
+  
+import org.junit.{Test,Ignore}
+import org.junit.Assert._
+
+class TestBS1While
+
+  def cbBool(b:Boolean): CB[Boolean] = ???
+
+ // Dotty crash.
+ // TODO: minimize and submit bug.
+ //
+  @Test def tWhileC1_11(): Unit =
+     val c = Async.transform[Unit]{
+        while(await(cbBool(false))) {
+          await(cbBool(false))
+        }
+     }
+     assert(true)
+```
+
+<details>
+<summary>Stack trace</summary>
+```scala
+[error]    |Exception occurred while executing macro expansion.
+[error]    |java.lang.AssertionError: assertion failed
+[error]    |	at dotty.DottyPredef$.assertFail(DottyPredef.scala:16)
+[error]    |	at dotty.tools.dotc.ast.tpd$.Apply(tpd.scala:45)
+[error]    |	at dotty.tools.dotc.core.tasty.TreeUnpickler$TreeReader.readLengthTerm$1(TreeUnpickler.scala:1091)
+[error]    |	at dotty.tools.dotc.core.tasty.TreeUnpickler$TreeReader.readTerm(TreeUnpickler.scala:1212)
+[error]    |	at dotty.tools.dotc.core.tasty.TreeUnpickler$TreeReader.readLengthTerm$1(TreeUnpickler.scala:1104)
+[error]    |	at dotty.tools.dotc.core.tasty.TreeUnpickler$TreeReader.readTerm(TreeUnpickler.scala:1212)
+[error]    |	at dotty.tools.dotc.core.tasty.TreeUnpickler$TreeReader.readLengthTerm$1(TreeUnpickler.scala:1115)
+[error]    |	at dotty.tools.dotc.core.tasty.TreeUnpickler$TreeReader.readTerm(TreeUnpickler.scala:1212)
+[error]    |	at dotty.tools.dotc.core.tasty.TreeUnpickler.unpickle(TreeUnpickler.scala:107)
+[error]    |	at dotty.tools.dotc.core.tasty.DottyUnpickler.computeRootTrees(DottyUnpickler.scala:59)
+[error]    |	at dotty.tools.dotc.ast.tpd$TreeProvider.rootTrees(tpd.scala:1107)
+[error]    |	at dotty.tools.dotc.core.tasty.DottyUnpickler.rootTrees(DottyUnpickler.scala:41)
+[error]    |	at dotty.tools.dotc.ast.tpd$TreeProvider.tree(tpd.scala:1111)
+[error]    |	at dotty.tools.dotc.core.tasty.DottyUnpickler.tree(DottyUnpickler.scala:41)
+[error]    |	at dotty.tools.dotc.core.quoted.PickledQuotes$.unpickle(PickledQuotes.scala:131)
+[error]    |	at dotty.tools.dotc.core.quoted.PickledQuotes$.unpickleExpr(PickledQuotes.scala:66)
+[error]    |	at dotty.tools.dotc.tastyreflect.ReflectionCompilerInterface.unpickleExpr(ReflectionCompilerInterface.scala:38)
+[error]    |	at scala.runtime.quoted.Unpickler$.unpickleExpr$direct(Unpickler.scala:16)
+[error]    |	at c.Async$.rootTransform$$anonfun$8$6$$anonfun$5$$anonfun$5$3$$anonfun$3(Async.scala:95)
+[error]    |	at dotty.tools.dotc.core.tasty.TreeUnpickler$TreeReader.readHole(TreeUnpickler.scala:1293)
+[error]    |	at dotty.tools.dotc.core.tasty.TreeUnpickler$TreeReader.readLengthTerm$1(TreeUnpickler.scala:1204)
+[error]    |	at dotty.tools.dotc.core.tasty.TreeUnpickler$TreeReader.readTerm(TreeUnpickler.scala:1212)
+[error]    |	at dotty.tools.dotc.core.tasty.TreeUnpickler$TreeReader.readLengthTerm$1(TreeUnpickler.scala:1115)
+[error]    |	at dotty.tools.dotc.core.tasty.TreeUnpickler$TreeReader.readTerm(TreeUnpickler.scala:1212)
+[error]    |	at dotty.tools.dotc.core.tasty.TreeUnpickler$TreeReader.readLengthTerm$1(TreeUnpickler.scala:1104)
+[error]    |	at dotty.tools.dotc.core.tasty.TreeUnpickler$TreeReader.readTerm(TreeUnpickler.scala:1212)
+[error]    |	at dotty.tools.dotc.core.tasty.TreeUnpickler$TreeReader.readLengthTerm$1(TreeUnpickler.scala:1123)
+...
+```
+</details>
+
+  When looking at problem, I see that Apply assume RefTree or GenericApply,  but actual value is Inlined.
+
+[dotty-cps-minimized-break-while11.tar.gz](https://github.com/lampepfl/dotty/files/4081235/dotty-cps-minimized-break-while11.tar.gz)
+
+
+Currently in order to unpickle the parents of a template in TASTy, you must parse many arbitrary trees including selecting the correct overloaded constructor, and performing unification of type variables on the return type of that constructor.
+
+In Scala 2 all that is required is the types of the parents; it is inefficient to traverse expressions to calculate and propagate a type.
+
+there should be a simple list of types enumerating the parents, that can be referenced to from the actual trees that make up the extends clauses.
+fixes #5201
+
+a previous PR in this area was #5783 by @Fnux, but it languished because it combined the basic license change with adding copyright headers to all the source files. this PR has just the license change; the headers stuff could perhaps be revived separately
+
+I kept @Fnux as author of the commit, and bumped the copyright year to 2020
+This PR adds a simple form of dependent typing by allowing match expressions to be typed as match types when their scrutinee type, pattern types, and body types align. Concretely, this means that we can define a value level counterpart to the `LeafElem` type from the match type documentation, and type check that expression with the match type: 
+
+```scala
+type LeafElem[X] = X match {
+  case String      => Char
+  case Array[t]    => LeafElem[t]
+  case Iterable[t] => LeafElem[t]
+  case AnyVal      => X
+}
+
+def leafElem[X](x: X): LeafElem[X] =
+  x match {
+    case x: String      => x.charAt(0)
+    case x: Array[t]    => leafElem(x(0))
+    case x: Iterable[t] => leafElem(x.head)
+    case _: AnyVal      => x
+  }
+```
+
+This special mode of typing for match expressions is only used when the following conditions are met: (that logic is implemented by the `isMatchTypeShaped` function in Typer.scala)
+
+1. The match expression patterns do not have guards
+2. The match expression scrutinee's type is a subtype of the match type scrutinee's type
+3. The match expression and the match type have the same number of cases
+4. The match expression patterns are all [Typed Patterns](https://scala-lang.org/files/archive/spec/2.13/08-pattern-matching.html#typed-patterns), and these types are `=:=` to their corresponding type patterns in the match type
+
+Follow up work could potentially relax some of these conditions, for instance to support unapply patterns that are equivalent to typed patterns.
+Currently, the phase `MoveStatic` has two functionality:
+
+- Move `@static` members from the companion object `A` to the class `A`
+- Create static constructor for static fields of the class `A`
+
+In an earlier phase, `CheckStatic` checks that `@static` members only locate in the companion object A. This restriction is just for semantic-correctness of user-written programs (to avoid changing the typer). For code that is synthesized from compiler phases, this restriction is annoying.
+
+We can make `@static` a general mechanism in the compiler by splitting `MoveStatic` into two phases:
+
+- one phase that performs the moving (can be merged with `CheckStatic`)
+- one phase `StaticConstructors` that synthesize the static constructor for static fields.
+
+The phase `CompleteJavaEnums` will benefit from the refactoring #8008.
+Repeats the changes in #7080 for `dotty-tasty-consumer`.
+
+Extract the staging out of the standard library and compiler.
+* Create `dotty-tasty-consumer` project that depends on `dotty-compiler`
+* Add missing test infrastructure dependencies on the `dotty-tasty-consumer` project or jar
+* Move `tasty.file.{ConsumeTasty, TastyConsumer}`, `TastyConsumerPhase`, and`TastyFromClass` to `dotty-tasty-consumer`
+* Implement `ConsumeTasty.apply` directly (instead of as a java reflection call)
+* Now projects need to depend on `"ch.epfl.lamp" %% "dotty-tasty-consumer" % scalaVersion.value`
+* Factored out `dotty.tools.dotc.util.ClasspathFromClassloader` core logic for `dotty-staging` and `dotty-tasty-consumer`
+* Enabled `tastdoc` tests on CI (mostly to check it compiles)
+The idea is to have a library that users can depend on (instead of the compiler itself). It will be similar to the changes done in #7080 when we created the `dotty-staging` library. We should probably rename `ConsumeTasty` to something more meaningful at this point.
+Please update syntax docs:
+ https://dotty.epfl.ch/docs/internals/syntax.html
+
+To reflect the changes: 
+https://github.com/lampepfl/dotty/issues/2041
+https://dotty.epfl.ch/docs/reference/changed-features/wildcards.html

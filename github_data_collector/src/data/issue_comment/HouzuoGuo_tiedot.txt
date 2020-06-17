@@ -1,0 +1,242 @@
+In #157 from how I can interpret it, added json config feature to set how much space tiedot shall use when creating the database, yet there's barely any hint of where the documentation is nor any examples/guidelines on how to use it beyond godocs.
+It works well when I check it yesterday, it has stores 51GB data.
+today it grows up to 61GB, it return nothing by http api, also by golang script.
+when I use Scrub to fix ,  panic as below
+
+panic: runtime error: makeslice: len out of range
+
+goroutine 1 [running]:
+github.com/HouzuoGuo/tiedot/data.(*Collection).Read(0xc00005e400, 0x17c0abd, 0x0, 0x0, 0x0)
+	/root/go/src/github.com/HouzuoGuo/tiedot/data/collection.go:47 +0x11f
+github.com/HouzuoGuo/tiedot/data.(*Partition).ForEachDoc(0xc000060600, 0x0, 0x14a, 0xc00009de00, 0x1)
+	/root/go/src/github.com/HouzuoGuo/tiedot/data/partition.go:133 +0xf1
+github.com/HouzuoGuo/tiedot/db.(*Col).forEachDoc(0xc0000843c0, 0xc00009de00, 0x510d00)
+	/root/go/src/github.com/HouzuoGuo/tiedot/db/col.go:116 +0x137
+github.com/HouzuoGuo/tiedot/db.(*DB).Scrub(0xc0000602d0, 0x510dff, 0xd, 0x0, 0x0)
+	/root/go/src/github.com/HouzuoGuo/tiedot/db/db.go:212 +0x581
+main.main()
+	/root/go/src/examples/main/dbtest.go:34 +0x14e
+Hi! Seems variable `numPartsAssumed` is unused and it can return error early. Please review it
+https://github.com/HouzuoGuo/tiedot/blob/791033267fb3d7b02f0465a2527e8048485ee506/httpapi/srv_test.go#L131
+
+Looks like there is a mistake inside 3 recovers inside that file.
+If `r` is `nil`, it can't match `sprintf` result, so there is something wrong here.
+I would guess that `&&` should be changed to `||`, but `r == fmt.Sprintf(...)` also look incorrect.
+Anyway, I don't have any context, it looks like it tries to test that panic is caught and that the value returned by `recover` match the expected one. Code inside tests doesn't do that in a clear way. right now.
+
+Hello,
+I was playing with Tiedot and came across an interesting scenario. I took the example code and modified it to simulate some concurrency.
+
+Here is my code:
+```
+package main
+
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/HouzuoGuo/tiedot/db"
+	"github.com/HouzuoGuo/tiedot/dberr"
+)
+
+func main() {
+	myDBDir := "MyDatabase"
+	os.RemoveAll(myDBDir)
+	defer os.RemoveAll(myDBDir)
+
+	// (Create if not exist) open a database
+	myDB, err := db.OpenDB(myDBDir)
+	if err != nil {
+		panic(err)
+	}
+
+	// Create  collections: Feeds
+	if err := myDB.Create("Feeds"); err != nil {
+		panic(err)
+	}
+
+	// ****************** Document Management ******************
+
+	// Start using a collection (the reference is valid until DB schema changes or Scrub is carried out)
+	feeds := myDB.Use("Feeds")
+
+	go func() {
+		// myDB, err := db.OpenDB(myDBDir)
+		// if err != nil {
+		// 	panic(err)
+		// }
+		// feeds := myDB.Use("Feeds")
+		for {
+			// Insert document (afterwards the docID uniquely identifies the document and will never change)
+			docID, err := feeds.Insert(map[string]interface{}{
+				"doc": fmt.Sprintf("Go 1.2 is released %d", time.Now().UnixNano())})
+			if err != nil {
+				panic(err)
+			}
+
+			// Read document
+			readBack, err := feeds.Read(docID)
+			if err != nil {
+				panic(err)
+			}
+			fmt.Println("Inserting - Document", docID, "is", readBack)
+			// if err := myDB.Scrub("Feeds"); err != nil {
+			// 	panic(err)
+			// }
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	time.Sleep(time.Second)
+	go func() {
+		// myDB, err := db.OpenDB(myDBDir)
+		// if err != nil {
+		// 	panic(err)
+		// }
+		// feeds := myDB.Use("Feeds")
+		for {
+			fmt.Println("Read - looping")
+			// Process all documents (note that document order is undetermined)
+			feeds.ForEachDoc(func(id int, _ []byte) (willMoveOn bool) {
+				fmt.Println("Read - Document id:", id)
+				data, err := feeds.Read(id)
+				if err != nil {
+					panic(err)
+				}
+				fmt.Println("Read - Document read:", data)
+
+				err = feeds.Delete(id)
+				if dberr.Type(err) == dberr.ErrorNoDoc {
+					fmt.Println("Read - The document was already deleted")
+				} else {
+					panic(err)
+				}
+				return true // move on to the next document
+			})
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	fmt.Println("Out of the loops. . . ")
+	var str string
+	fmt.Scanln(&str)
+	// Gracefully close database
+	if err := myDB.Close(); err != nil {
+		panic(err)
+	}
+}
+
+```
+
+I tried this on a mac and a linux box and the behavior was exactly the same. Looks like foreach locks up after the first read.
+  
+https://github.com/HouzuoGuo/tiedot/blob/21707c0a3e12f008577d5384772fbd7ce9bb059d/httpapi/jwt.go#L244
+
+if the first argument to pass type `type MapClaims map[string]interface{}`
+example how here:
+
+```go
+	if !sliceContainsStr(tokenClaims[JWT_ENDPOINTS_ATTR], url) {
+			http.Error(w, "", http.StatusUnauthorized)
+			return
+```
+It `switch possibleSlice.(type) {` will return `interface{}`
+accordingly, the function will never return true
+```go 
+func sliceContainsStr(possibleSlice interface{}, str string) bool {
+	switch possibleSlice.(type) {
+	case []string:
+		for _, elem := range possibleSlice.([]string) {
+			if elem == str {
+				return true
+			}
+		}
+	}
+	return false
+}
+```
+
+I suggest so:
+```go
+func sliceContainsStr(possibleSlice interface{}, str string) bool {
+	if possibleSlice, exist := possibleSlice.([]string); exist {
+		for _, elem := range possibleSlice {
+			if elem == str {
+				return true
+			}
+		}
+	}
+	return false
+}
+```
+Hi,
+
+i get the message "Bad hash table - repair ASAP /home/xxx/go/bin/onionscandb/relationships/Onion/0" after scanning an onion site with onionscan.
+
+my system:
+uname -a
+Linux user 4.10.0-28-generic #32~16.04.2-Ubuntu SMP Thu Jul 20 10:19:48 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux
+
+lsb_release -a
+No LSB modules are available.
+Distributor ID:	Ubuntu
+Description:	Ubuntu 16.04.3 LTS
+Release:	16.04
+Codename:	xenial
+
+any ideas?
+
+I'm experiencing strange behaviour when trying to query more complex JSON documents in embedded mode. When the document that is inserted inserted to tiedot is created from a string via json.Unmarshal() it can be queried successfully. In case it is created from a directly initialized object it can not be queried.
+
+Example object is taken from the example in documentation:
+```
+{"Name": [
+  {"PenName": "Joshua"}, 
+  {"PenName": ["John", "David"]}
+]}
+```
+
+Consider the following code snippet:
+```
+_, err = coll.Insert(jsonDoc)
+
+query := map[string]interface{}{
+	"eq": "John",
+	"in": []interface{}{"Name", "PenName"},
+}
+
+queryResult := make(map[int]struct{})
+if err := db.EvalQuery(query, coll, &queryResult); err != nil {
+	panic(err)
+}
+```
+
+Query returns any data only in a case when jsonDoc is created as:
+
+```
+s := `{"Name": [{"PenName": "Joshua"}, {"PenName": ["John", "David"]}]}`
+var jsonDoc map[string]interface{}
+json.Unmarshal([]byte(s), &jsonDoc)
+```
+
+but does not work when created as:
+```
+jsonDoc := map[string]interface{}{
+  "Name": []interface{}{
+    map[string]interface{}{
+      "PenName": "Joshua",
+    },
+    map[string]interface{}{
+      "PenName": []string{"John", "David"},
+    },
+  },
+}
+```
+From my understanding these two methods of creating jsonDoc are equivalent. What I'm missing?
+Hey, I'm starting to use Tiedot now in almost production environment of my project and the randomness of getting the data is starting to get to me. Also, I'm a little concerned about the lack of limits. At some point, it'll suck if someone tries to access some data collection and the query pulls back 10,000,000 rows in there right.. unless there isn't a performance hit for grabbing the documents
+
+anyway, I read in another issue about the hassle / performance hit with ordering data. I know that tiedot is similar to MongoDB, but I was wondering if there was a way to add created_at or updated_at fields?
+
+This way you could pull the content based on some created order and then you could have a limiter if needed.
+
+I don't know much about db development and I know that this doesn't really follow the nosql mongo pattern but I thought it may be a useful solution.
+

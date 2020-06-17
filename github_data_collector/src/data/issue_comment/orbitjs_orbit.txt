@@ -1,0 +1,220 @@
+I've got a configuration similar to https://github.com/orbitjs/todomvc-ember-orbit#scenario-4-memory--backup--remote, but where the store->remote operations are (sometimes) blocking.  I'm also using an IndexedDBBucket for all sources, which is persisting the transform log and (related to this issue) the request/sync queues.
+
+In this scenario, I've discovered that if I reload the browser while some request is pending remote response, then the store-requests and remote-requests items in the bucket contains those requests, and upon reload, both sources immediately attempt to re-process those requests, prior to activation.  
+
+If a request in the queue references some other identifier (e.g. a ``findRelatedRecords`` request), then because the store (as a MemorySource) starts out empty, then it throws an exception:
+```
+Error: Record not found: somemodel:aed0a5c4-ec33-4460-b2c2-bb3f13911662
+    at new Exception (vendor.js:199718)
+    at new RecordException (vendor.js:200781)
+    at new RecordNotFoundException (vendor.js:200795)
+    at findRelatedRecords (vendor.js:210910)
+    at MemoryCache._query (vendor.js:211347)
+    at MemoryCache.query (vendor.js:211310)
+    at MemorySource._query (vendor.js:208124)
+    at MemorySource.proto.__query__ (vendor.js:202214) "[unhandled rejection]"
+```
+Since this occurs prior to source activation, it is not possible to pull the data from the backup and sync it into the store as described in https://github.com/orbitjs/todomvc-ember-orbit#scenario-2-memory--backup.
+
+From what I can tell (in 0.16.4), the only way to defer the processing of the requestQueue until a later point is to configure the requestQueueSettings with ``autoProcess: false``.  However, this setting appears to require that all future operations on the source be followed with a call to ``requestQueue.process()``, which is not ideal.
+
+Truthfully, I think several other problems with the request queue initiating auto-processing on instantiation:
+1. No strategies are yet connected, so replication of data from one source to another is missed, and failures are not handled as expected.
+2. It would be preferable to discard unnecessary queries for which the application is clearly not waiting on a response.
+3. If there is a sequence of pending updates in the remote request queue, it would be preferable to distill them down to a smaller set before sending them to the server.
+
+I'm filing this issue because I don't see an immediate solution for this problem, and I am interested in receiving feedback on possible workarounds.  
+
+If it were possible to defer the request queue processing until source activation, that would at least give the opportunity inspect and manipulate the queue, which would solve some of the problem.  However, the coordinator activates sources before strategies, so the problem of missing strategies (bullet 1 above) would still remain.
+
+I've found that invalid strategies can be added to a coordinator, and even activated, but they fail silently (even with blocking: true) during task processing.
+
+Some examples of invalid strategies:
+ 1. Using SyncStrategy with JSONAPISource (which is not Syncable)
+ 2. Misspelling the ``action`` to invoke for the target (this is generalization of the first case)
+ 3. Misspelling the ``on`` to listen for the source
+
+In the first two cases, the generated listener throws an exception when trying to invoke the (missing) action, but (unless the listener was attached to a ``beforeXxx`` event) the exception is swallowed by settleInSeries.
+
+In the third case, the generated listener is attached to an event that will never fire, so it has no effect.
+
+To avoid confusion and help identify invalid strategies, it would be ideal if these cases were detected during coordinator/strategy activation.
+I have a typical optimistic query fetching strategy btw `memory` & `remote` sources. ~Also, I have a `transform` listener that queries the cache whenever there is a `transform` event on the memory source~. Also, I use the liveQuery (#718) listener on the record cache in order to re-render the react components (https://github.com/selvagsz/react-orbit/blob/master/src/hooks/useQuery.js#L14)
+
+But while paginating, when I skip the pages, the cache query returns empty []. I can see this is happening because of the cache pagination logic
+
+https://github.com/orbitjs/orbit/blob/master/packages/%40orbit/record-cache/src/operators/sync-query-operators.ts#L245
+
+
+```js
+
+// query page 1
+/articles?offset=0&limit=25 
+store.memory.cache.query(t=> t.findRecords('article').page({ offset: 0, limit: 25 }) // returns the record set as expected
+
+// skipped page 2
+
+// query page 3
+/articles?offset=50&limit=25 //page 3
+
+store.memory.cache.query(t=> t.findRecords('article').page({ offset: 50, limit: 25 }) // returns empty []
+
+``` 
+
+Any thoughts on how to deal with this ?
+Orbit allows to pass to a source a batch of operations (`Transform`) and (since 0.17-beta) of query expressions (`Query`). The problem is, the way `Query` and `Transform` are handled is all or nothing. Where it is aligned with `JSON:API` spec proposition for operations – it is a problem for different style of APIs. We might want find a way to return partial success/error from sources.
+This a new proposition to introduce query observers. This one is not relying on any known interface such as `RX` or `async iterator`. It uses orbit events. It does expose an `LiveQuery` interface, but it is simply an object with a `subscribe` method with returns a subscription with an `unsubscribe` method.
+
+The current one has a downside of looking like an `RX`/`Zen` Observable but not being one. I am worried it might confuse folks. One option I considered is to pass the callback directly to `liveQuery` method, but it makes it for a complex signature because of optional `options` and `id` arguments...
+
+What do you think @dgeb?
+Hi,
+
+I have used orbit with ember with JSONAPI, very nice implementation. Now I need to work on app which backend is in RESTApi. 
+
+Is there any guide on how to use that? or if even this is implemented? if not any plans for that.
+
+
+thanks
+While I was trying to figure out the handling of dasherized fields (#714), something that made it harder for me to understand what was going on was that JSONAPISource will pass an invalid attribute through to the server, and return it in the returned record.
+
+For completely-wrong attributes, some servers would error out, which would make the problem obvious. I'm not sure if erroring out is in the JSON:API spec. Even if it is in the spec, some non-compliant servers may silently ignore invalid attributes, and so it would be useful for Orbit to proactively error out in those cases.
+
+In the case of dasherized fields, it was more confusing because I was passing the `dasherized-version`, which _is_ a valid server attribute, but it doesn't correspond to the default formatting on the client side: the client side should be camelized. So when the server returned the `dasherized-version` upon first load it didn't map to the local `dasherized-version`, but when I uploaded a `dasherized-version` it _did_ map to the `dasherized-version` in the local field.
+
+Let's look at a reproduction, then proposals I have for two changes that could help.
+
+***
+
+# Reproduction
+
+Example code:
+- Client: https://github.com/CodingItWrong/orbit-sandbox-client/tree/dasherized-fields
+- API: https://github.com/CodingItWrong/orbit-sandbox-api
+
+The schema is configured with `created-at` and `delivered-at` fields. It seems that they should be `createdAt` and `deliveredAt` as Orbit automatically maps dasherized remote fields to camelized local ones. But the scenario I'm reproducing is accidentally using the dasherized fields locally:
+
+```
+const schema = new Schema({
+  models: {
+    widget: {
+      attributes: {
+        name: {type: 'string'},
+        'created-at': {type: 'date-time'},
+        'delivered-at': {type: 'date-time'},
+      },
+    },
+  },
+});
+```
+
+When the app is loaded, it loads all widgets, which returns:
+
+```
+{
+  "data": [
+    {
+      "id": "1",
+      "type": "widgets",
+      "links": {
+        "self": "http://localhost:3000/widgets/1"
+      },
+      "attributes": {
+        "name": "Widget 0",
+        "created-at": "2019-12-17T11:37:45.354Z",
+        "delivered-at": "2019-12-17T11:53:48.381Z"
+      }
+    },
+    ...
+]
+```
+
+So we have `created-at` and `delivered-at` fields present.
+
+Then the app attempts to log out the results. I get:
+
+<img width="448" alt="Screen Shot 2019-12-17 at 6 56 05 AM" src="https://user-images.githubusercontent.com/15832198/70993580-53ba6b80-209a-11ea-9412-2712392dd2a0.png">
+
+So `created-at` and `delivered-at` fields are not shown. This seems to be because Orbit camelizes the attributes by default; it looks for `createdAt` and `deliveredAt` attributes in the schema, and since they aren't found, the attributes are ignored. There's no problem with this behavior.
+
+Then the app attempts to write `delivered-at`. I call:
+
+```
+    recordToUpdate = {
+      ...recordToUpdate,
+      attributes: {
+        ...recordToUpdate.attributes,
+        'delivered-at': new Date(),
+      },
+    }
+
+    memory
+      .update(t => t.updateRecord(recordToUpdate))
+      .then(result => console.log(result));
+```
+
+It sends:
+
+```
+{
+  "data": {
+    "type": "widgets",
+    "id": "1",
+    "attributes": {
+      "name": "Widget 0",
+      "delivered-at": "2019-12-17T11:56:54.693Z"
+    }
+  }
+}
+```
+
+And logs out the result as well. So it's able to write a `delivered-at` field, and it includes it in the returned data afterward.
+
+I get the same behavior if I remove `delivered-at` from the schema entirely. The attribute returned from the server is not exposed in the schema. But I can update the attribute, and the updated attribute is included in the record resolved from the `update` call.
+
+***
+
+# Proposal
+
+I think it would be more predictable for Orbit to not persist unrecognized attributes to the server, and not return unrecognized attributes from `update` calls. It could either error out, warn, or silently omit those attributes. As this is a behavior change, at least a temporary deprecation warning is probably a good idea.
+
+This would lead to more consistency overall. Orbit does not pass-through data returned from the server unchanged, but only if attributes are included in the schema. But currently it sends invalid attributes to the server and returns them in the resolved updated records, which is inconsistent. If updates would also ignore (or error/warn on) invalid attributes, that would be more consistent.
+
+Once update attribute validation was in place, another question arises in this specific code sample: the dasherized attribute *is* a valid local attribute, and presumably it would make sense to serialize it to dasherized in transport. But due to Orbit's default camelization behavior, the data coming _back_ from the server would be converted from dasherized to camelized, and so would no longer match the field. The problem in that case seems to be that our attribute name in the schema uses a format (dasherized) that will never match data coming from the server, because Orbit camelizes it. The best way to expose that could be to raise a warning that that dasherized attribute name is invalid.
+
+With `JSONAPISource`s, Orbit by default seems to handle taking dasherized fields such as `created-at` and exposing them as camelized fields such as `createdAt`. Is this documented anywhere in the guides? I wasn't able to find it.
+
+Like I imagine a lot of JSON:API users, I use Rails an JSONAPI::Resources, which has a default behavior of mapping underscored field names such as `created_at` to dasherized such as `created-at`. Having _all three_ formats in my default stack is pretty confusing! It's true that each works with the default of the platform it's on. But it's a lot of automatic mapping that's not totally obvious in the guides of Orbit or JSONAPI::Resources.
+
+Short-term, I think it would be helpful to document this mapping in the guides clearly. If you're interested I could try to identify a place to put it and create a PR.
+
+Long-term, I think it would be worth considering migrating Orbit to not adjust fields by default. I think a little more cumbersome `['square-bracket']` lookup is worth the predictability, and I think it would help new users adopt the library. I'm sure this has been discussed before; what are your thoughts on the tradeoffs?
+This behavior may occur in the following situation:
+* We have object type `planet`
+* We store some information for `planet` in top-level `meta` field
+* We have two ways to get `planet` data (both return same data with same `meta` field):
+   * Endpoint `/planet/<id>`
+   * In `included` part of `/planet?filter[...]=...`
+* Memory cache is enabled
+
+Then you take the following steps:
+
+1. Ensure that memory cache is empty
+3. Fetch `/planet?filter[classification]=terrestrial`
+2. If you look at memory cache of `earth`, you see `meta` field is present
+1. Fetch planet data with `/planet/earth`
+4. In network tools you see, that both requests have returned same data for `earth`, both have same `meta` field.
+5. If you look at memory cache of `earth`, you see the same data but without `meta` field
+
+Expected behavior:
+
+* Either `meta` field is not supposed to be cached, so it should not be present in cache after first request.
+* Either `meta` field is supposed to be cached, so it should still be present after second request.
+
+Why problem occurs:
+
+* I think related logic is contained in [mergeRecords function](https://github.com/orbitjs/orbit/blob/master/packages/%40orbit/data/src/record.ts#L121)
+* When cache entry is empty this function copies entire record to cache without changes, that's why `meta` field is present after the first fetch.
+* During the second fetch merging occurs and `meta` fields gets removed.
+
+Perhaps, it'is a sort of XY problem connected with a misuse of `meta` field. Actually, we've solved it by getting rid of `meta` fields.

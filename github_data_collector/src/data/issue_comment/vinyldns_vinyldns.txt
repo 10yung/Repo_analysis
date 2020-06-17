@@ -1,0 +1,314 @@
+Changes in this pull request:
+- Add unique fqdn_type_index on recordset to avoid adding duplicate record entries during long zone syncs where a job might restart.
+
+We want to prevent users from changing recordset names and types during recordset updates. If a user is trying to change a recordset name or type they should really be creating a new record and deleting the existing record. This is going to help us move toward being able to display recordset change history based on the unique combination of a recordset's name and type.
+
+Changes in this pull request:
+- Add RecordSet validation to confirm the recordset name, type and zone ID in the given data for recordset update matches the name of the existing recordset. we already checked for zone ID changes, but this moves that into the same validation.
+
+There is a chance that the database is out-of-sync with the DNS backend. Rather than require for a change to be dependent on a zone sync if the DNS change would be permitted otherwise, we can allow the validation to be accepted and process it normally in the DNS backend.
+
+Changes in this pull request:
+- Allow certain scenarios to pass record set validations
+- Update unit tests
+
+Fixes #861
+
+Changes in this pull request:
+- Add GET `/recordsets` endpoint
+  - Requires `recordNameFilter` query parameter with minimum of two characters. `recordNameFilter` is run on the `fqdn` column in the recordset table in the database. Can use `*` for fuzz matching.
+  - If given an IP address (IPv4 or IPv6) we will convert it to an fqdn that we can then pass in for the database query.
+  - Optional query paratamers are nameSort (default is "ASC" for ascending, other option is "DESC" for descending), recordTypeFilter (an array of record types), maxItems, startFrom, and nextId.
+  - Doesn't require any access validations
+- Add GET `/recordsets/{recordsetID}`
+  - Doesn't require any access validations
+  - added endpoint to the portal
+## Description
+We should add logs around pertinent events to generate more insightful analytics to drive the product. The following breakdown groups logs and designs by events.
+
+## Events
+1.  **Routing error responses (API)**
+In the main routes `BatchChangeRouting`, `MembershipRouting`, `RecordSetRouting` and `ZoneRouting` we want to log the error responses that are raised back to the user. This involves creating a helper function that uses SLF4J logger for the class to capture the error message and username before returning the user response.
+
+1. **Routing error responses (portal)**
+For membership, record set and zone routes, the VinylDNS portal invokes the API directly and returns the response back to the user so no additional logging is needed. However, for the DNS Changes (i.e. batch change in the API), there are validations that are done in the portal prior to submission which mimics API validations and rejects bad requests before they hit the API. Logging should be added in `dns-change-new.controller.js` to capture these errors in the event that `$scope.batchChangeErrors` is set along with the submitter username.
+
+1. **Capture batch changes flagged for manual review**
+We want to know how many changes are going to manual review.  Record in our logs the user submitting the request, each reason for manual review (based on the soft error) with frequency, the record owner group and total number of changes in the request. The motivation for this is to drive information needed for internal FAQs and other communication with users. This will primariily be in `BatchChangeService`.
+
+1. **Capture manual review process metrics**
+We want to know how long it takes for batch changes to be manually reviewed along with the final disposition (in `BatchChangeService`). For approve or reject, capture the delta between the submit time and review time, the user who submitted the request, the end state (approved or rejected). For scheduled changes, we also want to determine the delta between review and scheduled times. This will provide insight to drive service-level agreement (SLA) timelines and determine whether they are being fulfilled.
+
+1. **Capture dotted host information in zone syncs and record changes**
+VinylDNS does advocates for sub-domains over dotted hosts, though allows management of existing dotted hosts that are synced in. We should add metrics around dotted hosts for visibility for DNS operations team that may want to address how frequently dotted hosts are being created/updated.
+
+1. **Capture any backend failures in logs**
+We want to know how many partial failures we are encountering, which we are currently capturing in the `BatchChangeHandler`, though we need to provide more specific data for the requests that are failing. Make sure we update existing logging to include the record data and the reason for failure.
+
+1. **Portal browser information**
+While user agent and other custom headers tied to DNS requests are captured in the API, we need to make sure that the portal also captures browser information as not all requests successfully hit the VinylDNS API (e.g. DNS Change validations fail for new submission in portal). Currently we have `user-agent=unknown` in our portal logs.
+In the DNS Changes table we don't show the Scheduled time for scheduled DNS Changes. 
+
+Considerations:
+- Need to figure out where to place that date as the table is already pretty full. 
+- Should we only display the scheduled time when the table is filtered by open DNS Changes?
+Per user feedback, we should try to improve the help text on the DNS Change form so users better understand what information goes in what fields.
+
+One suggestion is to have the heading "Input Name" include the help text "existing name" and the heading "Record Data" have the help text "alias"
+**Motivation**
+We are seeing regular log entries like `(a.a.ActorSystemImpl:86) | Illegal header: Illegal 'authorization' header: Invalid input '/'` that are not consequential to the health of the application.  Let's see if we can quiet this somehow.
+
+**Scope of change**
+Configure akka-http and/or logback to quiet that log entry
+
+## Current state of recordset search and access in VinylDNS
+
+Recordsets are only accessible through zones. The requesting user must have access to the zone as a member of the zone owner group, with a read, write or delete ACL rule, or as system admin. 
+
+With shared zones in particular users own recordsets but do not have the ability to view their current state if they don't have access to the zones the recordsets is in. Additionally, we've seen that groups own individual recordsets across many zones, so there's a need to list recordsets beyond the zone scope. Lastly we want to give users autonomy to look up recordsets and find owner groups if DNS conflicts arise.   
+
+## API Endpoints
+
+Proposing three routes, two would be new, one already exists but will have additional query parameters.
+
+- List all recordsets in VinylDNS
+```
+GET /recordsets
+```
+
+- List all records for a given zone (this endpoint already exists)
+```
+GET /zones/:zoneId/recordsets
+```
+
+- List all records owned by a given group. Direct record ownership only. Not including indirect ownership through zone ownership or ACL rules.
+```
+GET /groups/:groupId/recordsets
+```
+
+## Parameters
+ | Name | Type | Description |
+ |------------|------|------|
+ | recordNameFilter  | string  | Text to filter against the recordset name attribute. case-insensitive. exact match unless wildcards (`*`) are used. |
+  fqdnFilter  | string  | Text to filter against FQDN attribute. case-insensitive. exact match unless wildcards (`*`) are used. |
+ | recordTypes  | string  | A list of comma separated record types. Default is all record types if not provided. |
+ | direction  |  string | The direction of the sort. Either `asc` or `desc`. Default: `desc` |
+ | sort  |  string | What to sort results by. `fqdn`, `created`, `updated`. Default: `fqdn`  |
+ | since  | date-time | Only recordsets updated at or after this time. This is a timestamp in ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ. | 
+ | startFrom  | string | Recordset ID. Should be set to the nextId that is returned on the previous response to return the next page of results. | 
+ | maxItems  | integer | The number of items to return in the page. Valid values are 1 to 100. Defaults to 100 if not provided. | 
+
+## Response Attributes
+| Name | Type | Description |
+|------------|------|------|
+| recordsets  | array  | Array of recordsets. See recordset response for attributes. |
+| startFrom  | string  | startFrom sent in request. Will not be returned if not provided |
+| maxItems  | string  | maxItems sent in request. Default is 100. |
+| sort  |  string | Given sort string `fqdn`, `name`, `created`, `updated`. Default to `fqdn` if not provided.  |
+| nextId  | string  | startFrom sent in request. Will not be returned if not provided |
+| direction  |  string | The given direction of the sort `asc` `desc`. Default to `asc` if not provided. |
+| recordNameFilter  | string  | Requested record name to filter against. will not be returned if not provided. **Note:** only for zone recordset endpoint. |
+| fqdnNameFilter  | string  | Requested fqdn to filter against. will not be returned if not provided. **Note**: only for groups and global recordset endpoints. |
+| recordTypes  | string  | A list of comma separated record types requested. Will not be returned if not provided. |
+| since  | string | Given date time to look for updated recordsets. Will not be returned if not provided. | 
+| ipAddressFilter | string | Filter PTR records by their IP address formatted name |
+
+  
+### Recordset Response Attributes
+| Name | Type | Description|
+|------------|------|------|
+| fqdn  | string  | Full qualified domain name |
+| type  | string  | DNS record type |
+| zoneId  |  string | The ID of the zone the record is in |
+| name  | string  | Record name, Does not include the zone name |
+| zoneName  |  string | The name of the zone the record is in |
+| ttl  |  long | the TTL in seconds for the recordset  |
+| status  | string | The current state of the Recordset. `Active`, `Inactive`, `Pending`, `PendingUpdate`, `PendingDelete` | 
+| created  | date-time | The timestamp (UTC) when the recordset was created. ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ. | 
+| updated  | date-time | The timestamp (UTC) when the recordset was most recently updated. ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ. | 
+| records  | array of RecordData | Array of record data, a single RecordSet can have multiple DNS records as long as they are all the same type and the type supports multiple records | 
+| accessLevel  | string | Access the requesting user has to the recordset. `None`, `Read`, `Delete` | 
+| ownerGroupId  | string | The ID of the group that owns the record | 
+| ownerGroupName  | string | The name of the group that owns the record | 
+    
+## Access
+All authenticated, unlocked users should be able to make requests to these endpoints.
+This is a change for the existing recordsets by zone endpoint. It is currently restricted based on zone access.
+
+## Portal
+
+### Records
+```
+/records
+```
+
+New page in the portal at the root level.
+
+<img width="1087" alt="Screen Shot 2019-10-03 at 1 43 54 PM" src="https://user-images.githubusercontent.com/4439228/66150878-22c2b280-e5e4-11e9-8571-2145e75722a6.png">
+Table headings:
+
+| FQDN | Type |	TTL |	Record Data | Zone Type | Owner Group Name | Actions |
+|------|------|-----|-------------|---------|---------|---------|
+
+Table options:
+- Sort by FQDN in ascending or descending order. Default to ascending.
+
+Search options:
+- FQDN, wildcard support
+- Owner group name. See about making this predictive/autocomplete, otherwise drop down of group names.
+- Filter by record type. Default to all.
+
+### Group Records
+```
+/groups/:groupId/records
+```
+Similar to current Zone area of the site, make tabbed pages in the Group. One for the existing group data, "Membership" and another for the new data, "Records". Explicit routing is not required, but would be an improvement over our existing tab behavior.
+
+<img width="1097" alt="Screen Shot 2019-10-03 at 12 14 58 AM" src="https://user-images.githubusercontent.com/4439228/66098998-e5720c80-e572-11e9-9b3a-611bedaf4599.png">
+
+Table headings:
+
+| FQDN | Type |	TTL |	Record Data |	Actions |
+|------|------|-----|-------------|---------|
+
+Table options:
+- Sort by FQDN in ascending or descending order. Default to ascending.
+
+Search options:
+- FQDN, wildcard support.
+- Filter by record type. Checkboxes. Defaulted to all.
+
+### Zone Records
+```
+/zones/:zoneId
+```
+
+Existing page with proposed modifications.
+
+Table updates:
+- Sort by Name in ascending or descending order. Default to ascending.
+
+Search updates:
+- Filter by record type. Checkboxes. Defaulted to all.
+
+  
+Table headings:
+
+| FQDN | Type |	TTL |	Record Data |		Owner Group Name  |Actions |
+|------|------|-----|-------------|---------|---------|
+
+Table options:
+- Sort by FQDN in ascending or descending order. Default to descending.
+
+Search options:
+- FQDN, wildcard support.
+- Filter by record type. Checkboxes. Defaulted to all.
+
+## Considerations
+API & Portal:
+- Linking to groups in the portal will require access validation changes in the API.
+
+API:
+- Should the default direction change from `asc` to `desc` if the sort is `created` or `updated`
+- Need to think about IP address search, ho we'd do it and how to address clashes with other filters a user might pass in.
+
+Portal:
+- If we allow updating records in the Groups and Records areas we should only allow TTL, Record Data and Owner Group changes. Should not allow changing the FQDN which could change the record name and/or the zone.
+### Background
+VinylDNS does not currently handle DNS requests well when the database differs from the source of truth (i.e. DNS backend). The current process is that users attempt to change a record that VinylDNS thinks exists or doesn't exist when it does. This results in the user having to sync in changes from the zone and then resubmit the change.
+
+The proposal is to:
+1. Check against the DNS backend when making DNS changes (i.e. adds, deletes or updates). If everything is deemed correct, send to the backend for processing.
+2. When processing record set changes, we will determine during the `getProcessingStatus` stage whether or not the record set in the database is out-of-sync with the DNS backend. If so, generate both a record set and record set change with a new `RecordSetChangeStatus.Synced`.
+
+### Process flow
+#### Current flow
+Below are the current (simplified) sad path process flows for `RecordSetService` and `BatchChangeService` (with the batch interface collecting the record state for multiple records at the same time):
+
+Records in the DNS backend:
+```
+delete.foo.  A  1.1.1.1
+update.foo.   A   2.2.2.2
+```
+
+Records in VinylDNS:
+```
+add.foo.    A  1.1.1.1
+update.foo.   A  3.3.3.3
+```
+
+*Adds* (sad path, record exists in VinylDNS but not in DNS backend):
+1. User tries to add `add.foo.  A   1.1.1.1` which exists in VinylDNS but not the DNS backend
+1. VinylDNS attempts to retrieve `add.foo.  A` from the database
+1. A `RecordSetAlreadyExists` error is returned to the user
+1. User syncs in `foo.` zone and the `add.foo.  A` record is deleted from VinylDNS
+1. User resubmits change which is successfully validated and queued for processing
+
+*Deletes* (sad path, record doesn't exist in VinylDNS but exists in DNS backend):
+1. User tries to delete `delete.foo.  A` which does not exist in VinylDNS but does in the DNS backend
+1. VinylDNS attempts to retrieve `delete.foo.  A` from the database
+1. A `RecordDoesNotExist` error is returned to the user
+1. User syncs in `foo.` and the `delete.foo.  A` record appears in VinylDNS
+1. User resubmits change which is successfully validated and queued for processing
+
+#### Proposed flow
+*Adds* (sad path, record exists in VinylDNS but not in DNS backend):
+1. User tries to add `add.foo.  A  1.1.1.1` which exists in VinylDNS but not the DNS backend
+1. VinylDNS attempts to retrieve `add.foo.  A` from the database
+1. VinylDNS attempts to retrieve `add.foo.  A` from the DNS backend
+1. VinylDNS determines that `add.foo.  A` does not exist even though it shows up in VinylDNS and allows the change through
+1. Change request is successfully validated and queued for processing
+1. Command handler retrieves change from message queue and hands off change to record set change handler
+1. Record set change handler determines that the current record set state in the database is out-of-sync with the DNS backend
+1. Record set is first synced into the record set and record set change tables, deleting `add.foo.  A` from the database. The record set change will have a message indicating that it was synced in from DNS backend
+1. Record is processed normally, adding `add.foo.  A` to the DNS backend and database
+
+*Deletes* (sad path, record doesn't exist in VinylDNS but exists in DNS backend):
+1. User tries to delete `delete.foo.  A` which does not exist in VinylDNS but does in the DNS backend
+1. VinylDNS attempts to retrieve `delete.foo.  A` from the database
+1. VinylDNS attempts to retrieve `delete.foo.  A` from the DNS backend
+1. VinylDNS determines that `delete.foo.  A` exists despite not showing up in VinylDNS and allows the change through
+1. Change request is successfully validated and queued for processing
+1. Command handler retrieves change from message queue and hands off change to record set change handler
+1. Record set change handler determines that the current record set state in the database is out-of-sync with the DNS backend
+1. Record set is first synced into the record set and record set change tables, adding `delete.foo.  A` to the database. The record set change will have a message indicating that it was synced in from DNS backend
+1. Record is processed normally, deleting `delete.foo.  A` from the DNS backend and database
+
+
+### Notes about updates
+When updating using `DeleteRecordSet`, the validations should always work in the current proposal due to first deleting all entries for the current DNS record set and then adding the new record afterward.
+
+Where it becomes more of an issue is in the `DeleteRecord` scenario, in which case it is similar to the `Delete` path that is outlined above.
+
+### Design Outcome
+#### Add new `Sync`/`Synced` enumerations for `RecordSetChange`
+A new `Synced` status needs to be added to `RecordSetChangeStatus` and a new `Sync` type needs to be added to `RecordSetChangeType`. These represent the sync operation and status specifically for record set sync.
+
+#### Update `RecordSetChangeHandler` to sync in out-of-sync records
+`Validate` will have an initial step where we perform the DNS resolution of the record set and then compare the database record set state against the DNS backend. If there is a discrepancy, we will perform a record set sync operation where we 1. generate the proper record set change (i.e. create, update, delete), 2. generate the proper resulting record set and 3. save the changes to the respective tables.
+
+Notes:
+- This sync step should succeed even if the DNS backend has changed in such a way that the requested record set change is no longer valid. The benefit of this is that we will be syncing the updated record set state into the table so its status effectively gets "update" in VinylDNS.
+- There is likely to be some refactoring involved for `getProcessingStatus` where we can pass in an optional DNS resolution (which would be provided in the `Validate` step) so that we don't need to perform a repetitive lookup
+
+#### Update validations in `RecordSetValidations` to allow bypassing valid record set operations based on DNS backend
+`RecordSetValidations` will now have to utilize the DNS connection to perform DNS lookups against the backend for non-GET operations in the event that the database lookup fails. All validations that are checking against the stored record set from the database will need be updated accordingly.
+
+#### Update validations in `BatchChangeValidations` to allow bypassing valid record set operations based on DNS backend
+`BatchChangeValidations` will now have to utilize the DNS connection to perform DNS lookups against the backend for non-GET operations in the event that the database lookup fails. All validations that are checking against the stored record set from the database will need to be updated accordingly.
+
+### Alternative Approaches
+#### Sync VinylDNS view during validation step
+We entertained the notion of updating the database during the validation phase, but that 1. introduces timing complications, and 2. doesn't lend itself to retry on failure.
+
+#### Send a "sync record set" task even when validation fails 
+With the introduction of `Sync` for `RecordSetChange`, upon correctly failing a bad validation, we could send a "sync record set" to the backend where we would simply sync a record set. Would need to discuss with the team, and this isn't integral to the core feature.
+
+### Summary
+The proposed flow introduces a couple of key ideas:
+1. For each unique record in the batch change/record set request for create/update/delete, we need to retrieve the current state in the DNS backend
+1. A record set and record set change will be synced in prior to processing the actual record set request if there is a discrepancy. `systemMessage` will be used to indicate that the record was out-of-sync despite successful validation and processing
+
+Special notes:
+1. The retrieved DNS backend information is what is used as the basis for error messages.
+1. In the event that a record is out-of-sync and an error is returned to the user resulting in no new changes made via request, we should still sync in the record with a system message indicating that the record was synced.

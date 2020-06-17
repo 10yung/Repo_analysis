@@ -1,0 +1,245 @@
+I'm getting this error using Rails 6. Not sure if it's an issue with my code or if the Gem needs to be updated? 
+
+my DownloadsController: 
+
+```
+class DownloadsController < ApplicationController
+ 
+  def show
+    respond_to do |format|
+      format.pdf { send_audit_pdf }
+    end
+  end
+
+  private
+
+  def audit_pdf
+    audit = Audit.last
+    Download.new(audit) 
+  end
+
+
+  def send_audit_pdf
+    send_file download.to_pdf, download_attributes
+  end
+
+  def send_audit_pdf
+    send_file audit_pdf.to_pdf,
+      filename: audit_pdf.filename,
+      type: "application/pdf",
+      disposition: "inline"
+  end
+end
+```
+
+My Download model: 
+
+```
+require "render_anywhere"
+ 
+class Download 
+  include RenderAnywhere
+
+  def initialize(audit) 
+    @audit = audit
+  end
+ 
+  def to_pdf 
+    kit = PDFKit.new(as_html, page_size: 'A4')
+    kit.to_file("#{Rails.root}/public/audit.pdf")
+  end
+ 
+  def filename
+    "audit #{audit.id}.pdf"
+  end
+ 
+  private
+ 
+    attr_reader :audit
+ 
+    def as_html
+      byebug 
+      render template: "audits/pdf", layout: "audit_pdf", locals: { audit: audit }
+    end
+end
+
+```
+
+I have a template in `audit/pdf.html.erb`:
+
+```
+<h1>Request</h1>
+
+<div class="flex-grid">
+    <div class="items-col">
+
+        <h3>State</h3>
+        <h3>Time Modified</h3>
+        <h3>License</h3>
+        <h3>Account</h3>
+        <h3>DPPA Reason</h3>
+
+    </div>
+   <div class="items-col">
+
+        <h3><%= @audit[:request_state] %></h3>
+        <h3><%= @audit[:time_modified] %></h3>
+        <h3><%= @audit[:request_license] %></h3>
+        <h3><%= @audit[:account] %></h3>
+        <h3><%= @audit[:customers_reason] %></h3>
+
+    </div>
+</div>
+```
+
+and layouts/audit_pdf.html.erb:
+
+```
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Audit PDF</title>
+  <style>
+    <%= Rails.application.assets.find_asset('audit.pdf').to_s %>
+  </style>
+</head>
+<body>
+  <%= yield %>
+</body>
+</html>
+```
+
+I've byebugged myself all the way down and don't appear to be missing any params/variables upto `to_html` method. 
+When passing `footer_html` options from application to `wkhtmltopdf` via pdfkit
+```html
+<html>
+    <meta name='pdfkit-footer_html' content='http://localhost/footer?a=1&b=2'
+</html>
+```
+
+Pdfkit compose the following command to send to `wkhtmltopdf`
+`/bin/wkhtmltopdf --footer-html http://localhost/footer\?a\=1\&b\=2 - -`
+
+This causes a malformed command to `wkhmtltopdf`
+command output: `You need to specify at least one input file, and exactly one output file
+Use - for stdin or stdout`
+
+*Note: the command is valid when there is no `&` in command string*
+e.g. `/bin/wkhtmltopdf --footer-html http://localhost/footer\?a\=1 - -`
+
+I also read about similar issues being reported, such as https://github.com/pdfkit/pdfkit/issues/311, https://github.com/pdfkit/pdfkit/pull/312, https://github.com/pdfkit/pdfkit/pull/207, however, those were issues with source url instead of pdfkit options
+The RubyGems property rubyforge_project is removed without a replacement.
+
+I am generating PDF using the method mentioned in wiki - https://github.com/pdfkit/pdfkit/wiki/Adding-header-and-footers
+
+I feel since the PDFKit config is modified this is **not thread safe**. I am running `sidekiq` with concurrency `2` and I already getting mixed output. The PDF are generated with the right body content but the `header` and `footer` came from another PDF. 
+
+Is there a way to mention `header_html` in an instance variable instead of the constant `PDFKit`.
+
+```  
+def config
+    PDFKit.configure do |config|
+      config.wkhtmltopdf = "/usr/local/bin/wkhtmltopdf"
+
+      config.default_options = {
+        encoding:"UTF-8",
+        dpi: '300',
+        margin_top: '30',
+        margin_bottom: '23',
+        margin_left: '10',
+        margin_right: '10',
+        header_spacing: '0',
+        header_html: render_header_footer("header"),
+        footer_spacing: '2',
+        footer_html: render_header_footer("footer"),
+        quiet: true,
+        :"user-style-sheet" => "#{Rails.root}/app/assets/stylesheets/pdfkit.scss"
+      }
+    end
+  end
+```
+
+I have different `header` and `footer` for every PDF document generated.
+This PR adds the ability to log the output of wkhtmltopdf and the commands used to a separate logfile.
+
+Using i.e. 
+
+```
+PDFKit.configure do |config|
+  config.log_file = Rails.root.join("log/pdfkit-#{Rails.env}.log")
+end
+```
+
+makes the output is no longer read from stderr and injected into the standard webserver logs.
+Update to wkhtmltopdf-binary-edge as wkhtmltopdf-binary gem is deprecated
+pefkit - 0.6.1
+wkhtmltopdf - 0.12.4
+platform - linux
+
+```
+import pdfkit
+pdfkit.from_string('&#x3C;script src=&#x22;https://sehacure.xss.ht&#x22;&#x3E;&#x3C;/script&#x3E;', '<file_path>')
+```
+
+Actual Output:
+![image](https://user-images.githubusercontent.com/6340565/47951601-da8cb180-df88-11e8-8874-bf0dbf90b623.png)
+
+
+
+
+
+Expected Output:
+`&#x3C;script src=&#x22;https://sehacure.xss.ht&#x22;&#x3E;&#x3C;/script&#x3E;',` in pdf
+
+I am not sure whether this issue is solely with wkhtmltopdf or in calling wkhtmltopdf by pdfkit.
+
+The [spec states](http://www.rubydoc.info/github/rack/rack/file/SPEC#The_Body): 
+
+> If the body is replaced by a middleware after action, the original body must be closed first, if it responds to close.
+
+However, we can see that this does not happen:
+https://github.com/pdfkit/pdfkit/blob/master/lib/pdfkit/middleware.rb#L19
+I am getting an error in my Ubuntu OS. The error is:
+
+```sh
+pdf = printer.generate
+The switch --footer-right, is not support using unpatched qt, and will be ignored.The switch --footer-font-size, is not support using unpatched qt, and will be ignored.The switch --footer-center, is not support using unpatched qt, and will be ignored.The switch --header-html, is not support using unpatched qt, and will be ignored.The switch --header-spacing, is not support using unpatched qt, and will be ignored.The switch --footer-spacing, is not support using unpatched qt, and will be ignored.wkhtmltopdf: cannot connect to X server
+Errno::EPIPE: Broken pipe
+	from /home/inspection/application/releases/158/backend/ruby/vendor/bundle/ruby/2.4.0/gems/pdfkit-0.8.2/lib/pdfkit/pdfkit.rb:64:in `write'
+	from /home/inspection/application/releases/158/backend/ruby/vendor/bundle/ruby/2.4.0/gems/pdfkit-0.8.2/lib/pdfkit/pdfkit.rb:64:in `puts'
+	from /home/inspection/application/releases/158/backend/ruby/vendor/bundle/ruby/2.4.0/gems/pdfkit-0.8.2/lib/pdfkit/pdfkit.rb:64:in `block in to_pdf'
+	from /home/inspection/application/releases/158/backend/ruby/vendor/bundle/ruby/2.4.0/gems/pdfkit-0.8.2/lib/pdfkit/pdfkit.rb:63:in `popen'
+	from /home/inspection/application/releases/158/backend/ruby/vendor/bundle/ruby/2.4.0/gems/pdfkit-0.8.2/lib/pdfkit/pdfkit.rb:63:in `to_pdf'
+	from /home/inspection/application/releases/158/backend/ruby/vendor/bundle/ruby/2.4.0/gems/pdfkit-0.8.2/lib/pdfkit/pdfkit.rb:76:in `to_file'
+	from /home/inspection/application/releases/158/backend/ruby/app/services/pdf_printer.rb:48:in `generate'
+	from (irb):4
+	from /home/inspection/application/releases/158/backend/ruby/vendor/bundle/ruby/2.4.0/gems/railties-4.2.8/lib/rails/commands/console.rb:110:in `start'
+	from /home/inspection/application/releases/158/backend/ruby/vendor/bundle/ruby/2.4.0/gems/railties-4.2.8/lib/rails/commands/console.rb:9:in `start'
+	from /home/inspection/application/releases/158/backend/ruby/vendor/bundle/ruby/2.4.0/gems/railties-4.2.8/lib/rails/commands/commands_tasks.rb:68:in `console'
+	from /home/inspection/application/releases/158/backend/ruby/vendor/bundle/ruby/2.4.0/gems/railties-4.2.8/lib/rails/commands/commands_tasks.rb:39:in `run_command!'
+	from /home/inspection/application/releases/158/backend/ruby/vendor/bundle/ruby/2.4.0/gems/railties-4.2.8/lib/rails/commands.rb:17:in `<top (required)>'
+	from bin/rails:9:in `require'
+	from bin/rails:9:in `<main>'
+```
+
+The version of wkhtmltopdf is as follows.
+
+```sh
+$ wkhtmltopdf -V
+Name:
+  wkhtmltopdf 0.12.0 final
+
+License:
+  Copyright (C) 2010 wkhtmltopdf/wkhtmltoimage Authors.
+
+
+
+  License LGPLv3+: GNU Lesser General Public License version 3 or later
+  <http://gnu.org/licenses/lgpl.html>. This is free software: you are free to
+  change and redistribute it. There is NO WARRANTY, to the extent permitted by
+  law.
+```
+
+I installed wkhtmltopdf as described [here](https://gist.github.com/brunogaspar/bd89079245923c04be6b0f92af431c10#file-readme-md).
+
+Any idea how to fix this?

@@ -1,0 +1,259 @@
+#### Input
+
+```ruby
+  recursive = lambda do 
+    recursive[] # here recursive is NilClass
+  end
+```
+
+#### Expected behavior
+
+infer the right type for recursive lambda
+Pathname sub's signature should be same with String.sub.
+eval binding is optional
+This fixes issue https://github.com/sorbet/sorbet/issues/2487
+
+### Motivation
+
+### Test plan
+Run tests on Ruby 2.4.3 and it works
+
+```
+ruby ./test/types/props/decorator.rb
+```
+
+Without this PR, get the expected error
+```
+/home/dev/sorbet/gems/sorbet-runtime/lib/types/props/decorator.rb:532:in `block in define_getter_and_setter': private method `attr_reader' called for Opus::Types::Test::Props::DecoratorTest::StringArrayAndHashStruct:Class (NoMethodError)
+```
+#### Input
+
+```ruby
+require 'sorbet-runtime'
+
+class AA
+  extend T::Sig
+
+  sig { void }
+  def test_patch_method; puts('unpatch') end
+
+  test_patch_method = instance_method(:test_patch_method)
+  define_method(:test_patch_method) do
+    puts "patched"
+    test_patch_method.bind(self)[]
+  end
+
+  sig { void }
+  def test_alias_method; puts('unpatch') end
+
+  alias_method :test_alias_method_old, :test_alias_method
+  def test_alias_method
+    puts 'patched'
+    test_alias_method_old
+  end
+end
+
+a = AA.new
+puts "test_patch_method"
+for i in 0...3 do
+  a.test_patch_method
+end
+
+puts "test_alias_def patch"
+for i in 0...3 do
+  a.test_alias_method
+end
+```
+
+#### Observed output
+```
+test_patch_method
+patched
+unpatch
+unpatch
+unpatch
+test_alias_def patch
+patched
+unpatch
+unpatch
+unpatch
+```
+
+the patch method won't get called except the first one
+
+#### Expected behavior
+
+Not break the method patch behaviour
+
+
+<!-- (optional) Explain your change, focusing on the details of the solution. This is a great place to call out user-visible changes. -->
+
+Move cancellation from preprocessor thread to message processing thread.
+
+This document outlines the responsibilities of each thread with this change + preemption:
+https://paper.dropbox.com/doc/WIP-Sorbet-Language-Server-Architecture--AsnSWNlzPP54XG2S2qmFHR9YAQ-VUjWTDnXnHWT5B7gZDQ0p
+
+**WARNING: Should *not* be merged until the PR implementing preemption is ready, as it will regress performance in a very noticeable way.** I opened this separately to make reviewing as sane as I possibly can. This is why I have this marked as WIP, although it's totally ready to review.
+
+I'll illustrate the issue with an example. Given the following sequence of edits:
+
+* Edit 1: Introduces syntax error, which takes slow path.
+* Edit 2: Takes fast path, but would take slow path with edit 1.
+* Edit 3: Fixes syntax error, which takes the slow path in isolation but would take the fast path when combined with edits 1+2.
+
+In the world _before_ this update, the following would happen:
+* The preprocessor thread sees edit 1, and enqueues it.
+* The message processing thread dequeues edit 1, runs the slow path, and blocks.
+* The preprocessor thread sees edit 2, determines that it takes the fast path but not with edit 1, and enqueues it.
+* The preprocessor thread sees edit 3, determines that it takes the fast path with edits 1 and 2,  cancels slow path, and enqueues edits 1-3 combined.
+* The message processing thread unblocks because the slow path is canceled, dequeues edits 1-3, and typechecks them on the fast path.
+
+The end result: Introducing a syntax error and fixing it is fast (<1 slow path).
+
+In the world _after_ this update, the following will happen:
+* The preprocessor thread sees edit 1 and passes it along to the message processing thread.
+* The message processing thread dequeues edit 1 and starts a slow path, which unblocks once it begins. It then waits for more messages to come through.
+* The preprocessor thread sees edit 2 and enqueues it.
+* The message processing thread dequeues edit 2, sees that it takes the fast path but not with edit 1, and schedules a fast path to run on the typechecker thread. The fast path operation blocks until the slow path completes.
+* The preprocessor thread sees edit 3 and enqueues it.
+* The message processing thread completes the slow path, completes the fast path, and then sees edit 3 -- which takes another slow path.
+
+The end result is much worse than before: the user waits for 2 slow paths and a fast path.
+
+In the world _after_ this update _and preemption_, the following will happen:
+* The preprocessor thread sees edit 1 and passes it along to the message processing thread.
+* The message processing thread dequeues edit 1 and starts a slow path, which unblocks once it begins. It then waits for more messages to come through.
+* The preprocessor thread sees edit 2 and enqueues it.
+* The message processing thread dequeues edit 2, sees that it takes the fast path but not with edit 1, and schedules a fast path to _preempt the slow path_. The fast path operation blocks until it preempts and finishes.
+* The preprocessor thread sees edit 3 and enqueues it.
+* The message processing thread completes the preempted fast path, dequeues edit 3, sees that it would take the fast path with edits 1-2, cancels the running slow path, and typechecks edits 1-3 together.
+
+The responsiveness of the above is limited by the latency of preemption, which we aim to make fast. There will likely be an initial regression for this specific scenario until additional performance work on Sorbet is undertaken to make resolver faster and to speed up the slowest files to typecheck.
+
+### Motivation
+<!-- Why make this change? Describe the problem, not the solution. This can also be a link to an issue. -->
+
+This is one giant step toward preempting the slow path and improving responsiveness.
+
+### Test plan
+<!-- If you did not write tests for this change, replace the message below explaining why not. Why we should be confident this change is correct? If you changed the website, please include a screenshot of the proposed changes. -->
+
+See included automated tests.
+
+Building on #2448, this speeds up T::Struct#new, and also T::Props::Serializable#deserialize for cases where we are mostly using defaults.
+
+Most of the meat of the optimization is in re-implementing/replacing `get_default` by creating a  specialized `ApplyDefault` instance at prop definition time based on the type of any `:default` and/or `:factory` option. This lets us optimize the common-case fast paths (a primitive default or an empty-collection default) a lot, while also removing a branch & hash lookup or two even in the slow path.
+
+Specifically for constructors, we also reduce the redundancy between WeakConstructor and (strict) Constructor, as well as runtime branching, by splitting up props into "with default" and "without default", and handling each collection separately. WeakConstructor and Constructor can handle props with defaults identically, while splitting on their handling of props without.
+
+### Motivation
+On my laptop, produces a ~2x improvement in the benchmark for constructing an instance mostly with defaults, and a ~1.3x improvement for constructing with all props set explicitly.
+
+Also produces a ~1.2x improvement in deserialization with mostly defaults (with no effect on deserialization with props set explicitly).
+
+### Test plan
+Added tests here plus ~passing build in pay-server
+
+(Note: a pay-server build currently fails but all errors are ~trivial changes in error messages. If this approach looks good, I'll go ahead and relax the relevant tests to make them pass before we actually merge this.)
+Please let me know if I'm missing something here. Thanks!
+
+### Problem
+
+I'd like to define a method that takes one of a few possible constant values. For example:
+
+``` ruby
+class Fruit
+  extend T::Sig
+
+  BANANA = T.let("banana", String)
+  APPLE = T.let("apple", String)
+
+  sig { params(value: T.any(BANANA, APPLE)).returns(T::Boolean) }
+  def self.banana?(value)
+    value == BANANA
+  end
+end
+```
+
+I'd expect to be able to do this:
+
+``` ruby
+Fruit.banana?("banana")
+```
+
+But not this:
+
+``` ruby
+Fruit.banana?("monster truck")
+```
+
+I *could* use an enum. But in my real example, I'm already using these string values in other places. They can be returned from my model attributes and can be provided as params from a user. I don't want to have to convert these values every time I interact with them.
+
+### Proposed solution
+
+My suggestion would be for Sorbet to support literal values in type declarations.
+<!-- (optional) Explain your change, focusing on the details of the solution. This is a great place to call out user-visible changes. -->
+
+
+### Motivation
+This changes the autogen output to indicate whether the parent classes for printed subclasses are classes or modules. This information needed to be plumbed through some of the autogen paths.
+
+### Test plan
+<!-- If you did not write tests for this change, replace the message below explaining why not. Why we should be confident this change is correct? If you changed the website, please include a screenshot of the proposed changes. -->
+
+See included automated tests.
+
+#### Input
+`Gemfile.lock` with ` aws-sdk-kms (1.27.0)`
+
+#### Observed output
+
+```
+sorbet/rbi/gems/aws-sdk-kms.rbi:781: unexpected token $end https://srb.help/2001
+     781 |class Anonymous_Struct_126 < Struct
+     782 |
+```
+
+#### Expected behavior
+
+it probably shouldn't error out?
+#### Input
+
+```
+$ bundle install
+Fetching gem metadata from https://rubygems.org/............
+Resolving dependencies......
+Could not find sorbet-static-0.5.5258-universal-darwin-14 in any of the sources
+
+$ ruby -v
+ruby 2.7.0p0 (2019-12-25 revision 647ee6f091) [armv7l-linux-eabihf]
+
+$ gem -v
+3.1.2
+
+$ uname -a
+Linux raspberrypi 4.19.79-v7l+ #1273 SMP Fri Oct 11 18:23:45 BST 2019 armv7l GNU/Linux
+
+$ lsb_release -a
+No LSB modules are available.
+Distributor ID: Raspbian
+Description:    Raspbian GNU/Linux 10 (buster)
+Release:        10
+Codename:       buster
+
+$ cat Gemfile
+```
+
+``` ruby
+# frozen_string_literal: true
+
+source 'https://rubygems.org'
+
+git_source(:github) { |repo_name| "https://github.com/#{repo_name}" }
+
+gem 'sorbet-runtime'
+
+group :development do
+  gem 'sorbet'
+end
+```

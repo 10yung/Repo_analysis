@@ -1,0 +1,213 @@
+This adds the libaio option prio_percent which allows a certain percentage of commands to be sent at a higher priority. Since this only is relevant to reads on the drive side, only reads will be broken down into multiple priorities like this. The latencies of the two priority types will be reported separately in addition to the combined latencies. This will only affect normal and json reporting.
+Appveyor and Travis tests having been failing with t0010-b7aae4ba.fio:
+```
+# Expected result: fio runs and completes the job
+# Buggy result: fio segfaults
+#
+[test]
+ioengine=null
+size=10g
+io_submit_mode=offload
+iodepth=16
+```
+
+Previously this only happened on Windows but there have been recent failures on other platforms. Failures occurring on multiple platforms suggests that there is a genuine problem.
+
+- Windows failures (both x86 and x64)
+-- https://ci.appveyor.com/project/axboe/fio/builds/29724441/job/5yc42vujc3y46r5b
+-- https://ci.appveyor.com/project/axboe/fio/builds/29704848/job/4n6fq1rct22d70y3
+-- https://ci.appveyor.com/project/axboe/fio/builds/29643383/job/lswsoca5laxj7vw6
+-- https://ci.appveyor.com/project/vincentkfu/fio/builds/29688203/job/nc776ub9dt43w3qw
+-- https://ci.appveyor.com/project/vincentkfu/fio/builds/29578210/job/vj083pvj5nma9q9k
+-- https://ci.appveyor.com/project/vincentkfu/fio/builds/29342164/job/43q67r342g6wyd1f
+- macOS failures
+--  https://travis-ci.org/axboe/fio/jobs/631746909
+-- https://travis-ci.org/axboe/fio/jobs/635404562
+- Linux failure
+-- https://travis-ci.org/axboe/fio/jobs/633377483
+It need use env to run the program in different linux distributions.
+In Debian like distributions:
+   $ which bash
+   /bin/bash
+In RHEL like distributions:
+   $ which bash
+   /usr/bin/bash
+
+revert commit: 69746cd8631060a
+
+Signed-off-by: Changcheng Liu <changcheng.liu@aliyun.com>
+As the title suggests when there is a difference between the indicated and observed-requested.
+
+The storage subsystems configs are:
+•	A 32x 10TB NvME Gen4 rulers in a PCIe-4 bus and an Intel CPU PCIe-4 (engineering).  
+•	A 32x 10TB NvME Gen3 rulers in a PCIe-3 bus.
+•	A 64 x 8TB SSDs.
+From our xperf traces on our filesystem we have observed that in (1) we are not the bottleneck so we are suspecting that FIO might not be submitting the appropriate requests. When using DiskSpd and CFStest, we have no problem sustaining and equivalent load.
+ 
+For example
+ 
+1.	fio   --thread  --direct=1 --ioengine=windowsaio  --time_based --ramp_time=60--runtime=1200--directory=v\:\\FIO_Directory_1 --size=4000GB --rw=write --iodepth=64 --bs=1024K --nrfiles=1 --name=4xXR2 --numjobs=10 --fallocate=truncate --unlink=1
+IO depths    : 1=100.0%, 2=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=0.0%
+              submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+              complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+ 
+ 
+2.	fio   --thread  --direct=1 --ioengine=windowsaio  --time_based --ramp_time=60--runtime=1200 --directory=v\:\\FIO_Directory_1 --size=4000GB --rw=write --iodepth=64 --bs=1024K --nrfiles=1 --name=4xXR2 --numjobs=1 --fallocate=truncate --unlink=1  
+IO depths    : 1=0.0%, 2=0.1%, 4=0.3%, 8=99.7%, 16=0.0%, 32=0.0%, >=64=0.0%
+              submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+              complete  : 0=0.0%, 4=100.0%, 8=0.1%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+ 
+3.	fio   --thread  --direct=1 --ioengine=windowsaio  --time_based --ramp_time=60--runtime=1200--directory=v\:\\FIO_Directory_1 --size=4000GB --rw=write --iodepth=64 --bs=1024K --nrfiles=10 --name=4xXR2 --numjobs=1 --fallocate=truncate --unlink=1
+IO depths    : 1=0.1%, 2=0.1%, 4=0.6%, 8=99.3%, 16=0.0%, 32=0.0%, >=64=0.0%
+submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+complete  : 0=0.0%, 4=99.9%, 8=0.1%, 16=0.1%, 32=0.0%, 64=0.0%, >=64=0.0%
+ 
+None of these specs yield a volume/fs queue depth of anything close to 100 queued IOs
+1.	a 10-minute average of 1sec samples yields a 150 queued IOs
+2.	a 10-minute average of 1sec samples yields a 64 queued IOs
+3.	a 10-minute average of 1sec samples yields a 64 queued IOs
+ 
+The same is true symptom is valid for –iodepth=16,32,64,128,256,512,1024 in all storage subsystems.
+*we only test up to –iodepth=256 for SSDs
+ 
+responding to Sitsofe's questions:
+
+How much of a CPU is being taken up by fio alone? Is there any spare?
+CPU is “negligible” @around 2-5%
+
+Does xperf also confirm a max outstanding depth of only 5-8 I/Os?
+Xperf and controller firmware confirm the observations with regards to queued depths recieved and latencies not being an issue.
+
+If memory serves DiskSpd also sets the watermark (if needs be it will write the whole file once if it can't just mark all unwritten data as valid). Do things change if you use a per-existing file that's been entirely written at least once?
+
+fio   --thread  --direct=1 --ioengine=windowsaio  --directory=v\:\\ --size=40GB --rw=write --iodepth=64 --bs=1024K --nrfiles=1 --name=4xXR2 --numjobs=10 --fallocate=truncate --group_reporting=1 –overwrite=1 (or running the same test twice)
+
+IO depths    : 1=0.1%, 2=0.1%, 4=0.1%, 8=0.1%, 16=0.1%, 32=0.1%, >=64=99.8%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=99.9%, 8=0.1%, 16=0.1%, 32=0.1%, 64=0.1%, >=64=0.1%
+As for overwrite, this is one of the reasons why I [suggested the set valid data](https://github.com/axboe/fio/issues/833#issuecomment-547103718), not only to fix the very slow first allocations; but because data in place writes behave differently than first allocations.
+The overwrite command is painfully slow, especially when testing with large (>1TB) and multiple files (>100s) it would take an unreasonable time to set up the tests.
+
+
+
+
+As the script is compatible both with python2 and python3 then it makes sense do not hardcode to python2.7 and use the system pytohn version.
+
+There are plenty of containers for fio, but there are old and can't really trust them ...
+
+`fio` is really good to test volume accesses from Docker/Kubernetes so having an official and trustable Docker image would be really great.
+
+Would you mind (or anyone else) to build that image?
+This one doesn't do all that much clever (e.g. I assume `gettimeofday()` will be fast and accurate enough to time multiple `clock_gettime()` calls) and it introduces a conditional into the clock path. Even so it seems to give numbers similar to using the cpu clock and I think the cost in accuracy is made up for by the lower overhead.
+
+What do you think Jens?
+I am trying to write 10 files in a job, and then read them in another job.  So I have set filename_format to match and this works with fewer than 10 files per job.  But when nrfiles=10, the read job unlinks one file.  To see this more clearly, I have set allow_file_create=0.  In the below output, notice the output of `ls` at the end, it's missing one file.  I can't think of any reason for this so I guess it's a bug.  This is fio version 3.5.
+
+```
+root@freenas ~ # fio --name=write_file --rw=write --bs=1M --size=2G --end_fsync=1 --filename_format=/octa/file.\$jobnum.\$filenum --nrfiles=10
+write_file: (g=0): rw=write, bs=(R) 1024KiB-1024KiB, (W) 1024KiB-1024KiB, (T) 1024KiB-1024KiB, ioengine=psync, iodepth=1
+fio-3.5
+Starting 1 process
+write_file: Laying out IO files (10 files / total 2047MiB)
+Jobs: 1 (f=1): [F(1)][-.-%][r=0KiB/s,w=0KiB/s][r=0,w=0 IOPS][eta 00m:00s]
+write_file: (groupid=0, jobs=1): err= 0: pid=75333: Thu Oct  3 12:54:13 2019
+  write: IOPS=868, BW=869MiB/s (911MB/s)(2040MiB/2348msec)
+    clat (usec): min=200, max=1564, avg=227.49, stdev=82.32
+     lat (usec): min=210, max=1574, avg=240.05, stdev=94.30
+    clat percentiles (usec):
+     |  1.00th=[  204],  5.00th=[  206], 10.00th=[  206], 20.00th=[  208],
+     | 30.00th=[  208], 40.00th=[  210], 50.00th=[  219], 60.00th=[  219],
+     | 70.00th=[  221], 80.00th=[  221], 90.00th=[  225], 95.00th=[  237],
+     | 99.00th=[  668], 99.50th=[  873], 99.90th=[  947], 99.95th=[  947],
+     | 99.99th=[ 1565]
+  lat (usec)   : 250=97.21%, 500=0.49%, 750=1.42%, 1000=0.83%
+  lat (msec)   : 2=0.05%
+  cpu          : usr=2.34%, sys=20.40%, ctx=36, majf=0, minf=0
+  IO depths    : 1=100.5%, 2=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     issued rwts: total=0,2040,0,10 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=1
+
+Run status group 0 (all jobs):
+  WRITE: bw=869MiB/s (911MB/s), 869MiB/s-869MiB/s (911MB/s-911MB/s), io=2040MiB (2139MB), run=2348-2348msec
+
+root@freenas ~ # ls /octa
+file.0.0	file.0.2	file.0.4	file.0.6	file.0.8
+file.0.1	file.0.3	file.0.5	file.0.7	file.0.9
+
+root@freenas ~ # fio --name=read_file --rw=read --bs=1M --size=2G --filename_format=/octa/file.\$jobnum.\$filenum --allow_file_create=0 --nrfiles=10 --debug=file
+fio: set debug option file
+file     102664 add file /octa/file.0.0
+file     102664 resize file array to 11 files
+file     102664 file 0x801a040d0 "/octa/file.0.0" added at 0
+file     102664 add file /octa/file.0.1
+file     102664 file 0x801a04290 "/octa/file.0.1" added at 1
+file     102664 add file /octa/file.0.2
+file     102664 file 0x801a04450 "/octa/file.0.2" added at 2
+file     102664 add file /octa/file.0.3
+file     102664 file 0x801a04610 "/octa/file.0.3" added at 3
+file     102664 add file /octa/file.0.4
+file     102664 file 0x801a047d0 "/octa/file.0.4" added at 4
+file     102664 add file /octa/file.0.5
+file     102664 file 0x801a04990 "/octa/file.0.5" added at 5
+file     102664 add file /octa/file.0.6
+file     102664 file 0x801a04b50 "/octa/file.0.6" added at 6
+file     102664 add file /octa/file.0.7
+file     102664 file 0x801a04d10 "/octa/file.0.7" added at 7
+file     102664 add file /octa/file.0.8
+file     102664 file 0x801a04ed0 "/octa/file.0.8" added at 8
+file     102664 add file /octa/file.0.9
+file     102664 file 0x801a05090 "/octa/file.0.9" added at 9
+read_file: (g=0): rw=read, bs=(R) 1024KiB-1024KiB, (W) 1024KiB-1024KiB, (T) 1024KiB-1024KiB, ioengine=psync, iodepth=1
+fio-3.5
+Starting 1 process
+file     102664 setup files
+file     102664 get file size for 0x801a040d0/0//octa/file.0.0
+file     102664 get file size for 0x801a04290/1//octa/file.0.1
+file     102664 get file size for 0x801a04450/2//octa/file.0.2
+file     102664 get file size for 0x801a04610/3//octa/file.0.3
+file     102664 get file size for 0x801a047d0/4//octa/file.0.4
+file     102664 get file size for 0x801a04990/5//octa/file.0.5
+file     102664 get file size for 0x801a04b50/6//octa/file.0.6
+file     102664 get file size for 0x801a04d10/7//octa/file.0.7
+file     102664 get file size for 0x801a04ed0/8//octa/file.0.8
+file     102664 get file size for 0x801a05090/9//octa/file.0.9
+read_file: Laying out IO files (10 files / total 2047MiB)
+file     102664 layout unlink /octa/file.0.0
+file     102664 open file /octa/file.0.0, flags 401
+fio: file creation disallowed by allow_file_create=0
+
+
+Run status group 0 (all jobs):
+
+root@freenas ~ # ls /octa
+file.0.1	file.0.3	file.0.5	file.0.7	file.0.9
+file.0.2	file.0.4	file.0.6	file.0.8
+```
+When I use a fixed-iops workload with rate_iops=200,  I see 200 IOPS in the IOPS log but do not see it from the histogram log.   This is reproducible.   In output below, column 2 is the number of I/O operations that are recorded in the histogram log for each time interval -- this column is obtained by summing the counters in the histogram bucket for that record.   Spot checks show that it is correct.   But it does not come out to 200 IOPS, only about half that.      See files in attached zip file 
+[inconsistent-iops-hist.zip](https://github.com/axboe/fio/files/3668055/inconsistent-iops-hist.zip)
+
+```
+[bengland@bene-laptop inconsistent-iops-hist]$ ../../fio-histo-log-pctiles.py x_clat_hist.1.log 
+fio version = 3
+bucket groups = 29
+bucket bits = 6
+time quantum = 1 sec
+percentiles = 0.0,50.0,95.0,99.0,100.0
+buckets per group = 64
+buckets per interval = 1856 
+output unit = usec
+time (millisec), percentiles in increasing order with values in usec
+msec-since-start, samples, min, median, 95.0, 99.0, max, 
+       0,        0, , , , , , 
+    1000,        0, , , , , , 
+    2000,       96, 266.24, 727.267555556, 776.76544, 784.42496, 786.432
+    3000,      110, 119.808, 740.258579274, 782.609526685, 785.667505337, 786.432
+    4000,       89, 119.808, 751.748299742, 783.613255453, 785.868251091, 786.432
+    5000,       89, 145.408, 744.501461847, 783.091042204, 785.763808441, 786.432
+    6000,       87, 145.408, 754.74552809, 784.322744155, 786.010148831, 786.432
+    7000,       79, 466.944, 750.853341894, 782.452281336, 785.636056267, 786.432
+    8000,       75, 204.8, 765.026618392, 784.366832456, 786.018966491, 786.432
+    9000,      102, 204.8, 756.203129698, 784.003860789, 785.946372158, 786.432
+```

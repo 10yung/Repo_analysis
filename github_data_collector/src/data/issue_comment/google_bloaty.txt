@@ -1,0 +1,278 @@
+What does this error mean? I get it when trying to look at compileunits
+I'm not able to load ELFs for an embedded PowerPC platform that I'm using:
+```
+$ bloaty ppc_hello_world.elf
+bloaty: ELF region out-of-bounds
+```
+
+I'm running on Linux x64, and [here](https://github.com/google/bloaty/files/3979693/ppc_hello_world.elf.zip) is the sample file I'm trying to load.
+
+The exception is being thrown here:
+```
+Breakpoint 1, bloaty::(anonymous namespace)::StrictSubstr (data=..., off=off@entry=0, n=134217728)
+    at /home/awilke/code/bloaty/src/elf.cc:109
+109         THROW("ELF region out-of-bounds");
+(gdb) bt
+#0  bloaty::(anonymous namespace)::StrictSubstr (data=..., off=off@entry=0, n=134217728)
+    at /home/awilke/code/bloaty/src/elf.cc:109
+#1  0x00000000004bca0f in Next (this=0x7ffff6aa2930) at /home/awilke/code/bloaty/src/elf.cc:221
+#2  NoteIter (section=..., this=0x7ffff6aa2930) at /home/awilke/code/bloaty/src/elf.cc:205
+#3  bloaty::(anonymous namespace)::ElfObjectFile::GetBuildId (this=<optimized out>)
+    at /home/awilke/code/bloaty/src/elf.cc:1278
+#4  0x00000000004a0f4f in bloaty::Bloaty::ScanAndRollupFile (this=0x7fffffffda30, file=0xd0cb20,
+    rollup=rollup@entry=0xd0acf0, out_build_id=out_build_id@entry=0xd0ad48)
+    at /home/awilke/code/bloaty/src/bloaty.cc:1580
+#5  0x00000000004a17e7 in operator() (data=0xd0acf0, __closure=0xd0d718)
+    at /home/awilke/code/bloaty/src/bloaty.cc:1673
+<snip>
+```
+
+I'm assuming that `bloaty` is crashing when reading the section header for `.PPC.EMB.apuinfo`, since that's the only note-type section in this ELF:
+```
+$ readelf ppc_hello_world.elf -S | grep NOTE
+  [15] .PPC.EMB.apuinfo  NOTE            00000000 0300c8 000018 00      0   0  1
+```
+
+The header values parsed by `bloaty` don't make sense:
+```
+(gdb) frame 1
+#1  0x00000000004bca0f in Next (this=0x7ffff6aa2930) at /home/awilke/code/bloaty/src/elf.cc:221
+221           name_ = StrictSubstr(remaining_, 0, ptr->n_namesz);
+(gdb) p/x ptr->n_namesz
+$19 = 0x8000000
+(gdb) p/x ptr->n_descsz
+$20 = 0x4000000
+(gdb) p/x ptr->n_type
+$21 = 0x2000000
+(gdb)
+```
+However, these appear to be byte-reversed interpretations of the expected values in the header. See [this ABI reference](https://www.st.com/content/ccc/resource/technical/document/user_manual/ac/f2/bf/01/73/d8/48/e0/CD00161395.pdf/files/CD00161395.pdf/jcr:content/translations/en.CD00161395.pdf), section 2.2.1. The expected values are:
+- name size = 8 bytes
+- type = 2
+
+This is really pushing my knowledge of the ELF format, but it appears that this is an endianness issue when parsing the section header? PowerPC is a big-endian platform, and my host platform is little-endian.
+```
+$ readelf ppc_hello_world.elf -h | grep endian
+  Data:                              2's complement, big endian
+```
+
+Thanks for any help you can provide!
+I've been running bloaty on an iOS app recently and found that `-d compileunits`, while very helpful in some cases, was consistently telling me that a single `.c` file was >20MB. Is it possible that there is something going on when the binary is overly large?
+
+Output from the iOS App (with an embedded static lib)
+```
+$ bloaty -n 75 -d compileunits -s file --debug-file=<DSYM> <App Binary>
+     VM SIZE                                                                                        FILE SIZE
+ --------------                                                                                  --------------
+  36.4%  43.0Mi [5814 Others]                                                                     38.6Mi  34.0%
+  18.1%  21.4Mi external/APNGKit/APNGKit/libpng-apng/pngerror.c                                   21.4Mi  18.8%
+   9.9%  11.7Mi [__TEXT,__text]                                                                   11.7Mi  10.3%
+   9.0%  10.7Mi [__DATA,__objc_const]                                                             10.7Mi   9.4%
+   5.9%  6.93Mi [__LINKEDIT]                                                                      6.92Mi   6.1%
+   3.2%  3.77Mi [__TEXT,__cstring]                                                                3.77Mi   3.3%
+   1.4%  1.68Mi [__TEXT,__objc_methname]                                                          1.68Mi   1.5%
+   1.2%  1.43Mi [__DATA,__objc_data]                                                              1.43Mi   1.3%
+   1.1%  1.29Mi [__TEXT,__unwind_info]                                                            1.29Mi   1.1%
+   0.8%  1008Ki [__TEXT,__gcc_except_tab]                                                         1008Ki   0.9%
+   ...
+ 100.0%   118Mi TOTAL  
+``` 
+
+Output from the dependent library (built separately)
+```
+$ bloaty -n 75 -d compileunits -s file --debug-file=APNGKit.framework.dSYM/Contents/Resources/DWARF/APNGKit APNGKit.framework/APNGKit 
+     VM SIZE                                                                                        FILE SIZE
+ --------------                                                                                  --------------
+   1.2%  19.1Ki [__LLVM,__bundle]                                                                 1.27Mi  39.7%
+  78.7%  1.27Mi /Library/Caches/com.apple.xbs/Sources/arclite_iOS/arclite-76/source/arclite.mm    1.27Mi  39.5%
+   0.0%       0 [__TEXT,__text]                                                                    173Ki   5.3%
+   5.1%  84.5Ki [__LINKEDIT]                                                                       140Ki   4.3%
+   0.0%       0 [Unmapped]                                                                        29.1Ki   0.9%
+   1.5%  23.9Ki APNGKit/APNGKit/libpng-apng/pngrutil.c                                            25.5Ki   0.8%
+   0.7%  12.3Ki [__TEXT]                                                                          25.2Ki   0.8%
+   1.4%  23.1Ki APNGKit/APNGKit/libpng-apng/png.c                                                 25.0Ki   0.8%
+   0.6%  9.31Ki [__LLVM]                                                                          21.7Ki   0.7%
+   1.2%  19.9Ki APNGKit/APNGKit/libpng-apng/pngread.c                                             20.4Ki   0.6%
+   1.2%  19.3Ki APNGKit/APNGKit/libpng-apng/pngrtran.c                                            19.4Ki   0.6%
+   1.0%  16.5Ki APNGKit/APNGKit/libpng-apng/pngwutil.c                                            17.0Ki   0.5%
+   0.0%       0 [__TEXT,__cstring]                                                                15.8Ki   0.5%
+   0.9%  14.7Ki APNGKit/APNGKit/APNGImageView.swift                                               14.8Ki   0.4%
+   0.9%  14.5Ki APNGKit/APNGKit/APNGImage.swift                                                   14.5Ki   0.4%
+   0.8%  12.6Ki APNGKit/APNGKit/libpng-apng/pngset.c                                              12.7Ki   0.4%
+   0.7%  12.2Ki APNGKit/APNGKit/libpng-apng/pngwrite.c                                            12.7Ki   0.4%
+   0.6%  9.36Ki APNGKit/APNGKit/libpng-apng/pngpread.c                                            9.82Ki   0.3%
+   0.6%  9.55Ki APNGKit/APNGKit/Disassembler.swift                                                9.58Ki   0.3%
+   0.5%  8.04Ki /Users/JP21681/Library/Developer/Xcode/DerivedData/APNGKit-ctwilwszsgnxvzbbionmu  9.09Ki   0.3%
+   0.3%  4.33Ki [Mach-O Headers]                                                                  8.07Ki   0.2%
+   0.3%  5.11Ki APNGKit/APNGKit/libpng-apng/pngget.c                                              7.70Ki   0.2%
+   0.4%  6.44Ki APNGKit/APNGKit/libpng-apng/pngerror.c                                            7.08Ki   0.2%
+   ...
+   100.0%  1.61Mi TOTAL                                                                             3.21Mi 100.0%
+```
+On some binaries I have run through bloaty 1.0 (compiled from the tarball source), I have noticed that some functions which have `.cold` generated segments don't get demangled properly.
+
+As an example, if you had a function `foo` with the signature `void foo()` (mangled as `_Z3foov`), which had a "cold" section, the symbol would be `_Z3foov.cold`.
+
+Bloaty doesn't demangle `_Z3foov.cold`, which can sometimes make output confusing. Technically, the fact that it doesn't demangle it is _expected_, as I'm assuming that string doesn't adhere to the Itanium/etc mangling convention. However, even denoting it like
+
+```foo() [cold]```
+
+Could be more readable, perhaps?
+
+I'm not sure how easy this would be to resolve, and it sounds like a pretty low priority. However, I didn't see any existing issues covering this.
+In embedded applications, two pieces of code might have exactly the same set of addresses, but get paged out manually depending on what code is needed at that time.
+
+You can see more here:
+http://www.sourceware.org/binutils/docs-2.10/ld_3.html#SEC37
+https://en.wikipedia.org/wiki/Overlay_(programming)
+
+Suggested plan for Bloaty: Instead of using just the VM address to disambiguate, use (VM address, file offset). This will allow overlays to work correctly.
+Is it planed to add [Split DWARF](https://gcc.gnu.org/wiki/DebugFission) support to bloaty? 
+
+-d compileunits does not work for my build where debug info is outsourced into external .dwo files. 
+
+```
+    VM SIZE                                                          FILE SIZE
+ --------------                                                    --------------
+   0.0%       0 [section .debug_ranges]                             4.46Mi  26.0%
+   0.0%       0 [section .debug_addr]                               4.41Mi  25.7%
+   0.0%       0 [section .debug_line]                               2.78Mi  16.2%
+   0.0%       0 [section .gdb_index]                                2.78Mi  16.2%
+  77.2%  1.52Mi [DWARF is missing filename]                         1.86Mi  10.9%
+```
+
+
+_readelf --debug-dump_ looks like this:
+```
+Contents of the .debug_info section:
+
+  Compilation Unit @ offset 0x0:
+   Length:        0x30 (32-bit)
+   Version:       4
+   Abbrev Offset: 0x0
+   Pointer Size:  8
+ <0><b>: Abbrev Number: 1 (DW_TAG_compile_unit)
+    <c>   DW_AT_ranges      : 0x106d0
+    <10>   DW_AT_low_pc      : 0x0
+    <18>   DW_AT_stmt_list   : 0x0
+    <1c>   DW_AT_GNU_dwo_name: (indirect string, offset: 0x0): product/CMakeFiles/product_module_objlib.dir/product.cpp.dwo
+    <20>   DW_AT_comp_dir    : (indirect string, offset: 0x40): /develop/git1/gen/opt
+    <24>   DW_AT_GNU_pubnames: 1
+    <24>   DW_AT_GNU_addr_base: 0x0
+    <28>   DW_AT_GNU_dwo_id  : 0xdb38d234acb62a94
+    <30>   DW_AT_GNU_ranges_base: 0x0
+
+```
+Bloaty gives a `Corrupt Mach-O file` error on a file.
+
+`lipo -detailed_info` gives this output:
+
+```
+Fat header in: REDACTEDSdk
+fat_magic 0xcafebabe
+nfat_arch 5
+architecture armv7
+    cputype CPU_TYPE_ARM
+    cpusubtype CPU_SUBTYPE_ARM_V7
+    offset 108
+    size 8291248
+    align 2^2 (4)
+architecture armv7s
+    cputype CPU_TYPE_ARM
+    cpusubtype CPU_SUBTYPE_ARM_V7S
+    offset 8291356
+    size 8307560
+    align 2^2 (4)
+architecture i386
+    cputype CPU_TYPE_I386
+    cpusubtype CPU_SUBTYPE_I386_ALL
+    offset 16598916
+    size 8294024
+    align 2^2 (4)
+architecture x86_64
+    cputype CPU_TYPE_X86_64
+    cpusubtype CPU_SUBTYPE_X86_64_ALL
+    offset 34485416
+    size 8454008
+    align 2^3 (8)
+architecture arm64
+    cputype CPU_TYPE_ARM64
+    cpusubtype CPU_SUBTYPE_ARM64_ALL
+    offset 24892944
+    size 9592472
+    align 2^3 (8)
+```
+
+The hexdump of the first part of the file is this:
+
+```
+0000000 ca fe ba be 00 00 00 05 00 00 00 0c 00 00 00 09  >................<
+0000020 00 00 00 6c 00 7e 83 b0 00 00 00 02 00 00 00 0c  >...l.~..........<
+0000040 00 00 00 0b 00 7e 84 1c 00 7e c3 68 00 00 00 02  >.....~...~.h....<
+0000060 00 00 00 07 00 00 00 03 00 fd 47 84 00 7e 8e 88  >..........G..~..<
+0000100 00 00 00 02 01 00 00 07 00 00 00 03 02 0e 34 a8  >..............4.<
+0000120 00 80 ff 78 00 00 00 03 01 00 00 0c 00 00 00 00  >...x............<
+0000140 01 7b d6 10 00 92 5e 98 00 00 00 03 21 3c 61 72  >.{....^.....!<ar<
+0000160 63 68 3e 0a 23 31 2f 32 30 20 20 20 20 20 20 20  >ch>.#1/20       <
+0000200 20 20 20 20 31 35 31 39 32 32 31 38 35 30 20 20  >    1519221850  <
+0000220 35 30 31 20 20 20 32 30 20 20 20 20 31 30 30 36  >501   20    1006<
+```
+An issue for visualizing symbol dependency tree (from README/Future Work). This would be great for helping users find which part of their code is pulling in huge symbol dependencies.
+Just some information in case someone wants to add support for the Atmel AVR architecture to bloaty.
+
+I have tried analysing an elf-file compiled for the ATmega328P microcontroller (Atmel 8-bit AVR RISC-based architecture), which failed with the error "Unknown ELF machine value: 83'".
+
+The error is raised in elf.cc at line 850 since EM_AVR (value 83) does not get handled there. After a quick look at the documentation of the capstone decompiler, it seems that AVR microcontrollers are not explicitly supported (?). But I gave it a try anyway by selecting the ARM architecture (also RISC-based) with little endian and the resulting bloaty binary seems to be working fine with AVR elf-files after this little addition to the switch statement in the function ElfMachineToCapstone():
+`    case EM_AVR:
+      *arch = CS_ARCH_ARM;
+      *mode = CS_MODE_LITTLE_ENDIAN;
+      break;`
+
+Note though, that I do not know much about processor architectures and the way capstone works, so the question remains, if this change introduces problems I am not yet aware of (if anyone could provide additional information in this regard, I'd be grateful).
+
+Many thanks to the developers for this useful tool!
+
+
+
+
+I tried build my binary with g++ and clang++, and analyze with bloaty. I always had same error 
+```
+bloaty: Unexpected eh_frame format value: 8
+```
+
+I trying to analyze elf file (linux build), when I run bloaty without flags it prints correct output:
+```
+     VM SIZE                         FILE SIZE
+ --------------                   --------------
+   0.0%       0 .debug_info        63.3Mi  73.2%
+   0.0%       0 .debug_str         5.82Mi   6.7%
+   0.0%       0 .debug_loc         5.06Mi   5.8%
+   0.0%       0 .debug_line        3.11Mi   3.6%
+  65.1%  3.09Mi .text              3.09Mi   3.6%
+   0.0%       0 .debug_abbrev      1.71Mi   2.0%
+   0.0%       0 .debug_ranges      1.51Mi   1.7%
+   0.0%       0 .strtab             887Ki   1.0%
+  17.5%   848Ki .eh_frame           848Ki   1.0%
+  13.7%   664Ki .rodata             664Ki   0.7%
+   0.0%       0 .symtab             340Ki   0.4%
+   1.8%  86.9Ki .eh_frame_hdr      86.9Ki   0.1%
+   0.0%       0 .debug_aranges     77.0Ki   0.1%
+   1.0%  50.6Ki .gcc_except_table  50.6Ki   0.1%
+   0.5%  25.0Ki .bss                    0   0.0%
+   0.1%  6.73Ki .dynstr            6.73Ki   0.0%
+   0.1%  4.50Ki [22 Others]        4.98Ki   0.0%
+   0.1%  3.80Ki .dynsym            3.80Ki   0.0%
+   0.1%  3.17Ki .plt               3.17Ki   0.0%
+   0.0%     340 [ELF Headers]      1.86Ki   0.0%
+   0.0%  1.58Ki .rel.plt           1.58Ki   0.0%
+ 100.0%  4.75Mi TOTAL              86.6Mi 100.0%
+```
+
+But for compileuntis or symbols I had this error.
+
+OS: Ubuntu 16.04
+gcc (Ubuntu 5.4.0-6ubuntu1~16.04.10) 5.4.0 20160609
+clang version 3.8.0-2ubuntu4 (tags/RELEASE_380/final)
+
+I tried also -g and -ggdb3 flags, same problem
+

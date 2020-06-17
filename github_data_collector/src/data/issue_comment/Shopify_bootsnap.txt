@@ -1,0 +1,563 @@
+When running `rspec` for an application for which a new `config/something.yml.example` file has been added, and some code expects that `config/something.yml` is present, an obscure error appears:
+
+```
+         13: from /Users/pirj/.rvm/gems/ruby-2.5.1@my_project/gems/bootsnap-1.4.5/lib/bootsnap/load_path_cache/core_ext/kernel_require.rb:22:in `require'
+         12: from /Users/pirj/source/my_project/lib/models/some_model.rb:35:in `<top (required)>'
+         11: from /Users/pirj/source/my_project/lib/models/some_model.rb:50:in `<class:SomeModel>'
+         10: from /Users/pirj/source/my_project/lib/concerns/some_concern.rb:68:in `some_attribute'
+          9: from /Users/pirj/source/my_project/lib/concerns/some_concern.rb:68:in `delete'
+          8: from /Users/pirj/source/my_project/lib/concerns/some_concern.rb:68:in `block in some_attribute'
+          1: from /Users/pirj/.rvm/gems/ruby-2.5.1@my_project/gems/bootsnap-1.4.5/lib/bootsnap/compile_cache/yaml.rb:50:in `block in install!'
+/Users/pirj/.rvm/gems/ruby-2.5.1@my_project/gems/bootsnap-1.4.5/lib/bootsnap/compile_cache/yaml.rb:50:in `fetch': No such file or directory - bs_fetch:open_current_file:open (Errno::ENOENT)
+```
+(scrubbed)
+
+where the line that is fetching conf is:
+```ruby
+      @config = YAML.load_file(Rails.root.join(path)).deep_symbolize_keys[env]
+```
+
+WDYT of adding handling for this case to `lib/bootsnap/compile_cache/yaml.rb`:
+```diff
+          rescue Errno::EACCES
+            Bootsnap::CompileCache.permission_error(path)
++           rescue => Errno::ENOENT
++             # Something explaining which file can't be found
+          end
+        end
+```
+
+I can send a pull request real quick but would appreciate if you suggest what should be raised and how since I'm not very familiar with the internals of Bootsnap.
+Hey, when I am trying to run `rails server` I am getting the process aborted due to the following problem:
+
+```
+.rvm/gems/ruby-2.5.3@project-name/gems/bootsnap-1.3.2/lib/bootsnap/load_path_cache/core_ext/kernel_require.rb:32:in `require': cannot load such file -- dry/validation/schema/form (LoadError)
+```
+
+are you aware how can I fix it? Google does not provide and useful ideas.
+
+I am running on Mac OS Catalina 10.15.1 - I had some kernel related issue with the curb gem, where I had to upgrade it from 0.9.3 to 0.9.10. Maybe this case is somehow related. Since I am not a backend developer, I can only guess what’s going on here.
+If you're using Spring with Bootsnap, Spring requires ```fileutils``` via gem name (i.e. ```require 'fileutils'```, which in turn, always loads the latest version installed. Bootsnap requires ```fileutils``` [directly from the ruby lib dir](https://github.com/Shopify/bootsnap/blob/b2b30b3119cad30210fd803db6ddc8a68858ff20/lib/bootsnap/load_path_cache/store.rb#L4), which can cause ```already initialized constant FileUtils::``` if you have multiple versions installed.
+
+For example, on my system I have the following versions installed:
+
+```fileutils (1.4.1, default: 1.1.0)```
+
+Spring will load ```v1.4.1```, and Bootsnap will load ```v1.1.0```.
+
+Any suggestions? Or maybe Bootsnap should check if the ```FileUtils``` constant is already loaded before trying to require it? Thanks for your time.
+
+**Update 1**
+
+This really has nothing to do with Spring, it just so happens it uses ```fileutils``` and it's run before Bootsnap.
+I decided to keep up the momentum with #277 and create a tenative pull request with my proposed changes to load path cache.
+
+This includes:
+- Additional option to exclude some path to try them as potential load path to scan
+- New module in C to replace `Dir.glob`. It is both faster and easier on memory - unlike `Dir.glob` creating a large array and then iterating it, it yields with every found path and does path exclusion on C level.
+- Extending TravisCI matrix to test both with this new extension and without
+
+I tested those changes against Discourse, but without significant speedup:
+
+|                     | cold | warm |
+|---------------------|------|------|
+| no exclusions, Ruby | 3.49 | 3.19 |
+| no exclusions, C    | 3.48 | 3.2  |
+| exclusions, Ruby    | 3.62 | 3.13 |
+| exclusions, C       | 3.48 | 3.15 |
+
+However, with my internal project with **a lot** of javascript (webpacker etc.), caching etc. savings are significant:
+
+|                     | cold |       | warm |       |
+|---------------------|------|-------|------|-------|
+| no exclusions, Ruby | 9.45 | 0%    | 8.5  | 0%    |
+| no exclusions, C    | 9.02 | 4.5%  | 7.94 | 6.5%  |
+| exclusions, Ruby    | 8.49 | 10.1% | 6.83 | 19.6% |
+| exclusions, C       | 6.92 | 26.7% | 6.86 | 19.2% |
+
+**Legend:**
+- cold - with load path cache purged (`rm tmp/cache/bootsnap-load-path-cache`)
+- warm - with load path cache present and no changes to the files
+
+I'm not the best C programmer (or even mediocre one), so to use this new C extension one must set environment variable `BOOTSNAP_EXPERIMENTAL`. This way people with project in dire need to speed up can experimentally use this, while most of the people can safely use existing version.
+
+Let me know what you think about this direction.
+I noticed that 2.5 out of 10 seconds of my application's startup time after requiring bootsnap is consumed by `Bootsnap::LoadPathCache::PathScanner.call`. By tracking the issue down, I found that it checks more than 150000 files that `Dir.glob(path + ALL_FILES)` returns. Most of those files are `node_modules`, cache files and compiled assets.
+
+This is obviously unnecessary. By simply hardcoding skipping of those path I gained 20-25% less of application boot time. I was wondering how this can be parameterized without actually overwriting part of Bootsnap code. 
+
+"All-in" approach would be writing a C extension that would only return those paths that are not explicitly excluded from load path optimization instead of `Dir.glob`. I have some preliminary (working) result here: https://github.com/Shopify/bootsnap/compare/master...katafrakt:dir-walker?expand=1
+
+Lighter approach would be to just `next if excluded_paths.any? {|ep| absolute_path.start_with?(ep)}` to the block inside `Dir.glob.each`, but of course this would be a bit less performant (I don't know how much less).
+
+What are your thoughts about this issue?
+my project has many large migration files.
+stack level too deep error occurs when executed 'RAILS_ENV=test bundle exec rake app:setup'
+but not repro comment out "require 'bootsnap'" and Bootsnap.setup in boot.rb
+
+```
+rake aborted!
+SystemStackError: stack level too deep
+```
+
+using
+ruby 2.6.4
+rails 6.0.0
+bootsnap 1.4.5
+
+Thank you
+Since upgrading our Rails app to 5.2.3 a few months ago and introducing Bootsnap (currently using v1.4.4), I have intermittent issues with `User` and `Admin` namespaces not found after starting the rails server on my dev machine and visiting our `/login`, `/signup` or `/admin` routes. The workaround is to reload the page or restart the server and eventually I'm able to visit those pages. The errors do not occur in test and production environments. 
+
+Below is an example of error trace:
+<details>
+
+```
+Started GET "/signup" for 127.0.0.1 at 2019-08-01 14:23:38 +0300
+  
+ActionController::RoutingError (uninitialized constant Users):
+  
+bootsnap (1.4.4) lib/bootsnap/load_path_cache/core_ext/active_support.rb:79:in `block in load_missing_constant'
+bootsnap (1.4.4) lib/bootsnap/load_path_cache/core_ext/active_support.rb:8:in `without_bootsnap_cache'
+bootsnap (1.4.4) lib/bootsnap/load_path_cache/core_ext/active_support.rb:79:in `rescue in load_missing_constant'
+bootsnap (1.4.4) lib/bootsnap/load_path_cache/core_ext/active_support.rb:58:in `load_missing_constant'
+activesupport (5.2.3) lib/active_support/inflector/methods.rb:283:in `const_get'
+activesupport (5.2.3) lib/active_support/inflector/methods.rb:283:in `block in constantize'
+activesupport (5.2.3) lib/active_support/inflector/methods.rb:281:in `each'
+activesupport (5.2.3) lib/active_support/inflector/methods.rb:281:in `inject'
+activesupport (5.2.3) lib/active_support/inflector/methods.rb:281:in `constantize'
+actionpack (5.2.3) lib/action_dispatch/http/request.rb:88:in `controller_class_for'
+actionpack (5.2.3) lib/action_dispatch/http/request.rb:81:in `controller_class'
+actionpack (5.2.3) lib/action_dispatch/routing/route_set.rb:46:in `controller'
+actionpack (5.2.3) lib/action_dispatch/routing/route_set.rb:32:in `serve'
+actionpack (5.2.3) lib/action_dispatch/routing/mapper.rb:18:in `block in <class:Constraints>'
+actionpack (5.2.3) lib/action_dispatch/routing/mapper.rb:48:in `serve'
+actionpack (5.2.3) lib/action_dispatch/journey/router.rb:52:in `block in serve'
+actionpack (5.2.3) lib/action_dispatch/journey/router.rb:35:in `each'
+actionpack (5.2.3) lib/action_dispatch/journey/router.rb:35:in `serve'
+actionpack (5.2.3) lib/action_dispatch/routing/route_set.rb:840:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+rack-pjax (1.1.0) lib/rack/pjax.rb:12:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+omniauth (1.9.0) lib/omniauth/strategy.rb:192:in `call!'
+omniauth (1.9.0) lib/omniauth/strategy.rb:169:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+http_accept_language (2.1.1) lib/http_accept_language/middleware.rb:14:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/rack/agent_hooks.rb:30:in `traced_call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/rack/browser_monitoring.rb:32:in `traced_call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+remotipart (1.4.3) lib/remotipart/middleware.rb:32:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+warden (1.2.8) lib/warden/manager.rb:36:in `block in call'
+warden (1.2.8) lib/warden/manager.rb:34:in `catch'
+warden (1.2.8) lib/warden/manager.rb:34:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+rack (2.0.7) lib/rack/tempfile_reaper.rb:15:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+rack (2.0.7) lib/rack/etag.rb:25:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+rack (2.0.7) lib/rack/conditional_get.rb:25:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+rack (2.0.7) lib/rack/head.rb:12:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+actionpack (5.2.3) lib/action_dispatch/http/content_security_policy.rb:18:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+rack (2.0.7) lib/rack/session/abstract/id.rb:232:in `context'
+rack (2.0.7) lib/rack/session/abstract/id.rb:226:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+actionpack (5.2.3) lib/action_dispatch/middleware/cookies.rb:670:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+activerecord (5.2.3) lib/active_record/migration.rb:559:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+actionpack (5.2.3) lib/action_dispatch/middleware/callbacks.rb:28:in `block in call'
+activesupport (5.2.3) lib/active_support/callbacks.rb:98:in `run_callbacks'
+actionpack (5.2.3) lib/action_dispatch/middleware/callbacks.rb:26:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+actionpack (5.2.3) lib/action_dispatch/middleware/executor.rb:14:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+actionpack (5.2.3) lib/action_dispatch/middleware/debug_exceptions.rb:61:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+actionpack (5.2.3) lib/action_dispatch/middleware/show_exceptions.rb:33:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+railties (5.2.3) lib/rails/rack/logger.rb:38:in `call_app'
+railties (5.2.3) lib/rails/rack/logger.rb:26:in `block in call'
+activesupport (5.2.3) lib/active_support/tagged_logging.rb:71:in `block in tagged'
+activesupport (5.2.3) lib/active_support/tagged_logging.rb:28:in `tagged'
+activesupport (5.2.3) lib/active_support/tagged_logging.rb:71:in `tagged'
+railties (5.2.3) lib/rails/rack/logger.rb:26:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+sprockets-rails (3.2.1) lib/sprockets/rails/quiet_assets.rb:13:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+actionpack (5.2.3) lib/action_dispatch/middleware/remote_ip.rb:81:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+request_store (1.4.1) lib/request_store/middleware.rb:19:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+actionpack (5.2.3) lib/action_dispatch/middleware/request_id.rb:27:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+rack (2.0.7) lib/rack/method_override.rb:22:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+rack (2.0.7) lib/rack/runtime.rb:22:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+activesupport (5.2.3) lib/active_support/cache/strategy/local_cache_middleware.rb:29:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+actionpack (5.2.3) lib/action_dispatch/middleware/executor.rb:14:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+actionpack (5.2.3) lib/action_dispatch/middleware/static.rb:127:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+rack (2.0.7) lib/rack/sendfile.rb:111:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+honeybadger (4.3.1) lib/honeybadger/rack/error_notifier.rb:33:in `block in call'
+honeybadger (4.3.1) lib/honeybadger/agent.rb:345:in `with_rack_env'
+honeybadger (4.3.1) lib/honeybadger/rack/error_notifier.rb:30:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+honeybadger (4.3.1) lib/honeybadger/rack/user_feedback.rb:31:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+honeybadger (4.3.1) lib/honeybadger/rack/user_informer.rb:21:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+webpacker (4.0.7) lib/webpacker/dev_server_proxy.rb:29:in `perform_request'
+rack-proxy (0.6.5) lib/rack/proxy.rb:57:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+railties (5.2.3) lib/rails/engine.rb:524:in `call'
+newrelic_rpm (6.4.0.356) lib/new_relic/agent/instrumentation/middleware_tracing.rb:99:in `call'
+puma (4.0.0) lib/puma/configuration.rb:228:in `call'
+puma (4.0.0) lib/puma/server.rb:657:in `handle_request'
+puma (4.0.0) lib/puma/server.rb:467:in `process_client'
+puma (4.0.0) lib/puma/server.rb:328:in `block in run'
+puma (4.0.0) lib/puma/thread_pool.rb:135:in `block in spawn_thread'
+```
+</details>
+
+I would be grateful if someone would have an idea of the cause and how to fix this, thanks!
+
+Using Bootsnap 1.4.4, Ruby 2.6.3, Bundler 1.17.2, Rails 5.2.3 on macOS 10.14.5.
+Create a new app,when I run rails s, it throws me a cannot load such file -- bindex error.
+ I tried gem install bindex, it throws me the same error,
+ tried bundle update - the same error, 
+tried gem update - the same error.
+ I have no idea how to fix this.
+Please help me out.
+
+macos mojave 10.14.5
+rails 6.0.o.rc1
+ruby 2.6.1
+
+` ⮀ ⭠ master± ⮀ rails s
+=> Booting Puma
+=> Rails 6.0.0.rc1 application starting in development
+=> Run `rails server --help` for more startup options
+Exiting
+Traceback (most recent call last):
+bin/rails: Bootsnap::LoadPathCache::FallbackScan
+    77: from bin/rails:3:in `<main>'
+    76: from bin/rails:3:in `load'
+    75: from /Users/sujize/app_7/bin/spring:15:in `<top (required)>'
+    74: from /Users/sujize/app_7/bin/spring:15:in `require'
+    73: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/spring-2.1.0/lib/spring/binstub.rb:11:in `<top (required)>'
+    72: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/spring-2.1.0/lib/spring/binstub.rb:11:in `load'
+    71: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/spring-2.1.0/bin/spring:49:in `<top (required)>'
+    70: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/spring-2.1.0/lib/spring/client.rb:30:in `run'
+    69: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/spring-2.1.0/lib/spring/client/command.rb:7:in `call'
+    68: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/spring-2.1.0/lib/spring/client/rails.rb:28:in `call'
+    67: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/spring-2.1.0/lib/spring/client/rails.rb:28:in `load'
+    66: from /Users/sujize/app_7/bin/rails:9:in `<top (required)>'
+    65: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/activesupport-6.0.0.rc1/lib/active_support/dependencies.rb:302:in `require'
+    64: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/activesupport-6.0.0.rc1/lib/active_support/dependencies.rb:268:in `load_dependency'
+    63: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/activesupport-6.0.0.rc1/lib/active_support/dependencies.rb:302:in `block in require'
+    62: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/bootsnap-1.4.4/lib/bootsnap/load_path_cache/core_ext/kernel_require.rb:30:in `require'
+    61: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/bootsnap-1.4.4/lib/bootsnap/load_path_cache/core_ext/kernel_require.rb:21:in `require_with_bootsnap_lfi'
+    60: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/bootsnap-1.4.4/lib/bootsnap/load_path_cache/loaded_features_index.rb:92:in `register'
+    59: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/bootsnap-1.4.4/lib/bootsnap/load_path_cache/core_ext/kernel_require.rb:22:in `block in require_with_bootsnap_lfi'
+    58: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/bootsnap-1.4.4/lib/bootsnap/load_path_cache/core_ext/kernel_require.rb:22:in `require'
+    57: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/railties-6.0.0.rc1/lib/rails/commands.rb:18:in `<main>'
+    56: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/railties-6.0.0.rc1/lib/rails/command.rb:46:in `invoke'
+    55: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/railties-6.0.0.rc1/lib/rails/command/base.rb:65:in `perform'
+    54: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/thor-0.20.3/lib/thor.rb:387:in `dispatch'
+    53: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/thor-0.20.3/lib/thor/invocation.rb:126:in `invoke_command'
+    52: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/thor-0.20.3/lib/thor/command.rb:27:in `run'
+    51: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/railties-6.0.0.rc1/lib/rails/commands/server/server_command.rb:138:in `perform'
+    50: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/railties-6.0.0.rc1/lib/rails/commands/server/server_command.rb:138:in `tap'
+    49: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/railties-6.0.0.rc1/lib/rails/commands/server/server_command.rb:147:in `block in perform'
+    48: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/railties-6.0.0.rc1/lib/rails/commands/server/server_command.rb:37:in `start'
+    47: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/railties-6.0.0.rc1/lib/rails/commands/server/server_command.rb:77:in `log_to_stdout'
+    46: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/rack-2.0.7/lib/rack/server.rb:354:in `wrapped_app'
+    45: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/rack-2.0.7/lib/rack/server.rb:219:in `app'
+    44: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/rack-2.0.7/lib/rack/server.rb:319:in `build_app_and_options_from_config'
+    43: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/rack-2.0.7/lib/rack/builder.rb:40:in `parse_file'
+    42: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/rack-2.0.7/lib/rack/builder.rb:49:in `new_from_string'
+    41: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/rack-2.0.7/lib/rack/builder.rb:49:in `eval'
+    40: from config.ru:in `<main>'
+    39: from config.ru:in `new'
+    38: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/rack-2.0.7/lib/rack/builder.rb:55:in `initialize'
+    37: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/rack-2.0.7/lib/rack/builder.rb:55:in `instance_eval'
+    36: from config.ru:3:in `block in <main>'
+    35: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/bootsnap-1.4.4/lib/bootsnap/load_path_cache/core_ext/kernel_require.rb:48:in `require_relative'
+    34: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/activesupport-6.0.0.rc1/lib/active_support/dependencies.rb:302:in `require'
+    33: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/activesupport-6.0.0.rc1/lib/active_support/dependencies.rb:268:in `load_dependency'
+    32: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/activesupport-6.0.0.rc1/lib/active_support/dependencies.rb:302:in `block in require'
+    31: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/zeitwerk-2.1.8/lib/zeitwerk/kernel.rb:23:in `require'
+    30: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/bootsnap-1.4.4/lib/bootsnap/load_path_cache/core_ext/kernel_require.rb:30:in `require'
+    29: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/bootsnap-1.4.4/lib/bootsnap/load_path_cache/core_ext/kernel_require.rb:21:in `require_with_bootsnap_lfi'
+    28: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/bootsnap-1.4.4/lib/bootsnap/load_path_cache/loaded_features_index.rb:92:in `register'
+    27: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/bootsnap-1.4.4/lib/bootsnap/load_path_cache/core_ext/kernel_require.rb:22:in `block in require_with_bootsnap_lfi'
+    26: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/bootsnap-1.4.4/lib/bootsnap/load_path_cache/core_ext/kernel_require.rb:22:in `require'
+    25: from /Users/sujize/app_7/config/environment.rb:5:in `<main>'
+    24: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/railties-6.0.0.rc1/lib/rails/application.rb:362:in `initialize!'
+    23: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/railties-6.0.0.rc1/lib/rails/initializable.rb:60:in `run_initializers'
+    22: from /Users/sujize/.rvm/rubies/ruby-2.6.1/lib/ruby/2.6.0/tsort.rb:205:in `tsort_each'
+    21: from /Users/sujize/.rvm/rubies/ruby-2.6.1/lib/ruby/2.6.0/tsort.rb:226:in `tsort_each'
+    20: from /Users/sujize/.rvm/rubies/ruby-2.6.1/lib/ruby/2.6.0/tsort.rb:347:in `each_strongly_connected_component'
+    19: from /Users/sujize/.rvm/rubies/ruby-2.6.1/lib/ruby/2.6.0/tsort.rb:347:in `call'
+    18: from /Users/sujize/.rvm/rubies/ruby-2.6.1/lib/ruby/2.6.0/tsort.rb:347:in `each'
+    17: from /Users/sujize/.rvm/rubies/ruby-2.6.1/lib/ruby/2.6.0/tsort.rb:349:in `block in each_strongly_connected_component'
+    16: from /Users/sujize/.rvm/rubies/ruby-2.6.1/lib/ruby/2.6.0/tsort.rb:431:in `each_strongly_connected_component_from'
+    15: from /Users/sujize/.rvm/rubies/ruby-2.6.1/lib/ruby/2.6.0/tsort.rb:350:in `block (2 levels) in each_strongly_connected_component'
+    14: from /Users/sujize/.rvm/rubies/ruby-2.6.1/lib/ruby/2.6.0/tsort.rb:228:in `block in tsort_each'
+    13: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/railties-6.0.0.rc1/lib/rails/initializable.rb:61:in `block in run_initializers'
+    12: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/railties-6.0.0.rc1/lib/rails/initializable.rb:32:in `run'
+    11: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/railties-6.0.0.rc1/lib/rails/initializable.rb:32:in `instance_exec'
+    10: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/web-console-4.0.0/lib/web_console/railtie.rb:11:in `block in <class:Railtie>'
+     9: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/activesupport-6.0.0.rc1/lib/active_support/dependencies.rb:302:in `require'
+     8: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/activesupport-6.0.0.rc1/lib/active_support/dependencies.rb:268:in `load_dependency'
+     7: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/activesupport-6.0.0.rc1/lib/active_support/dependencies.rb:302:in `block in require'
+     6: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/zeitwerk-2.1.8/lib/zeitwerk/kernel.rb:23:in `require'
+     5: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/bootsnap-1.4.4/lib/bootsnap/load_path_cache/core_ext/kernel_require.rb:26:in `require'
+     4: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/bootsnap-1.4.4/lib/bootsnap/load_path_cache/core_ext/kernel_require.rb:40:in `rescue in require'
+     3: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/bootsnap-1.4.4/lib/bootsnap/load_path_cache/core_ext/kernel_require.rb:21:in `require_with_bootsnap_lfi'
+     2: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/bootsnap-1.4.4/lib/bootsnap/load_path_cache/loaded_features_index.rb:89:in `register'
+     1: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/bootsnap-1.4.4/lib/bootsnap/load_path_cache/core_ext/kernel_require.rb:22:in `block in require_with_bootsnap_lfi'
+/Users/sujize/.rvm/gems/ruby-2.6.1/gems/bootsnap-1.4.4/lib/bootsnap/load_path_cache/core_ext/kernel_require.rb:22:in `require': **cannot load such file -- bindex (LoadError)**`
+
+The error:
+`1: from /Users/sujize/.rvm/gems/ruby-2.6.1/gems/bootsnap-1.4.4/lib/bootsnap/load_path_cache/core_ext/kernel_require.rb:22:in `block in require_with_bootsnap_lfi'
+/Users/sujize/.rvm/gems/ruby-2.6.1/gems/bootsnap-1.4.4/lib/bootsnap/load_path_cache/core_ext/kernel_require.rb:22:in `require': **cannot load such file -- bindex (LoadError)**`
+
+Github:https://github.com/Zeesui/app_7
+In vanilla MRI, if you `require` a file via absolute path, which is also present on `$LOAD_PATH`, MRI internally caches it under its *relative* path, and will allow it to satisfy future `require "relative/path"` calls, even if such a call would otherwise resolve to a file earlier in `$LOAD_PATH`.
+
+`bootsnap` does not properly implement this behavior, resulting in a difference in behavior versus MRI's `require`, which turned out to break our application. This is honestly an odd behavior for us to be relying on and I'm going to attempt to work around it locally, but I wanted to report the bug for visibility.
+
+This behavior is [rather unclear](https://ruby-doc.org/core-2.6.1/Kernel.html#method-i-require) to me from the Ruby documentation, and arguably this could be reported as an MRI bug instead.
+
+I've built a simple reproducer that demonstrates different behavior under `bootsnap` and without here: https://github.com/nelhage-stripe/bootsnap-reproducer
+## Summary
+
+I have a cache path problem during test: the cache path generated by bootsnap seems randomly.
+
+This is occurred only in Debian packaging environment, this might not an bootsnap issue.
+
+Could you give some clue for solving this failure? Which thing makes the cache path randomly?
+
+## Problem
+
+Hi,
+
+when I build this gem with Debian package build tools (`dpkg-buildpackage`, `sbuild`, `pbuilder`, etc..), I got two test failures:
+
+```diff
+  1) Failure:
+CompileCacheTest#test_invalid_cache_file [/<<PKGBUILDDIR>>/test/compile_cache_test.rb:106]:
+Expected false to be truthy.
+
+  2) Failure:
+CompileCacheTest#test_no_write_permission_to_cache [/<<PKGBUILDDIR>>/test/compile_cache_test.rb:30]:
+Bootsnap::CompileCache::PermissionError expected but nothing was raised.
+```
+
+I found that both unit tests use the path made by `Help.cache_path()` for testing (write to desired cache path, chmod the cache dir). However, cache path generated by `Help.cache_path()` and generated by bootsnap C extension are different.
+
+More, I created a test unit to validate this mismatching problem more explicitly: #261. And failed:
+
+```diff
+  3) Failure:
+HelperTest#test_validate_cache_path [/<<PKGBUILDDIR>>/test/helper_test.rb:10]:
+Expected: true
+  Actual: false
+```
+
+## Debugging logs
+
+### Patch for debugging
+
+For tracing how the caches going on, I added two patches for debugging.
+
+This patch will add a function `Help.list_dir(dir)` on `test_helper.rb` to get a recursive `dir` directory listing.
+```diff
+--- a/test/test_helper.rb
++++ b/test/test_helper.rb
+@@ -68,6 +68,10 @@
+           FileUtils.touch(path, mtime: mtime)
+           path
+         end
++
++        def list_dir(dir)
++          Dir["#{dir}/**/*"]
++        end
+       end
+     end
+   end
+```
+
+This patch will raise a failure intentionally to print a `@tmp_dir` recursive listing using above `Help.list_dir()` on `compile_cache_test.rb` tests:
+ - `test_no_write_permission_to_cache`
+ - `test_invalid_cache_file`
+
+```diff
+--- a/test/compile_cache_test.rb
++++ b/test/compile_cache_test.rb
+@@ -27,6 +27,8 @@
+     folder = File.dirname(Help.cache_path(@tmp_dir, path))
+     FileUtils.mkdir_p(folder)
+     FileUtils.chmod(0400, folder)
++    load(path)
++    assert_output(stdout = "") { Help.list_dir(@tmp_dir).each { |x| puts x } }
+     assert_raises(Bootsnap::CompileCache::PermissionError) { load(path) }
+   end
+ 
+@@ -103,6 +105,7 @@
+     FileUtils.mkdir_p(File.dirname(cp))
+     File.write(cp, 'nope')
+     load(path)
++    assert_output(stdout = "") { Help.list_dir(@tmp_dir).each { |x| puts x } }
+     assert(File.size(cp) > 32) # cache was overwritten
+   end
+ end
+```
+
+### Start a debugging
+
+I ran the tests 3 times with above two patches applied.
+
+#### First try
+```diff
+  1) Failure:
+CompileCacheTest#test_invalid_cache_file [/<<PKGBUILDDIR>>/test/compile_cache_test.rb:108]:
+In stdout.
+--- expected
++++ actual
+@@ -1 +1,6 @@
+-""
++"/tmp/bootsnap-test20190614-29230-6vls1y/b9
++/tmp/bootsnap-test20190614-29230-6vls1y/b9/89185a0bb8068d
++/tmp/bootsnap-test20190614-29230-6vls1y/6a
++/tmp/bootsnap-test20190614-29230-6vls1y/6a/d393827a0ba05a
++/tmp/bootsnap-test20190614-29230-6vls1y/a.rb
++"
+
+
+  2) Failure:
+CompileCacheTest#test_no_write_permission_to_cache [/<<PKGBUILDDIR>>/test/compile_cache_test.rb:31]:
+In stdout.
+--- expected
++++ actual
+@@ -1 +1,5 @@
+-""
++"/tmp/bootsnap-test20190614-29230-ptev0q/d3
++/tmp/bootsnap-test20190614-29230-ptev0q/d3/0b50628b49ab28
++/tmp/bootsnap-test20190614-29230-ptev0q/6a
++/tmp/bootsnap-test20190614-29230-ptev0q/a.rb
++"
+```
+
+#### Second try
+```diff
+  1) Failure:
+CompileCacheTest#test_no_write_permission_to_cache [/<<PKGBUILDDIR>>/test/compile_cache_test.rb:31]:
+In stdout.
+--- expected
++++ actual
+@@ -1 +1,5 @@
+-""
++"/tmp/bootsnap-test20190614-3557-12bfb51/8f
++/tmp/bootsnap-test20190614-3557-12bfb51/8f/7b80d46d6c834f
++/tmp/bootsnap-test20190614-3557-12bfb51/6a
++/tmp/bootsnap-test20190614-3557-12bfb51/a.rb
++"
+
+
+  2) Failure:
+CompileCacheTest#test_invalid_cache_file [/<<PKGBUILDDIR>>/test/compile_cache_test.rb:108]:
+In stdout.
+--- expected
++++ actual
+@@ -1 +1,6 @@
+-""
++"/tmp/bootsnap-test20190614-3557-eo1u5s/6c
++/tmp/bootsnap-test20190614-3557-eo1u5s/6c/dfdbe912ff1cc2
++/tmp/bootsnap-test20190614-3557-eo1u5s/6a
++/tmp/bootsnap-test20190614-3557-eo1u5s/6a/d393827a0ba05a
++/tmp/bootsnap-test20190614-3557-eo1u5s/a.rb
++"
+```
+
+#### Third try
+```diff
+  1) Failure:
+CompileCacheTest#test_invalid_cache_file [/<<PKGBUILDDIR>>/test/compile_cache_test.rb:108]:
+In stdout.
+--- expected
++++ actual
+@@ -1 +1,6 @@
+-""
++"/tmp/bootsnap-test20190614-7936-15audvy/27
++/tmp/bootsnap-test20190614-7936-15audvy/27/aa596602ef1f94
++/tmp/bootsnap-test20190614-7936-15audvy/6a
++/tmp/bootsnap-test20190614-7936-15audvy/6a/d393827a0ba05a
++/tmp/bootsnap-test20190614-7936-15audvy/a.rb
++"
+
+
+  2) Failure:
+CompileCacheTest#test_no_write_permission_to_cache [/<<PKGBUILDDIR>>/test/compile_cache_test.rb:31]:
+In stdout.
+--- expected
++++ actual
+@@ -1 +1,5 @@
+-""
++"/tmp/bootsnap-test20190614-7936-vv4gq8/5c
++/tmp/bootsnap-test20190614-7936-vv4gq8/5c/941b7578d240a1
++/tmp/bootsnap-test20190614-7936-vv4gq8/6a
++/tmp/bootsnap-test20190614-7936-vv4gq8/a.rb
++"
+```
+
+#### Wrap up
+
+In test `CompileCacheTest#test_invalid_cache_file`,
+`Help.cache_path()` always output `6a/d393827a0ba05a` for all three times.
+but when real cache created with `load(path)`, its locations always differ:
+- first try: `b9/89185a0bb8068d`
+- second try: `6c/dfdbe912ff1cc2`
+- third try: `27/aa596602ef1f94`
+
+Also same in test `CompileCacheTest#test_no_write_permission_to_cache`:
+- first try: `d3/0b50628b49ab28`
+- second try: `8f/7b80d46d6c834f`
+- third try: `5c/941b7578d240a1`
+
+## Question
+
+This is occurred only in Debian packaging environment, this might not an bootsnap issue. For solving this problem, I have to know which part of bootsnap code affect this issue.
+
+Could you give some clue for solving this failure?
+
+Which thing makes the cache path randomly? Could the cache path affected by any arguments? or C extensions build arguments?
+
+Thank you!
+
+## System information
+
+```
+-- System Information:
+Debian Release: 10.0
+  APT prefers unstable
+  APT policy: (500, 'unstable')
+Architecture: amd64 (x86_64)
+
+Kernel: Linux 4.19.0-5-amd64 (SMP w/16 CPU cores)
+Kernel taint flags: TAINT_OOT_MODULE, TAINT_UNSIGNED_MODULE
+Locale: LANG=en_US.UTF-8, LC_CTYPE=en_US.UTF-8 (charmap=UTF-8) (ignored: LC_ALL set to en_US.UTF-8), LANGUAGE=en_US.UTF-8 (charmap=UTF-8) (ignored: LC_ALL set to en_US.UTF-8)
+Shell: /bin/sh linked to /usr/bin/dash
+Init: systemd (via /run/systemd/system)
+LSM: AppArmor: enabled
+```

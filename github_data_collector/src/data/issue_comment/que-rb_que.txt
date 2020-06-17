@@ -1,0 +1,114 @@
+
+Hey team!
+
+I'm opening this issue to get a sense of whether Que maintainers are supportive of an attempt to instrument the upstream Que project with native Prometheus metrics. We have an old fork of Que that we've modified to include this instrumentation, but are keen to move back to upstream- before we try porting our metrics, it would be good to understand if the project would be receptive to this attempt!
+
+I've attached a dashboard from a staging environments as an example of some top-level metrics we have. We've also tracked internal processes like job lock acquisition, which has helped us alert on degraded performance (as an example, whenever long snapshots are held open) in the past.
+
+Is this something that would be welcomed by the maintainers?
+
+Cheers,
+Lawrence
+
+![screencapture-grafana-gocardless-io-d-GyEPq1Zmz-que-2020-01-13-11_33_18](https://user-images.githubusercontent.com/3518874/72255391-8191c200-35fe-11ea-8d42-ba4b6d885025.png)
+I'm trying to integrate Que with Rails' ActiveJob, and it seems to be working fine with the exception of the queue name. I found on [this comment](https://github.com/que-rb/que/issues/179#issuecomment-284004802) that named queue support was removed from ActiveJob. My infrastructure has workers listening on different queues, and I use the queue name to determine which workers will process the job. The lack of support for named queues in ActiveJob is critically important to me, so I cannot use the ActiveJob integration.
+
+Are there any plans to support named queues in ActiveJob?
+I've been using https://github.com/airhorns/que-locks for some basic exclusive locking around job execution in my (admittedly pretty small) production app using `que` for a couple months now. Saw que fly by on HN the other day and figured it might be good to open source the locking code and share it, so I published that over there.
+
+From the que-locks readme:
+
+> `que-locks` adds an opt-in feature to `Que::Jobs` allowing jobs to specify that exactly one instance of a job should be executing at once. This is useful for jobs that are doing something important that should only ever happen one at a time, like processing a payment for a given user, or super expensive jobs that could cause thundering herd problems if enqueued all at the same time.
+
+This adds a link to the readme so folks can at least find `que-locks`, but it's worth noting that I've been the only user and not at crazy scale, so it might not meet the standard of what should be linked to in the readme. I don't mind waiting for some more users or something like that before adding this, but I figured I'd open the PR to see what the community thinks!
+
+
+We are deploying que workers in our Kubernetes environments, and would like to add [Liveness and Readiness checks](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/).
+
+Our immediate problem / use case is that during startup (worker init) CPU levels spike, so the autoscaler brings in more cascading pods. Adding an `initialDelaySeconds` can help with that, but the bigger issue of worker health is still to be addressed. 
+
+We've had a few ideas, including something as simple as the worker writing a file to disk when it is "ready" which can be looked for, or an embedded sinatra app that can be curled from inside the container (to avoid opening up ports) thus:
+
+```
+readinessProbe:
+  exec:
+    command: ["curl", "--silent", "--show-error", "--fail", "http://localhost:8080/health"]
+  initialDelaySeconds: 10
+  periodSeconds: 5
+```
+
+Beyond that it gets more complicated. How to tell between a hung worker and one that is processing a very long task etc...
+
+How are others handling this issue?
+
+
+It's great that the `que` worker process gives itself a bit of time upon receiving SIGTERM to finish the outstanding jobs. If those jobs are short, there's not much sense in throwing away all the work they've done so far if they're just about to complete. 
+
+With long running jobs however (like CSV exports -> S3 uploads, data api extracts, etc), the worker process ends up refusing to shut down if it's running any of them. This is more of an ergonomics thing, but, when developing locally, it's annoying to have to `kill -9` the que process if it's working on anything long running, and in production the orchestrator can't tell the difference between que being stuck or hung for some actually important issue, or if it was just working on a long running job that would be fine to abort. 
+
+I think it'd be great if `que` killed it's own workers after getting SIGTERM and waiting `x` seconds so that it could exit cleanly and let developers writing quote-unquote bad long running jobs restart the process easily. See https://github.com/mperham/sidekiq/wiki/Signals#term for sidekiq's config param that accomplishes the same thing. 
+Certain jobs are not written to the `que_jobs` table (although the `que_jobs_id_seq` PG sequence is incremented - which suggests the insert is rolled back).
+This might be related to #227.
+
+Here is a list of some examples that work or fail:
+~~~ruby
+PackMaterialApp::ERPPurchaseInvoiceJob.enqueue('abc', delivery_id: 2)                                         # FAILS
+# Change ERP to Erp in the classname:
+PackMaterialApp::ErpPurchaseInvoiceJob.enqueue('abc', delivery_id: 2)                                         # WORKS
+
+# Using Que.enqueue to allow enqueue of a class that does not exist:
+Que.enqueue 'abc', delivery_id: 2, job_class: 'PackMaterialApp::ERPPurchaseInvoiceJob', queue: 'packmat'      # FAILS
+# Change ERP to Erp in the classname:
+Que.enqueue 'abc', delivery_id: 2, job_class: 'PackMaterialApp::ErpPurchaseInvoiceJob', queue: 'packmat'      # WORKS
+
+# Add an "s" to the module name:
+Que.enqueue 'abc', delivery_id: 2, job_class: 'PackMaterialsApp::ERPPurchaseInvoiceJob', queue: 'packmat'     # WORKS
+
+# Change the args to a single Hash: [{usr: 'abc', delivery_id: 2}]
+Que.enqueue usr: 'abc', delivery_id: 2, job_class: 'PackMaterialApp::ERPPurchaseInvoiceJob', queue: 'packmat' # WORKS
+# Change the args to a simple array: ['abc', 2]
+Que.enqueue 'abc', 2, job_class: 'PackMaterialApp::ERPPurchaseInvoiceJob', queue: 'packmat'                   # WORKS
+~~~
+Note: all of these calls to enqueue return successfully - e.g.:
+~~~ruby
+=> #<Que::Job:0x000055a034dd3e00
+ @que_attrs=
+  {:priority=>100,
+   :run_at=>2019-08-08 10:39:33 +0200,
+   :id=>99,
+   :job_class=>"PackMaterialApp::ERPPurchaseInvoiceJob",
+   :error_count=>0,
+   :last_error_message=>nil,
+   :queue=>"packmat",
+   :last_error_backtrace=>nil,
+   :finished_at=>nil,
+   :expired_at=>nil,
+   :args=>["abc", {:delivery_id=>2}],
+   :data=>{}}>
+~~~
+Que 1.0.0.beta3
+Sequel 5.7.1
+sequel_pg 1.11.0
+PostgreSQL 9.5.18
+
+So far I don't have much details. We switched to que last week and noticed that every day some worker will stop executing new jobs. Restarting the process fixes the issue. I'm now in the process of figuring this out.
+
+I'm using Que 1.x with Rails/ActiveJob, we have 3 workers running on 3 separate heroku dynos, each worker is running 20 threads, each worker has a pool of 20 connections + 1 for locker.
+
+So far I noticed the worker will stop processing jobs after a few hours after booting up. Connections will be closed but threads will be still running.
+Hi! 👋 
+
+We're seeing an uncontrolled growth of the `que_jobs_data_gin_idx` index and wonder if anyone else has seen this or has remedies.
+
+We're using `que` within Rails, wrapped with ActiveJob on Postgres 10.7.
+
+This weekend we performed `VACUUM FULL` of our `que_jobs` table as `que_jobs_args_gin_idx` grew up to 4GB and we noticed autovacuum was struggling. The autovacuum would run for 25 minutes, take a minute nap and then run again. By the time it would run again it would already have thousands of dead rows to clean up.
+
+The `VACUUM FULL` has helped a lot: the autovacuum seems to run fast enough (I can't see how fast it's running, suddenly it doesn't appear in logs, but I can see that the timestamp of last autovacuum updates frequently). There are only hundreds of dead rows now to clean up.
+
+The table is now at the stable size (around 1.8MB), but the `que_jobs_args_gin_idx` index seems to grow daily. 15h after `VACUUM FULL` it grew to 14MB, morning after it was already 30MB and 4 days later it's at 74MB. The `que_jobs_data_gin_idx` is only 120kB.
+
+I'm starting to believe this could be a PG bug and doesn't have anything to do with `que`. I guess I'm still curious if anyone else has seen this happen in their setup and if there's a remedy?
+
+We're considering to rebuild the index nightly, or even dropping it completely, as index is 10 times the size of the table itself in less then 24h so nightly rebuilds might not have any effect.
+See spec failures at https://circleci.com/gh/chanks/que/1717 (among others). It's possible that things are working fine and the specs just need to be updated, though, I haven't paid attention to developments in Rails-land in a while.

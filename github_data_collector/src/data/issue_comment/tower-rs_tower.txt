@@ -1,0 +1,119 @@
+Currently if `poll_ready` returns `Ready` it effectively reserves something (for instance a semaphore token). This means you *must* be following up with `call` next. The only other option is to `Drop` the service which however is not always possible.
+
+It was mentioned in the tokio repo that it would be useful to be able to disarm a service (https://github.com/tokio-rs/tokio/issues/898).
+
+This would be particularly useful when one wants to implement an HTTP health check for a load balancer by checking `poll_ready` without actually calling.
+
+Example:
+
+```rust
+pub trait Service<Request> where
+    <Self::Future as Future>::Output == Result<Self::Response, Self::Error>, {
+    type Response;
+    type Error;
+    type Future: Future;
+    fn poll_ready(&mut self, cx: &mut Context) -> Poll<Result<(), Self::Error>>;
+    fn call(&mut self, req: Request) -> Self::Future;
+    fn disarm_ready(&mut self) {}
+}
+```
+
+And then be used like this:
+
+```rust
+pub trait HealthcheckServiceExt<Request>: Service<Request> {
+    fn is_healthy(&mut self) -> bool {
+        if self.poll_ready().is_ready() {
+            self.disarm_ready();
+            true
+        } else {
+            false
+        }
+    }
+}
+```
+
+The proposed new flow would be the following:
+
+* `poll_ready` must be called. If it's `Ready` it must be followed up with either `call` or `disarm_ready`.
+* `call` must not be called without `poll_ready` being called before
+* `disarm_ready` may always be called and should undo what `poll_ready` did
+* `Clone` is supposed to either internally call `disarm_ready` or do the same it does (a Clone should always be disarmed)
+
+The latter is already the logic that exists in some layers.
+
+Now obviously it's a bit suboptimal that it means not all services will be able to disarmed so it might also be possible to indicate if something can actually be disarmed. For instance already existing services might just not ever be disarmable until they get retrofitted.
+**Rationale**
+Often one wants to quickly whip up a basic service. Many basic services will always be ready and the more complex polling dynamics will arise from layers wrapping them. 
+
+This makes `Poll::Ready(Ok(())` a canonical and reasonable choice for a default implementation.
+
+**Result**
+Less boilerplate.
+
+
+**Motivation**
+It is often the case that one wishes to take a service and modify it's output or input in some way without changing the behavior of `poll_ready()`. For example, turning a service returning `Result<(Parts, Body), _>` into a service returning `Result<Request<Body>, _>` or modifying the error type.
+
+Currently, there is no ergonomic way to apply such changes without a fair amount of boilerplate.
+
+**Proposal**
+Extend `ServiceExt` trait to add various methods mirroring the combinators from `TryFutureExt` and various services and layers to accommodate this.
+
+**Requirements**
+Because combinators could be heavily chained together it's probably wise to trim all the fat off here and if possible make it zero-cost when compared to simply applying the combinators inside of the inner service's call.
+
+**Result**
+Having such methods should allow a more expressive algebra of tools to construct and combine services.
+
+**Current Implementation**
+At the time of writing I've introduced three combinators:
+```rust
+    fn map_ok<F, Response>(self, f: F) -> MapOk<Self, F>
+    where
+        Self: Sized,
+        F: FnOnce(Self::Response) -> Response + Clone,
+    {
+        MapOk::new(self, f)
+    }
+
+    fn map_err<F, Error>(self, f: F) -> MapErr<Self, F>
+    where
+        Self: Sized,
+        F: FnOnce(Self::Error) -> Error + Clone,
+    {
+        MapErr::new(self, f)
+    }
+
+    fn with<F, NewRequest>(self, f: F) -> With<Self, F>
+    where
+        Self: Sized,
+        F: FnOnce(NewRequest) -> Request + Clone,
+    {
+        With::new(self, f)
+    }
+```
+and an associated `Service` and `Layer` for each.
+
+**TODO**
+
+- [ ] Which trait constraints are minimally required on the closures to ensure an ergonomic API without any excess overhead?
+- [ ] Documentation
+- [ ] More combinators such as and_then
+Currently, we have an alpha release of tower and its sub crates. We never had a `0.1` release. So I woudl like to bring up we consider releasing it as a 0.3 and move forward. I think as long as we keep `tower-service` as `0.3` it should be fine to release.
+
+@jonhoo and @olix0r I'd like to know if you both have any reservations about going ahead and publishing those as a `0.3`?
+
+Currently in `tower-test`, the `Mock` service's error type is fixed to `Box<dyn Error + Send + Sync>`.
+
+I guess it's possible to work around it at the moment by creating a wrapper `Service` that does boxing/downcasting of errors, but are you open to the idea of having the error type be configurable? (it could even be a type param that defaults to `Box<dyn Error + Send + Sync>` if unspecified)
+Currently, we have a mix and match of crates that use `From` bounds over `Into` bounds. This is causing issues when wanting to compose the services together. I suggest we move them all to `From` since that is what `Try` is based on.
+
+cc @jonhoo @seanmonstar @carllerche @hawkw 
+Fixes #383
+
+These changes reconnect to return the make service failure in the future instead of in poll_ready. This change allows us to _reuse_ the reconnect service on failed reconnects. This pushes the error down to the caller of `call` since technically the `make_service` is ready. This makes it so you can keep calling call until the service reconnects. 
+
+This service is a bit odd, because it doesn't really fit in with the other types of services. This is because its an adapter to go from `MakeService` to `Service`. Thus, the `poll_ready` contract here doesn't mean the same as a regular `Service` because it has to bundle connecting.
+
+This question brings up a big issue with how buffer is implemented, because if `poll_ready` returns the error then we must throw away the service, and buffer will just keep returning the failed connection error, even if we can successfully reestablish.

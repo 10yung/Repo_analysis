@@ -1,0 +1,179 @@
+队列+自定义进程通过http-client调取数据接口，每秒处理200-300次队列，内存会无限增加，Swoole Tracker监控未发现内存溢出情况
+
+**ES启动时，开启队列+自定义进程**
+```
+public static function mainServerCreate(EventRegister $register)
+{
+        //添加redis队列
+        $config = new RedisConfig([
+            'host'      => '127.0.0.1',
+            'port'      => '6379',
+            'auth'      => '',
+            'db'        => null,
+            'serialize' => \EasySwoole\Redis\Config\RedisConfig::SERIALIZE_NONE
+        ]);
+        $redis = new RedisPool($config);
+
+        //开启爬虫队列
+        $driver = new Redis($redis, 'CrawlerQueue');
+        \App\Utility\Queue\CrawlerQueue::getInstance($driver);
+
+        //启动10个爬虫处理进程
+        for ($i = 1; $i < 11; $i++) {
+            $processConfig = new Config();
+            ServerManager::getInstance()
+                ->addProcess(
+                    new \App\Utility\Process\CrawlerProcess($processConfig),
+                    'CrawlerProcess' . $i
+                );
+        }
+}
+```
+   
+
+**队列类**
+```
+namespace App\Utility\Queue;
+
+use EasySwoole\Component\Singleton;
+use EasySwoole\Queue\Queue;
+
+class CrawlerQueue extends Queue
+{
+    use Singleton;
+}
+```
+
+
+**自定义进程类**
+
+```
+namespace App\Utility\Process;
+
+use App\Utility\Queue\CrawlerQueue;
+use EasySwoole\Component\Process\AbstractProcess;
+use EasySwoole\HttpClient\HttpClient;
+use EasySwoole\Queue\Job;
+
+class CrawlerProcess extends AbstractProcess
+{
+    protected function run($arg)
+    {
+        \go(function () use ($arg) {
+            CrawlerQueue::getInstance()->consumer()->listen(function (Job $job) {
+                $data = $job->getJobData();
+                $url = 'https://***.***.***?id=' . $data['id'];
+                $client = new HttpClient($url);
+                json_decode($client->get()->getBody(), TRUE);
+            });
+        });
+    }
+}
+```
+
+saveAll函数没有考虑读写分离情况，
+![image](https://user-images.githubusercontent.com/23518931/72596508-13733500-3947-11ea-9fde-cc043b2bc6d3.png)
+
+权限表数据如下
+id        name          url             fid             update_at                         update_at
+5	修改用户	/Users/update	2	0000-00-00 00:00:00	0000-00-00 00:00:00
+4	删除用户	/Users/del	2	0000-00-00 00:00:00	0000-00-00 00:00:00
+3	增加用户	/Auth/register	2	0000-00-00 00:00:00	0000-00-00 00:00:00
+2	用户列表	/Users/list	1	0000-00-00 00:00:00	0000-00-00 00:00:00
+1	会员管理		0	0000-00-00 00:00:00	0000-00-00 00:00:00
+
+ORM代码为
+public function father()
+    {
+        return $this->hasOne(Permission::class, null, 'fid', 'id');
+    }
+public function getAllPermissions($page = 1, $limit = 10)
+    {
+        return self::create()->with(['father'])->all();
+    }
+请求的getAllPermissions方法结果返回数据结果错乱
+
+返回结果为
+{
+    "code": 200,
+    "data": [
+        {
+            "id": 1,
+            "name": "会员管理",
+            "url": "",
+            "fid": 0,
+            "create_at": "0000-00-00 00:00:00",
+            "update_at": "0000-00-00 00:00:00"
+        },
+        {
+            "id": 2,
+            "name": "用户列表",
+            "url": "/Users/list",
+            "fid": 1,
+            "create_at": "0000-00-00 00:00:00",
+            "update_at": "0000-00-00 00:00:00",
+            "father": {
+                "id": 1,
+                "name": "会员管理",
+                "url": "",
+                "fid": 0,
+                "create_at": "0000-00-00 00:00:00",
+                "update_at": "0000-00-00 00:00:00"
+            }
+        },
+        {
+            "id": 3,
+            "name": "增加用户",
+            "url": "/Auth/register",
+            "fid": 2,
+            "create_at": "0000-00-00 00:00:00",
+            "update_at": "0000-00-00 00:00:00",
+            "father": {
+                "id": 2,
+                "name": "用户列表",
+                "url": "/Users/list",
+                "fid": 1,
+                "create_at": "0000-00-00 00:00:00",
+                "update_at": "0000-00-00 00:00:00"
+            }
+        },
+        {
+            "id": 3,
+            "name": "增加用户",
+            "url": "/Auth/register",
+            "fid": 2,
+            "create_at": "0000-00-00 00:00:00",
+            "update_at": "0000-00-00 00:00:00",
+            "father": {
+                "id": 2,
+                "name": "用户列表",
+                "url": "/Users/list",
+                "fid": 1,
+                "create_at": "0000-00-00 00:00:00",
+                "update_at": "0000-00-00 00:00:00"
+            }
+        },
+        {
+            "id": 3,
+            "name": "增加用户",
+            "url": "/Auth/register",
+            "fid": 2,
+            "create_at": "0000-00-00 00:00:00",
+            "update_at": "0000-00-00 00:00:00",
+            "father": {
+                "id": 2,
+                "name": "用户列表",
+                "url": "/Users/list",
+                "fid": 1,
+                "create_at": "0000-00-00 00:00:00",
+                "update_at": "0000-00-00 00:00:00"
+            }
+        }
+    ],
+    "msg": "success"
+}
+用easyswoole的开发im  支持上万个用户同时在线？ 
+## ORM求支持 中间表关联查询
+
+怎么实现orm关联查询where条件，目前文档好像只支持本模型的where 条件查询，被关联模型的where怎么写
+扫码支付第二种方法，刷新二维码，不支付，也能接收到值，可以打log看

@@ -1,0 +1,378 @@
+Hi, thank you for this crate! I love the combo of declarative + performant infrastructure.
+
+Was wondering if you'd be open to a PR for line and column info. To do this, I'd like to add a method to `Lexer` that returns a `Span` representing the extent of the token. This would probably be a pair of `Pos` structures, where a `Pos` is a line/column tuple. Tracking this information isn't a big deal, but there may be some performance implications involved when scanning each token for newlines.
+
+What do you think?
+To be specific, I'm getting this issue with 7a31ef303a2d90cbf91ccd8cf20931ac020e9cc2, but not with efc666dd6e8f7ab598a1d1d6850fe3b1e564f77a. (The ones in-between causes me compilation errors, so it's hard to say which of them introduced the code that leads to this problem.)
+
+This is my configuration:
+
+<details>
+<summary>Token type</summary>
+
+```rust
+#[derive(Debug, PartialEq, Clone, Copy, Logos)]
+pub enum Token {
+    #[end]
+    EndOfProgram,
+
+    #[regex = "\"[^\"]*\""]
+    Text,
+
+    #[regex = "'(\\\\x[0-9a-fA-F]+|\\\\[0-7]+|\\\\(n|t|r|\\\\|\"|'))'"]
+    Char,
+
+    #[regex = "-?([0-9]*\\.[0-9]+|[0-9]+\\.[0-9]*)"]
+    Float,
+
+    #[regex = "-?0(x|X)[0-9a-fA-F]+"]
+    Hex,
+
+    #[regex = "-?[0-9]+"]
+    Integer,
+
+    #[regex = "(struct|bool|char|int|float|string|color)_t"]
+    Type,
+
+    #[regex = "[a-zA-Z_]+"]
+    Identifier,
+
+    #[regex = "#[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]"]
+    Color,
+
+    #[token = "{"]
+    BraceOpen,
+
+    #[token = "}"]
+    BraceClose,
+
+    #[token = "="]
+    Assign,
+
+    #[token = ","]
+    Comma,
+
+    #[token = "["]
+    BracketOpen,
+
+    #[token = "]"]
+    BracketClose,
+
+    #[regex = "//[^\n]*"]
+    #[token = "/*"]
+    #[callback = "ignore_comments"]
+    #[error]
+    UnexpectedToken,
+    UnexpectedEndOfProgram,
+}
+```
+</details>
+<details>
+<summary>Sufficient amount of document causing lexing issues in 0.10</summary>
+
+```
+tileset "Default Tileset" {
+	tileWidth=16
+	tileHeight=16
+	description="Foobar"
+	author="BazQuux"
+	version="0.15"
+
+	texture "terrain.png"
+	{
+		terrain_sprite {
+			sprites=[0]
+		}
+
+		terrain_sprite "grass" {
+			sprites=[
+			// Height < -1.0
+				20,
+			// Height < -0.5
+				21,
+			// Height < 0.0
+				22,
+			// Height < 0.25
+				23,
+			// Height < 0.5
+				24,
+			// Height < 1.0
+				25,
+			// Height < 2.0
+				26,
+			// Height < 4.0
+				27,
+			// Height >= 4.0
+				28
+			]
+			heightSplits=[-1.0, -0.5, 0.0, 0.25, 0.5, 1.0, 2.0, 4.0]
+			snowSprites=[152]
+			edgeSprites=[16,17,18,19]
+			snowEdgeSprites=[148,149,150,151]
+
+			details=[192,193,194,195,208,209,210,211]
+			snowedDetails=[196,197,198,199,212,213,214,215]
+			detailsChance=0.0625
+
+			burntOverlay=[32,33,34,35,36]
+			corruption=[128,129,130,131,
+						144,145,146,147,
+						160,161,162,163,
+						176,177,178,179]
+		}
+```
+</details>
+<details>
+<summary>Relevant part of token stream on 0.9.7</summary>
+
+```
+    (
+        Comma,
+        ",",
+        810..811,
+    ),
+    (
+        Integer,
+        "36",
+        811..813,
+    ),
+    (
+        BracketClose,
+        "]",
+        813..814,
+    ),
+    (
+        Identifier,
+        "corruption",
+        819..829,
+    ),
+    (
+        Assign,
+        "=",
+        829..830,
+    ),
+    (
+        BracketOpen,
+        "[",
+        830..831,
+    ),
+    (
+        Integer,
+        "128",
+        831..834,
+    ),
+```
+</details>
+<details>
+<summary>Relevant part of token stream on 0.10</summary>
+
+```
+    (
+        Comma,
+        ",",
+        810..811,
+    ),
+    (
+        Integer,
+        "36",
+        811..813,
+    ),
+    (
+        BracketClose,
+        "]",
+        813..814,
+    ),
+    (
+        Identifier,
+        "c",
+        819..820,
+    ),
+    (
+        Identifier,
+        "orruption",
+        820..829,
+    ),
+    (
+        Assign,
+        "=",
+        829..830,
+    ),
+    (
+        BracketOpen,
+        "[",
+        830..831,
+    ),
+    (
+        Integer,
+        "128",
+        831..834,
+    ),
+```
+</details>
+
+As you can see, in 0.9.7, I get a single `Identifier` token with the value "corruption" from 819..830, while in 0.10, I get two `Identifier` tokens, one with the value "c" from 819..820, and one with the value "orruption" from 820..830.
+
+This is obviously a bug; the lexer should do as in 0.9.7 and consume the whole identifier at once, not divide it like it does in 0.10.
+
+By chance, after experimenting trying to figure out what differentiated identifiers that stayed whole from those that got divided like this before submitting this issue, I discovered that the cause is when an identifier has a two-or-more character overlap with any of the keywords in the `Type` token. "corruption" gets, well, corrupted, because of the "color," and if you change "burntOverlay" to "borntOverlay," (overlaps with "bool") you get the same behavior there. It seems like a partial match from one token doesn't get correctly dealt with when another token matches fully later. By removing/commenting out the `Type` token, the behavior ceases.
+![image](https://user-images.githubusercontent.com/21138299/66552091-515c0280-eb7b-11e9-8dcf-bd1de10a7790.png)
+
+Look at the picture. 
+If I didn't cancel it, the rustc will be stuck for a long time and then tell a error.  Sometimes it even make my system crash. 
+```
+#[derive(Logos, Debug, PartialEq)]
+enum Token {
+    #[end]
+    End,
+    #[error]
+    Error,
+    #[token="fast"]
+    Fast,
+    #[regex="lexer"]
+    Lexer,
+    #[regex="[a-z]+"]
+    Word,
+}
+
+fn main() {
+    let mut lexer = Token::lexer("fast lexer");
+    assert_eq!(lexer.token, Token::Fast);
+    lexer.advance();
+    assert_eq!(lexer.token, Token::Lexer)
+}
+```
+Are there any guarantees of these two tokens in the code to be Token::Fast and Token::Lexer, rather than Token::Word?
+This lexer:
+
+```rust
+#[derive(Logos, Debug, PartialEq)]
+enum Token {
+    #[end] End,
+    #[error] Error,
+
+    #[regex = "a(a)+"] Aaa,
+}
+```
+
+incorrectly matches a single `a`. Changing the regex to `aa+` makes it work correctly.
+Not sure if this is related to the previous issues with the regex macro but this code results in stack overflow in the compiler.
+
+```rust
+extern crate logos;
+
+use logos::Logos;
+
+#[derive(Logos, Debug, PartialEq)]
+enum Token {
+    #[end]
+    End,
+    #[error]
+    Error,
+    #[regex = "[0-9]*.?[0-9]+"]
+    Text,
+}
+
+fn main() {}
+```
+Given this token rule:
+```Rust
+    #[regex = r"\p{XID_Start}\p{XID_Continue}*"]
+    LiteralIdentifier,
+```
+… `logos` will spin up a single CPU core to 100%, then receive a `SIGKILL` if the core overheats. Otherwise, when my laptop manages to keep the core from overheating, compilation seems to take a billion years. Well, at least 5min. I `Ctrl`+`C`d out of impatience. RAM usage is pretty low, though.
+
+So things that might help:
+- Find opportunities to parallelise the work.
+- Figure out when work takes too long and maybe `sleep` for a little or be `nice`.
+- Whatever else helps getting this beast to work.
+
+Until then I'll have to use ASCII identifiers. ),:
+
+**Edit:** Using v0.9.7 from https://crates.io/
+
+**Edit 2:** Compilation never seems to finish. With successful cooling, the core still overheats. And `logos` starts using a lot of RAM, so might also be related to #78 .
+So I'm realizing that what I actually need is a parser/lexer. However, I don't know if that relates to chewing up all the memory or not so I figured I'd submit this anyway just in case it helps solve a problem.
+
+This is the lexer I'm working with
+
+```Rust
+#[derive(Logos, Debug, PartialEq)]
+enum Token {
+    #[end]
+    End,
+    #[error]
+    Error,
+
+    // #[regex = r"(?s)/\*.*\*/"]
+    // BlockCommentStart,
+    //
+    // #[regex = r"//.*\n?"]
+    // LineComment,
+
+    #[regex = r"/\s*\{"]
+    RootNode,
+
+    #[regex = r"\s*([[:digit:][:alpha:]_]*:)?\s*[[:digit:][:alpha:],._+@-]*\s*\{"]
+    Node,
+
+    #[regex = r"\s*};"]
+    NodeEnd,
+
+    #[regex = r#"(?m)\s*[#[:digit:][:alpha:],._+-]*\s*=\s*(<|"|\[)[[:alpha:][:digit:],]*(>|"|\]);"#]
+    Property,
+
+    #[regex = r"\s/[[:alpha:]-]*/\s[[:alpha:][:digit:]_&@-]*;\n?"]
+    Directive,
+
+    #[regex = r#"\s*#include (<|")[[:alpha:][:digit:]_-]*\.(h|(dtsi))(>|")"#]
+    Include,
+
+    // #[regex = r"\s*[[:alpha:][:digit:],#]*\n"]
+    // NonStdProperty,
+}
+```
+
+The problem is that, in addition to taking forever to finish, it will use up all 16GB of RAM on my machine and then die when it tries to grab another ~41MB at some point. 
+
+If this is doing more than what Logos is supposed to, go ahead and close this out.
+Hi there!
+
+I am trying out your library but am having trouble with compiler errors:
+```
+ |
+1 | use logos::Logos;
+  |     ------------ previous import of the macro `Logos` here
+2 | use logos_derive::Logos;
+  |     ^^^^^^^^^^^^^^^^^^^ `Logos` reimported here
+```
+I am trying to to the Inner/Outer lexer switch as in the test example code.
+If I DON'T specify `use logos_derive::Logos;` then the compiler says it cannot find `advance_as`,
+and if I ONLY specify `use logos_derive::Logos;` then compiler complains about not finding `Outer::lexer(..`.
+
+Kind regards
+Calvin
+Hi,
+
+while playing with Logos, I noticed that for similar regex's (which share the same start, for example) the longest match is not necessarily chosen. I don't know if this is the same issue as #18, because in this case two regexs create the problem.
+```rust
+use logos::Logos;
+
+#[derive(Logos, Debug, PartialEq)]
+enum Token {
+    #[end]
+    End,
+    #[error]
+    Error,
+    #[regex = "[a-zA-Z]+"]
+    Text,
+    #[regex = r"[a-zA-Z0-9+/]+[=]*"]
+    Base64,
+}
+
+fn main() {
+    let lexer = Token::lexer("SGVsbG8gV29ybGQ=");
+    assert_eq!(lexer.token, Token::Base64);
+}
+```
+
+I tried the code with version 0.9.7 and version 0.10.0-rc2, but both versions behave the same.

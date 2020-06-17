@@ -1,0 +1,369 @@
+I am not sure what to look or how to debug the issue but the error message is 
+```
+ERROR: failed to read cargo metadata: EOF while parsing a value at line 1 column 0
+```
+
+It only appears in proc-macro repos.
+
+Travis CI log for failing job with tarpaulin: https://travis-ci.org/Rair-Project/rair-core/jobs/638586153
+Travis CI log for same job passing tests without tarpaulin https://travis-ci.org/Rair-Project/rair-core/builds/638586152
+
+#### Issue description
+
+While running tarpaulin on an integration test with the --test-threads=1 flag, the test segfaults.  I did try to cut the code base and test code down to a minimal test case.  I suspect I only achieved minimal-ish, but it's much smaller than the original project.
+
+#### Steps to reproduce the issue
+
+1.  git clone git@github.com:jeffrey-howard/minimal.git
+2.  cd minimal
+3.  cargo tarpaulin --verbose -- --test-threads=1
+
+#### What's the expected result?
+
+- The expected result is that tarpaulin finishes the test, the test passes, and tarpaulin produces coverage results.  (As a side note, this is exactly what happens when running tarpaulin without the --test-threads=1 command line argument.)
+
+#### What's the actual result?
+
+- The test run concludes in a segmentation fault, as follows:
+
+> [INFO tarpaulin] Running Tarpaulin
+> [INFO tarpaulin] Building project
+>     Finished dev [unoptimized + debuginfo] target(s) in 0.10s
+> [DEBUG tarpaulin] Processing Target(lib)
+> [INFO tarpaulin] Launching test
+> [INFO tarpaulin] running /home/ec2-user/environment/minimal/target/debug/deps/minimal-e862dd173fc29ea3
+> 
+> running 0 tests
+> 
+> test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+> 
+> [DEBUG tarpaulin] Processing Target(test: server_test)
+> [INFO tarpaulin] Launching test
+> [INFO tarpaulin] running /home/ec2-user/environment/minimal/target/debug/deps/server_test-9279f386a85d2063
+> 
+> running 1 test
+> test server_bad_address ... Error: "Failed to get test coverage! Error: Failed to run tests: A segfault occurred while executing tests"
+
+#### Additional details
+
+Output from uname -a:
+
+> Linux [IP REMOVED] 4.14.146-93.123.amzn1.x86_64 #1 SMP Tue Sep 24 00:45:23 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux
+
+Tarpaulin version: 0.10.0
+
+Rustc version: rustc 1.40.0 (73528e339 2019-12-16)
+
+As I was removing as much code as possible to try to get to a minimal project showing this behavior, I did try stripping out the error reporting, at which point the test seemed to run fine.  That makes me wonder if it's the thread communication in lib.rs on lines 61 and 94 that might be causing the segfault.
+
+Running tarpaulin in a docker container:
+`Error: "Failed to get test coverage! Error: Failed to run tests: A segfault occurred while executing tests"`
+
+It's my own docker image:
+```
+FROM ekidd/rust-musl-builder:latest
+
+USER root
+
+RUN apt-get update && \
+    apt-get install -y python3 python3-pip
+RUN apt-get clean
+RUN rm -rf /var/lib/apt/lists/*
+
+USER rust
+
+RUN pip3 install --upgrade --user awscli
+ENV PATH="/home/rust/.local/bin:${PATH}"
+
+COPY --chown=rust credentials /home/rust/.aws/credentials
+
+RUN cargo install cargo-tarpaulin
+
+RUN mkdir -p /home/rust/.cargo/git /home/rust/.cargo/registry /home/rust/src/target
+```
+and container is run with `docker run --security-opt seccomp=unconfined -it -v "$(pwd):/home/rust/src" my-rust-musl`
+I have a somewhat iffy test case that succeeds when run with `cargo test`, but fails on invocation of `cargo tarpaulin`.
+
+Boundary conditions: I am running `rustc 1.37.0 (eae3437df 2019-08-13)` and `cargo-tarpaulin version: 0.9.3` on `Linux volt-stgrie 5.0.0-37-generic #40~18.04.1-Ubuntu SMP Thu Nov 14 12:06:39 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux`.
+
+The (pretty much minimally reproducing) test case is 
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn signal_reg() {
+            let fg = std::sync::Arc::new(std::sync::atomic::AtomicBool::default());
+            let si = signal_hook::flag::register(signal_hook::SIGQUIT, fg.clone());
+            assert!(si.is_ok());
+            // test if atomic is unset before signal
+            assert!(!fg.load(std::sync::atomic::Ordering::Relaxed));
+            unsafe { libc::raise(signal_hook::SIGQUIT) };
+            // test if atomic was set after signal
+            assert!(fg.load(std::sync::atomic::Ordering::Relaxed));
+        }
+    }
+
+the according project thus uses
+
+    [dev-dependencies]
+    signal-hook = "0.1.12"
+    libc = "0.2.66"
+
+(the only other relevant `cargo.toml` entry is probably `edition = "2018"`)
+
+As stated already, `cargo test` outputs
+
+>    Compiling tarp-sig-test v0.1.0 (/home/stefan/projects/tarp-sig-test)
+    Finished dev [unoptimized + debuginfo] target(s) in 0.18s
+     Running target/debug/deps/tarp_sig_test-1dba07752f9cbea9
+>    
+>    running 1 test
+>    test tests::signal_reg ... ok
+>    
+>    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+>    
+>    Doc-tests tarp-sig-test
+>    
+>    running 0 tests
+>    
+>    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+while `cargo tarpaulin -v` yields
+
+>    [INFO tarpaulin] Running Tarpaulin
+>    [INFO tarpaulin] Building project
+>        Finished dev [unoptimized + debuginfo] target(s) in 0.04s
+>    [DEBUG tarpaulin] Processing Target(lib)
+>    [INFO tarpaulin] Launching test
+>    [INFO tarpaulin] running /home/stefan/projects/tarp-sig-test/target/debug/deps/tarp_sig_test-4713170db2ac1871
+>    
+>    running 1 test
+>    test tests::signal_reg ... FAILED
+>    
+>    failures:
+>    
+>    ---- tests::signal_reg stdout ----
+>    thread 'tests::signal_reg' panicked at 'assertion failed: fg.load(std::sync::atomic::Ordering::Relaxed)', src/lib.rs:14:9
+>    stack backtrace:
+>       0: backtrace::backtrace::libunwind::trace
+>                 at /cargo/registry/src/github.com-1ecc6299db9ec823/backtrace-0.3.29/src/backtrace/libunwind.rs:88
+>       1: backtrace::backtrace::trace_unsynchronized
+>                 at /cargo/registry/src/github.com-1ecc6299db9ec823/backtrace-0.3.29/src/backtrace/mod.rs:66
+>       2: std::sys_common::backtrace::_print
+>                 at src/libstd/sys_common/backtrace.rs:47
+>       3: std::sys_common::backtrace::print
+>                 at src/libstd/sys_common/backtrace.rs:36
+>       4: std::panicking::default_hook::{{closure}}
+>                 at src/libstd/panicking.rs:200
+>       5: std::panicking::default_hook
+>                 at src/libstd/panicking.rs:211
+>       6: std::panicking::rust_panic_with_hook
+>                 at src/libstd/panicking.rs:477
+>       7: std::panicking::begin_panic
+>                 at /rustc/eae3437dfe991621e8afdc82734f4a172d7ddf9b/src/libstd/panicking.rs:411
+>       8: tarp_sig_test::tests::signal_reg
+>                 at src/lib.rs:14
+>       9: tarp_sig_test::tests::signal_reg::{{closure}}
+>                 at src/lib.rs:4
+>      10: core::ops::function::FnOnce::call_once
+>                 at /rustc/eae3437dfe991621e8afdc82734f4a172d7ddf9b/src/libcore/ops/function.rs:231
+>      11: <alloc::boxed::Box<F> as core::ops::function::FnOnce<A>>::call_once
+>                 at /rustc/eae3437dfe991621e8afdc82734f4a172d7ddf9b/src/liballoc/boxed.rs:746
+>      12: __rust_maybe_catch_panic
+>                 at src/libpanic_unwind/lib.rs:82
+>      13: std::panicking::try
+>                 at /rustc/eae3437dfe991621e8afdc82734f4a172d7ddf9b/src/libstd/panicking.rs:275
+>      14: std::panic::catch_unwind
+>                 at /rustc/eae3437dfe991621e8afdc82734f4a172d7ddf9b/src/libstd/panic.rs:394
+>      15: test::run_test::run_test_inner::{{closure}}
+>                 at src/libtest/lib.rs:1466
+>    note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+>    
+>    
+>    failures:
+>        tests::signal_reg
+>    
+>    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+>    
+>    [INFO tarpaulin] Coverage Results:
+>    || Uncovered Lines:
+>    || Tested/Total Lines:
+>    || src/lib.rs: 7/7 +0%
+>    || 
+>    100.00% coverage, 7/7 lines covered, +0% change in coverage
+>    Error: "Test failed during run"
+
+I'm not terribly familiar with the inner workings of Tarpaulin, but I would speculate that the breakpoint insertions (or whatever else tarpaulin actually does to the code in order to measure covered lines) don't work well with Unix signal handling code or maybe screw up the atomic ordering.
+I'm trying to use tarpaulin to get coverage but its failing to parse the binary. I thought it might be something about my project so I made a new lib with nothing other than the default boilerplate and its still giving me the same error. Running with the -v flag doesn't give me more info.
+
+```
+tmp with odzt60a
+❯ cargo new --lib covtest
+     Created library `covtest` package
+
+tmp with odzt60a
+❯ cd covtest
+
+tmp/covtest is 📦 v0.1.0 via 🦀 v1.39.0 with odzt60a
+❯ ls
+src  Cargo.toml
+
+tmp/covtest is 📦 v0.1.0 via 🦀 v1.39.0 with odzt60a
+❯ cargo tarpaulin
+[INFO tarpaulin] Running Tarpaulin
+[INFO tarpaulin] Building project
+Error: "Failed to get test coverage! Error: Unable to parse binary."
+[INFO tarpaulin] Launching test
+[INFO tarpaulin] running /home/jlusby/tmp/covtest/target/debug/deps/covtest-d9ba10c7fe643f7e
+
+tmp/covtest is 📦 v0.1.0 via 🦀 v1.39.0 with odzt60a
+❯ cargo tarpaulin -v
+[INFO tarpaulin] Running Tarpaulin
+[INFO tarpaulin] Building project
+    Finished dev [unoptimized + debuginfo] target(s) in 0.01s
+[DEBUG tarpaulin] Processing Target(lib)
+Error: "Failed to get test coverage! Error: Unable to parse binary."
+[INFO tarpaulin] Launching test
+[INFO tarpaulin] running /home/jlusby/tmp/covtest/target/debug/deps/covtest-d9ba10c7fe643f7e
+```
+As of 0.9.2 tarpaulin stores a serialisation of the result `TraceMap` in `target/tarpaulin` so it can report the change in coverage between runs. It would be nice if this could be added to the HTML reports.
+
+I admit I have zero front-end skill so if anyone fancies tackling this it would be appreciated
+Hello!
+
+I am trying to figure out the code coverage of a unique non-test function, is this possible?
+
+Thanks!
+System: Linux laptop 5.3.5-arch1-1-ARCH #1 SMP PREEMPT Mon Oct 7 19:03:08 UTC 2019 x86_64 GNU/Linux
+Rust version: rustc 1.38.0 (625451e37 2019-09-23)
+cargo-tarpaulin version: 0.9.0
+
+It seems that Tarpaulin has the most trouble when logical lines are split across multiple lines.
+
+I have a few examples of this behavior. I maintain [rubik/orizuru](https://github.com/rubik/orizuru), and I'm referring to the code at commit https://github.com/rubik/orizuru/tree/6a569c574137549af0d2c9148be694e2254c175c.
+
+It's easier to see Tarpaulin's output on Coveralls, but I'll attach the raw output at the bottom of this post. On Coveralls, we can see that lines 32, 122, 126, 127, 130, 132, 133, 150, 165 of [`src/consumer.rs`](https://coveralls.io/builds/26268688/source?filename=src/consumer.rs) are marked as uncovered but they are obviously covered. In [`src/gc.rs`](https://coveralls.io/builds/26268688/source?filename=src/gc.rs), the same thing is true for line 36, while on the other hand line 37 is wrongly marked as covered, when it should be line 38.
+
+Here is the raw output from `cargo tarpaulin -v --ignore-tests`:
+```
+$ cargo tarpaulin --ignore-tests -v
+[INFO tarpaulin] Running Tarpaulin
+[INFO tarpaulin] Building project
+   Compiling orizuru v0.0.1 (/home/miki/exp/orizuru)
+    Finished dev [unoptimized + debuginfo] target(s) in 4.62s
+[DEBUG tarpaulin] Processing Target(test: producer)
+[INFO tarpaulin] Launching test
+[INFO tarpaulin] running /home/miki/exp/orizuru/target/debug/deps/producer-2ef6002cc111b285
+
+running 1 test
+test producer_can_enqueue ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+[DEBUG tarpaulin] Processing Target(test: consumer)
+[INFO tarpaulin] Launching test
+[INFO tarpaulin] running /home/miki/exp/orizuru/target/debug/deps/consumer-fe2596306e0a75d1
+
+running 9 tests
+test no_heartbeat ... ok
+test register ... ok
+test one_heartbeat ... ok
+test acked_are_released ... ok
+test decodes_job ... ok
+test can_be_stopped ... ok
+test unacked_to_unack_queue ... ok
+test rejected_to_unack_queue ... ok
+test multiple_heartbeat ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+[DEBUG tarpaulin] Processing Target(test: gc)
+[INFO tarpaulin] Launching test
+[INFO tarpaulin] running /home/miki/exp/orizuru/target/debug/deps/gc-421ed796d3795885
+
+running 5 tests
+test collect_one_runs_with_no_jobs ... ok
+test collect_noop_with_no_consumers ... ok
+test collect_runs_with_a_consumer_and_no_jobs ... ok
+test collect_one_runs_with_some_jobs ... ok
+test collect_runs_with_a_consumer_and_some_jobs ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+[DEBUG tarpaulin] Processing Target(test: test_utils)
+[INFO tarpaulin] Launching test
+[INFO tarpaulin] running /home/miki/exp/orizuru/target/debug/deps/test_utils-7a56f348bdb14280
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+[DEBUG tarpaulin] Processing Target(lib)
+[INFO tarpaulin] Launching test
+[INFO tarpaulin] running /home/miki/exp/orizuru/target/debug/deps/orizuru-7134647b58b7d504
+
+running 4 tests
+test message::tests::cant_decode_if_not_string ... ok
+test message::tests::cant_decode_if_not_msgpack ... ok
+test message::tests::payload_field_is_accessible ... ok
+test message::tests::message_field_is_accessible ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+[INFO tarpaulin] Coverage Results:
+|| Uncovered Lines:
+|| src/consumer.rs: 32, 119, 122, 126-127, 130, 132-133, 150, 157-159, 165, 167-168
+|| src/gc.rs: 36, 38-39
+|| src/message.rs: 126-127
+|| Tested/Total Lines:
+|| src/consumer.rs: 62/77
+|| src/gc.rs: 25/28
+|| src/message.rs: 28/30
+|| src/producer.rs: 8/8
+|| 
+86.01% coverage, 123/143 lines covered
+```
+Hi, we noticed a few inconsistencies with what lines are considered covered and which are not.
+
+Some things we found:
+
+* macros in function bodies are not considered covered even if they get executed: https://codecov.io/gh/simd-lite/simdjson-rs/src/master/src/stage2.rs#L133
+* branch heads are sometimes not considered covered even if their bodies are: https://codecov.io/gh/simd-lite/simdjson-rs/src/master/src/stage2.rs#L227
+* inline  function headers are not always considered covered: https://codecov.io/gh/simd-lite/simdjson-rs/src/master/src/lib.rs#L177
+* unsafe blocks are not considered covered: https://codecov.io/gh/simd-lite/simdjson-rs/src/master/src/lib.rs#L196
+* initalisation to 0 is sometimes not considered covered: https://codecov.io/gh/simd-lite/simdjson-rs/src/master/src/lib.rs#L227
+* refferences as function parameters (to inlined functions) are not considered covered: https://codecov.io/gh/simd-lite/simdjson-rs/src/master/src/avx2/stage1.rs#L413
+* precompiler directives in function bodies are not considered covered: https://codecov.io/gh/simd-lite/simdjson-rs/src/master/src/avx2/generator.rs#L21
+* `break` is not considered covered: https://codecov.io/gh/simd-lite/simdjson-rs/src/master/src/avx2/deser.rs#L87
+* some let assignments are not considered covered: https://codecov.io/gh/simd-lite/simdjson-rs/src/master/src/avx2/deser.rs#L124
+* some match statements are not considered covered: https://codecov.io/gh/simd-lite/simdjson-rs/src/master/src/value/borrowed.rs#L87
+For this code
+```rust
+enum E{
+    A,
+    B(i32),
+}
+pub fn foo(i: i32) -> i32 {
+    let e = if i == 0 { E::A } else { E::B(i) };
+    match e {
+        E::A => 1,
+        E::B(x) => x,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn it_works() {
+        use crate::foo;
+        assert_eq!(foo(0), 1);
+        assert_eq!(foo(2), 2);
+    }
+}
+```
+I get a false positive for an uncovered line 7 (`match e`).
+
+```sh
+$ cargo tarpaulin -V
+cargo-tarpaulin version: 0.8.7
+```

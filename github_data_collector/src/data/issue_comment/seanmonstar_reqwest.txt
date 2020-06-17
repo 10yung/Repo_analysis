@@ -1,0 +1,127 @@
+Hi Sean, thanks for your hard work, you build an awesome Http client. I have encountered a problem when I used system proxy with reqwest. The document claims `reqwest` doesn't need the explict system proxy setting, system proxies are enabled by default:
+> System proxies look in environment variables to set HTTP or HTTPS proxies.
+
+> HTTP_PROXY or http_proxy provide http proxies for http connections while HTTPS_PROXY or https_proxy provide HTTPS proxies for HTTPS connections.
+What I struggle with is that I have explictly set the system proxy setting with:
+```rust
+export HTTPS_PROXY=socks5://127.0.0.1:2085
+```
+but `reqwest` still goes without proxy.
+
+This is my code:
+
+```rust
+use std::env;
+extern crate log;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    match env::var("HTTPS_PROXY") {
+        Ok(proxy) => println!("proxy: {}", proxy),
+        Err(e) => println!("Couldn't read HTTPS_PROXY ({})", e),
+    };
+    let client = reqwest::blocking::Client::builder()
+        .connection_verbose(true)
+        .build()?;
+    let mut res = client.get("https://httpbin.org/ip").send()?;
+    // copy the response body directly to stdout
+    res.copy_to(&mut std::io::stdout())?;
+    Ok(())
+}
+```
+
+This is the output:
+
+```shell
+$ RUST_LOG=reqwest=debug cargo run
+   Compiling reqwest-test v0.1.0 (/private/tmp/reqwest-test)
+    Finished dev [unoptimized + debuginfo] target(s) in 3.74s
+     Running `target/debug/reqwest-test`
+proxy: socks5://127.0.0.1:2085
+[2020-01-19T08:05:15Z DEBUG reqwest::async_impl::response] Response: '200 OK' for https://httpbin.org/ip
+{
+  "origin": "ip1, ip2" // this is definitely not the ip of my proxy server
+}
+```
+
+Do I do something wrong or miss something? I can't figure out why couldn't `reqwest` work with system proxy.
+`Request` has a method `body_mut()` which allows you to `.take()` the body out of the request, but once you have the body, you can't do anything with it.
+
+I'm trying to implement a library that computes a hash of the body contents to insert into the request as a header, but that's only possible if I can await the aggregation of the body stream before the request is sent, and then re-add the body.
+
+I could get around this by implementing my own RequestBuilder type that then produces a reqwest Request or RequestBuilder, but I'd rather not do that
+Hello,
+
+With each sent request, reqwest automatically inserts certain headers that are not given when you call `request.headers()`. Expected behavior is that *all* headers - whether automatically inserted or not - would be retrieved when one calls `request.headers()`.
+
+The reason these headers are not being added is because most of the automatic headers are being attached while the request is in flight (approximately), while a call of `request.headers()` happens before a request is sent. I believe this is also the case for user-given default headers.
+
+Here is the list of potentially automatically inserted headers I found in the source:
+
+- `Accept`
+- `Accept-Encoding`
+- `Host`
+- `User-Agent`
+- `Proxy-Authorization` (added only in certain cases)
+- `Referer` (added only in certain cases)
+
+Additionally, even when you change the set of default headers, the above headers can still be automatically inserted: when the end-user changes the default set of headers with `request.default_headers()`, they presume that they will be changing *every* default parameter, and **not** have reqwest automatically insert different ones.
+
+One solution I see would be to have the automatic headers be inserted into the `request.headers`, as right now the automatic headers are only inserted into `ClientBuilder.config.headers.`
+
+- - -
+
+Code to reproduce:
+```rust
+use reqwest::*;
+
+fn main() {
+    let req = Client::new()
+        .request(Method::GET, Url::parse("http://example.com").unwrap())
+        .build().unwrap();
+    println!("{:#?}", req.headers());
+}
+```
+
+Output:
+```json
+{}
+```
+
+Expected output:
+```json
+{
+  "headers": {
+    "Accept": "*/*",
+    "Accept-Encoding": "gzip",
+    "Host": "httpbin.org",
+    "User-Agent": "reqwest/0.9.24" // from what I understand, this isn't in 0.10
+  }
+}
+```
+Closes #618 
+
+cc @bluejekyll 
+I'm writing a crate in which I make a client which wraps the native `reqwest::Client`. The wrapper handles authentication and host selection, so that the user can pass just the API endpoint like this:
+
+```rust
+async fn get_thing(client: &my::Client) -> anyhow::Result<Vec<Device>> {
+    client.get("v1/devices")
+        .send()
+        .await?
+        .json::<Vec<Device>>()
+        .await
+        .map_err(anyhow::Error::from)
+}
+```
+
+The `my::Client` internally has a base URL and calls `join` to add the user-specified path onto that base. That function can return an error, so my wrapper for `get`, `post`, etc. has to return a `Result<RequestBuilder>`. I'd rather just return the `RequestBuilder`, with the error stashed in the `request` field inside the builder.
+
+Can that be made public in some capacity? (I recognize exposing it as `new` might be a bit prominent for such a niche use-case)
+If a `request_timeout` is set, creating a future for a request has to be called within a tokio runtime, because it calls `tokio::timer::delay_for()`. This was surprising to at least one person, who tried to build the `Client` and `Request` outside of an async context and then use `tokio::Runtime::block_on()` on the resulting `Future`.
+
+Could it be possible to defer calling `delay_for()` until the request future is first polled, to allow the `Request` to be built outside an async context?
+Is there any plan to support brotli, or how to implement my own decoder and apply it?
+Currently, it seems as though the internal configuration uses an Arc and I would like to rotate a proxy on existing client and retain the `cookie_store` however it would require major internal changes. Would it be possible to have a `reqwest::Client` function to return the internal `cookie_store` if it is available, and when building a `reqwest::Client` be able to supply an existing `cookie_store`?
+Added bytes() function to blocking::Response akin to async_impl::Response.
+Rather than repeatedly calling `if myerror.is_some_case() {…} else if myerror.is_some_other_case() {…} else …`, I would rather just use rust's built-in ergonomic pattern matching on enums. `reqwest` already has `Kind` so why not expose this to allow `match myerror.kind() { …}` or `if let` or any of the other pattern matching expressions?

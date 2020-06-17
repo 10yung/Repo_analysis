@@ -1,0 +1,142 @@
+Basically reopen of #127 to track separately. Original [comment](https://github.com/paritytech/parity-wasm/issues/127):
+
+> This issue seems to still remain (or has been re-introduced). @NikVolf can you re-open please?
+> 
+> Few examples:
+> 
+> ![image](https://user-images.githubusercontent.com/557590/69544605-fa25bc00-0f87-11ea-871b-e0dd251f1efe.png)
+> 
+> ![image](https://user-images.githubusercontent.com/557590/69544644-0e69b900-0f88-11ea-9937-ccd13bdf2195.png)
+> 
+> ![image](https://user-images.githubusercontent.com/557590/69544697-2ccfb480-0f88-11ea-940d-5d3347bfcf3e.png)
+
+
+Hello! https://github.com/paritytech/substrate/issues/3885 mentions that it would be nice to have the option to validate a wasm file as it's being parsed, to check for things like `f32`/`f64`s in smart contracts. There are some aspects of validation that could probably only happen once the module has been fully deserialized, but perhaps we could do something like `fn deserialize_buffer(contents: &[u8], type_blacklist: &[ValueType])`?
+
+This way we could perform an early return if a type is blacklisted.
+Constrained targets such as microcontroller will rarely have more than a few kilo byte of stack.
+
+It took me a bit to figure this out and I think the documentation doesn't really cover it and I had to piece things together from the code so I want to leave a snippet here that may help others.
+
+This is a pretty nifty test which illustrates compiling identical modules from wat with `wat2wasm` in the `wabt` crate and the `parity-wasm` module builder api.
+
+```rust
+#[cfg(test)]
+mod tests {
+  extern crate wabt;
+  extern crate parity_wasm;
+
+  use wabt::{ wat2wasm };
+  use parity_wasm::{ deserialize_buffer, builder, elements };
+  use parity_wasm::elements::Instruction::{
+    GetLocal,
+    I32Sub,
+    End
+  };
+
+  #[test]
+  fn it_can_build_module() {
+    let wast = r#"
+      (module 
+        (func (export "sub") (param $x i32) (param $y i32) (result i32)
+          ;; return x - y;
+          (i32.sub
+            (get_local $x) (get_local $y)
+          )
+        )
+      )
+    "#;
+    let module_bytes = wat2wasm(wast).unwrap();
+    let m0: elements::Module = deserialize_buffer(&module_bytes).expect("Can't deserialize module");
+    let m1 = builder::module()
+      .export()
+        .field("sub").internal().func(0)
+        .build()
+      .function()
+        .signature()
+          .param().i32()
+          .param().i32()
+          .return_type().i32()
+          .build()
+        .body()
+          .with_instructions(elements::Instructions::new([
+            GetLocal(0),
+            GetLocal(1),
+            I32Sub,
+            End
+          ].to_vec()))
+          .build()
+        .build()
+    .build();
+
+    assert_eq!(m0.version(), 1);
+    assert_eq!(m0, m1);
+  }
+}
+```
+
+It would be nice if there was a bit more documentation on `.with_instructions()` since that was the piece that seemed to be missing for me. 
+This works with 0.35.0 and panics on 0.38.0:
+
+```
+        let wasm: Vec<u8> = FromHex::from_hex("0061736d0100000001080260017e0060000002170103656e760f657468657265756d5f757365476173000003030201010503010001071102046d61696e0001066d656d6f727902000801020a070202000b02000b0020046e616d65010e0201046d61696e02056d61696e320209030001000001000200").unwrap();
+
+        let mut module: Module = parity_wasm::deserialize_buffer::<Module>(&wasm).unwrap();
+        module = module.parse_names().unwrap(); // panic here
+```
+
+Error snippet:
+```
+panicked at 'called `Result::unwrap()` on an `Err` value: ([(7, Other("index is larger than expected"))], Module { magic: 1836278016, version: 1, sections: [Type(TypeSe
+ction([Function(FunctionType { form: 96, params: [I64], return_type: None }), Function(FunctionType { form: 96, params: [], return_type: None })])), Import(ImportSection([ImportEntry { module_str: "env", field_str
+: "ethereum_useGas", external: Function(0) }])), Function(FunctionSection([Func(1), Func(1)])), Memory(MemorySection([MemoryType(ResizableLimits { initial: 1, maximum: None, shared: false })])), Export(ExportSecti
+on([ExportEntry { field_str: "main", internal: Function(1) }, ExportEntry { field_str: "memory", internal: Memory(0) }])), Start(2), Code(CodeSection([FuncBody { locals: [], instructions: Instructions([End]) }, Fu
+ncBody { locals: [], instructions: Instructions([End]) }])), Custom(CustomSection { name: "name", payload: [1, 14, 2, 1, 4, 109, 97, 105, 110, 2, 5, 109, 97, 105, 110, 50, 2, 9, 3, 0, 1, 0, 0, 1, 0, 2, 0] })] })',
+ src/libcore/result.rs:997:5
+```
+
+I'm using Ubuntu 18.0.4.
+https://travis-ci.org/paritytech/parity-wasm/jobs/491694241#L918
+
+```bash
+[0Ktravis_time:start:0523f275
+[0K$ [ $TRAVIS_BRANCH = master ] &&
+    [ $TRAVIS_PULL_REQUEST = false ] &&
+    cargo doc \
+    && echo '<meta http-equiv=refresh content=0;url=parity_wasm/index.html>' > target/doc/index.html && \
+    sudo pip install ghp-import && \
+    ghp-import -n target/doc && \
+    git push -qf https://${TOKEN}@github.com/${TRAVIS_REPO_SLUG}.git gh-pages
+ Documenting parity-wasm v0.37.0 (/home/travis/build/paritytech/parity-wasm)
+    Finished dev [unoptimized + debuginfo] target(s) in 3.37s
+The directory '/home/travis/.cache/pip/http' or its parent directory is not owned by the current user and the cache has been disabled. Please check the permissions and owner of that directory. If executing pip with sudo, you may want sudo's -H flag.
+The directory '/home/travis/.cache/pip' or its parent directory is not owned by the current user and caching wheels has been disabled. check the permissions and owner of that directory. If executing pip with sudo, you may want sudo's -H flag.
+Collecting ghp-import
+/usr/local/lib/python2.7/dist-packages/pip/_vendor/requests/packages/urllib3/util/ssl_.py:318: SNIMissingWarning: An HTTPS request has been made, but the SNI (Subject Name Indication) extension to TLS is not available on this platform. This may cause the server to present an incorrect TLS certificate, which can cause validation failures. You can upgrade to a newer version of Python to solve this. For more information, see https://urllib3.readthedocs.io/en/latest/security.html#snimissingwarning.
+  SNIMissingWarning
+/usr/local/lib/python2.7/dist-packages/pip/_vendor/requests/packages/urllib3/util/ssl_.py:122: InsecurePlatformWarning: A true SSLContext object is not available. This prevents urllib3 from configuring SSL appropriately and may cause certain SSL connections to fail. You can upgrade to a newer version of Python to solve this. For more information, see https://urllib3.readthedocs.io/en/latest/security.html#insecureplatformwarning.
+  InsecurePlatformWarning
+/usr/local/lib/python2.7/dist-packages/pip/_vendor/requests/packages/urllib3/util/ssl_.py:122: InsecurePlatformWarning: A true SSLContext object is not available. This prevents urllib3 from configuring SSL appropriately and may cause certain SSL connections to fail. You can upgrade to a newer version of Python to solve this. For more information, see https://urllib3.readthedocs.io/en/latest/security.html#insecureplatformwarning.
+  InsecurePlatformWarning
+/usr/local/lib/python2.7/dist-packages/pip/_vendor/requests/packages/urllib3/util/ssl_.py:122: InsecurePlatformWarning: A true SSLContext object is not available. This prevents urllib3 from configuring SSL appropriately and may cause certain SSL connections to fail. You can upgrade to a newer version of Python to solve this. For more information, see https://urllib3.readthedocs.io/en/latest/security.html#insecureplatformwarning.
+  InsecurePlatformWarning
+  Downloading https://files.pythonhosted.org/packages/bd/95/27cb11b5d09643c2756f04a1412b0d62aadeb0b909564f85122270c4097c/ghp-import-0.5.5.tar.gz
+Installing collected packages: ghp-import
+  Running setup.py install for ghp-import: started
+    Running setup.py install for ghp-import: finished with status 'done'
+Successfully installed ghp-import-0.5.5
+/usr/local/lib/python2.7/dist-packages/pip/_vendor/requests/packages/urllib3/util/ssl_.py:122: InsecurePlatformWarning: A true SSLContext object is not available. This prevents urllib3 from configuring SSL appropriately and may cause certain SSL connections to fail. You can upgrade to a newer version of Python to solve this. For more information, see https://urllib3.readthedocs.io/en/latest/security.html#insecureplatformwarning.
+  InsecurePlatformWarning
+/usr/local/lib/python2.7/dist-packages/pip/_vendor/requests/packages/urllib3/util/ssl_.py:122: InsecurePlatformWarning: A true SSLContext object is not available. This prevents urllib3 from configuring SSL appropriately and may cause certain SSL connections to fail. You can upgrade to a newer version of Python to solve this. For more information, see https://urllib3.readthedocs.io/en/latest/security.html#insecureplatformwarning.
+  InsecurePlatformWarning
+You are using pip version 9.0.1, however version 19.0.2 is available.
+You should consider upgrading via the 'pip install --upgrade pip' command.
+remote: Invalid username or password.
+fatal: Authentication failed for 'https://[secure]@github.com/paritytech/parity-wasm.git/'
+travis_time:end:0523f275:start=1549900580077528459,finish=1549900586358214121,duration=6280685662
+[0Ktravis_fold:end:after_success
+[0K
+```
+When generating sections from scratch, initialization from `Vec<ImportEntry>` for `ImportSection` and others would be handy 
+and elements::* should be at root
+should be no-std and more generic

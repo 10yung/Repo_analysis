@@ -1,0 +1,161 @@
+
+In the same spirit as the following environment variable
+https://github.com/rust-lang/cargo/blob/dc83ead224d8622f748f507574e1448a28d8dcc7/src/cargo/ops/fix.rs#L419
+
+`cargo fix` could try first applying all suggestions _and if it fails_ applying only the `MachineApplicable` ones. This could be problematic depending on the codebase size due to compilation times, but may be it could be worked around by keeping `rustc` statistics of prior runs and only do this if compile times are short "enough".
+Work for #141 and rust-lang/rust#53934.
+
+**Don't merge this yet**; we need to evaluate downstream consequences
+Here is a diff created by running `cargo fix --edition-idioms` on a piece of code:
+
+``` diff
+diff --git a/src/main.rs b/src/main.rs
+index 900f3d2..3c06c49 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,10 +1,10 @@
+-extern crate futures;
+-extern crate hyper;
+-extern crate hyper_tls;
+-extern crate serde;
++
++
++
++
+```
+
+The four blank lines it substituted for the `extern crate` statements it removed are useless and just create a bunch of odd looking space in the source code. It'd be better to just remove the lines without replacement.
+(Excuse me if this is not the right place to bring this up.)
+
+What if a library could use `#[deprecated]` + a convention about what to put in the note to enable cargo fix to automatically fix the deprecation, if it's due to a rename.
+
+```rust
+#[deprecated(note="Renamed to `new_name`")]
+pub fn old_name(x: i32) -> i32 {
+    new_name(x)
+}
+
+pub fn new_name(x: i32) -> i32 {
+    unimplemented!()
+}
+```
+
+Here's the rustc warning:
+
+```rust
+Warning: use of deprecated item 'old_name': Renamed to `new_name`
+  --> src/visit/reversed.rs:56:40
+   |
+56 |         old_name(3)
+   |         ^^^^^^^^
+   |
+   = note: #[warn(deprecated)] on by default
+```
+
+In that sense it is guided by rustc. I don't know at all if this is doable, but I imagine it would require some kind of agreed "protocol" for the format of the deprecation message. A more formal way to go about it would be to design this in rustc and for example use a new attribute or a new option on the attribute like `#[deprecated(renamed_to="new_name")]`
+In an empty directory, run:
+```sh
+cargo new --lib a
+cargo new --lib b
+cargo new --lib a/c
+echo 'b = {path = "../b"}' >> a/Cargo.toml
+echo 'c = {path = "./c"}' >> a/Cargo.toml
+cat > a/src/lib.rs <<END
+pub fn foo() {}
+
+pub mod bar {
+    use foo;
+    pub fn baz() { foo() }
+}
+END
+cp a/src/lib.rs b/src/lib.rs
+cp a/src/lib.rs a/c/src/lib.rs
+(cd a && cargo +nightly fix --edition -j1)
+find -name lib.rs | xargs grep use
+rm -r a b
+```
+
+This creates three crates with identical code, with one depending on the other two through `path` Cargo dependencies. `cargo fix` is able to silently fix the "root" crate, for the other two it only prints warnings.
+
+Output with `nightly-2018-11-01` which contains `cargo 1.31.0-nightly (2d0863f65 2018-10-20)` which depends on `rustfix = "0.4.2"`:
+
+```rust
+     Created library `a` project
+     Created library `b` project
+     Created library `a/c` project
+    Checking b v0.1.0 (/tmp/foo/b)                                                                                     
+warning: absolute paths must start with `self`, `super`, `crate`, or an external crate name in the 2018 edition        
+ --> /tmp/foo/b/src/lib.rs:4:9                                                                                         
+  |                                                                                                                    
+4 |     use foo;                                                                                                       
+  |         ^^^ help: use `crate`: `crate::foo`                                                                        
+  |                                                                                                                    
+  = note: `-W absolute-paths-not-starting-with-crate` implied by `-W rust-2018-compatibility`                          
+  = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in the 2018 edition!
+  = note: for more information, see issue #53130 <https://github.com/rust-lang/rust/issues/53130>                      
+                                                                                                                       
+    Checking c v0.1.0 (/tmp/foo/a/c)                                                                                   
+warning: absolute paths must start with `self`, `super`, `crate`, or an external crate name in the 2018 edition        
+ --> c/src/lib.rs:4:9                                                                                                  
+  |                                                                                                                    
+4 |     use foo;                                                                                                       
+  |         ^^^ help: use `crate`: `crate::foo`                                                                        
+  |                                                                                                                    
+  = note: `-W absolute-paths-not-starting-with-crate` implied by `-W rust-2018-compatibility`                          
+  = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in the 2018 edition!
+  = note: for more information, see issue #53130 <https://github.com/rust-lang/rust/issues/53130>                      
+                                                                                                                       
+    Checking a v0.1.0 (/tmp/foo/a)                                                                                     
+      Fixing src/lib.rs (1 fix)                                                                                        
+    Finished dev [unoptimized + debuginfo] target(s) in 0.44s                                                          
+./b/src/lib.rs:    use foo;
+./a/c/src/lib.rs:    use foo;
+./a/src/lib.rs:    use crate::foo;
+```
+https://blog.rust-lang.org/2018/10/30/help-test-rust-2018.html
+> The first step is to run `cargo fix`:
+>
+> ```
+> $ cargo fix --edition
+> ```
+>
+> This will check your code, and automatically fix any issues that it can. `cargo fix` is still pretty new, and so it can’t always fix your code automatically. If `cargo fix` can’t fix something, it will print the warning that it cannot fix to the console. If you see one of these warnings, you’ll have to update your code manually.
+
+Indeed, running (roughly) this command with `nightly-2018-11-01` prints some warnings. So many warnings that just transferring them through SSH saturates the 100 Mbps link from my build server.
+
+```sh
+$ touch **/lib.rs
+$ cargo fix --edition --allow-dirty --manifest-path ports/servo/Cargo.toml > /tmp/fix.log 2>&1
+$ ls -sh /tmp/fix.log 
+96M /tmp/fix.log
+$ wc --lines /tmp/fix.log
+1450907 /tmp/fix.log
+$ grep '^warning:' /tmp/fix.log -c          
+160015
+$  grep '^warning:' /tmp/fix.log|sort|uniq -c 
+ 159696 warning: absolute paths must start with `self`, `super`, `crate`, or an external crate name in the 2018 edition
+      9 warning: anonymous parameters are deprecated and will be removed in the next edition.
+      8 warning: `async` is a keyword in the 2018 edition
+    302 warning: `try` is a keyword in the 2018 edition
+$ grep 'help: use `crate`:' /tmp/fix.log -c   
+157968
+```
+
+To be fair these numbers are inflated because a lot of the relevant code is generated. But still, I hope this shows that the absolute-path warnings are extremely common. I feel it is essential that rustfix can fix them automatically for the edition migration path to be viable.
+
+These absolute-path warnings seem to be mostly in one of three cases:
+
+1. An `use` statement for an item in the same crate. The warning message suggests adding `crate::` and even shows what the new import should look like. So it seems like we’re most of the way there to apply this fix automatically.
+
+2. An `use` statement for an item in an external crate, but that crate has been renamed with for example `extern crate mozjs as js;`. In this case a path starting with `js::` could be considered absolute and referring to an external crate. (Though this is a language change rather than a rustfix change.)
+
+3. An `#[derive(…)]` attribute with a derive defined in a proc-macro crate. (“Built-in” derives like `#[derive(Clone)]` are not affected.) The correct fix is probably to add `use crate_name::DeriveName;` near the start of the module? Again, automatically.
+Is something like `--dry-run` planned? Or rustfix will always require a VCS?
+Here:
+
+https://github.com/rust-lang-nursery/rustfix/blob/89217428c130b62c7ddaa0734eb4ebaa33673a86/src/lib.rs#L191-L198
+
+This issue concerns the matter of a single suggestion that happens to replace multiple spans (functionality that is not used _often_, but which [does exist](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_errors/struct.Diagnostic.html#method.multipart_suggestion)). This is not to be confused with multiple suggestions that happen to touch the same code, which (if I understand correctly while reading quickly) was what #140 was about.
+
+I'm happy to work on this because I need it for rust-lang/rust#53013.
+A place for people to report success (or partial success) and things they liked.

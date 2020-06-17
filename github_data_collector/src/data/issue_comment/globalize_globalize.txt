@@ -1,0 +1,134 @@
+When migrating existing fields from the model into the translation table,
+the newly created fields are all `nil`.
+
+Example:
+```ruby
+# Before migration:
+class Post < ApplicationRecord
+  translates :title
+
+  # `body` attribute is not translated
+end
+
+Post.find(1).body
+# => 'Untranslated body' 
+
+# Migrating `body` to being translated:
+class Post < ApplicationRecord
+  translates :title, :body
+end
+
+# In the migration:
+Post.add_translation_fields!(
+  {
+    body: :text,
+  },
+  migrate_data: true
+)
+
+Post.find(1).body
+# => nil
+```
+
+After some digging, I think it comes from the [call to `read_attribute`](https://github.com/globalize/globalize/blob/master/lib/globalize/active_record/migration.rb#L145) during the data migration. It seems that instead of returning the raw data from the column, it returns `nil`. Even [the call to ActiveRecord's `_read_attribute`](https://github.com/globalize/globalize/blob/master/lib/globalize/active_record/instance_methods.rb#L70) returns `nil` 🤔 
+
+For now we have to run the data migrations manually:
+```ruby
+  def up
+    add_column :post_translations, :body, :string
+
+    Post.find_each do |post|
+      translation = post.translation_for(:en)
+      translation.update!(body: post.body)
+    end
+  end
+
+  def down
+    remove_column :post_translations, :body
+  end
+```
+
+This is using:
+- `globalize 5.3.0`
+- `rails 6.0.2.1`
+This is based on the commits in PR #467, extended by @phansch :smile: 
+
+Closes #467
+Closes phansch/globalize#1
+Initial review of a fix for #723 that removes database checks for column names and ignored columns.  This suggestion is based off the fact that it should not be connecting to the database for tests, and before it is in a production setting.  
+
+Developers should _technically_ be reading the docs to see how it uses the columns and translation tables before implementing.  :D .  Shoutout for love of docs <3
+We shouldn't try to connect to the database during asset precompilation, 
+for example.
+
+Thanks to #723 and #724
+- ruby '2.6.1'
+- gem 'rails', '~> 5.2.2'
+- gem 'globalize', '~> 5.2'
+
+When precompiling assets in a Docker environment, Rails fails with the following error:
+
+```
+rails aborted!
+PG::ConnectionBad: could not connect to server: Connection refused
+  Is the server running on host "localhost" (::1) and accepting
+  TCP/IP connections on port 5432?
+could not connect to server: Connection refused
+  Is the server running on host "localhost" (127.0.0.1) and accepting
+  TCP/IP connections on port 5432?
+/Volumes/...<omitted>.../app/models/category.rb:18:in `<class:Category>'
+/Volumes/...<omitted>.../app/models/category.rb:13:in `<main>'
+/Volumes/...<omitted>.../config/initializers/rails_admin.rb:59:in `block in <main>'
+/Volumes/...<omitted>.../config/initializers/rails_admin.rb:3:in `<main>'
+/Volumes/...<omitted>.../config/environment.rb:7:in `<main>'
+/Volumes/...<omitted>.../bin/rails:11:in `<top (required)>'
+/Volumes/...<omitted>.../bin/spring:16:in `<top (required)>'
+./bin/rails:5:in `load'
+./bin/rails:5:in `<main>'
+Tasks: TOP => environment
+(See full trace by running task with --trace)
+```
+
+Because we're doing this as part of a Docker build, we don't have access to any database. Rails is attempting to open a connection because a translation exists on my `Category` model, which is being interrogated by Rails Admin.
+
+This issue originally arose in #601 and was resolved in #602 by guarding database checks with `connected?`. A subsequent PR to support Rails 5.1 (#619) reintroduced this bug in 42b173f66e3a6a63e7908549aa5422881244596e, because `connected?` doesn't return true when running tests using a database because there's nothing to trigger the actual connection. 
+
+#619 altered the behaviour to `rescue ActiveRecord::NoDatabaseError`, however a failed Postgres connection raises `PG::ConnectionBad`, which leads to the error I'm experiencing.
+
+#719 suggested rescuing from `PG::ConnectionBad`, but understandably this was rejected as it makes `pg` a dependency of `globalize`, and doesn't cater for `Mysql2::Error::ConnectionError `.
+
+[This comment](https://github.com/rails/rails/issues/32994#issuecomment-416090206) has some insight into how this could be avoided in Globalize, but I'm not familiar enough with Globalize/ActiveRecord to put together a fix (happy to be pointed in the right direction though...).
+
+I'm mostly opening this issue for visibility, as the conversations/comments are all on closed issues and merged PRs.
+
+Would you be open to a PR reverting 42b173f66e3a6a63e7908549aa5422881244596e in the interim?
+[Globalize::ActiveRecord::InstanceMethods#save](https://github.com/globalize/globalize/blob/ef1e362f3144b2276d89f47407c67ffa3fc1f9f2/lib/globalize/active_record/instance_methods.rb#L145) wraps `ActiveRecord::Base#save`, and therefore all lifecycle methods, with an explicit set of `Globalize#locale` equal to the localization value at the point when `#save` was called. 
+
+This is problematic because it makes calls to `I18n.with_locale` (and friends) in an after_save not change `Globalize.locale`, and therefore makes translated models not work in that context. My use-case is indexing translations in elasticsearch via an after_save callback, where I was surprised to find that only in `#after_save` my models were not responding to switching locales.
+
+In other words, in any AR lifecycle callback, the following holds true so long as the model was saved while `I18n.locale == :en`:
+
+    I18n.with_locale(:es) { Globalize.locale } #=> :en
+
+[Here's a gist with the repro case](https://gist.github.com/woahdae/ec3a2445ade123882643478e0898a572).
+
+Possibly related to #476 and/or #460 
+I don't know if this is an edge case or not, but I added the option to enable fallbacks for empty translations for all models. It might not be necessary, but I thought it might be useful in some cases.
+
+Calling `#find_by_attribute_name` on translated object produces following output:
+
+```
+2.2.0 :001 > Place.find_by_name 'London'
+
+  Place Load (4.0ms)  SELECT  `places`.* FROM `places` INNER JOIN `place_translations` ON `place_translations`.`place_id` = `places`.`id` WHERE `place_translations`.`name` = '--- !ruby/object:ActiveRecord::StatementCache::Substitute {}\n' AND `place_translations`.`locale` = 'de' LIMIT 1
+ => nil
+
+2.2.0 :002 > Place.where(name: 'London').first
+
+  Place Load (4.0ms)  SELECT  `places`.* FROM `places` INNER JOIN `place_translations` ON `place_translations`.`place_id` = `places`.`id` WHERE `place_translations`.`name` = 'London' AND `place_translations`.`locale` IN ('en', 'de')  ORDER BY `places`.`id` ASC LIMIT 1
+  Place::Translation Load (0.4ms)  SELECT `place_translations`.* FROM `place_translations` WHERE `place_translations`.`place_id` IN (1)
+ => #<Place id: 1, name: "London", created_at: "2013-04-04 09:48:42", updated_at: "2015-02-23 11:51:41"> 
+```
+- ruby 2.2.0p0 (2014-12-25 revision 49005) [x86_64-linux]
+- rails 4.2.0
+- globalize 5.0.1

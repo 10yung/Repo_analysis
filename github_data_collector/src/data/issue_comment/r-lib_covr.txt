@@ -1,0 +1,242 @@
+Method signatures are listed, but the associated generic is not.  So we can
+get a report like
+
+```
+> print(p, "functions")
+cpack Coverage: 40.00%
+B: 0.00%
+numeric#character#A: 0.00%
+numeric#numeric: 0.00%
+A: 100.00%
+numeric#character: 100.00%
+```
+additionally, the tally reported for a generic seems not to reflect the fact that
+some of its methods may be untested.  the little report above is generated with
+`p = package_coverage()` for https://github.com/vjcitn/cpack
+
+```
+R Under development (unstable) (2019-11-01 r77355)
+Platform: x86_64-apple-darwin15.6.0 (64-bit)
+Running under: macOS Mojave 10.14.6
+
+Matrix products: default
+BLAS:   /Library/Frameworks/R.framework/Versions/4.0/Resources/lib/libRblas.0.dylib
+LAPACK: /Library/Frameworks/R.framework/Versions/4.0/Resources/lib/libRlapack.dylib
+
+locale:
+[1] en_US.UTF-8/en_US.UTF-8/en_US.UTF-8/C/en_US.UTF-8/en_US.UTF-8
+
+attached base packages:
+[1] stats     graphics  grDevices utils     datasets  methods   base     
+
+other attached packages:
+[1] covr_3.4.0     cpack_0.0.0    testthat_2.3.1 rmarkdown_2.0 
+
+loaded via a namespace (and not attached):
+ [1] Rcpp_1.0.3        compiler_4.0.0    prettyunits_1.0.2 remotes_2.1.0    
+ [5] tools_4.0.0       digest_0.6.23     pkgbuild_1.0.6    pkgload_1.0.2    
+ [9] evaluate_0.14     memoise_1.1.0     rlang_0.4.2       rex_1.1.2        
+[13] cli_2.0.0         rstudioapi_0.10   xopen_1.0.0       xfun_0.11        
+[17] xml2_1.2.2        withr_2.1.2       stringr_1.4.0     knitr_1.26       
+[21] roxygen2_7.0.2    desc_1.2.0        fs_1.3.1          devtools_2.2.1   
+[25] rprojroot_1.3-2   glue_1.3.1        R6_2.4.1          processx_3.4.1   
+[29] fansi_0.4.0       rcmdcheck_1.3.3   sessioninfo_1.1.1 startup_0.14.0   
+[33] callr_3.4.0       purrr_0.3.3       magrittr_1.5      backports_1.1.5  
+[37] codetools_0.2-16  ps_1.3.0          ellipsis_0.3.0    htmltools_0.4.0  
+[41] usethis_1.5.1     assertthat_0.2.1  stringi_1.4.3     lazyeval_0.2.2   
+[45] crayon_1.3.4   
+```  
+
+I currently use this slightly adapted version of `file_coverage` to also trace code run using `mclapply`, `mcparallel`, etc.:
+```
+file_coverage <- function(source_files, test_files, line_exclusions = NULL,
+                          function_exclusions = NULL, parent_env = parent.frame()) {
+  tdir <- tempfile("covr_traces_")
+  dir.create(tdir)
+  fix_mcexit(paste0("'", tdir, "'"))
+
+  env <- new.env(parent = parent_env)
+  withr::with_options(c(keep.parse.data.pkgs = TRUE), {
+    lapply(source_files, sys.source, keep.source = TRUE,
+           envir = env)
+  })
+  trace_environment(env)
+  on.exit({
+    reset_traces()
+    clear_counters()
+  })
+  lapply(test_files, sys.source, keep.source = TRUE, envir = env)
+
+  save_trace(tdir)
+  coverage <- structure(merge_coverage(list.files(tdir, full.names = TRUE)),
+                        class = "coverage")
+  exclude(coverage, line_exclusions = line_exclusions, function_exclusions = function_exclusions,
+          path = NULL)
+}
+```
+Maybe you want to consider adding this to covr? I guess, one would certainly want to make patching `parallel:::mcexit` optional, just as it is for `package_coverage`.
+E.g. from Travis, I saw:
+
+```
+$ Rscript -e 'covr::codecov()'
+Error in parse_exclusions(x$file_lines, exclude_pattern, exclude_start,  : 
+  2 starts but only 1 ends!
+Calls: <Anonymous> ... package_coverage -> exclude -> lapply -> FUN -> parse_exclusions
+Execution halted
+```
+
+Would be nice to have the file name + source line.
+Otherwise you don't get any feedback in RStudio until they're done (which might take a while)
+Hello, all. At my company, we have an extensive array of tests using testthat on
+our proprietary codebase, and we track coverage using covr. This is for a nightly test run
+that checks our development git branch. To shorten our debugging loop and make it faster 
+than a 24 hour cycle, we've discovered that it's feasible to assemble a traceability matrix 
+that identifies precisely which of our >150 tests would be hit by a proposed commit or pull 
+request affecting a particular subset of our 45K lines of covered code. 
+
+Step 1: get a named list of coverage objects from the nightly run. 
+Step 2: Run this function on it.
+```
+
+#' @title       Tally File Coverage for a traceability matrix
+#' @description Merge a list of fc objects
+#' @param       fcl named list of fc objects
+#' @return      A data.table wiht the filename, line, and functions columns from the
+#' fc objects, and a column for each name in the fcl holding its value column.
+aggregateTestMatrix <- function(fcl) {
+  filename <- NULL # appease R CMD Check
+  if (!requireNamespace('covr')) {
+    return(NULL)
+  }
+  # safety catch here.
+  tcl <- lapply(Filter(function(x) { inherits(x,'coverage') }, fcl),
+                covr::tally_coverage )
+  for (n in names(tcl) ) {
+    colnames(tcl[[n]]) <- c( "filename",  "functions" ,"line",n)
+  }
+  rc <- Reduce( function(x,y) { merge( x,y, by=c("filename","line","functions"),sort=T)} , tcl)
+  # for some reason it sorts the line column by character, so this reverts to numeric
+  as.data.table(rc)[order(filename,line)]
+}
+
+```
+Step 3: with this data.table, you can name the tests you're expecting to affect: 
+```
+
+
+findTests <-  function(fname, tm,
+                        start=NULL, end=NULL, tm ) {
+  filename <- NULL # R CMD Check
+  if (is.null(start)) {
+    start  <- tm[filename == paste0('./R/',fname),min(line)]
+  }
+  if (is.null(end)) {
+    end  <- tm[filename == paste0('./R/',fname),max(line)]
+  }
+  sdcols <- colnames(tm)[4:length(colnames(tm))]
+  tsts <- tm[filename == paste0('./R/',fname) & line >= start & line <= end ,]
+  tsts <- tsts[,lapply(.SD, sum) > 0, .SDcols = sdcols]
+  names( Filter(function(x){x}, as.list(tsts)))
+}
+
+```
+And, we have a function to identify the filenames and lines based on 
+your git diff, if you have uncommitted work, or versus a branch-to-branch 
+diff if you're abotu to submit a pull request. A new change to the git2r library 
+will let us make a cleaner version of the function once it propagates to CRAN.  
+
+```
+preCommit <- function(PR = FALSE, URL = 'elided URL to our main Git repository') {
+  if (!requireNamespace('git2r')) {
+    warning("Install the git2r package to use pre_commit")
+    return(NULL)
+  }
+  # todo: enable PR comparisons as well.
+  repo <- git2r::repository('.')
+  if (PR){
+    if (!git2r::libgit2_features()$ssh) {
+      warning("Install the git2r package WITH SSH (ask Omri) to use pre_commit(PR=T)")
+      return(NULL)
+    }
+    if (length(git2r::status(repo)$unstaged) > 0) {
+      warning("You have uncommitted work. Commit or remove before checking a PR.")
+      return(NULL)
+    }
+    warning("Changing branches under this R process to get the diff. ")
+    t_myfork  <-  git2r::tree(git2r::last_commit(repo))
+    git2r::remote_add(repo,'r_develop', URL  )
+    git2r::fetch(name = 'r_develop')
+    git2r::checkout(repo, branch = 'r_develop/master')
+    t_develop = git2r::tree(git2r::last_commit(repo))
+    D <- git2r::diff(t_develop, new_tree = t_myfork)
+    git2r::checkout(repo, branch = 'master')
+    git2r::remote_remove(repo,'r_develop')
+
+  } else {
+
+    D <- git2r::diff(repo,context_lines = 0)
+  }
+  # for each file, gather line numbers affected in old version,
+  # and feed into find_tests.
+
+  queries <- lapply(
+    D$files,
+    function(x) {
+      lapply(x$hunks,
+             function(h){
+               list(filename = basename(x$old_file),
+                    start = h$old_start,
+                    end = h$old_start + h$old_lines)})})
+  return(
+    Filter(function(x) { length(x) > 0},
+           sapply(Reduce(append,queries), function(x){ findTests(x$filename,x$start,x$end)},
+                  USE.NAMES = TRUE ))
+  )
+}
+
+```
+The result of all this put together is that before a commit and before a pull request, 
+each of our developers can find out what portions of our test suite may be affected overnight,
+and they are encouraged to run some of those tests pre-emptively and paste the test
+outputs onto their PRs. I'm posting this here as a feature request ticket to see if
+these functions might have a place in the covr codebase. I realize they will need editing to 
+remove our dependency on data.table, but they could be of great utility, and other users may be able to integrate this kind of functionality into the covr HTML reports. 
+Hello!
+
+As a Carpentries instructor, I'm considering to include a section about code/test coverage in a lesson for intermediate R users. I noticed that `covr` does not penalise tests which reuse a function's default argument values, rather than sending their own. I presume that this is intended, and that a dedicated [argument/parameter value coverage](https://en.wikipedia.org/wiki/Code_coverage#Parameter_value_coverage) may be a bit out-of-scope.
+
+However, might `covr` users benefit from it checking whether any non-default values for function arguments with a default are used in the tests, and if so, showing a warning (or message)?
+
+I imagine that this could help unit-testing-novices to understand that other coverages besides `if` & `else` branches can be important.
+
+What do you think?
+
+cc @cbeleites for suggesting `covr::report()` to me which got me thinking about this.
+
+> Edit: Hadn't finished drafting when I accidentally hit `Submit`...
+Just discovered the great feature of `covr` (Coverage of Examples). However, I can not get my examples running with `covr`
+Although all of them run with devtools::run_examples or  devtools::check. R CMD check etc I cant get them running with :
+package_coverage( type="example" )
+
+The error is always:
+could not find function "xyz"
+in the code generated from the examples of the exported function xyz
+Which seems that the package isn't loaded. 
+
+I would be happy to debug the problem more closely however, the directory containing the file package-Ex.Rout.fail 
+is deleted after  covr::package_coverage.
+
+Error: Failure in `C:/Users/wolski/AppData/Local/Temp/Rtmp2xqd5e/R_LIBS52c0555e627/LFQService/LFQService-Ex.Rout.fail`
+
+
+In the `.covrignore` section of the readme, it would be helpful to have an example of a `.covrignore` format. I'm not sure what a "System.glob" is (in terms of inputs). 
+
+Just something like: 
+```r
+tests/testthat/test-foo.R
+tests/testthat/test-bar.R
+```
+I'm not sure if the lines should refer to the test files, or the `R/` files. 
+
+I'm happy to open a PR with my guess as to how it should be formatted. 
+I'm using report() as part of generating a larger HTML report of package diagnostics and analyses for support of package review, and was wondering if it could be wrapped so it could be included in a larger document. I have tweaked version at https://github.com/noamross/launchboat/blob/master/coverage-report-widget.R, happy to do a little more to make it robust and do a PR.

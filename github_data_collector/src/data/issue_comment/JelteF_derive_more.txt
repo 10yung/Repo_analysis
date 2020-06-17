@@ -1,0 +1,143 @@
+Hi.
+This code:
+```rust
+#[derive(Deref, DerefMut)]
+pub struct Has<T>(T)
+where
+    T: Clone + Send + Sync + 'static;
+```
+
+Expands to:
+```rust
+impl <T: ::core::ops::Deref> ::core::ops::Deref for Has<T> where T: Clone +
+ Send + Sync + 'static {
+    type
+    Target
+    =
+    T;
+    #[inline]
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+impl <T: ::core::ops::DerefMut> ::core::ops::DerefMut for Has<T> where
+ T: Clone + Send + Sync + 'static {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+}
+```
+
+But `T` need not be bounded `::core::ops::Deref`.
+We have a lot of instances of this pattern: 
+```rust
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, DieselNewType, Serialize, Deserialize, From, Into, Display)]
+pub struct Foo(Uuid);
+
+impl FromStr for Foo {
+    type Err = MyError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(
+            Foo(
+                s.parse()
+                    .map_err(|err| MyError::InvalidFoo(err, Backtrace::new()))?
+            )
+        )
+    }
+}
+```
+We currently can't use `derive(FromStr)` to reduce this boilerplate but it would be nice if support for wrapping the error using a custom function could be added.  
+E.g.
+```rust
+#[derive(FromStr)]
+#[from_str = |err| MyError::InvalidFoo(err, Backtrace::new())]
+struct Foo(Uuid);
+```
+Or similar.. Would that be possible? :)
+Implementation is mostly done, but there are 3 unresolved issues:
+
+- [The way `State` process attributes need some reorganization.][state-attribute-processing-issue] Right now I've worked around it [by sticking conditional on "deriving Error" right into `State` code][state-attribute-processing-issue-workaround].
+- I'm not sure what is the proper way to [(unstable-)feature-gate macro-generated code][macro-generated-code-feature-gating].
+- I'm not sure what is the proper way to enable/disable tests for unstable features (e.g., backtrace) [[1]][tests-feature-gating-1] [[2]][tests-feature-gating-2].
+
+[state-attribute-processing-issue]: https://github.com/JelteF/derive_more/issues/92#issuecomment-556081021
+[state-attribute-processing-issue-workaround]: https://github.com/JelteF/derive_more/pull/110/files#diff-3dbd16223f25e8b5e0bcf099743107e9R384
+[macro-generated-code-feature-gating]: https://github.com/JelteF/derive_more/pull/110/files#diff-9a269209bed069ffb36d5565a91c9840R241
+[tests-feature-gating-1]: https://github.com/JelteF/derive_more/pull/110/files#diff-42b35eae59c844e338d41162d1653d1aR1
+[tests-feature-gating-2]: https://github.com/JelteF/derive_more/pull/110/files#diff-b62cdc7ae8f9b197b5f1b1ec1abae2d6R51
+Love the library, thanks for your work. Wanted to point out a small bug:
+
+I have a struct like:
+```rust
+#[allow(clippy::too_many_arguments)]
+#[derive(Constructor, Clone)]
+pub struct SomeStruct {
+    pub field1: String,
+ ...
+    pub field10: String
+}
+```
+
+The `allow` attribute doesn't seem to get passed through to the generated constructor. I'd expect this to work generally for lints.
+
+Thanks!
+There's not really a reason to derive from for `()` for variants without fields. It's somewhat unexpected and results in the problems described here in #105. Let's remove this in the next breaking release, probably 1.0.
+This would allow the same flexibility that's provided by [`derive_new`](https://github.com/nrc/derive-new) for `From`, `TryFrom`, `FromStr` and `Constructor`. It would also be nice to add `new` as a derive as well, so `derive_more` can be a drop-in replacement for `derive_new`.
+As was initially proposed in #87, it would be very useful to have a general way of deriving for enums. The basic idea is that when there's an enum we all variants forward to their fields. So in case of `Index` something like the following would work:
+```rust
+#[derive(Index)]
+enum VecOrSlice<'slice> {
+    Vec(Vec<123>)
+    Slice(&'slice [123])
+}
+```
+We can currently forward `From`, but not `TryFrom`. Implementing this for a single field would be fairly easy. For multiple fields this would be harder/impossible, because we would have to figure out what to do with the multiple possibly different errors that you can get. This would probably mean creating a temporary `enum`.
+
+For `TryInto` we only support deriving it for an enum, but we don't allow forwarding it to the inner field. This should also be supported. For a struct with multiple fields this would have the same problem as `TryFrom`.
+@tyranron I thought some more about your idea for deriving only `Error` with `derive(Error)` in #25 and I think it's a great idea. I also saw the new [thiserror](https://github.com/dtolnay/thiserror) crate coming by on reddit, which has some cool ideas. I put some ideas on how to add those to derive_more here: https://github.com/dtolnay/thiserror/issues/2#issuecomment-541356699. I asked the author if he wanted to work together on this, but it seems he isn't a fan of that (which is completele fine ofcourse). Please let me know what you think of this syntax and if you're indeed going to pick it up.
+
+For completeness here is the content of my comment with ideas (the rest of the issue thread is also useful for context):
+
+> That's definitely a good point. Some options I can think of:
+> ```rust
+> // Specific solution for error, that does auto detection of backtrace field
+> #[derive(From, Debug)]
+> enum EnumError {
+>     #[from(error)] 
+>     Example{error: io::Error, backtrace: Backtrace),
+>     NotFromable(i32),
+> }
+> ```
+> 
+> ```rust
+> // More general, but more verbose
+> #[derive(From, Debug)]
+> enum EnumError {
+>     Example{
+>        error: io::Error, 
+>        #[from(default="Backtrace::capture()")] 
+>        backtrace: Backtrace,
+>     },
+>     NotFromable(i32),
+> }
+> ```
+> 
+> Because of the way I've implemented attribute handling, the first one would also work easily for the big struct by putting the from attribute on the enum:
+> ```rust
+> #[derive(From, Display, Error)]
+> #[display("E prefix: {}")
+> #[from(error)]
+> pub enum E {
+>     #[display('io error')]
+>     E0{source: io::Error, backtrace: Backtrace},
+>     E1{source: serde_json::Error, backtrace: Backtrace},
+>     E2{source: regex::Error, backtrace: Backtrace},
+>     E3{source: hyper::Error, backtrace: Backtrace},
+>     E4{source: anyhow::Error, backtrace: Backtrace},
+>     #[from(ignore)]
+>     #[source(ignore)] // maybe #[error(ignore)]
+>     #[display("wrong count {count}")]
+>     SomeCustomError{count: i32, backtrace: Backtrace},
+> }
+> ```
+> 
+> I'll think a bit more about this, but I actually like the option above quite a bit.
+I'm not sure if this has been proposed before, but has there been any thought to implementing support for deriving the `Read` and `Write` traits from `std::io`? I think it might be useful to save boilerplate when making an enum where each of the variants contains something that implements Read/Write.

@@ -1,0 +1,186 @@
+In earlier versions if the object at fullPath was nil GetFunction returned null.
+Now if the object is not a LuaFunction a LuaFunction is created -> so GetFunction will never return null.
+
+Is this really  the intended behavior?
+Tests submitted for the issue #344 
+Both of the tests cause crashes on Linux but run fine on Windows. I've run them on netcore 3.1.
+While testing some Lua scripts using NLua I've encountered a strange behavior, possibly related to some bug with runtime stack. Here is a minimal example of the bug reproduction: [LuaTest.zip](https://github.com/NLua/NLua/files/4035439/LuaTest.zip)
+
+How the code works:
+The Lua script is being loaded into a new Lua state and executed.
+The `pcall` functions call TestClass method `exceptionMethod` which throws an exception. The exception should be caught by the `pcall` and store the exception in `err` and `errMsg` variables.
+When executing the code on `Windows 10` everything works as expected. I can see the output of WriteLine:
+
+```
+False : NLua.Exceptions.LuaScriptException: A .NET exception occured in user-code
+False : NLua.Exceptions.LuaScriptException: A .NET exception occured in user-code
+```
+
+However the same code executed on `Ubuntu 18.04` ends with a "Segmentation fault (core dumped)" and no output.
+When running the app through the debugger on Ubuntu i can see:
+
+```
+Exception thrown: 'System.Exception' in SampleApp.dll
+Exception thrown: 'System.Exception' in Unknown Module.
+The program '[31625] SampleApp.dll' has exited with code 0 (0x0).
+```
+
+I have tested the code on .NET Core versions 3.0.1 and 3.1 producing the same results on both `Windows 10` (works as expected) and `Ubuntu 18.04` (results in segmentation fault).
+
+I expect that throwing the exception (maybe) breaks the stack but I don't know how to test this further or fix it. Could it be a bug in the runtime implementation for linux?
+
+This should fix the error I was having, though it's hard to tell now that I'm getting a different error for a different file (it can't find a .NET property that actually exists on a .NET object), so I can't really test it.
+Hello.
+
+Current behaviour: executing a code sample under the try/catch block kills the process instead of throwing an exception.
+Expected result: exception is thrown.
+
+I prepared a project to demonstrate what's happening.
+[LuaTest.zip](https://github.com/NLua/NLua/files/3944078/LuaTest.zip)
+
+Could you help me resolving this problem. I assume if something wrong with a script, we should get a message over the exception (process must live).
+
+I upgraded to the latest NLua NuGet package and now my Lua scripts no longer load.
+
+```
+System.InvalidCastException
+  HResult=0x80004002
+  Message=Unable to cast object of type 'KeraLua.LuaFunction' to type 'System.Reflection.MemberInfo'.
+  Source=NLua
+  StackTrace:
+   at NLua.MetaFunctions.TrySetMember(Lua luaState, ProxyType targetType, Object target, BindingFlags bindingType, String& detailMessage)
+   at NLua.MetaFunctions.SetFieldOrPropertyInternal(Lua luaState)
+   at KeraLua.NativeMethods.lua_pcallk(IntPtr luaState, Int32 nargs, Int32 nresults, Int32 errorfunc, IntPtr ctx, IntPtr k)
+   at NLua.Lua.DoFile(String fileName)
+   at Blugen.Stage.BG..ctor(BG bg, Blugen game, Lua state, Animation[] animations, Vector2 localCoord, SFF sff, SND snd, String filePath) in R:\dev\Blugen\Stage\BG.cs:line 73
+   at Blugen.Blugen.LoadBG(String filePath) in R:\dev\Blugen\Blugen.cs:line 897
+   at Blugen.Blugen.LoadContent() in R:\dev\Blugen\Blugen.cs:line 679
+   at Microsoft.Xna.Framework.Game.Initialize()
+   at Blugen.Blugen.Initialize() in R:\dev\Blugen\Blugen.cs:line 621
+   at Microsoft.Xna.Framework.Game.DoInitialize()
+   at Microsoft.Xna.Framework.Game.Run(GameRunBehavior runBehavior)
+   at Blugen.Program.Main(String[] args) in R:\dev\Blugen\Program.cs:line 67
+```
+
+What's in the Lua file:
+```
+function Stage:Process()
+end
+
+function Stage:Display()
+end
+
+Stage.States = 
+{
+	[0] = Stage.Display,
+}
+```
+
+Relevant line of code that causes the exception:
+```
+            // Initialize Lua
+            this.state = state;
+            state.NewTable("Stage");
+            state["Stage.data"] = this;
+            state.DoString("setmetatable(Stage, mt)");
+
+            // Load the states
+            for (int j = 0; j < bg.Files.States.Length; j++)
+            {
+                string fp = Path.Combine(filePath, bg.Files.States[j]);
+
+                // Now load it
+                var f = state.DoFile(fp); // BG.cs:line 73
+            }
+```
+
+Metatable definition:
+```
+            state.NewTable("mt");
+            state.DoString(@"mt.__index = function(self,key)
+                                 local k = self.data[key]
+                                 local metatable = getmetatable(k)
+                                 if key == 'data' or not k then
+                                     return rawget(self, key)
+                                 elseif type(k) ~= 'function' and (metatable == nil or metatable.__call == nil) then
+                                     return k
+                                 else
+                                     return function(...)
+                                         if self == ... then
+                                             return k(self.data, select(2,...))
+                                         else
+                                             return k(...)
+                                         end
+                                     end
+                                 end
+                             end");
+            state.DoString(@"mt.__newindex = function(self, key, value)
+                                 local c = rawget(self, key, value)
+                                 if not c then
+                                     local dataHasKey = self.data[key] ~= key
+                                     if not dataHasKey then
+                                         rawset(self, key, value)
+                                     else
+                                         self.data[key] = value
+                                     end
+                                 else
+                                     rawset(self, key, value)
+                                 end
+                             end");
+            state.DoString("collectgarbage('setpause', 100)");
+```
+
+This worked before with Lua 5.2, and I believe NLua now uses Lua 5.3, but I don't see why this would break.
+Trying to access a member that doesn't exist in a CLR object should result in obtaining `nil`. Instead, it *always* results in obtaining a function that throws `Trying to invoke invalid method`.
+
+I've tried to figure out what was going on, and found the following:
+
+https://github.com/NLua/NLua/blob/83fb7adc67ab04c4200cd5cd25c703d033b2bf91/src/Metatables.cs#L358-L361
+
+`PushInvalidMethodCall` (introduced in https://github.com/NLua/NLua/commit/a6721a31884d7b3a5be9ebfdc71eb5475d56cf59) is always called for non-existing members, probably because it cannot be known what "type" is expected (field / property value or function).
+
+Wouldn't it make more sense to return `nil` when trying to access a field / property / method that doesn't exist, and resort to Lua throwing `attempt to call a nil value` when it's being used as a function?
+Hi, I'm trying to create coroutines for my methods so that all my scripts can make use of yield.  However, it doesn't seem to be possible to call coroutine.create from C#?  What's the correct way of working with coroutines?
+
+```
+using System;
+using System.Diagnostics;
+using System.Linq;
+using NLua;
+
+namespace CLuaTest
+{
+    class Program
+    {
+        static void Main(string[] args)
+        {
+            Lua state = new Lua();
+            state.DoString(@"
+                function fib(n)
+                    if n < 2 then 
+                        return n
+                    end
+                    return fib(n - 2) + fib(n - 1);
+                end
+            ");
+            var scriptFunc = state["fib"] as LuaFunction;
+            var coroutine = state["coroutine"] as LuaTable;
+            var create = coroutine["create"] as LuaFunction;
+            var status = coroutine["status"] as LuaFunction;
+            var co = create.Call(scriptFunc);
+            if (co.Length == 1 && co[0] == null)
+            {
+                Console.WriteLine("wat da heck");
+                Console.ReadKey();
+                return;
+            }
+
+            Console.WriteLine("ok all good");
+            Console.ReadKey();
+        }
+    }
+}
+```
+This is an awesome project but as I'm integrating it into my app, the lack of documentation is becoming noticeable.
+Documenting the few public classes NLua offers would definitely help.
+* Lua 5.4.0 support.

@@ -1,0 +1,718 @@
+Introduce a ThreadFactory that will set `Thread#setDaemon` according
+to the _auto_terminate_ value.
+
+This makes the need for the `AtExit` functionality uneeded since all
+threads can now be started daemonized.
+
+Furthermore, the gross **hack** of `Configuration#disable_at_exit_handlers!`
+is especially not needed since this allows the JVM to properly terminate
+even with minitest.
+
+You can test this with:
+```
+ruby test/concurrent/executor/test_cached_thread_pool.rb
+```
+
+This fixes issues reported by others wherein the JVM fails to shutdown when used with Minitest.
+
+fixes #839
+fixes #817
+I have a small reproduction example:
+```ruby
+  def test_timer_task
+    task = Concurrent::TimerTask.new(execution_interval: 1) do
+      puts "Here"
+    end
+    task.execute
+  end
+```
+
+The threads started by TimerTask **should be** daemons however the JVM does not shutdown.
+There seems to be some other _concurrent-ruby_ thread which is not a **daemon**
+
+The problem is that at the end of the test, the JVM remains active and does not shutdown.
+
+(The following is from _jstack_)
+```
+"pool-6-thread-1" #61 prio=5 os_prio=31 tid=0x00007fe599823800 nid=0xb103 in Object.wait() [0x0000700013a56000]
+   java.lang.Thread.State: TIMED_WAITING (on object monitor)
+        at java.lang.Object.wait(Native Method)
+        at java.lang.Object.wait(Object.java:460)
+        at org.jruby.RubyThread$SleepTask.run(RubyThread.java:1410)
+        - locked <0x000000076e124a08> (a com.concurrent_ruby.ext.SynchronizationLibrary$JRubyLockableObject)
+        at org.jruby.RubyThread.executeBlockingTask(RubyThread.java:1463)
+        at org.jruby.RubyThread.wait_timeout(RubyThread.java:1933)
+        at com.concurrent_ruby.ext.SynchronizationLibrary$JRubyLockableObject.nsWait(SynchronizationLibrary.java:254)
+        at com.concurrent_ruby.ext.SynchronizationLibrary$JRubyLockableObject$INVOKER$i$0$1$nsWait_DBG.call(SynchronizationLibrary$JRubyLockableObject$INVOKER$i$0$1$nsWait_DBG.gen)
+        at org.jruby.internal.runtime.methods.JavaMethod$JavaMethodN.call(JavaMethod.java:796)
+        at org.jruby.internal.runtime.methods.DynamicMethod.call(DynamicMethod.java:202)
+        at org.jruby.runtime.callsite.CachingCallSite.call(CachingCallSite.java:153)
+        at org.jruby.ir.interpreter.InterpreterEngine.processCall(InterpreterEngine.java:315)
+        at org.jruby.ir.interpreter.InterpreterEngine.interpret(InterpreterEngine.java:159)
+        at org.jruby.ir.interpreter.Interpreter.INTERPRET_BLOCK(Interpreter.java:127)
+        at org.jruby.runtime.InterpretedIRBlockBody.yieldDirect(InterpretedIRBlockBody.java:109)
+        at org.jruby.runtime.IRBlockBody.yieldSpecific(IRBlockBody.java:80)
+        at org.jruby.runtime.Block.yieldSpecific(Block.java:134)
+        at org.jruby.RubyKernel.loop(RubyKernel.java:1316)
+        at org.jruby.RubyKernel$INVOKER$s$0$0$loop_DBG.call(RubyKernel$INVOKER$s$0$0$loop_DBG.gen)
+        at org.jruby.internal.runtime.methods.JavaMethod$JavaMethodZeroBlock.call(JavaMethod.java:536)
+        at org.jruby.runtime.callsite.CachingCallSite.call(CachingCallSite.java:77)
+        at org.jruby.runtime.callsite.CachingCallSite.callIter(CachingCallSite.java:84)
+        at org.jruby.ir.instructions.CallBase.interpret(CallBase.java:429)
+        at org.jruby.ir.interpreter.InterpreterEngine.processCall(InterpreterEngine.java:360)
+        at org.jruby.ir.interpreter.InterpreterEngine.interpret(InterpreterEngine.java:159)
+        at org.jruby.ir.interpreter.InterpreterEngine.interpret(InterpreterEngine.java:84)
+        at org.jruby.internal.runtime.methods.InterpretedIRMethod.INTERPRET_METHOD(InterpretedIRMethod.java:182)
+        at org.jruby.internal.runtime.methods.InterpretedIRMethod.call(InterpretedIRMethod.java:165)
+        at org.jruby.runtime.callsite.CachingCallSite.call(CachingCallSite.java:163)
+        at org.jruby.runtime.callsite.CachingCallSite.callIter(CachingCallSite.java:170)
+        at org.jruby.ir.interpreter.InterpreterEngine.processCall(InterpreterEngine.java:336)
+        at org.jruby.ir.interpreter.InterpreterEngine.interpret(InterpreterEngine.java:159)
+        at org.jruby.ir.interpreter.Interpreter.INTERPRET_BLOCK(Interpreter.java:127)
+        at org.jruby.runtime.InterpretedIRBlockBody.yieldDirect(InterpretedIRBlockBody.java:109)
+        at org.jruby.runtime.BlockBody.yield(BlockBody.java:114)
+        at org.jruby.runtime.Block.yield(Block.java:165)
+        at com.concurrent_ruby.ext.SynchronizationLibrary$JRubyLockableObject.rubySynchronize(SynchronizationLibrary.java:232)
+        - locked <0x000000076e124a08> (a com.concurrent_ruby.ext.SynchronizationLibrary$JRubyLockableObject)
+        at com.concurrent_ruby.ext.SynchronizationLibrary$JRubyLockableObject$INVOKER$i$0$0$rubySynchronize_DBG.call(SynchronizationLibrary$JRubyLockableObject$INVOKER$i$0$0$rubySynchronize_DBG.gen)
+```
+
+```
+* Operating system:               mac
+* Ruby implementation:             jruby 9.1.17.0 (2.3.3)
+* `concurrent-ruby` version:       1.1.5
+* `concurrent-ruby-ext` installed: no
+* `concurrent-ruby-edge` used:     no
+```
+
+Ruby often idiomatically uses blocks to open a resource and close it again automatically.
+
+For example:
+
+```ruby
+file = File.open('file', 'r')
+# do work with file
+file.close
+
+# vs
+
+File.open('file', 'r') do |file|
+  # do work with file
+end
+# file closed automatically
+```
+
+**This teaches semaphores a similar technique:**
+
+```ruby
+semaphore = Concurrent::Semaphore.new(1)
+
+semaphore.acquire
+# do work
+semaphore.release
+
+# vs
+
+semaphore.acquire do
+  # do work
+end
+# permit automatically released
+```
+This PR updates the CI matrix to use latest JRuby, **9.2.9.0**.
+
+[JRuby 9.2.9.0 release blog post](https://www.jruby.org/2019/10/30/jruby-9-2-9-0.html)
+Solves #822
+
+Changes:
+
+b9d481e0 (Petr Blaho, 28 seconds ago)
+   Generates docs for WrappingExecutor
+
+ecb321c7 (Petr Blaho, 71 seconds ago)
+   Adds WrappingExecutor class
+
+   This can be used for wrapping args and task before passing it to Executor.
+TODO:
+- [x] update docs
+- [ ] implement soft shutdown
+- [x] handle re-execution
+It currently uses TimerSet which runs in IO pool and creates unnecessary threads.
+Is there an easy way to wait for an Actor to terminate? I'm aware that I can wait till all messages are processed:
+
+```ruby
+actor = MyActor.spawn(name: 'actor')
+actor << :dostuff
+actor.ask(:await).wait
+```
+
+or wait for the actor to respond (which AFAIK is the same)
+
+```ruby
+actor = MyActor.spawn(name: 'actor')
+actor << :dostuff
+actor.ask(:some_result).value # or actor.ask!(:some_result)
+```
+
+but both are not what I'm looking for. I want to know how to block until an actor is terminated when the actor has asynchronous execution itself:
+
+```ruby
+class MyActor < Concurrent::Actor::Context
+  def on_message(message)
+    case message
+    when :start
+      promises = 10.times.map do |n|
+        Concurrent::Promises.future do
+          sleep 1
+          n
+        end
+      end
+
+      Concurrent::Promises.zip(*promises).then do
+        self.tell :terminate!
+      end
+
+      Concurrent::Actor::Behaviour::MESSAGE_PROCESSED
+    else
+      pass
+    end
+  end
+end
+
+my_actor = MyActor.spawn(name: 'actor')
+my_actor.tell(:start)
+
+# How to do this, as this is obviously not great:
+loop do
+  break if my_actor.ask!(:terminated?)
+end
+```
+Trying to update concurrent-ruby package in Fedora, the test suite is quite unstable. Here are the failing tests if I am lucky enough and there is no deadlock:
+
+~~~
+Failures:
+
+  1) Concurrent::ScheduledTask observation notifies all observers on fulfillment
+     Failure/Error: expect(observer.value).to eq(42)
+     
+       expected: 42
+            got: nil
+     
+       (compared using ==)
+     # ./spec/concurrent/scheduled_task_spec.rb:267:in `block (3 levels) in <module:Concurrent>'
+
+  2) Concurrent::ScheduledTask observation notifies all observers on rejection
+     Failure/Error: expect(observer.reason).to be_a(StandardError)
+       expected nil to be a kind of StandardError
+     # ./spec/concurrent/scheduled_task_spec.rb:276:in `block (3 levels) in <module:Concurrent>'
+
+  3) Concurrent::ScheduledTask#cancel returns false if the task has already been performed
+     Failure/Error: expect(task.cancel).to be_falsey
+     
+       expected: falsey value
+            got: true
+     # ./spec/concurrent/scheduled_task_spec.rb:180:in `block (3 levels) in <module:Concurrent>'
+
+  4) Concurrent::ScheduledTask#cancel returns false if the task is already in progress
+     Failure/Error: expect(task.cancel).to be_falsey
+     
+       expected: falsey value
+            got: true
+     # ./spec/concurrent/scheduled_task_spec.rb:190:in `block (3 levels) in <module:Concurrent>'
+
+  5) Concurrent::ScheduledTask execution sets the state to :processing when the task is running
+     Failure/Error: expect(state).to eq :processing
+     
+       expected: :processing
+            got: :pending
+     
+       (compared using ==)
+     
+       Diff:
+       @@ -1,2 +1,2 @@
+       -:processing
+       +:pending
+       
+     # ./spec/concurrent/scheduled_task_spec.rb:171:in `block (3 levels) in <module:Concurrent>'
+
+  6) Concurrent::ScheduledTask behavior it should behave like obligation #value blocks the caller when :pending and timeout is nil
+     Failure/Error: @__Condition__.wait @__Lock__, timeout
+     
+     fatal:
+       No live threads left. Deadlock?
+       33 threads, 33 sleeps current:0x000055d4b2fc5ea0 main thread:0x000055d4b2fc5ea0
+       * #<Thread:0x000055d4b2ff32c8 sleep_forever>
+          rb_thread_t:0x000055d4b2fc5ea0 native:0x00007fb6464a2740 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/synchronization/mutex_lockable_object.rb:46:in `sleep'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/synchronization/mutex_lockable_object.rb:46:in `wait'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/synchronization/mutex_lockable_object.rb:46:in `ns_wait'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/synchronization/abstract_lockable_object.rb:43:in `ns_wait_until'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/atomic/event.rb:87:in `block in wait'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/synchronization/mutex_lockable_object.rb:41:in `block in synchronize'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/synchronization/mutex_lockable_object.rb:41:in `synchronize'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/synchronization/mutex_lockable_object.rb:41:in `synchronize'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/atomic/event.rb:84:in `wait'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/concern/obligation.rb:75:in `wait'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/concern/obligation.rb:66:in `value'
+          /builddir/build/BUILD/spec/concurrent/concern/obligation_shared.rb:70:in `block (3 levels) in <top (required)>'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/example.rb:257:in `instance_exec'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/example.rb:257:in `block in run'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/example.rb:503:in `block in with_around_and_singleton_context_hooks'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/example.rb:460:in `block in with_around_example_hooks'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/hooks.rb:464:in `block in run'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/hooks.rb:602:in `run_around_example_hooks_for'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/hooks.rb:464:in `run'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/example.rb:460:in `with_around_example_hooks'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/example.rb:503:in `with_around_and_singleton_context_hooks'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/example.rb:254:in `run'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/example_group.rb:633:in `block in run_examples'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/example_group.rb:629:in `map'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/example_group.rb:629:in `run_examples'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/example_group.rb:595:in `run'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/example_group.rb:596:in `block in run'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/example_group.rb:596:in `map'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/example_group.rb:596:in `run'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/example_group.rb:596:in `block in run'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/example_group.rb:596:in `map'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/example_group.rb:596:in `run'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/example_group.rb:596:in `block in run'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/example_group.rb:596:in `map'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/example_group.rb:596:in `run'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/runner.rb:116:in `block (3 levels) in run_specs'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/runner.rb:116:in `map'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/runner.rb:116:in `block (2 levels) in run_specs'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/configuration.rb:2008:in `with_suite_hooks'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/runner.rb:111:in `block in run_specs'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/reporter.rb:74:in `report'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/runner.rb:110:in `run_specs'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/runner.rb:87:in `run'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/runner.rb:71:in `run'
+          /usr/share/gems/gems/rspec-core-3.8.2/lib/rspec/core/runner.rb:45:in `invoke'
+          /usr/share/gems/gems/rspec-core-3.8.2/exe/rspec:4:in `<top (required)>'
+          /usr/bin/rspec:23:in `load'
+          /usr/bin/rspec:23:in `<main>'
+       * #<Thread:0x000055d4b47c2ef8@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b4d5bc40 native:0x00007fb643eb4700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4b9a170@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b4f6ffe0 native:0x00007fb6437ad700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4bcb680@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b4bf8830 native:0x00007fb642aa0700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4e0eb40@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b50dc3c0 native:0x00007fb6432a8700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4e185c8@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b50d7d70 native:0x00007fb5b9b5b700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4e93a48@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b47c5d90 native:0x00007fb6440b6700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4e99fb0@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b4e13250 native:0x00007fb5bb979700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4e9ef60@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b31bfc30 native:0x00007fb642096700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4ea7520@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b3c22950 native:0x00007fb640e84700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4ec0408@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x00007fb5c8004c00 native:0x00007fb5c27e7700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4ec9418@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b50cfb40 native:0x00007fb5c3fff700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4ed7e50@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b4e79a10 native:0x00007fb6438ae700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4eda1f0@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b4e66850 native:0x00007fb5c15d5700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4ef3d80@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b4fc1df0 native:0x00007fb5c03c3700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4ef6990@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b4e87790 native:0x00007fb5ba565700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4f01728@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x00007fb5e402fdd0 native:0x00007fb6436ac700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4f0a5d0@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b4dd0970 native:0x00007fb64249a700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4f0e900@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b4db4e00 native:0x00007fb643cb2700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4f1d2e8@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b4e65660 native:0x00007fb643ab0700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4f20ce0@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x00007fb620004c00 native:0x00007fb64269c700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4f29b60@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b5067fd0 native:0x00007fb5bc989700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4f3e8f8@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b50efbe0 native:0x00007fb5c19d9700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4f44eb0@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b50306c0 native:0x00007fb64289e700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4f56bb0@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b4df4190 native:0x00007fb5c13d3700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4f659a8@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b4f04f30 native:0x00007fb64279d700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4f74340@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b513f560 native:0x00007fb5c25e5700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4f81a18@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b4dfd1d0 native:0x00007fb5bcd8d700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4f93448@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b4dac0e0 native:0x00007fb6430a6700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4f9aea0@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x00007fb5c4004970 native:0x00007fb642ca2700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b4faddc0@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b51f84c0 native:0x00007fb5ba767700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x000055d4b50e5e18@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b4dc4800 native:0x00007fb5ba161700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+       * #<Thread:0x00007fb5f803d850@/builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:317 sleep_forever>
+          rb_thread_t:0x000055d4b501cec0 native:0x00007fb642298700 int:0
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `pop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:322:in `block (3 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `loop'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:320:in `block (2 levels) in create_worker'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `catch'
+          /builddir/build/BUILD/concurrent-ruby-1.1.5/usr/share/gems/gems/concurrent-ruby-1.1.5/lib/concurrent/executor/ruby_thread_pool_executor.rb:319:in `block in create_worker'
+     Shared Example Group: :obligation called from ./spec/concurrent/scheduled_task_spec.rb:49
+     # ./lib/concurrent/synchronization/mutex_lockable_object.rb:46:in `sleep'
+     # ./lib/concurrent/synchronization/mutex_lockable_object.rb:46:in `wait'
+     # ./lib/concurrent/synchronization/mutex_lockable_object.rb:46:in `ns_wait'
+     # ./lib/concurrent/synchronization/abstract_lockable_object.rb:43:in `ns_wait_until'
+     # ./lib/concurrent/atomic/event.rb:87:in `block in wait'
+     # ./lib/concurrent/synchronization/mutex_lockable_object.rb:41:in `block in synchronize'
+     # ./lib/concurrent/synchronization/mutex_lockable_object.rb:41:in `synchronize'
+     # ./lib/concurrent/synchronization/mutex_lockable_object.rb:41:in `synchronize'
+     # ./lib/concurrent/atomic/event.rb:84:in `wait'
+     # ./lib/concurrent/concern/obligation.rb:75:in `wait'
+     # ./lib/concurrent/concern/obligation.rb:66:in `value'
+     # /builddir/build/BUILD/spec/concurrent/concern/obligation_shared.rb:70:in `block (3 levels) in <top (required)>'
+
+  7) Concurrent::ScheduledTask behavior it should behave like obligation #value returns the value when fulfilled before timeout
+     Failure/Error: DEFAULT_FAILURE_NOTIFIER = lambda { |failure, _opts| raise failure }
+     
+       expected: truthy value
+            got: nil
+     Shared Example Group: :obligation called from ./spec/concurrent/scheduled_task_spec.rb:49
+     # /builddir/build/BUILD/spec/concurrent/concern/obligation_shared.rb:48:in `block (3 levels) in <top (required)>'
+
+  8) Concurrent::ScheduledTask behavior it should behave like observable first notification calls the #update method on all observers without a specified :func
+     Failure/Error: DEFAULT_FAILURE_NOTIFIER = lambda { |failure, _opts| raise failure }
+     
+       expected: 0
+            got: 5
+     
+       (compared using ==)
+     Shared Example Group: :observable called from ./spec/concurrent/scheduled_task_spec.rb:51
+     # /builddir/build/BUILD/spec/concurrent/concern/observable_shared.rb:127:in `block (3 levels) in <top (required)>'
+
+  9) Concurrent::ScheduledTask behavior it should behave like observable first notification calls the appropriate function on all observers which specified a :func
+     Failure/Error: DEFAULT_FAILURE_NOTIFIER = lambda { |failure, _opts| raise failure }
+     
+       expected: 0
+            got: 5
+     
+       (compared using ==)
+     Shared Example Group: :observable called from ./spec/concurrent/scheduled_task_spec.rb:51
+     # /builddir/build/BUILD/spec/concurrent/concern/observable_shared.rb:138:in `block (3 levels) in <top (required)>'
+
+  10) Concurrent::ScheduledTask behavior it should behave like observable first notification calls the proc for all observers added as a block
+      Failure/Error: DEFAULT_FAILURE_NOTIFIER = lambda { |failure, _opts| raise failure }
+      
+        expected: 0
+             got: 5
+      
+        (compared using ==)
+      Shared Example Group: :observable called from ./spec/concurrent/scheduled_task_spec.rb:51
+      # /builddir/build/BUILD/spec/concurrent/concern/observable_shared.rb:148:in `block (3 levels) in <top (required)>'
+
+  11) Concurrent::ScheduledTask class #execute passes the block to the new ScheduledTask
+      Failure/Error: expect(@expected).to be_truthy
+      
+        expected: truthy value
+             got: false
+      # ./spec/concurrent/scheduled_task_spec.rb:118:in `block (3 levels) in <module:Concurrent>'
+
+  12) Concurrent::TimerTask observation notifies all observers on error
+      Failure/Error: expect(observer.ex).to be_a(ArgumentError)
+        expected nil to be a kind of ArgumentError
+      # ./spec/concurrent/timer_task_spec.rb:262:in `block (3 levels) in <module:Concurrent>'
+
+  13) Concurrent::TimerTask observation notifies all observers on success
+      Failure/Error: expect(observer.value).to eq(42)
+      
+        expected: 42
+             got: nil
+      
+        (compared using ==)
+      # ./spec/concurrent/timer_task_spec.rb:241:in `block (3 levels) in <module:Concurrent>'
+
+  14) Concurrent::TimerTask observation notifies all observers on timeout
+      Failure/Error: expect(observer.ex).to be_a(Concurrent::TimeoutError)
+        expected nil to be a kind of Concurrent::TimeoutError
+      # ./spec/concurrent/timer_task_spec.rb:252:in `block (3 levels) in <module:Concurrent>'
+
+  15) Concurrent::TimerTask execution waits for :execution_interval seconds when the :run_now option is not given
+      Failure/Error: expect(latch.wait(1)).to be_truthy
+      
+        expected: truthy value
+             got: false
+      # ./spec/concurrent/timer_task_spec.rb:199:in `block (3 levels) in <module:Concurrent>'
+
+  16) Concurrent::TimerTask execution waits for :execution_interval seconds when the :run_now option is false
+      Failure/Error: expect(latch.wait(1)).to be_truthy
+      
+        expected: truthy value
+             got: false
+      # ./spec/concurrent/timer_task_spec.rb:191:in `block (3 levels) in <module:Concurrent>'
+
+  17) Concurrent::TimerTask observable it should behave like observable first notification calls the proc for all observers added as a block
+      Failure/Error: DEFAULT_FAILURE_NOTIFIER = lambda { |failure, _opts| raise failure }
+      
+        expected: 0
+             got: 5
+      
+        (compared using ==)
+      Shared Example Group: :observable called from ./spec/concurrent/timer_task_spec.rb:50
+      # /builddir/build/BUILD/spec/concurrent/concern/observable_shared.rb:148:in `block (3 levels) in <top (required)>'
+
+  18) Concurrent::TimerTask observable it should behave like observable first notification calls the appropriate function on all observers which specified a :func
+      Failure/Error: DEFAULT_FAILURE_NOTIFIER = lambda { |failure, _opts| raise failure }
+      
+        expected: 0
+             got: 5
+      
+        (compared using ==)
+      Shared Example Group: :observable called from ./spec/concurrent/timer_task_spec.rb:50
+      # /builddir/build/BUILD/spec/concurrent/concern/observable_shared.rb:138:in `block (3 levels) in <top (required)>'
+
+  19) Concurrent::TimerTask observable it should behave like observable first notification calls the #update method on all observers without a specified :func
+      Failure/Error: DEFAULT_FAILURE_NOTIFIER = lambda { |failure, _opts| raise failure }
+      
+        expected: 0
+             got: 5
+      
+        (compared using ==)
+      Shared Example Group: :observable called from ./spec/concurrent/timer_task_spec.rb:50
+      # /builddir/build/BUILD/spec/concurrent/concern/observable_shared.rb:127:in `block (3 levels) in <top (required)>'
+
+Finished in 3 minutes 16.1 seconds (files took 0.42356 seconds to load)
+1995 examples, 19 failures, 6 pending
+
+Failed examples:
+
+rspec ./spec/concurrent/scheduled_task_spec.rb:263 # Concurrent::ScheduledTask observation notifies all observers on fulfillment
+rspec ./spec/concurrent/scheduled_task_spec.rb:271 # Concurrent::ScheduledTask observation notifies all observers on rejection
+rspec ./spec/concurrent/scheduled_task_spec.rb:177 # Concurrent::ScheduledTask#cancel returns false if the task has already been performed
+rspec ./spec/concurrent/scheduled_task_spec.rb:183 # Concurrent::ScheduledTask#cancel returns false if the task is already in progress
+rspec ./spec/concurrent/scheduled_task_spec.rb:161 # Concurrent::ScheduledTask execution sets the state to :processing when the task is running
+rspec ./spec/concurrent/scheduled_task_spec.rb[1:1:1:2:6] # Concurrent::ScheduledTask behavior it should behave like obligation #value blocks the caller when :pending and timeout is nil
+rspec ./spec/concurrent/scheduled_task_spec.rb[1:1:1:2:3] # Concurrent::ScheduledTask behavior it should behave like obligation #value returns the value when fulfilled before timeout
+rspec ./spec/concurrent/scheduled_task_spec.rb[1:1:3:5:1] # Concurrent::ScheduledTask behavior it should behave like observable first notification calls the #update method on all observers without a specified :func
+rspec ./spec/concurrent/scheduled_task_spec.rb[1:1:3:5:2] # Concurrent::ScheduledTask behavior it should behave like observable first notification calls the appropriate function on all observers which specified a :func
+rspec ./spec/concurrent/scheduled_task_spec.rb[1:1:3:5:3] # Concurrent::ScheduledTask behavior it should behave like observable first notification calls the proc for all observers added as a block
+rspec ./spec/concurrent/scheduled_task_spec.rb:114 # Concurrent::ScheduledTask class #execute passes the block to the new ScheduledTask
+rspec ./spec/concurrent/timer_task_spec.rb:256 # Concurrent::TimerTask observation notifies all observers on error
+rspec ./spec/concurrent/timer_task_spec.rb:236 # Concurrent::TimerTask observation notifies all observers on success
+rspec ./spec/concurrent/timer_task_spec.rb:246 # Concurrent::TimerTask observation notifies all observers on timeout
+rspec ./spec/concurrent/timer_task_spec.rb:195 # Concurrent::TimerTask execution waits for :execution_interval seconds when the :run_now option is not given
+rspec ./spec/concurrent/timer_task_spec.rb:187 # Concurrent::TimerTask execution waits for :execution_interval seconds when the :run_now option is false
+rspec ./spec/concurrent/timer_task_spec.rb[1:2:1:5:3] # Concurrent::TimerTask observable it should behave like observable first notification calls the proc for all observers added as a block
+rspec ./spec/concurrent/timer_task_spec.rb[1:2:1:5:2] # Concurrent::TimerTask observable it should behave like observable first notification calls the appropriate function on all observers which specified a :func
+rspec ./spec/concurrent/timer_task_spec.rb[1:2:1:5:1] # Concurrent::TimerTask observable it should behave like observable first notification calls the #update method on all observers without a specified :func
+~~~
+
+It seesm that the `scheduled_task_spec.rb` and `timer_task_spec.rb` are unstable for some reason.
+
+<!-- Thank you for submitting an issue!. 
+     Please fill following if applicable, delete otherwise: -->
+```
+* Operating system:                linux
+* Ruby implementation:             Ruby
+* `concurrent-ruby` version:       2.6.3
+* `concurrent-ruby-ext` installed: no
+* `concurrent-ruby-edge` used:     no
+```
+
+ThreadLocalVar can be expensive as it spins a thread in finalizers. In some
+cases consumers may want to swap in a constant value implementations that
+is very cheap.
+
+`Concurrent::ConstantThreadLocalVar` is interface compatible with
+AbstractThreadLocalVar, however does not allow any changing of .value
+
+See more context in: https://github.com/rails/rails/pull/36949
+
+@pitr-ch how do you feel about this? Would you prefer this here or in Rails? 

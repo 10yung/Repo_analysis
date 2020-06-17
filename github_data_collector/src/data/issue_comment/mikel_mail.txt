@@ -1,0 +1,119 @@
+**(Following up on an old PR (https://github.com/mikel/mail/pull/1089)**
+
+I encountered the following error after setting `ActionMailer::Base.smtp_settings#openssl_verify_mode` to 'peer':
+
+`SSL_connect returned=1 errno=0 state=error: certificate verify failed (unable to get local issuer certificate)`
+
+The way to fix this for me is manually setting the smtp_settings' ca_file, but the ca_file is an [undocumented configuration parameter](https://guides.rubyonrails.org/action_mailer_basics.html#action-mailer-configuration) and thus not really clear to users.
+
+I have now monkey patched my application with the change from this PR. Adding this as a default parameter does not harm the existing behaviour as far as I have found going through code and manual testing.
+In #683 a workaround was introduced for [broken dot-stuffing in Net::SMTP](https://bugs.ruby-lang.org/issues/9627) in older Ruby versions. However, the workaround is applied to all versions of Ruby, causing additional leading dots in the email being sent.
+
+Also, this PR fixes a bug in the original workaround. We only need to do manual dot-stuffing if the last line of the email contains only a dot with no trailing newline. The tests imply that we also need to dot-stuff all lines with single dots, but that is wrong and also causes additional dots in the email being sent.
+
+## Steps to reproduce
+```
+Mail.new do |m|
+  m.from "from@example.com"
+  m.to   "to@example.com"
+  m.body ".foo\n."
+end.deliver!
+```
+
+### Expected body (as displayed in email client)
+```
+.foo
+.
+```
+
+### Actual body
+```
+.foo
+..
+```
+- fix a copy/paste error in Mail#last
+- **prior to conversation:** fix #decode example in README. Here I am not 100% sure but calling #decode on a mail-object gives me `Can not decode an entire message, try calling #decoded on the various fields and body or parts if it is a multipart message.`. Although I'd find it pretty cool if #decode gives me whatever text/body-part there is.
+- **after conversation:** Slightly improved message of NoMethodError in `Message#decode`. Agreed on further improvements should include choosing a more distinct Error class.
+
+Fixes #1219 
+We're using v2.7.1 of the mail gem with ruby 2.4.4
+
+Some of our users are typoing their names - not their email addresses - in ways that are causing syntax errors when we try and send the email.
+
+Here are some examples, one that works fine, and two different failing examples - names have been changed, but the typos have been kept the same
+
+Working:
+```
+to = "\"Joe Bloggs\" <joe.bloggs@example.com>"
+m = Mail.new
+m.to = to
+#<Mail::Message:92412660, Multipart: false, Headers: <To: "Joe Bloggs" <joe.bloggs@example.com>>>
+```
+
+Failure 1:
+```
+to = "\"Joe B\"log-gs\" <joe.bloggs@example.com>"
+m = Mail.new
+m.to = to
+#<Mail::Message:92412660, Multipart: false, Headers: <To: "Joe B"log-gs" <joe.bloggs@example.com>>>
+```
+
+Falure 2:
+```
+to = "\"JOE BLOGGS\\\" <joe.bloggs@example.com>"
+m = Mail.new
+m.to = to
+#<Mail::Message:92412660, Multipart: false, Headers: <To: "JOE BLOGGS\" <joe.bloggs@example.com>>>
+```
+
+When we try and send the failures we get the error:
+```
+Net::SMTPSyntaxError: 501 Syntax error in parameters
+/app/vendor/ruby-2.4.4/lib/ruby/2.4.0/net/smtp.rb:969 in check_response
+/app/vendor/ruby-2.4.4/lib/ruby/2.4.0/net/smtp.rb:937 in getok
+/app/vendor/ruby-2.4.4/lib/ruby/2.4.0/net/smtp.rb:837 in mailfrom
+/app/vendor/ruby-2.4.4/lib/ruby/2.4.0/net/smtp.rb:658 in send_message
+/gems/mail-2.7.1/lib/mail/network/delivery_methods/smtp_connection.rb:54 in deliver!
+/gems/mail-2.7.1/lib/mail/network/delivery_methods/smtp.rb:101 in block in deliver!
+/app/vendor/ruby-2.4.4/lib/ruby/2.4.0/net/smtp.rb:519 in start
+/gems/mail-2.7.1/lib/mail/network/delivery_methods/smtp.rb:109 in start_smtp_session
+/gems/mail-2.7.1/lib/mail/network/delivery_methods/smtp.rb:100 in deliver!
+/gems/mail-2.7.1/lib/mail/message.rb:276 in deliver!
+```
+
+I've tried to find out what the allowed characters in the to are, but I haven't been able to find it.
+
+I'm wondering if there is something we could do escape the characters, I tried CGI.escape but it didn't seem to have the effect I wanted
+```
+"%22JOE+BLOGGS%5C%22+%3Cjoe.bloggs%40example.com%3E"
+#<Mail::Message:92412660, Multipart: false, Headers: <To: %22JOE+BLOGGS%5C%22+%3Cjoe.bloggs%40example.com%3E>>
+```
+
+Any advice on how we could prevent the errors, and allow the emails to be sent correctly would be appreciated
+A library such as this should ideally not report errors and warnings using Kernel.warn or similar.
+
+This is because it is difficult for callers to detect when such events occur.
+Intercepting Warning.warn may work. However this can get complicated if the caller is a top-level app that needs to report warnings to a console.
+
+One way round this would be to report all such events through a utility method.
+That could then be overridden without affecting other code.
+This PR allows the SMTP-settings to be configured via a url, e.g.
+```ruby
+Mail.defaults do
+  delivery_method :smtp, url: 'smtps://user%40gmail.com:app-password@smtp.gmail.com'
+end
+```
+
+The Travis-builds seemed to fail for reasons unrelated to the code. Fixing this failed so I setup separate builds reachable via the ✅ at https://gitlab.com/eval/mail/tree/smtp-url.
+
+The included smtp-delivery examples for gmail and fastmail were successfully tested. 
+
+
+
+Fixes https://github.com/mikel/mail/issues/1329
+
+First attempt at a fix: https://github.com/mikel/mail/pull/1332
+
+In this second attempt, I tried to scope down the issue to where the issue appears most probable: inline images.
+
+We do not add a default filename for the nameless attachment, rather just ensure that the message part is considered an attachment if it is an inline image.

@@ -1,0 +1,242 @@
+Hi With this PR we can fix the behaviour described in #2903.
+
+**With current drone version**
+
+![image](https://user-images.githubusercontent.com/5883405/72604755-d2b1f680-391b-11ea-8e91-acd28202f44b.png)
+
+**With this patch**
+
+![image](https://user-images.githubusercontent.com/5883405/72604826-eeb59800-391b-11ea-867a-c6fe29119dc9.png)
+
+Hi to all drone followers.
+
+First I would like to be grateful with drone owners and collaborators for this great software.
+
+As previously discused in https://discourse.drone.io/t/triggered-builds-by-cron-have-high-deviation-against-expected-time/6612/4 , we have detected some accuracy problems with builds triggered from cron with expressions `@every XX`  ( continuous period without no important where  it exact begins) 
+
+The 2 main discussion issues was.
+
+## Accumulated delay
+
+ on jobs needed to have a stable cadence (with acceptance of some jitter) it could be a problem as there is lack of data.
+
+**With current drone version**
+
+![image](https://user-images.githubusercontent.com/5883405/72604755-d2b1f680-391b-11ea-8e91-acd28202f44b.png)
+
+En the previous image cron jobs should be triggered each 10min but all cron-jobs has been accumulating time until bypass one period 
+
+**Expected**
+
+![image](https://user-images.githubusercontent.com/5883405/72604826-eeb59800-391b-11ea-867a-c6fe29119dc9.png)
+
+This is the expected behaviour, where there is one execution on each time bucket
+
+
+
+##  job alignment
+
+Right now drone changes the triggering time depending on the DRONE_CRON_INTERVAL if drone-server (for maintenance or for incidence) has been stopped more than one "XX period"  on restart all cron jobs will be triggered first at the same time.  This fact could have impact on not much efficient resource consumption distributión and could overload runner system. 
+
+Could be interesting if Drone could maintain the cron deploy initial time by the end user ( this is like delegate resource load distribucion on the end user ) , instead of changing it with this dangerous behaviour
+
+There is currently a feature request associated with being able to run
+some sort of pipeline at the termination of some git event; specifically
+in this case a "closure" of a pull request.
+
+This allows the consumers of drone to use drone to spin up ephemeral
+environments for the purpose of testing, and then later have them torn
+down automatically by Drone once the pull request has been closed.
+
+This commit implements such a solution after reading the guidance on:
+
+  https://github.com/drone/drone/pull/2884
+
+It attempts to use the "actions" component of the spec rather than
+create new first level event primitive, but stubs out that actions
+primitive in the case that the user has not supplied any so as to
+preserve BC with the existing pipelines.
+
+== Design Notes
+=== COMPLETELY UNTESTED
+
+This compiles, but that's the chunk of testing done on it so far. It's
+late and I'm tired, so this is a discussion patch.
+
+=== General Design
+
+The design follows the patn of other drone events as much as possible.
+Because this is the first event that would likely break users (unlike
+the "sync" event on pull requests for example), BC preservation is a
+little more difficult. If this comes up frequently in future it might be
+reasonable to extend a "default "pipeline object, rather than
+deserialize the pipeline only from Yaml.
+
+
+
+We should have a global option to provide an allowed list of platforms (os, arch), kinds of pipelines (docker, kubernetes, etc) and the node labels. If a manifest tries and uses values not in the allowed-list the pipeline can fail.
+
+This prevents a situation where a user defines criteria in a manifest that we know will never have a matching runner, and will therefore sit in a pending state indefinitely.
+We recently upgraded to Drone 1.6.1 running in Kubernetes and just had an issue where all builds were failing with the following error:
+
+> Post http://localhost:3001: dial tcp 127.0.0.1:3001: connect: cannot assign requested address
+
+which is the `DRONE_CONVERT_PLUGIN_ENDPOINT` and in our case is the [drone-convert-starlark](https://github.com/drone/drone-convert-starlark) extension running as a sidecar in the pod spec. Restarting the drone-ci server pod fixed our issue. But having seen that error before (usually indicating exhaustion of ephemeral port range) I started looking into metrics and found what looks like a resource leak related to how the server calls the converter.
+
+`process_open_fds{kubernetes_namespace="drone"}` grew to 28267 over ~22 days
+`go_goroutines{kubernetes_namespace="drone"}` grew to 56547 indicating a potential issue with goroutines not returning/finishing
+
+Investigating the open connections inside the new pod we saw the connections from localhost to the converter service on 127.0.0.1:3001 were often (but not always) staying in the ESTABLISHED state. Established connections to the secret endpoint (drone-vault in our case) also may be leaking but at a much slower pace.
+
+Here you can see 4 samples each taken 10 minutes apart, showing src IPs and the local listening port they are connected to. In this data all the sockets are in the ESTABLISHED state, and you can also see the go_goroutines gauge metric is steadily increasing.
+```
+/ # for run in `seq 1 10`; do uptime;netstat -nat > /dev/shm/netstat; echo "Totals: $(curl -s 127.0.0.1:80/metrics|grep '^go_goroutines')       Established $(grep 'ESTABLISHED' /dev/shm/netstat | wc -l)"; gawk 'BEGIN {OFS="\t"} $1 ~ /tcp/ && $6 !~ /LISTEN/ && $4 ~ /:(3000|3001)$/{ndst=split($4,dst,":");nsrc=split($5,src,":");groups[(src[nsrc-1] "-> :" dst[ndst])]++;states[(src[nsrc-1] "-> :" dst[ndst])][$6]++}END{PROCINFO["sorted_in"] = "@val_num_desc";for (g in groups) if (groups[g]>5) {statelist=" ";for (s in states[g]) statelist=statelist s "=" states[g][s] " ";print groups[g],g,statelist}}' /dev/shm/netstat; sleep 600;done;
+
+ 23:50:40 up 6 days,  6:07,  load average: 0.04, 0.75, 2.24
+Totals: go_goroutines 2295   Established 2545
+1088	127.0.0.1-> :3001      ESTABLISHED=1088 
+75	10.97.82.95-> :3000	     ESTABLISHED=75 
+69	10.102.153.135-> :3000	 ESTABLISHED=69 
+57	10.101.239.149-> :3000	 ESTABLISHED=57 
+48	10.96.21.19-> :3000	     ESTABLISHED=48 
+37	10.97.82.93-> :3000	     ESTABLISHED=37 
+17	10.97.111.6-> :3000	     ESTABLISHED=17 
+16	10.107.202.127-> :3000	 ESTABLISHED=16 
+7	10.102.229.196-> :3000	   ESTABLISHED=7 
+
+ 00:00:41 up 6 days,  6:17,  load average: 0.00, 0.08, 1.15
+Totals: go_goroutines 2350   Established 2637
+1136	127.0.0.1-> :3001      ESTABLISHED=1136 
+77	10.97.82.95-> :3000	     ESTABLISHED=77 
+70	10.102.153.135-> :3000	 ESTABLISHED=70 
+55	10.101.239.149-> :3000	 ESTABLISHED=55 
+51	10.96.21.19-> :3000	     ESTABLISHED=51 
+38	10.97.82.93-> :3000	     ESTABLISHED=38 
+22	10.97.111.6-> :3000	     ESTABLISHED=22 
+18	10.107.202.127-> :3000	 ESTABLISHED=18 
+9	10.102.229.196-> :3000	   ESTABLISHED=9 
+
+ 00:10:41 up 6 days,  6:27,  load average: 0.20, 0.10, 0.63
+Totals: go_goroutines 2459   Established 2746
+1167	127.0.0.1-> :3001      ESTABLISHED=1167 
+76	10.97.82.95-> :3000	     ESTABLISHED=76 
+69	10.102.153.135-> :3000	 ESTABLISHED=69 
+59	10.101.239.149-> :3000	 ESTABLISHED=59 
+52	10.96.21.19-> :3000	     ESTABLISHED=52 
+42	10.97.82.93-> :3000	     ESTABLISHED=42 
+24	10.97.111.6-> :3000	     ESTABLISHED=24 
+21	10.107.202.127-> :3000	 ESTABLISHED=21 
+13	10.102.229.196-> :3000	 ESTABLISHED=13 
+
+ 00:20:42 up 6 days,  6:37,  load average: 0.19, 0.32, 0.47
+Totals: go_goroutines 2490   Established 2785
+1184	127.0.0.1-> :3001      ESTABLISHED=1184 
+75	10.97.82.95-> :3000	     ESTABLISHED=75 
+69	10.102.153.135-> :3000	 ESTABLISHED=69 
+62	10.101.239.149-> :3000	 ESTABLISHED=62 
+55	10.96.21.19-> :3000	     ESTABLISHED=55 
+42	10.97.82.93-> :3000	     ESTABLISHED=42 
+24	10.97.111.6-> :3000	     ESTABLISHED=24 
+23	10.107.202.127-> :3000	 ESTABLISHED=23 
+15	10.102.229.196-> :3000	 ESTABLISHED=15 
+```
+
+Checking the code I do see a 60 second timeout in a few places ([remote converter method](https://github.com/drone/drone/blob/9c9b99bd70339af1d9272c2c34ae4539055aba96/plugin/converter/remote.go#L50), [http client Do method](https://github.com/drone/drone-go/blob/1d2e07e87e79109e32b9d7a1291751571433283a/plugin/internal/client/client.go#L95)) so I'd expect things to get cleaned up rather quickly, not continued growth like we're seeing.
+
+I don't see any pproff endpoints in the 1.6 server, but I hope to be able to get some stack traces via triggering a core dump using `pkill -SIGABRT $(pidof drone-server)`. Hopefully that will help track down what all the extra goroutines and sockets are doing.
+
+Graph Execution is awesome!
+
+What about add limit for service execution? 
+For example i need database and other infrastructure only for testing, but testing is not end of pipeline. I want to free resource immediately as it no more necessary. 
+
+```yaml
+---
+kind: pipeline
+type: docker
+name: default
+
+steps:
+- name: database
+  image: mariadb
+  detach:
+    until: 
+      - unit
+      - e2e
+
+- name: install
+  image: node
+  commands:
+  - npm install
+
+- name: unit
+  image: node
+  commands:
+  - npm test
+
+- name: e2e
+  image: node
+  commands:
+  - npm e2e
+
+- name: build / push / deploy / notify / something else
+  ...
+```
+I have added the `close_pull_request` event trigger to make it possible to cleanup a PR environment with the github hooks.
+
+Hi,
+
+I will give the context of this PR:
+
+We have been working on a configuration plugin to handle our monorepo and the solution we came up with does the following steps:
+- clones the repo based on the build event in the same way https://github.com/drone/drone-git does it
+- looks for diff files affected by the current build
+- for affected each files it traverses the repo upward until it finds a drone config file
+- parses these drone config files and passes them to a template engine to compute the root drone file of the repository and send back the final config
+
+Leveraging the multi-pipeline feature we have been able to come up with a solution which handles each microservice individually, erasing the drawbacks of monorepos in classic CI environments.
+
+A root drone file using this can look like the following:
+```yaml
+kind: pipeline
+type: docker
+name: "lint"
+
+steps:
+- name: lint
+  image: golang:1.12
+  commands:
+  - lint
+
+{{ if .Pipelines }}
+{{ .Pipelines | toYaml }}
+---
+kind: pipeline
+type: docker
+name: "deploy"
+
+steps:
+- name: deploy
+  image: debian
+  commands:
+  - deploy
+
+depends_on:
+{{ .PipelinesName | toYaml }}
+{{- end }}
+```
+
+What we have done works great and we are planning to make it available to the community. 
+
+Yet there is one problem, our monorepo is pretty big and even though we created a cache mechanism using a mirror repo as reference, it still takes between 5~8 secs to fetch the repository in the configuration plugin and it leads to timeouts in the Github webhooks as the timeout is set at 10sec.
+
+Following the good practices advised by github here https://developer.github.com/v3/guides/best-practices-for-integrators/, we've decided to come up with this PR which makes the handling of a webhook more asynchronous. 
+
+With this PR, the triggerer starts a goroutine to do most of the heavy lifting to create the build, if an error occurs, it creates the build with an error message.
+
+Thanks for the feedbacks
+Hi,
+
+Our code coverage tool (Codeclimate) requires to access the commit timestamp, which is not accessible right now from the Runner environment. This is a tiny addition just to expose it as an environment variable to the runners.
+
+P.S. I couldn't find a contributing guide, so I just made sure to not break the format, and that all unit tests are passing locally, by running `go test ...`, but didn't add one as these variables don't have unit tests. I just made sure that `build.Timestamp` existed and was accessible.

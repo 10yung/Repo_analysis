@@ -1,0 +1,89 @@
+I am interested about your opinion about an `prev_init_panicked` method (not attached to the name).
+
+If we don't want to give guarantees about side effects, it is not possible to implement poisoning with user code. Even `sync::Lazy` relies on side effects to synchronize its `Cell<Option<F>>`.
+
+I still think it is the right choice to have `OnceCell` act as if there is no poisoning in the common case is a good default, as it matches what you care about: initialization, not upholding some variant as running exactly once.
+
+For `std` the changes to the implementation are minimal.
+
+For the `parking_lot` implementation I had to go with the same pattern to use a finalizer that sets the appropriate state on panic/err/success. To keep the size of `OnceCell` the same as before, I used an `AtomicU8` which bumps the MSRV for the `parking_lot` feature to 1.34.
+
+This is based on top of https://github.com/matklad/once_cell/pull/72, only the last two commits are relevant.
+
+Before using `MaybeUninit` there were two ways to check whether a `OnceCell` was initialized:
+1. call `is_initialized`, which had the side effect of acquiring the value.
+2. test if the option was `Some`, which didn't do any synchronization.
+
+After https://github.com/matklad/once_cell/pull/72 we just always call `is_initialized`. I would like to bring back the distinction:
+1. `fn sync_get` will check if it is initialized, acquire and return the value
+2. `fn is_initialized` will only check if it is initialized, without synchronizing.
+
+This is the only change I would need to the `sync` module to be able to add an experimental implementation using consume. Do you think it makes sense on its own? And is the change small enough not to bother duplicating the `sync` module?
+
+The last commit is optional. It seems nice if `initialize` would return `value`. This prevents an unnessecary `unwrap` in `get_or_try_init`, for which the code used an unsafe `get_unchecked` before to prevent.
+Replace `UnsafeCell<Option<T>>` with `UnsafeCell<MaybeUninit<T>>`.
+
+I included a terrible imitation of `MaybeUninit` based on `Option`, so there is no change in behavior right now. The real implementation that uses `std::mem::MaybeUninit` is behind a feature flag `maybe_uninit` and only usable with nightly.
+
+I did find one complexity: `OnceCell` now has to implement `Drop` itself. Therefore it has to check `is_initialized`. `into_inner` now has to use the `mem::replace` trick to move the `value` field out of the `OnceCell`, and then free the cell without dropping (because `initialized` is not reset).
+
+Conclusion: a bit messy. But I think it makes sense, as a preparation for the future. And it is a plus that `is_initialized` is now the single source of truth.
+The Atomic ordering consume is meant for data structures that are rarely written but often read. That sounds like a description of `once_cell` :smile:. On all modern processors it can be implemented without using any synchronization fences.
+
+This PR is an experiment, to see if it really gives a performance improvement. This is very much a proof of concept, not cleaned up or intended for merging.
+
+To use consume ordering, there has to be a data dependency between the atomic and the data it synchronizes. In other words: without reading the atomic it must be impossible for this thread to know where the data *lives* that has to be synchronized.
+
+The queue of `Waiters` in the std implementation is a perfect fit: the atomic contains a pointer to the first node, and every node contains a pointer to the next. This is like an example from the book of a data dependency chain that could be used with Consume. But as that part is not performance sensitive, we can just leave it as is.
+
+To create a data dependency of `value` on `state`, I made `state` encode an offset from the address of the `OnceCell` struct to the `value` field. Encoding a raw pointer is not possible, as the `OnceCell` can be moved. This trick relies on the compiler not to change the layout of an initialized struct (which seems like something we can rely on).
+
+Rust doesn't expose an `Ordering::Consume`. But it doesn't need anything special: just using `Ordering::Relaxed` is enough, and is what Crossbeam uses. We just have to next use the atomic as a pointer, array index, pointer offset, etc.
+
+To test the ordering works, I added a `break_it` test in `examples`. It can reliably detect unsufficent synchronization when I run it in release mode on my phone, which is easy using [dinghy](https://github.com/snipsco/dinghy). If I intentionally reduce the synchronization of the current implementation, it will detect a few races. But with consume it works. To make sure it doesn't work by accident, I tuned down all other orderings to the lowest possible for now.
+
+In the existing benchmark that does nothing but read from a `OnceCell` in a loop, there is not any real difference I can measure. In a changed benchmark where all threads also do some work, like writing some data, a difference becomes more clear. This is a result of 10 runs of the modified `bench.rs`:
+
+| x86_64 acquire | x86_64 consume | aarch64 acquire | aarch64 consume |
+|---------|---------|---------|---------|
+| 171.6ms | 107.5ms | 204.5ms | 155.2ms |
+| 158.7ms | 115.4ms | 204.1ms | 179.5ms |
+| 184.3ms | 108.0ms | 207.7ms | 156.3ms |
+| 107.2ms | 116.3ms | 204.0ms | 181.0ms |
+| 143.2ms | 114.3ms | 204.0ms | 181.6ms |
+| 164.5ms | 116.5ms | 204.8ms | 154.3ms |
+| 113.6ms | 114.8ms | 205.9ms | 157.3ms |
+| 107.4ms | 116.1ms | 203.7ms | 155.0ms |
+| 181.0ms | 114.6ms | 205.5ms | 177.1ms |
+| 176.0ms | 105.2ms | 202.2ms | 155.7ms |
+
+To make `state` in the std implementation encode everything, I set up the following scheme:
+```text
+>= 0 INITIALIZED (offset to data)
+  -1 EMPTY
+  -2 RUNNING
+< -2 RUNNING, encoded waiter pointer, -(waiterptr >> 1)
+```
+- One goal was to make the check on whether a `OnceCell` is initialized cheap: just a comparison against zero, with no bitmasks or even another integer to compare against.
+- The offset in the initialized case can be any positive number between 0..isize::max. It is doubtful such a large struct can be allocated, let alone to have padding that large! The maximum alignment that can be specified using `#[repr(align)]` is 2^29. And with large alignments, the compiler currently changes the layout of the struct to have `state` after `value`, which gives an offset of 0. Anyway, reserving this whole range seems like a safe enough choice.
+- All negative values indicate the `OnceCell` is not initialized. We can control the alignment of the `Waiter` nodes, which I set to 8. This causes the pointer to a `Waiter` node to be in the range 8..usize::max. after encoding it with `-(waiterptr >> 1)` it will be in the range -(4..isize::max). That still leaves -1, -2 and -3 to encode the states EMPTY and RUNNING (without other threads waiting).
+
+I will start cleaning the code up, and add more comments. Don't put too much time in reviewing yet. But I am interested in your opinion! Is this worth pursuing?
+Your RFC states "It is an error to reentrantly initialize the cell from `f`. Doing so results in a panic." Currently `sync:OnceCell` does not give that guarantee. I tried to see how a solution would look like, but haven't found something easy yet.
+
+Option 1 was to use a `ReentrantMutex`, and an atomic. Suppose the atomic says an initializer is running. If we are able to lock the mutex, this must be a case of reentrant initialization. Otherwise the mutex will block, which is what we want in case another thread is busy initializing. See my not working experiment in https://github.com/pitdicker/once_cell/commit/bd4a940c94b41ee2b6f595854ea2565e0a76a73e. `parking_lot` does not expose a const `{Raw}ReentrantMutex::new`.
+
+Option 2 is using some sort of thread id, which is stored in the `OnceCell` when the initializer starts to run. When another initializer sees the `OnceCell` is in the process of being initialized, it can compare the stored thread id to its own, and choose between blocking or panicking. Interestingly `parking_lot::ReentrantMutex` also needs some sort of thread id to function. I don't yet have working code though.
+
+The disadvantage of both options is it would add quite some complexity, and 4 or 8 bytes to the size of the `OnceCell`. Is that worth the trouble?
+
+Also getting a thread id is not ideal: `std::process::id` is not supported on all platforms (like CloudABI). And `std::thread::Thread::id` is an opaque type, so it can't (officially) be stored in an atomic, but needs a `Cell` and manual synchronisation.
+We currently don't provide `sync` module in no_std, as it requires OS-level support for blocking. What lazy_static does in this case is that it has a `spin` feature, which replaces locking with spinning. 
+
+I think just silently replacing OS mutexes with busy waiting is the wrong approach, this is an important distinction which should be reflected in the type system. 
+
+So, we should instead add an opt-in `spin` module, which has the same API as `sync`, but is based on the `spin` crate. That is, with both `std` and `spin` features enabled, the user should be able to use both `once_cell::sync` and `once_cell::spin`.
+OnceCell::get and OnceCell:: set could work without blocking, so we should support these APIs in no std. Note that we intentionally do not want to implement no_std blocking via spinning, see https://www.reddit.com/r/rust/comments/cy910u/comment/eyrfmna for rationale. 
+This crate uses `unsafe` quite a bit for both `sync` and `unsync` variants of `OnceCell`. I feel rather confident about `unsync` usages of unsafe: the implementation is the same as in the `lazycell`. However the `sync` version, which is inspired by `lazy_static`, has quite a bit more of my own invention.
+
+It would be cool if knowledgeable people in the area reviewed the code for safety issues!

@@ -1,0 +1,281 @@
+I couldn’t find any documentation why modules was not enabled even though users explicitly specify it.
+Tracking issue on [Bazel Configurability Roadmap](https://www.bazel.build/roadmaps/configuration.html])
+
+As a precursor to optimizing multiplatform builds with trimming and better action caching, we need to understand how much inefficiency there currently is and where it comes from.
+
+This issue covers a tool you can run over a project to describe this information as precisely as possible. Beside helping optimize today's builds, this provides clearer guidance for ongoing trimming/output caching efforts.
+
+This is the follow up of: [1]. Gerrit Code Review project had an serious build corruption incident: [2].
+
+Because of partial upgrade of `http_file()` rule, the final artifact was shipped with the file called: `caffeine-guava_2.8.1.jar`, however, the content was actually `caffeine-guava_2.8.0.jar`.
+
+The most annoying fact about that build corruption incident is that it is almost went unnoticed, and especially disappointing is the fact, that the CI successfully verified that broken patch set and voted `Verified+1`.
+
+How could that happen, and what must be done to rectify the problem and prevent it from happening again?
+
+> How could that happen
+
+Gerrit CI is using docker images, with pre-warmed caches, so that the current `caffeine-guava_2.8.0.jar` was shipped with the docker image as the part of the repository cache.
+
+Because in the patch set 1 of: [2] only the URL was upgraded, but the hash value was missed to be upgraded, there was a repository cache hit, and the wrong file was delivered and final artifact was corrupted.
+
+> what must be done to rectify the problem
+
+According to this design document: [3] repository cache API was extended with `canonical id` concept, to fix similar issue related to the `http_archive` rule: [4]. Unfortunately, `http_file` was missed to be upgraded, even though it is using the same extended repository cache. So that trying to use `canonical_id` would fail with:
+
+```
+ERROR: /home/jenkins/workspace/Gerrit-verifier-bazel/gerrit/WORKSPACE:309:1: //external:caffeine-guava-renamed: no such attribute 'canonical_id' in 'http_file' rule
+```
+
+Therefore, the `http_file` rule must be updated first to offer `canonical_id` attribute.
+
+> [...] and prevent it from happening again
+
+The `http_file` rule in Gerrit build tool chain must be amended to use the `canonical_id`:
+
+```python
+diff --git a/WORKSPACE b/WORKSPACE
+index 6495faac5a..3d9af054ad 100644
+--- a/WORKSPACE
++++ b/WORKSPACE
+@@ -300,6 +300,8 @@ maven_jar(
+     sha1 = "6000774d7f8412ced005a704188ced78beeed2bb",
+ )
+ 
++CAFFEINE_GUAVA_SHA256 = "3a66ee3ec70971dee0bae6e56bda7b8742bc4bedd7489161bfbbaaf7137d89e1"
++
+ # TODO(davido): Rename guava.jar to caffeine-guava.jar on fetch to prevent potential
+ # naming collision between caffeine guava adapater and guava library itself.
+ # Remove this renaming procedure, once this upstream issue is fixed:
+@@ -307,7 +309,7 @@ maven_jar(
+ http_file(
+     name = "caffeine-guava-renamed",
+     downloaded_file_path = "caffeine-guava-" + CAFFEINE_VERS + ".jar",
+-    sha256 = "3a66ee3ec70971dee0bae6e56bda7b8742bc4bedd7489161bfbbaaf7137d89e1",
++    sha256 = CAFFEINE_GUAVA_SHA256,
+     urls = [
+         "https://repo1.maven.org/maven2/com/github/ben-manes/caffeine/guava/" +
+         CAFFEINE_VERS +
+@@ -315,6 +317,7 @@ http_file(
+         CAFFEINE_VERS +
+         ".jar",
+     ],
++    canonical_id = "caffeine-guava-" + CAFFEINE_VERS + ".jar-" + CAFFEINE_GUAVA_SHA256,
+ )
+```
+
+With patched Bazel, and with this diff in place, partial upgrades of `http_file` rule would fail the build:
+
+```
+  $ bazel build :headless
+INFO: Invocation ID: 27c281bb-73e3-4ac5-bfbc-983392aeeb8a
+DEBUG: /home/davido/.cache/bazel/_bazel_davido/5c01f4f713b675540b8b424c5c647f63/external/bazel_toolchains/rules/version_check.bzl:45:9: 
+Current running Bazel is not a release version and one was not defined explicitly in rbe_autoconfig target. Falling back to '0.25.2'
+DEBUG: /home/davido/.cache/bazel/_bazel_davido/5c01f4f713b675540b8b424c5c647f63/external/bazel_skylib/lib/versions.bzl:96:13: Current Bazel is not a release version; cannot check for compatibility. Make sure that you are running at least Bazel 2.0.0.
+INFO: Call stack for the definition of repository 'caffeine-guava-renamed' which is a http_file (rule definition at /home/davido/.cache/bazel/_bazel_davido/5c01f4f713b675540b8b424c5c647f63/external/bazel_tools/tools/build_defs/repo/http.bzl:382:13):
+ - <builtin>
+ - /home/davido/projects/gerrit2/WORKSPACE:309:1
+WARNING: Download from https://repo1.maven.org/maven2/com/github/ben-manes/caffeine/guava/2.8.1/guava-2.8.1.jar failed: class com.google.devtools.build.lib.bazel.repository.downloader.UnrecoverableHttpException Checksum was 25da1aee744e477c015b78fe6e015a8795ff91cd9d58be20dfa30b99c0d05ad0 but wanted 3a66ee3ec70971dee0bae6e56bda7b8742bc4bedd7489161bfbbaaf7137d89e1
+```
+
+The fix for `http_file` is here: [5]. The fix of Gerrit build tool chain on top of it is here: [6].
+
+[1] https://github.com/bazelbuild/bazel/issues/5144
+[2] https://gerrit-review.googlesource.com/c/gerrit/+/251113/1
+[3] https://github.com/bazelbuild/proposals/blob/master/designs/2019-04-29-cache.md
+[4] https://github.com/bazelbuild/bazel/issues/5144
+[5] https://bazel-review.googlesource.com/c/bazel/+/127210
+[6] https://gerrit-review.googlesource.com/c/gerrit/+/251095
+Resolves #8077
+c4f2d80270f1ce947fcf7fb0a4e5f0afb3a7062d changed legacy globbing (without a test) to prepend ':' to any targets starting with '@'. It did not change the skyframe globbing logic, which means incrementality bugs. Fix this issue by doing the escaping just before glob() returns its result, which is a common path for both glob implementations.
+
+Fixes https://github.com/bazelbuild/bazel/issues/10606.
+For Gerrit Code Review project we should be able to produce plugins without transitive dependencies. The dependencies are included in Gerrit core's: `gerrit.war`.
+
+One use case is to create protobuf library. The problem is, that when such artifact is used as dependency for `java_binary` transitive dependency `protobuf-java.jar` is pulled into the `java_binary_deploy.jar`. This is unnecessary, because `protobuf-java.jar` already included in `gerrit.war`. The real life example is `checks` plugin: [1].
+
+The usual idiom is as the following:
+
+```python
+proto_library(
+    name = "cache_proto",
+    srcs = ["cache.proto"],
+)
+
+java_proto_library(
+    name = "cache_java_proto",
+    deps = [":cache_proto"],
+)
+
+java_binary(
+    name = "foo",
+    main_class = "Dummy",
+    runtime_deps = [":cache_java_proto"],
+)
+```
+
+The final artifact `foo_deploy.jar` contains the full protobuf-java.jar.
+
+One possible workaround, is to use `deploy_env` that was added by @ulfjack and @lberki in: [2], [3].
+
+However, that's is somehow convoluted way and force us to create an intermediate `java_binary` artifact that we don't actually need:
+
+```python
+java_binary(
+    name = "protobuf_java_env",
+    main_class = "Dummy",
+    runtime_deps = ["@com_google_protobuf//:protobuf_java"],
+)
+
+java_binary(
+    name = "foo",
+    main_class = "Dummy",
+    runtime_deps = [":cache_java_proto"],
+    deploy_env = ["protobuf_java_env"],
+)
+```
+Now, the final artifact: `foo_deploy.jar` only has the protobuf classes, without transitive protobuf library: [4].
+
+Ideally, the native `java_proto_library` rule would offer a way to exclude transitive dependency on `protobuf-java.jar`.
+
+The workaround is pending for review: [5], [6].
+
+[1] https://gerrit.googlesource.com/plugins/checks
+[2] https://github.com/bazelbuild/bazel/commit/a92347e405ebe022a7f216541aaa46753e311563
+[3] https://github.com/emusand/bazel/commit/db359e069739964439ce4a46fb5683b774469e12
+[4] http://paste.openstack.org/show/788546
+[5] https://gerrit-review.googlesource.com/c/gerrit/+/251092
+[6] https://gerrit-review.googlesource.com/c/plugins/checks/+/251093
+
+#10257 # Description of the problem / feature request:
+Hello, I am trying to run `sh_binary` which is in  .bzl file inside a directory called hello and it looks like:
+`
+def test_shell(name):
+    native.sh_binary(
+        name = name,
+        srcs = ["script.sh"],
+    )
+
+`
+
+What I am trying is referring it from another projects WORKSPACE like below:
+`
+git_repository(
+    name = "hello-repo",
+    branch = "master",
+    remote = "git@github.com:myorg/hello-repo.git",
+)
+
+load("@hello-repo/hello:shelltest.bzl", "test_shell")
+
+test_shell(
+    name = "test",
+)
+`
+> But, I get the above error which is `sh_binary cannot be in the WORKSPACE file (used by //external:test-shell)`
+
+### Feature requests: what underlying problem are you trying to solve with this feature?
+
+> Run a shell so that I can perform something using a WORKSPACE file
+
+### Bugs: what's the simplest, easiest way to reproduce this bug? Please provide a minimal example if possible.
+
+> Replace this line with your answer.
+
+### What operating system are you running Bazel on?
+
+> MacOS
+
+### What's the output of `bazel info release`?
+
+> Just like bazel build ...
+`
+ERROR: /Users/myname/projects/my-proj/WORKSPACE:58:1: Traceback (most recent call last):
+        File "/Users/myname/projects/my-proj//WORKSPACE", line 58
+                test_shell(name = "test")
+        File "/private/var/tmp/_bazel_myname/3fd196aec6a1a3ada23d0601a6698c81/external/hello-repo/hello/shelltest.bzl", line 3, in test_shell
+                native.sh_binary(name = name srcs = ["script..."])
+sh_binary cannot be in the WORKSPACE file (used by //external:test)
+ERROR: Error evaluating WORKSPACE file
+ERROR: error loading package 'external': Package 'external' contains errors
+`
+
+### If `bazel info release` returns "development version" or "(@non-git)", tell us how you built Bazel.
+
+> bazel is installed using scripts from Bazel website not from source
+
+### What's the output of `git remote get-url origin ; git rev-parse master ; git rev-parse HEAD` ?
+
+> Replace this line with your answer.
+
+###  Have you found anything relevant by searching the web?
+
+> Didn't find anything relevant.
+>
+> Places to look:
+> - StackOverflow: http://stackoverflow.com/questions/tagged/bazel
+> - GitHub issues: https://github.com/bazelbuild/bazel/issues
+> - email threads on https://groups.google.com/forum/#!forum/bazel-discuss
+
+### Any other information, logs, or outputs that you want to share?
+
+> Can `sh_binary` not be used from WORKSPACE?
+>
+> If the files are large, upload as attachment or provide link.
+
+### Description of the problem / feature request:
+
+When globbing a directory containing source files or directories starting with `@`, the output of `glob()` is not deterministic.
+
+### Bugs: what's the simplest, easiest way to reproduce this bug? Please provide a minimal example if possible.
+
+```
+$ cat BUILD
+genrule(
+    name = "test",
+    srcs = ["//subdir:srcs"],
+    outs = ["test_output.txt"],
+    cmd = "find . > $@",
+)
+
+$ cat subdir/BUILD
+srcs = glob(["**/*"])
+print("srcs: ", srcs)
+filegroup(
+    name = "srcs",
+    srcs = srcs,
+    visibility = ["//visibility:public"],
+)
+
+$ cat subdir/@ohno.txt
+$
+```
+
+```
+$ bazel build //:test
+DEBUG: /Users/jmillikin/src/bazeltest-globcolon/subdir/BUILD:2:1: srcs:  [":@ohno.txt", "BUILD"]
+[...]
+INFO: Build completed successfully, 2 total actions
+
+$ touch subdir/BUILD
+$ bazel build //:test
+DEBUG: /Users/jmillikin/src/bazeltest-globcolon/subdir/BUILD:2:1: srcs:  ["@ohno.txt", "BUILD"]
+ERROR: /Users/jmillikin/src/bazeltest-globcolon/subdir/BUILD:3:1: no such package '@ohno.txt//': The repository '@ohno.txt' could not be resolved and referenced by '//subdir:srcs'
+ERROR: Analysis of target '//:test' failed; build aborted: no such package '@ohno.txt//': The repository '@ohno.txt' could not be resolved
+```
+
+### What operating system are you running Bazel on?
+
+macOS and Linux
+
+### What's the output of `bazel info release`?
+
+`release 2.0.0`
+Windows environment variable name can contain brackets for example,
+`ProgramFiles(x86)=C:\Program Files (x86)`
+
+This variable is necessary to configure Visual Studio toolchain.
+If the variable is missing next sequence fails:
+`vcvarsall.bat` -> `typescript.bat` -> `if exist %ProgramFiles(x86)%\TypeScript`.
+(`typescript.bat` is called from `vcvarsall.bat` if TypeScript Visual Studio workload is installed).
+Work in progress.

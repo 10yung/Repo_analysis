@@ -1,0 +1,102 @@
+Closes #306 
+
+To be honest, I don't like the fact that the `flock` will be nil when reading databases in read-only mode. A fake/stub lock would be nicer. Anything wanting to use `flock` will need to do a nil check...
+
+Let me know if you have any suggestions.
+https://github.com/facebook/rocksdb/wiki/SeekForPrev
+i want to removes a database entirely, removing everything from the filesystem.
+
+who can tell me what i should do 
+
+thanks
+Executing db.GetProperty("leveldb.blockpool") concurrently with BufferPool.Get/Put will lead to data race.
+It is probably not a big deal, but definitely an inconvience during tests/e2e simulations.
+
+The easiest way to reproduce a problem is to run following test multile times,e.g:
+
+go test ./leveldb/util/ -count=10 -run=TestConcurrentReads
+
+```go
+func TestConcurrentReads(t *testing.T) {
+	pool := NewBufferPool(10)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		pool.Get(100)
+		wg.Done()
+	}()
+	go func() {
+		pool.String()
+		wg.Done()
+	}()
+	wg.Wait()
+}
+```
+
+I was able to workaround this race only by coppying buffer pool state atomically (including size* arrays).
+Will be glad to know if there are better options.
+**Proposal**
+
+Add a `Sync` method to sync all records written before `Sync` was called to disk.
+
+**Motivation**
+
+Currently, it's possible to synchronously write individual records. However, synchronously writing a record doesn't guarantee that previously written (non-sync) records will be synced (they could be in a different journal).
+
+When writing collections of objects, it's useful to be able to:
+
+* Write a collection of objects.
+* Sync the collection of objects.
+* Synchronously update an index over those objects.
+
+Importantly, the index shouldn't be updated until the objects have been synced.
+
+goleveldb currently provides batches and transactions but neither seem to serve this purpose. The best external solution I can think of is to write a wrapper with an in-memory write buffer. However, I'd prefer to just write to disk and let the OS decide when to sync and/or when the buffer is full.
+
+**Implementation**
+
+Unfortunately, my understanding of leveldb and goleveldb is limited. My first attempt was #310 but I didn't realize journals were rotated. Given that journals are rotated, the only solution I can think of is:
+
+* When closing a journal, asynchronously fsync it before closing.
+* When the user calls `Sync`, sync the current journal, wait for all asynchronously syncing journals to finish syncing, then fsync the directory.
+* When opening a "finished" journal for the first time, fsync it in the background (in the program crashed while data was still being written to disk).
+
+Does this sound like it'll work?
+to optimize compaction process for cases that have frequent key updates and deletions
+`go mod` by default likes to pick the latest stable version, currently that's the `v1` branch, which is missing half a year's worth of commits.
+This seems to be related to #111, but I don't think any fix was upstreamed.
+
+### Expected behaviour
+Since I am opening the database in `ReadOnly` mode, I would expect that a lock doesn't need to be acquired since nothing should be written. However, I'm not sure if this is how it works in LevelDB.
+
+### Actual behaviour
+When calling `OpenFile` on a locked database (`LOCK` file present), with the `ReadOnly` database option set to `true`, the database will fail to open. On Windows, I'm getting:
+
+```
+The process cannot access the file because it is being used by another process.
+```
+Hi @syndtr ,
+
+I merge a lot of optimize from bytes.Buffer, e.g.:
+
+https://github.com/golang/go/commit/55310403ddf051634fa398b4c9e6013d530753f5
+https://github.com/golang/go/commit/c08ac36761d3dc03d0a0b0ffb240c4a7c524536b
+https://github.com/golang/go/commit/1ba4556a2c84f552f7c9697ad7323fd6cdbc6970
+
+
+```
+name                       old time/op   new time/op   delta
+WriteByte-4                 22.9µs ± 2%   14.8µs ± 1%  -35.54%  (p=0.008 n=5+5)
+Alloc-4                     22.5µs ± 1%   18.8µs ± 0%  -16.23%  (p=0.004 n=5+6)
+BufferNotEmptyWriteRead-4    276µs ± 2%    301µs ± 3%   +8.97%  (p=0.004 n=5+6)
+BufferFullSmallReads-4      73.2µs ±24%   63.3µs ± 3%  -13.49%  (p=0.002 n=6+6)
+
+name                       old speed     new speed     delta
+WriteByte-4                179MB/s ± 2%  277MB/s ± 1%  +55.12%  (p=0.008 n=5+5)
+Alloc-4                    182MB/s ± 1%  217MB/s ± 0%  +19.36%  (p=0.004 n=5+6)
+```
+Hi @syndtr ,
+
+There are many asynchronous Releaser() holding BufferPool,
+thus there is no deterministic chance close BufferPool.
+We can make it is closed by GC when its reference reduce to zore.

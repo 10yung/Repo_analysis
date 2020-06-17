@@ -1,0 +1,1174 @@
+For example:
+```
+// test.js
+PHP.someFunction()
+```
+```
+// test.php
+function someFunction() {
+   if($starsAreInWrongOrder) {
+      throw new Exception("I think I don't want to execute your code in file [FILE] on line [LINE]")
+   }
+}
+```
+
+How to show the proper [FILE] and [LINE] when I'm not in context of V8JsScriptException?
+Related to #255 and #247 
+
+I stopped using registerExtension, but I think there might be one more registerExtension bug anyway, or even non-obvious bugs.
+
+- From MSHUTDOWN_FUNCTION, the only thing I can think of that would leak are extensions and their associated data (e.g. deps).
+
+Motivation for suggesting switching all uses of zend_string_dup/zend_string_copy to zend_string_init() instead
+- I don't expect copying strings vs adding references to be a large source of extra memory usage for v8js.
+- If this crashes or misbehaves (e.g. frees a string twice, or too early, or not at all), it would be easier to narrow down the cause when running with VALGRIND.
+- Interned or temporary strings can cause problem if they're persisted by v8js beyond the lifetime of a request.
+
+```
+» grep -E 'zend_string_(copy|dup)' *.cc *.h
+v8js_class.cc:  Z_STR_P(p) = zend_string_dup(Z_STR_P(p), 1);
+v8js_class.cc:  // (zend_string_dup would return the original interned string, if interned, so we don't use that)
+v8js_v8object_class.cc:                 f->common.function_name = zend_string_copy(method);
+v8js_variables.cc:        ctx->variable_name = zend_string_copy(Z_STR_P(item));
+```
+
+One use from registerExtension with an array of deps seems like it might also be a problem for non-ZTS builds.
+
+Because of that, **zend_persistent_zval_dup should probably use zend_string_init instead**. zend_string_dup() will return the original pointer for interned strings (e.g. in php 7.2)
+
+```cpp
+	// Allocate a persistent string which will survive until module shutdown on both ZTS(Persistent) and NTS(Not interned, those would be cleaned up)
+	// (zend_string_dup would return the original interned string, if interned, so we don't use that)
+	jsext->name = zend_string_init(ZSTR_VAL(name), ZSTR_LEN(name), 1);
+	jsext->source = zend_string_init(ZSTR_VAL(source), ZSTR_LEN(source), 1);
+
+	if (jsext->deps) {
+		jsext->deps_ht = (HashTable *) malloc(sizeof(HashTable));
+		zend_hash_init(jsext->deps_ht, jsext->deps_count, NULL, v8js_persistent_zval_dtor, 1);
+		zend_hash_copy(jsext->deps_ht, Z_ARRVAL_P(deps_arr), v8js_persistent_zval_ctor);
+	}
+```
+
+------------
+
+Context for why I'm looking at string copying in V8js (if anyone has similar issues): I'm seeing a segfault in zend_interned_string_find_permanent in long-running httpd processes for a fraction of apache restarts (if I read the instruction pointer correctly).
+- I'm not using registerExtension anywhere
+- I'm using php 7.2.24 and v8js 2.1.0. Some opcache bugs were fixed in 7.2.25 and 7.3, but they all seem unrelated.
+- The code in question uses V8Js with instance properties that are strings, PHP closures with use($var), etc.
+- Some V8js instances execute multiple scripts, then have methods invoked multiple times. I haven't obtained a core dump yet. Rolling back V8js seems to have helped in 7.1
+- This happens with opcache enabled, and with/without xdebug
+- There are two apache(httpd) pools - the segfault only seems to happen during restarts after the second pool gets stopped, not the first. This might be a coincidence.
+
+zend_interned_string_find_permanent seems like it would only get called by opcache in php 7.2. The line it crashes on suggests that the pointer to the zend_string that is being looked up was corrupted.
+
+```asm
+0000000000474110 <zend_interned_string_find_permanent>:
+  474110:       41 57                   push   %r15
+  474112:       49 89 ff                mov    %rdi,%r15
+  474115:       41 56                   push   %r14
+  474117:       41 55                   push   %r13
+  474119:       41 54                   push   %r12
+  47411b:       55                      push   %rbp
+  47411c:       53                      push   %rbx
+  47411d:       48 83 ec 08             sub    $0x8,%rsp
+  474121:       48 8b 6f 08             mov    0x8(%rdi),%rbp  <- crashes here, probably fetching zend_string_hash_val(str) for an invalid str pointer
+  474125:       48 85 ed                test   %rbp,%rbp
+  474128:       74 7e                   je     4741a8 <zend_interned_string_find_permanent+0x98>
+....
+```
+
+EDIT: I obtained a core dump. I was mistaken about what called zend_interned_string_find_permanent(). The source before signal_handler can vary (memcached, curl, reading files, etc), but it's just any point when signal_handler can get called for the httpd stop.
+
+For `gdb /path/to/libphp7.so path/to/core_dump`
+
+```
+Program terminated with signal 11, Segmentation fault.                                                                         
+...
+(gdb) bt                                              
+#0  0x00007f3e483ca121 in zend_interned_string_find_permanent () from /usr/local/php/modules/libphp7.so
+#1  0x00007f3e3d0679f9 in accel_shutdown () from /usr/local/php/lib/php/20170718/opcache.so            
+#2  0x00007f3e3d069ff0 in zm_shutdown_zend_accelerator () from /usr/local/php/lib/php/20170718/opcache.so
+#3  0x00007f3e483a3ae3 in module_destructor () from /usr/local/php/modules/libphp7.so
+#4  0x00007f3e4839b3cc in module_destructor_zval () from /usr/local/php/modules/libphp7.so             
+#5  0x00007f3e483afa48 in zend_hash_graceful_reverse_destroy () from /usr/local/php/modules/libphp7.so
+#6  0x00007f3e4839d1ce in zend_shutdown () from /usr/local/php/modules/libphp7.so                        
+#7  0x00007f3e4832f99b in php_module_shutdown () from /usr/local/php/modules/libphp7.so
+#8  0x00007f3e4832fa59 in php_module_shutdown_wrapper () from /usr/local/php/modules/libphp7.so
+#9  0x00007f3e48466e51 in php_apache_child_shutdown () from /usr/local/php/modules/libphp7.so         
+#10 0x00007f3e503011ae in apr_pool_destroy () from /lib64/libapr-1.so.0          
+#11 0x00007f3e4ada823c in clean_child_exit () from /etc/httpd/modules/mod_mpm_prefork.so
+#12 0x00007f3e4ada827b in just_die () from /etc/httpd/modules/mod_mpm_prefork.so               
+#13 0x00007f3e483ca30d in zend_signal_handler () from /usr/local/php/modules/libphp7.so      
+#14 0x00007f3e483ca45b in zend_signal_handler_defer () from /usr/local/php/modules/libphp7.so
+#15 <signal handler called>                                                                                                    
+#16 0x00007f3e500da6f0 in __read_nocancel () from /lib64/libpthread.so.0        
+#17 0x00007f3e4834d079 in php_stdiop_read () from /usr/local/php/modules/libphp7.so    
+#18 0x00007f3e4834770c in _php_stream_fill_read_buffer () from /usr/local/php/modules/libphp7.so
+#19 0x00007f3e48347ba7 in _php_stream_get_line () from /usr/local/php/modules/libphp7.so
+#20 0x00007f3e4829cb03 in php_exec () from /usr/local/php/modules/libphp7.so
+#21 0x00007f3e4829ce7a in zif_exec () from /usr/local/php/modules/libphp7.so                                               
+#22 0x00007f3e4845a8ec in execute_ex () from /usr/local/php/modules/libphp7.so         
+#23 0x00007f3e48465664 in zend_execute () from /usr/local/php/modules/libphp7.so                                                                                                                                                                               
+#24 0x00007f3e4839d830 in zend_execute_scripts () from /usr/local/php/modules/libphp7.so                                                                                                                                                                       
+#25 0x00007f3e4832fcf0 in php_execute_script () from /usr/local/php/modules/libphp7.so                                                                                                                                                                         
+#26 0x00007f3e484680ca in php_handler () from /usr/local/php/modules/libphp7.so                                                                                                                                                                                
+#27 0x000055c9bc02ca40 in ?? ()                                                                                                                                                                                                                                
+#28 0x000055c9bc75ca30 in ?? ()                                                                                                                                                                                                                                
+#29 0x000055c9bc3f4be0 in ?? ()                                                                                                                                                                                                                                
+#30 0x000055c9bc6e5ad0 in ?? ()                                                                                                
+#31 0x000055c9bc02cf89 in ?? ()                                                                                                
+#32 0x000055c9bc40bad8 in ?? ()                                                                                                
+#33 0x000055c9bc025c4f in ?? ()                                                                                                
+#34 0x000000005e0fbb63 in ?? ()                                                                                                
+#35 0x951cbc1dbc51bb00 in ?? ()                                                                                                
+#36 0x000055c9bc75dfc6 in ?? ()                                                                                                
+#37 0x000055c9bc75ca30 in ?? ()                                                                                                
+#38 0x0000000000000000 in ?? ()    
+```
+
+EDIT: The larger problem is that this is a hard restart instead of a graceful restart, so the details of shutdown are less important.
+I don't believe these error messages have any unit tests covering them.
+Some may be unreachable in practice.
+
+This might not be comprehensive - I didn't look at other files.
+
+Noticed when looking into uses of zend_string for a crash in zend_interned_string_find_permanent in an application using V8Js 2.1.0. It might not even be related to v8js, and definitely isn't related to this PR.
+
+```
+struct _zend_class_entry {
+	char type;
+	zend_string *name;
+```
+Trying to compile php7 branch for php7.4 version, but got this errors:
+linux-um0w:/ # pecl install v8js
+PHP Warning:  PHP Startup: v8js: Unable to initialize module
+Module compiled with module API=20180731
+PHP    compiled with module API=20190902
+These options need to match
+ in Unknown on line 0
+WARNING: channel "pecl.php.net" has updated its protocols, use "pecl channel-update pecl.php.net" to update
+downloading v8js-2.1.1.tgz ...
+Starting to download v8js-2.1.1.tgz (101,888 bytes)
+.......................done: 101,888 bytes
+28 source files, building
+running: phpize
+Configuring for:
+PHP Api Version:         20190902
+Zend Module Api No:      20190902
+Zend Extension Api No:   320190902
+Please provide the installation prefix of libv8 [autodetect] : /opt/v8
+
+Warning: Use of undefined constant name - assumed 'name' (this will throw an Error in a future version of PHP) in PEAR/Builder.php on line 407
+PHP Warning:  Use of undefined constant name - assumed 'name' (this will throw an Error in a future version of PHP) in /usr/share/php7/PEAR/PEAR/Builder.php on line 407
+building in /tmp/pear/temp/pear-build-viper_workmyaH6l/v8js-2.1.1
+running: /tmp/pear/temp/v8js/configure --with-php-config=/usr/bin/php-config --with-v8js=/opt/v8
+configure: loading site script /usr/share/site/x86_64-unknown-linux-gnu
+checking for grep that handles long lines and -e... /bin/grep
+checking for egrep... /bin/grep -E
+checking for a sed that does not truncate output... /bin/sed
+checking for pkg-config... /usr/bin/pkg-config
+checking pkg-config is at least version 0.9.0... yes
+checking for cc... cc
+checking whether the C compiler works... yes
+checking for C compiler default output file name... a.out
+checking for suffix of executables...
+checking whether we are cross compiling... no
+checking for suffix of object files... o
+checking whether we are using the GNU C compiler... yes
+checking whether cc accepts -g... yes
+checking for cc option to accept ISO C89... none needed
+checking how to run the C preprocessor... cc -E
+checking for icc... no
+checking for suncc... no
+checking for system library directory... lib
+checking if compiler supports -R... no
+checking if compiler supports -Wl,-rpath,... yes
+checking build system type... x86_64-pc-linux-gnu
+checking host system type... x86_64-pc-linux-gnu
+checking target system type... x86_64-pc-linux-gnu
+checking for PHP prefix... /usr
+checking for PHP includes... -I/usr/include/php7 -I/usr/include/php7/main -I/usr/include/php7/TSRM -I/usr/include/php7/Zend -I/usr/include/php7/ext -I/usr/include/php7/ext/date/lib
+checking for PHP extension directory... /usr/lib64/php7/extensions
+checking for PHP installed headers prefix... /usr/include/php7
+checking if debug is enabled... no
+checking if zts is enabled... no
+checking for gawk... gawk
+checking for V8 Javascript Engine... yes, shared
+checking for g++... g++
+checking whether we are using the GNU C++ compiler... yes
+checking whether g++ accepts -g... yes
+checking how to run the C++ preprocessor... g++ -E
+checking for C standard version... c++11
+checking how to allow c++11 narrowing... -Wno-narrowing
+checking for libv8_libplatform... found
+checking for V8 version... 7.5.288.23
+checking for natives_blob.bin... found (/opt/v8/lib/natives_blob.bin)
+checking for snapshot_blob.bin... found (/opt/v8/lib/snapshot_blob.bin)
+checking for v8::ArrayBuffer::Allocator::NewDefaultAllocator... yes
+checking how to print strings... printf
+checking for a sed that does not truncate output... (cached) /bin/sed
+checking for fgrep... /bin/grep -F
+checking for ld used by cc... /usr/x86_64-suse-linux/bin/ld
+checking if the linker (/usr/x86_64-suse-linux/bin/ld) is GNU ld... yes
+checking for BSD- or MS-compatible name lister (nm)... /usr/bin/nm -B
+checking the name lister (/usr/bin/nm -B) interface... BSD nm
+checking whether ln -s works... yes
+checking the maximum length of command line arguments... 1572864
+checking how to convert x86_64-pc-linux-gnu file names to x86_64-pc-linux-gnu format... func_convert_file_noop
+checking how to convert x86_64-pc-linux-gnu file names to toolchain format... func_convert_file_noop
+checking for /usr/x86_64-suse-linux/bin/ld option to reload object files... -r
+checking for objdump... objdump
+checking how to recognize dependent libraries... pass_all
+checking for dlltool... no
+checking how to associate runtime and link libraries... printf %s\n
+checking for ar... ar
+checking for archiver @FILE support... @
+checking for strip... strip
+checking for ranlib... ranlib
+checking for gawk... (cached) gawk
+checking command to parse /usr/bin/nm -B output from cc object... ok
+checking for sysroot... no
+checking for a working dd... /bin/dd
+checking how to truncate binary pipes... /bin/dd bs=4096 count=1
+checking for mt... mt
+checking if mt is a manifest tool... no
+checking for ANSI C header files... yes
+checking for sys/types.h... yes
+checking for sys/stat.h... yes
+checking for stdlib.h... yes
+checking for string.h... yes
+checking for memory.h... yes
+checking for strings.h... yes
+checking for inttypes.h... yes
+checking for stdint.h... yes
+checking for unistd.h... yes
+checking for dlfcn.h... yes
+checking for objdir... .libs
+checking if cc supports -fno-rtti -fno-exceptions... no
+checking for cc option to produce PIC... -fPIC -DPIC
+checking if cc PIC flag -fPIC -DPIC works... yes
+checking if cc static flag -static works... no
+checking if cc supports -c -o file.o... yes
+checking if cc supports -c -o file.o... (cached) yes
+checking whether the cc linker (/usr/x86_64-suse-linux/bin/ld -m elf_x86_64) supports shared libraries... yes
+checking whether -lc should be explicitly linked in... no
+checking dynamic linker characteristics... GNU/Linux ld.so
+checking how to hardcode library paths into programs... immediate
+checking whether stripping libraries is possible... yes
+checking if libtool supports shared libraries... yes
+checking whether to build shared libraries... yes
+checking whether to build static libraries... no
+checking how to run the C++ preprocessor... g++ -E
+checking for ld used by g++... /usr/x86_64-suse-linux/bin/ld -m elf_x86_64
+checking if the linker (/usr/x86_64-suse-linux/bin/ld -m elf_x86_64) is GNU ld... yes
+checking whether the g++ linker (/usr/x86_64-suse-linux/bin/ld -m elf_x86_64) supports shared libraries... yes
+checking for g++ option to produce PIC... -fPIC -DPIC
+checking if g++ PIC flag -fPIC -DPIC works... yes
+checking if g++ static flag -static works... no
+checking if g++ supports -c -o file.o... yes
+checking if g++ supports -c -o file.o... (cached) yes
+checking whether the g++ linker (/usr/x86_64-suse-linux/bin/ld -m elf_x86_64) supports shared libraries... yes
+checking dynamic linker characteristics... (cached) GNU/Linux ld.so
+checking how to hardcode library paths into programs... immediate
+configure: patching config.h.in
+configure: creating ./config.status
+config.status: creating config.h
+config.status: executing libtool commands
+running: make
+/bin/sh /tmp/pear/temp/pear-build-viper_workmyaH6l/v8js-2.1.1/libtool --mode=compile g++ -Wno-narrowing -std=c++11 -I. -I/tmp/pear/temp/v8js -DPHP_ATOM_INC -I/tmp/pear/temp/pear-build-viper_workmyaH6l/v8js-2.1.1/include -I/tmp/pear/temp/pear-build-viper_workmyaH6l/v8js-2.1.1/main -I/tmp/pear/temp/v8js -I/usr/include/php7 -I/usr/include/php7/main -I/usr/include/php7/TSRM -I/usr/include/php7/Zend -I/usr/include/php7/ext -I/usr/include/php7/ext/date/lib -I/opt/v8/include -I/opt/v8  -DHAVE_CONFIG_H  -g -O2   -c /tmp/pear/temp/v8js/v8js_array_access.cc -o v8js_array_access.lo
+libtool: compile:  g++ -Wno-narrowing -std=c++11 -I. -I/tmp/pear/temp/v8js -DPHP_ATOM_INC -I/tmp/pear/temp/pear-build-viper_workmyaH6l/v8js-2.1.1/include -I/tmp/pear/temp/pear-build-viper_workmyaH6l/v8js-2.1.1/main -I/tmp/pear/temp/v8js -I/usr/include/php7 -I/usr/include/php7/main -I/usr/include/php7/TSRM -I/usr/include/php7/Zend -I/usr/include/php7/ext -I/usr/include/php7/ext/date/lib -I/opt/v8/include -I/opt/v8 -DHAVE_CONFIG_H -g -O2 -c /tmp/pear/temp/v8js/v8js_array_access.cc  -fPIC -DPIC -o .libs/v8js_array_access.o
+In file included from /usr/include/php7/Zend/zend_types.h:25,
+                 from /usr/include/php7/Zend/zend.h:27,
+                 from /usr/include/php7/main/php.h:33,
+                 from /tmp/pear/temp/v8js/php_v8js_macros.h:42,
+                 from /tmp/pear/temp/v8js/v8js_array_access.cc:17:
+/usr/include/php7/Zend/zend_operators.h: In function ‘zend_long zend_dval_to_lval(double)’:
+/tmp/pear/temp/v8js/php_v8js_macros.h:38:21: error: ‘std::std’ has not been declared
+   38 | #define isfinite(a) std::isfinite(a)
+      |                     ^~~
+/usr/include/php7/Zend/zend_portability.h:323:52: note: in definition of macro ‘UNEXPECTED’
+  323 | # define UNEXPECTED(condition) __builtin_expect(!!(condition), 0)
+      |                                                    ^~~~~~~~~
+/usr/include/php7/main/../main/php_config.h:2342:26: note: in expansion of macro ‘isfinite’
+ 2342 | #define zend_finite std::isfinite
+      |                          ^~~~~~~~
+/usr/include/php7/Zend/zend_operators.h:110:18: note: in expansion of macro ‘zend_finite’
+  110 |  if (UNEXPECTED(!zend_finite(d)) || UNEXPECTED(zend_isnan(d))) {
+      |                  ^~~~~~~~~~~
+/tmp/pear/temp/v8js/php_v8js_macros.h:35:18: error: ‘std::std’ has not been declared
+   35 | #define isnan(a) std::isnan(a)
+      |                  ^~~
+/usr/include/php7/Zend/zend_portability.h:323:52: note: in definition of macro ‘UNEXPECTED’
+  323 | # define UNEXPECTED(condition) __builtin_expect(!!(condition), 0)
+      |                                                    ^~~~~~~~~
+/usr/include/php7/main/../main/php_config.h:2340:25: note: in expansion of macro ‘isnan’
+ 2340 | #define zend_isnan std::isnan
+      |                         ^~~~~
+/usr/include/php7/Zend/zend_operators.h:110:48: note: in expansion of macro ‘zend_isnan’
+  110 |  if (UNEXPECTED(!zend_finite(d)) || UNEXPECTED(zend_isnan(d))) {
+      |                                                ^~~~~~~~~~
+/usr/include/php7/Zend/zend_operators.h: In function ‘zend_long zend_dval_to_lval_cap(double)’:
+/tmp/pear/temp/v8js/php_v8js_macros.h:38:21: error: ‘std::std’ has not been declared
+   38 | #define isfinite(a) std::isfinite(a)
+      |                     ^~~
+/usr/include/php7/Zend/zend_portability.h:323:52: note: in definition of macro ‘UNEXPECTED’
+  323 | # define UNEXPECTED(condition) __builtin_expect(!!(condition), 0)
+      |                                                    ^~~~~~~~~
+/usr/include/php7/main/../main/php_config.h:2342:26: note: in expansion of macro ‘isfinite’
+ 2342 | #define zend_finite std::isfinite
+      |                          ^~~~~~~~
+/usr/include/php7/Zend/zend_operators.h:121:18: note: in expansion of macro ‘zend_finite’
+  121 |  if (UNEXPECTED(!zend_finite(d)) || UNEXPECTED(zend_isnan(d))) {
+      |                  ^~~~~~~~~~~
+/tmp/pear/temp/v8js/php_v8js_macros.h:35:18: error: ‘std::std’ has not been declared
+   35 | #define isnan(a) std::isnan(a)
+      |                  ^~~
+/usr/include/php7/Zend/zend_portability.h:323:52: note: in definition of macro ‘UNEXPECTED’
+  323 | # define UNEXPECTED(condition) __builtin_expect(!!(condition), 0)
+      |                                                    ^~~~~~~~~
+/usr/include/php7/main/../main/php_config.h:2340:25: note: in expansion of macro ‘isnan’
+ 2340 | #define zend_isnan std::isnan
+      |                         ^~~~~
+/usr/include/php7/Zend/zend_operators.h:121:48: note: in expansion of macro ‘zend_isnan’
+  121 |  if (UNEXPECTED(!zend_finite(d)) || UNEXPECTED(zend_isnan(d))) {
+      |                                                ^~~~~~~~~~
+In file included from /usr/include/dirent.h:245,
+                 from /usr/include/php7/Zend/zend_virtual_cwd.h:91,
+                 from /usr/include/php7/main/php.h:438,
+                 from /tmp/pear/temp/v8js/php_v8js_macros.h:42,
+                 from /tmp/pear/temp/v8js/v8js_array_access.cc:17:
+/tmp/pear/temp/v8js/v8js_class.h: In function ‘v8js_ctx* v8js_ctx_fetch_object(zend_object*)’:
+/tmp/pear/temp/v8js/v8js_class.h:83:54: warning: offsetof within non-standard-layout type ‘v8js_ctx’ is conditionally-supported [-Winvalid-offsetof]
+   83 |  return (struct v8js_ctx *)((char *)obj - XtOffsetOf(struct v8js_ctx, std));
+/tmp/pear/temp/v8js/v8js_class.h:83:43: note: in expansion of macro ‘XtOffsetOf’
+   83 |  return (struct v8js_ctx *)((char *)obj - XtOffsetOf(struct v8js_ctx, std));
+      |                                           ^~~~~~~~~~
+/tmp/pear/temp/v8js/v8js_array_access.cc: In function ‘void v8js_array_access_enumerator(const v8::PropertyCallbackInfo<v8::Array>&)’:
+/tmp/pear/temp/v8js/v8js_array_access.cc:213:43: warning: ‘v8::Local<v8::Context> v8::Isolate::GetEnteredContext()’ is deprecated: Use GetEnteredOrMicrotaskContext(). [-Wdeprecated-declarations]
+  213 |    result->Set(isolate->GetEnteredContext(), i ++, V8JS_INT(j));
+      |                                           ^
+In file included from /opt/v8/include/v8-internal.h:14,
+                 from /opt/v8/include/v8.h:25,
+                 from /tmp/pear/temp/v8js/php_v8js_macros.h:52,
+                 from /tmp/pear/temp/v8js/v8js_array_access.cc:17:
+/opt/v8/include/v8.h:7926:32: note: declared here
+ 7926 |                 Local<Context> GetEnteredContext());
+      |                                ^~~~~~~~~~~~~~~~~
+/opt/v8/include/v8config.h:311:3: note: in definition of macro ‘V8_DEPRECATED’
+  311 |   declarator __attribute__((deprecated(message)))
+      |   ^~~~~~~~~~
+/tmp/pear/temp/v8js/v8js_array_access.cc:213:63: warning: ignoring return value of ‘v8::Maybe<bool> v8::Object::Set(v8::Local<v8::Context>, uint32_t, v8::Local<v8::Value>)’, declared with attribute warn_unused_result [-Wunused-result]
+  213 |    result->Set(isolate->GetEnteredContext(), i ++, V8JS_INT(j));
+      |                                                               ^
+In file included from /tmp/pear/temp/v8js/php_v8js_macros.h:52,
+                 from /tmp/pear/temp/v8js/v8js_array_access.cc:17:
+/opt/v8/include/v8.h:3369:37: note: declared here
+ 3369 |   V8_WARN_UNUSED_RESULT Maybe<bool> Set(Local<Context> context, uint32_t index,
+      |                                     ^~~
+/tmp/pear/temp/v8js/v8js_array_access.cc:217:41: warning: ‘v8::Local<v8::Context> v8::Isolate::GetEnteredContext()’ is deprecated: Use GetEnteredOrMicrotaskContext(). [-Wdeprecated-declarations]
+  217 |  result->Set(isolate->GetEnteredContext(), V8JS_SYM("length"), V8JS_INT(i));
+      |                                         ^
+In file included from /opt/v8/include/v8-internal.h:14,
+                 from /opt/v8/include/v8.h:25,
+                 from /tmp/pear/temp/v8js/php_v8js_macros.h:52,
+                 from /tmp/pear/temp/v8js/v8js_array_access.cc:17:
+/opt/v8/include/v8.h:7926:32: note: declared here
+ 7926 |                 Local<Context> GetEnteredContext());
+      |                                ^~~~~~~~~~~~~~~~~
+/opt/v8/include/v8config.h:311:3: note: in definition of macro ‘V8_DEPRECATED’
+  311 |   declarator __attribute__((deprecated(message)))
+      |   ^~~~~~~~~~
+/tmp/pear/temp/v8js/v8js_array_access.cc:217:75: warning: ignoring return value of ‘v8::Maybe<bool> v8::Object::Set(v8::Local<v8::Context>, v8::Local<v8::Value>, v8::Local<v8::Value>)’, declared with attribute warn_unused_result [-Wunused-result]
+  217 |  result->Set(isolate->GetEnteredContext(), V8JS_SYM("length"), V8JS_INT(i));
+      |                                                                           ^
+In file included from /tmp/pear/temp/v8js/php_v8js_macros.h:52,
+                 from /tmp/pear/temp/v8js/v8js_array_access.cc:17:
+/opt/v8/include/v8.h:3364:37: note: declared here
+ 3364 |   V8_WARN_UNUSED_RESULT Maybe<bool> Set(Local<Context> context,
+      |                                     ^~~
+/tmp/pear/temp/v8js/v8js_array_access.cc: In function ‘void v8js_array_access_named_getter(v8::Local<v8::Name>, const v8::PropertyCallbackInfo<v8::Value>&)’:
+/tmp/pear/temp/v8js/v8js_array_access.cc:248:54: warning: ‘v8::Local<v8::Context> v8::Isolate::GetEnteredContext()’ is deprecated: Use GetEnteredOrMicrotaskContext(). [-Wdeprecated-declarations]
+  248 |   if(!prototype->ToObject(isolate->GetEnteredContext()).ToLocal(&prototype_object)) {
+      |                                                      ^
+In file included from /opt/v8/include/v8-internal.h:14,
+                 from /opt/v8/include/v8.h:25,
+                 from /tmp/pear/temp/v8js/php_v8js_macros.h:52,
+                 from /tmp/pear/temp/v8js/v8js_array_access.cc:17:
+/opt/v8/include/v8.h:7926:32: note: declared here
+ 7926 |                 Local<Context> GetEnteredContext());
+      |                                ^~~~~~~~~~~~~~~~~
+/opt/v8/include/v8config.h:311:3: note: in definition of macro ‘V8_DEPRECATED’
+  311 |   declarator __attribute__((deprecated(message)))
+      |   ^~~~~~~~~~
+/tmp/pear/temp/v8js/v8js_array_access.cc:253:52: warning: ‘v8::Local<v8::Context> v8::Isolate::GetEnteredContext()’ is deprecated: Use GetEnteredOrMicrotaskContext(). [-Wdeprecated-declarations]
+  253 |   prototype_object->Get(isolate->GetEnteredContext(), property).ToLocal(&ret_value);
+      |                                                    ^
+In file included from /opt/v8/include/v8-internal.h:14,
+                 from /opt/v8/include/v8.h:25,
+                 from /tmp/pear/temp/v8js/php_v8js_macros.h:52,
+                 from /tmp/pear/temp/v8js/v8js_array_access.cc:17:
+/opt/v8/include/v8.h:7926:32: note: declared here
+ 7926 |                 Local<Context> GetEnteredContext());
+      |                                ^~~~~~~~~~~~~~~~~
+/opt/v8/include/v8config.h:311:3: note: in definition of macro ‘V8_DEPRECATED’
+  311 |   declarator __attribute__((deprecated(message)))
+      |   ^~~~~~~~~~
+/tmp/pear/temp/v8js/v8js_array_access.cc:253:72: warning: ignoring return value of ‘bool v8::MaybeLocal<T>::ToLocal(v8::Local<S>*) const [with S = v8::Value; T = v8::Value]’, declared with attribute warn_unused_result [-Wunused-result]
+  253 |   prototype_object->Get(isolate->GetEnteredContext(), property).ToLocal(&ret_value);
+      |   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~
+make: *** [Makefile:206: v8js_array_access.lo] Ошибка 1
+ERROR: `make' failed
+
+**Output:**
+```
+/bin/bash /tmp/v8js/libtool --mode=compile g++ -Wno-narrowing -std=c++11 -I. -I/tmp/v8js -DPHP_ATOM_INC -I/tmp/v8js/include -I/tmp/v8js/main -I/tmp/v8js -I/usr/include/php/20180731 -I/usr/include/php/20180731/main -I/usr/include/php/20180731/TSRM -I/usr/include/php/20180731/Zend -I/usr/include/php/20180731/ext -I/usr/include/php/20180731/ext/date/lib -I/usr  -DHAVE_CONFIG_H  -g -O2   -c /tmp/v8js/v8js_convert.cc -o v8js_convert.lo 
+libtool: compile:  g++ -Wno-narrowing -std=c++11 -I. -I/tmp/v8js -DPHP_ATOM_INC -I/tmp/v8js/include -I/tmp/v8js/main -I/tmp/v8js -I/usr/include/php/20180731 -I/usr/include/php/20180731/main -I/usr/include/php/20180731/TSRM -I/usr/include/php/20180731/Zend -I/usr/include/php/20180731/ext -I/usr/include/php/20180731/ext/date/lib -I/usr -DHAVE_CONFIG_H -g -O2 -c /tmp/v8js/v8js_convert.cc  -fPIC -DPIC -o .libs/v8js_convert.o
+In file included from /usr/include/dirent.h:245:0,
+                 from /usr/include/php/20180731/Zend/zend_virtual_cwd.h:76,
+                 from /usr/include/php/20180731/main/php.h:467,
+                 from /tmp/v8js/php_v8js_macros.h:42,
+                 from /tmp/v8js/v8js_convert.cc:22:
+/tmp/v8js/v8js_class.h: In function ‘v8js_ctx* v8js_ctx_fetch_object(zend_object*)’:
+/tmp/v8js/v8js_class.h:82:54: warning: offsetof within non-standard-layout type ‘v8js_ctx’ is undefined [-Winvalid-offsetof]
+  return (struct v8js_ctx *)((char *)obj - XtOffsetOf(struct v8js_ctx, std));
+/tmp/v8js/v8js_class.h:82:43: note: in expansion of macro ‘XtOffsetOf’
+  return (struct v8js_ctx *)((char *)obj - XtOffsetOf(struct v8js_ctx, std));
+                                           ^~~~~~~~~~
+/tmp/v8js/v8js_convert.cc: In function ‘v8::Local<v8::Value> v8js_hash_to_jsarr(zval*, v8::Isolate*)’:
+/tmp/v8js/v8js_convert.cc:73:14: error: ‘ZEND_HASH_GET_APPLY_COUNT’ was not declared in this scope
+  if (myht && ZEND_HASH_GET_APPLY_COUNT(myht) > 1) {
+              ^~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/v8js/v8js_convert.cc:73:14: note: suggested alternative: ‘ZEND_HASH_APPLY_STOP’
+  if (myht && ZEND_HASH_GET_APPLY_COUNT(myht) > 1) {
+              ^~~~~~~~~~~~~~~~~~~~~~~~~
+              ZEND_HASH_APPLY_STOP
+/tmp/v8js/v8js_convert.cc:89:5: error: ‘ZEND_HASH_INC_APPLY_COUNT’ was not declared in this scope
+     ZEND_HASH_INC_APPLY_COUNT(myht);
+     ^~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/v8js/v8js_convert.cc:89:5: note: suggested alternative: ‘ZEND_HASH_APPLY_STOP’
+     ZEND_HASH_INC_APPLY_COUNT(myht);
+     ^~~~~~~~~~~~~~~~~~~~~~~~~
+     ZEND_HASH_APPLY_STOP
+/tmp/v8js/v8js_convert.cc:95:5: error: ‘ZEND_HASH_DEC_APPLY_COUNT’ was not declared in this scope
+     ZEND_HASH_DEC_APPLY_COUNT(myht);
+     ^~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/v8js/v8js_convert.cc:95:5: note: suggested alternative: ‘ZEND_HASH_APPLY_STOP’
+     ZEND_HASH_DEC_APPLY_COUNT(myht);
+     ^~~~~~~~~~~~~~~~~~~~~~~~~
+     ZEND_HASH_APPLY_STOP
+/tmp/v8js/v8js_convert.cc: In function ‘v8::Local<v8::Value> zend_long_to_v8js(zend_long, v8::Isolate*)’:
+/tmp/v8js/v8js_convert.cc:105:10: warning: integer overflow in expression [-Woverflow]
+  if (v < - std::numeric_limits<int32_t>::min() || v > std::numeric_limits<int32_t>::max()) {
+          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Makefile:214: recipe for target 'v8js_convert.lo' failed
+make: *** [v8js_convert.lo] Error 1
+root@gr1ng0wf:/tmp/v8js# sudo make install
+/bin/bash /tmp/v8js/libtool --mode=compile g++ -Wno-narrowing -std=c++11 -I. -I/tmp/v8js -DPHP_ATOM_INC -I/tmp/v8js/include -I/tmp/v8js/main -I/tmp/v8js -I/usr/include/php/20180731 -I/usr/include/php/20180731/main -I/usr/include/php/20180731/TSRM -I/usr/include/php/20180731/Zend -I/usr/include/php/20180731/ext -I/usr/include/php/20180731/ext/date/lib -I/usr  -DHAVE_CONFIG_H  -g -O2   -c /tmp/v8js/v8js_convert.cc -o v8js_convert.lo 
+libtool: compile:  g++ -Wno-narrowing -std=c++11 -I. -I/tmp/v8js -DPHP_ATOM_INC -I/tmp/v8js/include -I/tmp/v8js/main -I/tmp/v8js -I/usr/include/php/20180731 -I/usr/include/php/20180731/main -I/usr/include/php/20180731/TSRM -I/usr/include/php/20180731/Zend -I/usr/include/php/20180731/ext -I/usr/include/php/20180731/ext/date/lib -I/usr -DHAVE_CONFIG_H -g -O2 -c /tmp/v8js/v8js_convert.cc  -fPIC -DPIC -o .libs/v8js_convert.o
+In file included from /usr/include/dirent.h:245:0,
+                 from /usr/include/php/20180731/Zend/zend_virtual_cwd.h:76,
+                 from /usr/include/php/20180731/main/php.h:467,
+                 from /tmp/v8js/php_v8js_macros.h:42,
+                 from /tmp/v8js/v8js_convert.cc:22:
+/tmp/v8js/v8js_class.h: In function ‘v8js_ctx* v8js_ctx_fetch_object(zend_object*)’:
+/tmp/v8js/v8js_class.h:82:54: warning: offsetof within non-standard-layout type ‘v8js_ctx’ is undefined [-Winvalid-offsetof]
+  return (struct v8js_ctx *)((char *)obj - XtOffsetOf(struct v8js_ctx, std));
+/tmp/v8js/v8js_class.h:82:43: note: in expansion of macro ‘XtOffsetOf’
+  return (struct v8js_ctx *)((char *)obj - XtOffsetOf(struct v8js_ctx, std));
+                                           ^~~~~~~~~~
+/tmp/v8js/v8js_convert.cc: In function ‘v8::Local<v8::Value> v8js_hash_to_jsarr(zval*, v8::Isolate*)’:
+/tmp/v8js/v8js_convert.cc:73:14: error: ‘ZEND_HASH_GET_APPLY_COUNT’ was not declared in this scope
+  if (myht && ZEND_HASH_GET_APPLY_COUNT(myht) > 1) {
+              ^~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/v8js/v8js_convert.cc:73:14: note: suggested alternative: ‘ZEND_HASH_APPLY_STOP’
+  if (myht && ZEND_HASH_GET_APPLY_COUNT(myht) > 1) {
+              ^~~~~~~~~~~~~~~~~~~~~~~~~
+              ZEND_HASH_APPLY_STOP
+/tmp/v8js/v8js_convert.cc:89:5: error: ‘ZEND_HASH_INC_APPLY_COUNT’ was not declared in this scope
+     ZEND_HASH_INC_APPLY_COUNT(myht);
+     ^~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/v8js/v8js_convert.cc:89:5: note: suggested alternative: ‘ZEND_HASH_APPLY_STOP’
+     ZEND_HASH_INC_APPLY_COUNT(myht);
+     ^~~~~~~~~~~~~~~~~~~~~~~~~
+     ZEND_HASH_APPLY_STOP
+/tmp/v8js/v8js_convert.cc:95:5: error: ‘ZEND_HASH_DEC_APPLY_COUNT’ was not declared in this scope
+     ZEND_HASH_DEC_APPLY_COUNT(myht);
+     ^~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/v8js/v8js_convert.cc:95:5: note: suggested alternative: ‘ZEND_HASH_APPLY_STOP’
+     ZEND_HASH_DEC_APPLY_COUNT(myht);
+     ^~~~~~~~~~~~~~~~~~~~~~~~~
+     ZEND_HASH_APPLY_STOP
+/tmp/v8js/v8js_convert.cc: In function ‘v8::Local<v8::Value> zend_long_to_v8js(zend_long, v8::Isolate*)’:
+/tmp/v8js/v8js_convert.cc:105:10: warning: integer overflow in expression [-Woverflow]
+  if (v < - std::numeric_limits<int32_t>::min() || v > std::numeric_limits<int32_t>::max()) {
+          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Makefile:214: recipe for target 'v8js_convert.lo' failed
+make: *** [v8js_convert.lo] Error 1
+```
+
+**Config.log**
+`This file contains any messages produced by compilers while
+running configure, to aid debugging if configure makes a mistake.
+
+It was created by configure, which was
+generated by GNU Autoconf 2.69.  Invocation command line was
+
+  $ ./configure --with-v8js=/opt/v8 LDFLAGS=-lstdc++
+
+## --------- ##
+## Platform. ##
+## --------- ##
+
+hostname = gr1ng0wf
+uname -m = x86_64
+uname -r = 4.15.0-72-generic
+uname -s = Linux
+uname -v = #81-Ubuntu SMP Tue Nov 26 12:20:02 UTC 2019
+
+/usr/bin/uname -p = unknown
+/bin/uname -X     = unknown
+
+/bin/arch              = unknown
+/usr/bin/arch -k       = unknown
+/usr/convex/getsysinfo = unknown
+/usr/bin/hostinfo      = unknown
+/bin/machine           = unknown
+/usr/bin/oslevel       = unknown
+/bin/universe          = unknown
+
+PATH: /tmp/depot_tools
+PATH: /usr/local/sbin
+PATH: /usr/local/bin
+PATH: /usr/sbin
+PATH: /usr/bin
+PATH: /sbin
+PATH: /bin
+PATH: /usr/games
+PATH: /usr/local/games
+
+
+## ----------- ##
+## Core tests. ##
+## ----------- ##
+
+configure:2271: checking for grep that handles long lines and -e
+configure:2329: result: /bin/grep
+configure:2334: checking for egrep
+configure:2396: result: /bin/grep -E
+configure:2401: checking for a sed that does not truncate output
+configure:2465: result: /bin/sed
+configure:2604: checking for cc
+configure:2620: found /usr/bin/cc
+configure:2631: result: cc
+configure:2662: checking for C compiler version
+configure:2671: cc --version >&5
+cc (Ubuntu 7.4.0-1ubuntu1~18.04.1) 7.4.0
+Copyright (C) 2017 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+configure:2682: $? = 0
+configure:2671: cc -v >&5
+Using built-in specs.
+COLLECT_GCC=cc
+COLLECT_LTO_WRAPPER=/usr/lib/gcc/x86_64-linux-gnu/7/lto-wrapper
+OFFLOAD_TARGET_NAMES=nvptx-none
+OFFLOAD_TARGET_DEFAULT=1
+Target: x86_64-linux-gnu
+Configured with: ../src/configure -v --with-pkgversion='Ubuntu 7.4.0-1ubuntu1~18.04.1' --with-bugurl=file:///usr/share/doc/gcc-7/README.Bugs --enable-languages=c,ada,c++,go,brig,d,fortran,objc,obj-c++ --prefix=/usr --with-gcc-major-version-only --program-suffix=-7 --program-prefix=x86_64-linux-gnu- --enable-shared --enable-linker-build-id --libexecdir=/usr/lib --without-included-gettext --enable-threads=posix --libdir=/usr/lib --enable-nls --with-sysroot=/ --enable-clocale=gnu --enable-libstdcxx-debug --enable-libstdcxx-time=yes --with-default-libstdcxx-abi=new --enable-gnu-unique-object --disable-vtable-verify --enable-libmpx --enable-plugin --enable-default-pie --with-system-zlib --with-target-system-zlib --enable-objc-gc=auto --enable-multiarch --disable-werror --with-arch-32=i686 --with-abi=m64 --with-multilib-list=m32,m64,mx32 --enable-multilib --with-tune=generic --enable-offload-targets=nvptx-none --without-cuda-driver --enable-checking=release --build=x86_64-linux-gnu --host=x86_64-linux-gnu --target=x86_64-linux-gnu
+Thread model: posix
+gcc version 7.4.0 (Ubuntu 7.4.0-1ubuntu1~18.04.1) 
+configure:2682: $? = 0
+configure:2671: cc -V >&5
+cc: error: unrecognized command line option '-V'
+cc: fatal error: no input files
+compilation terminated.
+configure:2682: $? = 1
+configure:2671: cc -qversion >&5
+cc: error: unrecognized command line option '-qversion'; did you mean '--version'?
+cc: fatal error: no input files
+compilation terminated.
+configure:2682: $? = 1
+configure:2702: checking whether the C compiler works
+configure:2724: cc   -lstdc++ conftest.c  >&5
+configure:2728: $? = 0
+configure:2776: result: yes
+configure:2779: checking for C compiler default output file name
+configure:2781: result: a.out
+configure:2787: checking for suffix of executables
+configure:2794: cc -o conftest   -lstdc++ conftest.c  >&5
+configure:2798: $? = 0
+configure:2820: result: 
+configure:2842: checking whether we are cross compiling
+configure:2850: cc -o conftest   -lstdc++ conftest.c  >&5
+configure:2854: $? = 0
+configure:2861: ./conftest
+configure:2865: $? = 0
+configure:2880: result: no
+configure:2885: checking for suffix of object files
+configure:2907: cc -c   conftest.c >&5
+configure:2911: $? = 0
+configure:2932: result: o
+configure:2936: checking whether we are using the GNU C compiler
+configure:2955: cc -c   conftest.c >&5
+configure:2955: $? = 0
+configure:2964: result: yes
+configure:2973: checking whether cc accepts -g
+configure:2993: cc -c -g  conftest.c >&5
+configure:2993: $? = 0
+configure:3034: result: yes
+configure:3051: checking for cc option to accept ISO C89
+configure:3114: cc  -c -g -O2  conftest.c >&5
+configure:3114: $? = 0
+configure:3127: result: none needed
+configure:3153: checking how to run the C preprocessor
+configure:3184: cc -E  conftest.c
+configure:3184: $? = 0
+configure:3198: cc -E  conftest.c
+conftest.c:9:10: fatal error: ac_nonexistent.h: No such file or directory
+ #include <ac_nonexistent.h>
+          ^~~~~~~~~~~~~~~~~~
+compilation terminated.
+configure:3198: $? = 1
+configure: failed program was:
+| /* confdefs.h */
+| #define PACKAGE_NAME ""
+| #define PACKAGE_TARNAME ""
+| #define PACKAGE_VERSION ""
+| #define PACKAGE_STRING ""
+| #define PACKAGE_BUGREPORT ""
+| #define PACKAGE_URL ""
+| /* end confdefs.h.  */
+| #include <ac_nonexistent.h>
+configure:3223: result: cc -E
+configure:3243: cc -E  conftest.c
+configure:3243: $? = 0
+configure:3257: cc -E  conftest.c
+conftest.c:9:10: fatal error: ac_nonexistent.h: No such file or directory
+ #include <ac_nonexistent.h>
+          ^~~~~~~~~~~~~~~~~~
+compilation terminated.
+configure:3257: $? = 1
+configure: failed program was:
+| /* confdefs.h */
+| #define PACKAGE_NAME ""
+| #define PACKAGE_TARNAME ""
+| #define PACKAGE_VERSION ""
+| #define PACKAGE_STRING ""
+| #define PACKAGE_BUGREPORT ""
+| #define PACKAGE_URL ""
+| /* end confdefs.h.  */
+| #include <ac_nonexistent.h>
+configure:3288: checking for icc
+configure:3297: result: no
+configure:3311: checking for suncc
+configure:3320: result: no
+configure:3338: checking whether cc understands -c and -o together
+configure:3366: cc -c conftest.c -o conftest2.o >&5
+configure:3370: $? = 0
+configure:3376: cc -c conftest.c -o conftest2.o >&5
+configure:3380: $? = 0
+configure:3435: result: yes
+configure:3449: checking for system library directory
+configure:3464: result: lib
+configure:3471: checking if compiler supports -R
+configure:3490: cc -o conftest -g -O2  -lstdc++ conftest.c -R /usr/lib  >&5
+cc: error: unrecognized command line option '-R'
+configure:3490: $? = 1
+configure: failed program was:
+| /* confdefs.h */
+| #define PACKAGE_NAME ""
+| #define PACKAGE_TARNAME ""
+| #define PACKAGE_VERSION ""
+| #define PACKAGE_STRING ""
+| #define PACKAGE_BUGREPORT ""
+| #define PACKAGE_URL ""
+| /* end confdefs.h.  */
+| 
+| int
+| main ()
+| {
+| 
+|   ;
+|   return 0;
+| }
+configure:3500: result: no
+configure:3505: checking if compiler supports -Wl,-rpath,
+configure:3524: cc -o conftest -g -O2  -lstdc++ conftest.c -Wl,-rpath,/usr/lib  >&5
+configure:3524: $? = 0
+configure:3534: result: yes
+configure:3579: checking build system type
+configure:3593: result: x86_64-pc-linux-gnu
+configure:3613: checking host system type
+configure:3626: result: x86_64-pc-linux-gnu
+configure:3646: checking target system type
+configure:3659: result: x86_64-pc-linux-gnu
+configure:3762: checking for PHP prefix
+configure:3764: result: /usr
+configure:3766: checking for PHP includes
+configure:3768: result: -I/usr/include/php/20180731 -I/usr/include/php/20180731/main -I/usr/include/php/20180731/TSRM -I/usr/include/php/20180731/Zend -I/usr/include/php/20180731/ext -I/usr/include/php/20180731/ext/date/lib
+configure:3770: checking for PHP extension directory
+configure:3772: result: /usr/lib/php/20180731
+configure:3774: checking for PHP installed headers prefix
+configure:3776: result: /usr/include/php/20180731
+configure:3779: checking if debug is enabled
+configure:3805: result: no
+configure:3808: checking if zts is enabled
+configure:3834: result: no
+configure:3905: checking for re2c
+configure:3935: result: no
+configure:3960: WARNING: You will need re2c 0.13.4 or later if you want to regenerate PHP parsers.
+configure:3974: checking for gawk
+configure:4005: result: no
+configure:3974: checking for nawk
+configure:3991: found /usr/bin/nawk
+configure:4002: result: nawk
+configure:4025: checking if nawk is broken
+configure:4032: result: no
+configure:4045: checking for V8 Javascript Engine
+configure:4085: result: yes, shared
+configure:4323: checking for g++
+configure:4339: found /usr/bin/g++
+configure:4350: result: g++
+configure:4377: checking for C++ compiler version
+configure:4386: g++ --version >&5
+g++ (Ubuntu 7.4.0-1ubuntu1~18.04.1) 7.4.0
+Copyright (C) 2017 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+configure:4397: $? = 0
+configure:4386: g++ -v >&5
+Using built-in specs.
+COLLECT_GCC=g++
+COLLECT_LTO_WRAPPER=/usr/lib/gcc/x86_64-linux-gnu/7/lto-wrapper
+OFFLOAD_TARGET_NAMES=nvptx-none
+OFFLOAD_TARGET_DEFAULT=1
+Target: x86_64-linux-gnu
+Configured with: ../src/configure -v --with-pkgversion='Ubuntu 7.4.0-1ubuntu1~18.04.1' --with-bugurl=file:///usr/share/doc/gcc-7/README.Bugs --enable-languages=c,ada,c++,go,brig,d,fortran,objc,obj-c++ --prefix=/usr --with-gcc-major-version-only --program-suffix=-7 --program-prefix=x86_64-linux-gnu- --enable-shared --enable-linker-build-id --libexecdir=/usr/lib --without-included-gettext --enable-threads=posix --libdir=/usr/lib --enable-nls --with-sysroot=/ --enable-clocale=gnu --enable-libstdcxx-debug --enable-libstdcxx-time=yes --with-default-libstdcxx-abi=new --enable-gnu-unique-object --disable-vtable-verify --enable-libmpx --enable-plugin --enable-default-pie --with-system-zlib --with-target-system-zlib --enable-objc-gc=auto --enable-multiarch --disable-werror --with-arch-32=i686 --with-abi=m64 --with-multilib-list=m32,m64,mx32 --enable-multilib --with-tune=generic --enable-offload-targets=nvptx-none --without-cuda-driver --enable-checking=release --build=x86_64-linux-gnu --host=x86_64-linux-gnu --target=x86_64-linux-gnu
+Thread model: posix
+gcc version 7.4.0 (Ubuntu 7.4.0-1ubuntu1~18.04.1) 
+configure:4397: $? = 0
+configure:4386: g++ -V >&5
+g++: error: unrecognized command line option '-V'
+g++: fatal error: no input files
+compilation terminated.
+configure:4397: $? = 1
+configure:4386: g++ -qversion >&5
+g++: error: unrecognized command line option '-qversion'; did you mean '--version'?
+g++: fatal error: no input files
+compilation terminated.
+configure:4397: $? = 1
+configure:4401: checking whether we are using the GNU C++ compiler
+configure:4420: g++ -c   conftest.cpp >&5
+configure:4420: $? = 0
+configure:4429: result: yes
+configure:4438: checking whether g++ accepts -g
+configure:4458: g++ -c -g  conftest.cpp >&5
+configure:4458: $? = 0
+configure:4499: result: yes
+configure:4527: checking how to run the C++ preprocessor
+configure:4554: g++ -E  conftest.cpp
+configure:4554: $? = 0
+configure:4568: g++ -E  conftest.cpp
+conftest.cpp:10:10: fatal error: ac_nonexistent.h: No such file or directory
+ #include <ac_nonexistent.h>
+          ^~~~~~~~~~~~~~~~~~
+compilation terminated.
+configure:4568: $? = 1
+configure: failed program was:
+| /* confdefs.h */
+| #define PACKAGE_NAME ""
+| #define PACKAGE_TARNAME ""
+| #define PACKAGE_VERSION ""
+| #define PACKAGE_STRING ""
+| #define PACKAGE_BUGREPORT ""
+| #define PACKAGE_URL ""
+| #define PHP_V8_EXEC_PATH "/opt/v8/lib/libv8.so"
+| /* end confdefs.h.  */
+| #include <ac_nonexistent.h>
+configure:4593: result: g++ -E
+configure:4613: g++ -E  conftest.cpp
+configure:4613: $? = 0
+configure:4627: g++ -E  conftest.cpp
+conftest.cpp:10:10: fatal error: ac_nonexistent.h: No such file or directory
+ #include <ac_nonexistent.h>
+          ^~~~~~~~~~~~~~~~~~
+compilation terminated.
+configure:4627: $? = 1
+configure: failed program was:
+| /* confdefs.h */
+| #define PACKAGE_NAME ""
+| #define PACKAGE_TARNAME ""
+| #define PACKAGE_VERSION ""
+| #define PACKAGE_STRING ""
+| #define PACKAGE_BUGREPORT ""
+| #define PACKAGE_URL ""
+| #define PHP_V8_EXEC_PATH "/opt/v8/lib/libv8.so"
+| /* end confdefs.h.  */
+| #include <ac_nonexistent.h>
+configure:4671: checking for C standard version
+configure:4696: g++ -o conftest -g -O2 -std=c++11 -lstdc++ -Wl,--rpath=/opt/v8/lib conftest.cpp -lstdc++  >&5
+configure:4696: $? = 0
+configure:4696: ./conftest
+configure:4696: $? = 0
+configure:4714: result: c++11
+configure:4717: checking how to allow c++11 narrowing
+configure:4746: g++ -o conftest -std=c++11  -lstdc++ -Wl,--rpath=/opt/v8/lib conftest.cpp -lstdc++  >&5
+conftest.cpp: In function 'int main()':
+conftest.cpp:11:45: error: narrowing conversion of '-1' from 'int' to 'unsigned int' inside { } [-Wnarrowing]
+         struct { unsigned int x; } foo = {-1};
+                                             ^
+configure:4746: $? = 1
+configure: program exited with status 1
+configure: failed program was:
+| /* confdefs.h */
+| #define PACKAGE_NAME ""
+| #define PACKAGE_TARNAME ""
+| #define PACKAGE_VERSION ""
+| #define PACKAGE_STRING ""
+| #define PACKAGE_BUGREPORT ""
+| #define PACKAGE_URL ""
+| #define PHP_V8_EXEC_PATH "/opt/v8/lib/libv8.so"
+| /* end confdefs.h.  */
+| int main() {
+|         struct { unsigned int x; } foo = {-1};
+|         (void) foo;
+|         return 0;
+|     }
+configure:4765: g++ -o conftest -Wno-c++11-narrowing -std=c++11  -lstdc++ -Wl,--rpath=/opt/v8/lib conftest.cpp -lstdc++  >&5
+conftest.cpp: In function 'int main()':
+conftest.cpp:11:49: error: narrowing conversion of '-1' from 'int' to 'unsigned int' inside { } [-Wnarrowing]
+             struct { unsigned int x; } foo = {-1};
+                                                 ^
+At global scope:
+cc1plus: warning: unrecognized command line option '-Wno-c++11-narrowing'
+configure:4765: $? = 1
+configure: program exited with status 1
+configure: failed program was:
+| /* confdefs.h */
+| #define PACKAGE_NAME ""
+| #define PACKAGE_TARNAME ""
+| #define PACKAGE_VERSION ""
+| #define PACKAGE_STRING ""
+| #define PACKAGE_BUGREPORT ""
+| #define PACKAGE_URL ""
+| #define PHP_V8_EXEC_PATH "/opt/v8/lib/libv8.so"
+| /* end confdefs.h.  */
+| int main() {
+|             struct { unsigned int x; } foo = {-1};
+|             (void) foo;
+|             return 0;
+|         }
+configure:4784: g++ -o conftest -Wno-narrowing -std=c++11  -lstdc++ -Wl,--rpath=/opt/v8/lib conftest.cpp -lstdc++  >&5
+configure:4784: $? = 0
+configure:4784: ./conftest
+configure:4784: $? = 0
+configure:4816: result: -Wno-narrowing
+configure:4835: checking for libv8_libplatform
+configure:4855: g++ -o conftest -g -O2  -I/opt/v8/include -std=c++11 -lstdc++ -Wl,--rpath=/opt/v8/lib -L/opt/v8/lib conftest.cpp -lstdc++   -lv8_libplatform -lv8 >&5
+configure:4855: $? = 0
+configure:4857: result: found
+configure:4905: checking for V8 version
+configure:4933: g++ -o conftest -g -O2  -I/opt/v8/include -std=c++11 -lstdc++ -Wl,--rpath=/opt/v8/lib -L/opt/v8/lib conftest.cpp -lstdc++   -lv8_libplatform -Wl,-rpath,/opt/v8/lib -L/opt/v8/lib -lv8  >&5
+configure:4933: $? = 0
+configure:4933: ./conftest
+./conftest: symbol lookup error: /opt/v8/lib/libv8.so: undefined symbol: _ZTVN6icu_6013FieldPositionE
+configure:4933: $? = 127
+configure: program exited with status 127
+configure: failed program was:
+| /* confdefs.h */
+| #define PACKAGE_NAME ""
+| #define PACKAGE_TARNAME ""
+| #define PACKAGE_VERSION ""
+| #define PACKAGE_STRING ""
+| #define PACKAGE_BUGREPORT ""
+| #define PACKAGE_URL ""
+| #define PHP_V8_EXEC_PATH "/opt/v8/lib/libv8.so"
+| /* end confdefs.h.  */
+| #include <v8.h>
+| #include <iostream>
+| #include <fstream>
+| using namespace std;
+| 
+| int main ()
+| {
+| 	ofstream testfile ("conftestval");
+| 	if (testfile.is_open()) {
+| 		testfile << v8::V8::GetVersion();
+| 		testfile << "\n";
+| 		testfile.close();
+| 		return 0;
+| 	}
+| 	return 1;
+| }
+configure:4944: result: NONE
+configure:4967: error: could not determine libv8 version
+
+## ---------------- ##
+## Cache variables. ##
+## ---------------- ##
+
+ac_cv_build=x86_64-pc-linux-gnu
+ac_cv_c_compiler_gnu=yes
+ac_cv_cxx_compiler_gnu=yes
+ac_cv_env_CCC_set=
+ac_cv_env_CCC_value=
+ac_cv_env_CC_set=
+ac_cv_env_CC_value=
+ac_cv_env_CFLAGS_set=
+ac_cv_env_CFLAGS_value=
+ac_cv_env_CPPFLAGS_set=
+ac_cv_env_CPPFLAGS_value=
+ac_cv_env_CPP_set=
+ac_cv_env_CPP_value=
+ac_cv_env_CXXCPP_set=
+ac_cv_env_CXXCPP_value=
+ac_cv_env_CXXFLAGS_set=
+ac_cv_env_CXXFLAGS_value=
+ac_cv_env_CXX_set=
+ac_cv_env_CXX_value=
+ac_cv_env_LDFLAGS_set=set
+ac_cv_env_LDFLAGS_value=-lstdc++
+ac_cv_env_LIBS_set=
+ac_cv_env_LIBS_value=
+ac_cv_env_LT_SYS_LIBRARY_PATH_set=
+ac_cv_env_LT_SYS_LIBRARY_PATH_value=
+ac_cv_env_build_alias_set=
+ac_cv_env_build_alias_value=
+ac_cv_env_host_alias_set=
+ac_cv_env_host_alias_value=
+ac_cv_env_target_alias_set=
+ac_cv_env_target_alias_value=
+ac_cv_host=x86_64-pc-linux-gnu
+ac_cv_objext=o
+ac_cv_path_EGREP='/bin/grep -E'
+ac_cv_path_GREP=/bin/grep
+ac_cv_path_SED=/bin/sed
+ac_cv_prog_AWK=nawk
+ac_cv_prog_CPP='cc -E'
+ac_cv_prog_CXXCPP='g++ -E'
+ac_cv_prog_ac_ct_CC=cc
+ac_cv_prog_ac_ct_CXX=g++
+ac_cv_prog_cc_c89=
+ac_cv_prog_cc_cc_c_o=yes
+ac_cv_prog_cc_g=yes
+ac_cv_prog_cxx_g=yes
+ac_cv_target=x86_64-pc-linux-gnu
+ac_cv_v8_cstd=c++11
+ac_cv_v8_narrowing=-Wno-narrowing
+ac_cv_v8_version=NONE
+php_cv_cc_dashr=no
+php_cv_cc_rpath=yes
+
+## ----------------- ##
+## Output variables. ##
+## ----------------- ##
+
+AR=''
+AWK='nawk'
+CC='cc'
+CFLAGS='-g -O2'
+CONFIGURE_COMMAND=' '\''./configure'\''  '\''--with-v8js=/opt/v8'\'''
+CONFIGURE_OPTIONS=' '\''--with-v8js=/opt/v8'\'''
+CPP='cc -E'
+CPPFLAGS=' -I/opt/v8/include -std=c++11'
+CXX='g++'
+CXXCPP='g++ -E'
+CXXFLAGS='-g -O2'
+DEFS=''
+DLLTOOL=''
+DSYMUTIL=''
+DUMPBIN=''
+ECHO_C=''
+ECHO_N='-n'
+ECHO_T=''
+EGREP='/bin/grep -E'
+EXEEXT=''
+FGREP=''
+GREP='/bin/grep'
+LD=''
+LDFLAGS='-lstdc++ -Wl,--rpath=/opt/v8/lib -L/opt/v8/lib'
+LIBOBJS=''
+LIBS='-lstdc++   -lv8_libplatform -Wl,-rpath,/opt/v8/lib -L/opt/v8/lib -lv8 '
+LIBTOOL=''
+LIPO=''
+LN_S=''
+LTLIBOBJS=''
+LT_SYS_LIBRARY_PATH=''
+MANIFEST_TOOL=''
+NM=''
+NMEDIT=''
+OBJDUMP=''
+OBJEXT='o'
+OTOOL64=''
+OTOOL=''
+PACKAGE_BUGREPORT=''
+PACKAGE_NAME=''
+PACKAGE_STRING=''
+PACKAGE_TARNAME=''
+PACKAGE_URL=''
+PACKAGE_VERSION=''
+PATH_SEPARATOR=':'
+RANLIB=''
+RE2C='exit 0;'
+SED='/bin/sed'
+SHELL='/bin/bash'
+SHLIB_DL_SUFFIX_NAME='so'
+SHLIB_SUFFIX_NAME='so'
+STRIP=''
+ac_ct_AR=''
+ac_ct_CC='cc'
+ac_ct_CXX='g++'
+ac_ct_DUMPBIN=''
+bindir='${exec_prefix}/bin'
+build='x86_64-pc-linux-gnu'
+build_alias=''
+build_cpu='x86_64'
+build_os='linux-gnu'
+build_vendor='pc'
+datadir='${datarootdir}'
+datarootdir='${prefix}/share'
+docdir='${datarootdir}/doc/${PACKAGE}'
+dvidir='${docdir}'
+exec_prefix='NONE'
+host='x86_64-pc-linux-gnu'
+host_alias='x86_64-pc-linux-gnu'
+host_cpu='x86_64'
+host_os='linux-gnu'
+host_vendor='pc'
+htmldir='${docdir}'
+includedir='${prefix}/include'
+infodir='${datarootdir}/info'
+libdir='${exec_prefix}/lib'
+libexecdir='${exec_prefix}/libexec'
+localedir='${datarootdir}/locale'
+localstatedir='${prefix}/var'
+mandir='${datarootdir}/man'
+oldincludedir='/usr/include'
+pdfdir='${docdir}'
+prefix='/usr'
+program_transform_name='s,x,x,'
+psdir='${docdir}'
+runstatedir='${localstatedir}/run'
+sbindir='${exec_prefix}/sbin'
+sharedstatedir='${prefix}/com'
+sysconfdir='${prefix}/etc'
+target='x86_64-pc-linux-gnu'
+target_alias=''
+target_cpu='x86_64'
+target_os='linux-gnu'
+target_vendor='pc'
+
+## ----------- ##
+## confdefs.h. ##
+## ----------- ##
+
+/* confdefs.h */
+#define PACKAGE_NAME ""
+#define PACKAGE_TARNAME ""
+#define PACKAGE_VERSION ""
+#define PACKAGE_STRING ""
+#define PACKAGE_BUGREPORT ""
+#define PACKAGE_URL ""
+#define PHP_V8_EXEC_PATH "/opt/v8/lib/libv8.so"
+
+configure: exit 1`
+
+**phpize output**
+- PHP Api Version:         20180731
+- Zend Module Api No:      20180731
+- Zend Extension Api No:   320180731
+
+
+In README.md
+
+> If you execute untrusted JavaScript code, make sure to use V8 version 6.4.388.18, 6.5.143 or higher. See notes on untrusted code mitigations for further details.
+
+However, the latest version of v8js requires libv8 version 6.9, so this note should mention it only needs to be checked when building older releases of v8js (or be removed)
+
+This may be related to #373, I believe, although the code triggering the error is different.
+
+Test script:
+
+```js
+const formatter = new Intl.NumberFormat('fr-FR', {
+    style: 'currency',
+    currency: 'EUR'
+});
+
+formatter.format(9.9);
+```
+
+Result:
+
+```
+#
+# Fatal error in , line 0
+# Failed to create ICU number format, are ICU data files missing?
+#
+#
+#
+#FailureMessage Object: 0x7fffcb60e0d0
+==== C stack trace ===============================
+
+    /lib64/libnode.so.64(v8::base::debug::StackTrace::StackTrace()+0x1a) [0x7f8a5596745a]
+    /lib64/libnode.so.64(+0x92e8b1) [0x7f8a54eef8b1]
+    /lib64/libnode.so.64(V8_Fatal(char const*, int, char const*, ...)+0x177) [0x7f8a55962f57]
+    /lib64/libnode.so.64(v8::internal::NumberFormat::InitializeNumberFormat(v8::internal::Isolate*, v8::internal::Handle<v8::internal::String>, v8::internal::Handle<v8::internal::JSObject>, v8::internal::Handle<v8::internal::JSObject>)+0x1d9) [0x7f8a55643f79]
+    /lib64/libnode.so.64(v8::internal::Runtime_CreateNumberFormat(int, v8::internal::Object**, v8::internal::Isolate*)+0x18f) [0x7f8a55768cef]
+    [0x1446de65c0d8]
+Illegal instruction (core dumped)
+```
+
+Do you think the issues lies with:
+- V8 itself?
+- the way V8JS [initializes ICU default location](https://groups.google.com/forum/#!topic/v8-users/4DOD6z57xfU)?
+- or my system?
+
+I'm using [remi](https://blog.remirepo.net/)'s `php73-php-pecl-v8js` RPM package on Fedora 30. I have `libicu` installed.
+Just in case anyone spends a bunch of time debugging.  for this error
+
+`/tmp/v8jstmp/v8js/v8js_convert.cc:215:59: error: no matching function for call to ‘v8::Value::BooleanValue(v8::Local<v8::Context>&)’
+   v8::Maybe<bool> value = jsValue->BooleanValue(v8_context);
+`
+
+Compiling against a very recent version of V8 will fail due to this patch: https://github.com/v8/v8/commit/c76f377a990343b18953123c2726337b38c59812#diff-3dd7a0f46b1e5c1cc67921449e7180ac
+
+Looks like it "may" have gone into 7.6.58
+My apologies, I just really need assistance :-)
+
+My question is here:
+
+https://stackoverflow.com/questions/57164363/building-v8-from-source-on-centos-7
+
+Thank you!
+If i do something like the following:
+
+```php
+class MyV8 extends V8Js {
+	function foo($payload) {
+		echo $payload['name']; // nope :-(
+		echo $payload->name; // this is ok.
+	}
+}
+
+$v8 = new MyV8('myv8');
+$v8->executeString('myv8.foo({ name:"Testing" })')
+```
+
+then i'll get a "Cannot use object of type V8Object as array" error. This is unless I use FLAG_FORCE_ARRAY. If we were calling ::foo() via PHP, it'd be quite normal to be passing an array (e.g `$this->foo(['name' => 'Testing'])` ) and not an object instance - so I cannot share the function between the JS and PHP space without conditional conversions.
+
+I don't use FLAG_FORCE_ARRAY as I find the default setup generally more useful, and because it just blanket applies to everything. Anyway...
+Would it be feasible to offer (at initialisation) PHP classes that would extend the default V8Object/V8Function, etc so that we could perhaps deal with
+these sorts of cases? Then this would be possible:
+
+```php
+class MyV8Object extends V8Object implements ArrayAccess {
+}
+```
+
+so the FLAG_FORCE_ARRAY-type functionality can be much more selective.
+
+Cheers
+Mark

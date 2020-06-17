@@ -1,0 +1,152 @@
+I am using this library and have run into the need to capture a potential error inside of the `filter_entry` predicate. I asked in a [forum topic](https://users.rust-lang.org/t/is-there-a-way-to-escape-a-closure-to-throw-an-error/34503?u=zicklag) about my problem and the response was that the best way to accomplish it would be with a `try_filter_entry` iterator so that I could return a result inside of the filter predicate.
+
+I did a quick check of the source code to see how I might be able to implement that, but I was wondering if you might have any guidance on how you would want that implemented.
+
+I haven't ever written an iterator before, but it looks like, if I wanted to create a `FilterEntry` iterator that it would be *nearly* identical to the existing `TryFilterEntry` iterator, but not quite the same.
+
+Is there any way to share most of the implementation without duplicating code, or is it better just to create a copy of `FilterEntry` and the make the changes necessary.
+```rust
+impl<P> FilterEntry<IntoIter, P> where P: FnMut(&DirEntry) -> bool {
+    pub fn filter_entry(self, predicate: P) -> FilterEntry<Self, P> {
+        FilterEntry { it: self, predicate: predicate }
+    }
+}
+```
+
+This requires the `P` for the `filter_entry` to be the same as the one already applied. So this requires a second application of `filter_entry` to use the same type as the first. This means it's not possible to call `filter_entry` on a `WalkDir` twice with two different closures; instead, function pointers (or boxed closures) need to be used instead.
+
+I find it amusing it took so long to find this 😆 I guess 99.99% of use cases only need one filter. My workaround is to combine the two filters I was applying, though readability suffers for it.
+
+<details><summary>The snippet in question</summary>
+
+```rust
+    let dir = WalkDir::new(manifest_dir.join(attr.dir.value()));
+    let tests: Result<Vec<DirEntry>, _> = dir
+        .contents_first(true)
+        .into_iter()
+        .filter_entry(|entry: &DirEntry| entry.file_type().is_file())
+        .filter_entry(|entry: &DirEntry| {
+            ext.is_none()
+                || entry.path().extension().unwrap_or(OsStr::new("")) == &**ext.as_ref().unwrap()
+        })
+        .collect();
+```
+</details>
+
+The better impl would give `FilterEntry::filter_entry` the same signature as `IntoIter::filter_entry`:
+
+```rust
+impl<P> FilterEntry<IntoIter, P> where P: FnMut(&DirEntry) -> bool {
+    pub fn filter_entry<Q>(self, predicate: Q) -> FilterEntry<Self, Q>
+    where Q: FnMut(&DirEntry) -> bool
+    {
+        FilterEntry { it: self, predicate: predicate }
+    }
+}
+```
+
+IIUC this is a "major breaking" change as someone could have used an empty turbofish (e.g. [`let _: fn(_, fn(&_) -> _) -> _ = walkdir::FilterEntry::filter_entry::<>;`](https://play.rust-lang.org/?version=stable&mode=debug&edition=2018&gist=90ccacfef850b2b6881f769228119d86)) to observe the lack of generic arguments.
+When iterating over the WalkDir dictionary in Windows 10, rust stable 1.36, if the user does not have permission to read a directory, an error is given, but not the actual path.  When hitting an error with files, the path in the error is displayed but not with directories for some reason:
+
+> Error on entry 'Err(Error { depth: 2, inner: Io { path: None, err: Os { code: 5, kind: PermissionDenied, message: "Access is denied." } } })': Error { depth: 2, inner: Io { path: None, err: Os { code: 5, kind: PermissionDenied, message: "Access is denied." } } }
+
+
+
+```
+    for entry in WalkDir::new(some_path){
+        prepath = match &entry {
+            Ok(path) => { 
+                path
+            }
+            Err(err) => {
+                println!("Error on entry '{:?}': {:?}", entry, err);             
+                continue
+            }
+        };
+```
+I recently wrote a short test program using walkdir to count 6M files in a single directory.  I then wrote the same test program using `std::fs::read_dir`, and found a surprisingly large performance difference.
+
+To create the test data:
+```
+mkdir testdir
+(cd testdir ; seq 6000000 | xargs touch)
+```
+
+Using walkdir:
+
+```rust
+fn main() {
+    let dir = &std::env::args().nth(1).expect("Usage: countdir dirname");
+    println!("{}: {} files", dir, walkdir::WalkDir::new(dir).min_depth(1).max_depth(1).into_iter().count());
+}
+```
+
+Performance:
+```
+$ time target/release/countdir testdir
+testdir: 6000000 files
+
+real	0m3.476s
+user	0m1.308s
+sys	0m2.168s
+```
+
+Using `std::fs::read_dir`:
+
+```rust
+fn main() {
+    let dir = &std::env::args().nth(1).expect("Usage: countdir dirname");
+    println!("{}: {} files", dir, std::fs::read_dir(dir).expect("read_dir").count());
+}
+```
+
+```
+$ time target/release/countdir testdir
+testdir: 6000000 files
+
+real	0m2.716s
+user	0m0.580s
+sys	0m2.136s
+```
+
+Note that the two programs use almost the same system time, and strace shows them making almost exactly the same syscalls other than an extra `lstat` (which makes sense, as walkdir uses `std::fs::read_dir` underneath). However, walkdir uses a lot more user time.
+
+This seems worth investigating, to try to reduce the overhead.
+WalkDir cannot handle long paths that `find`  handles fine.
+
+```rust
+extern crate walkdir;
+use std::fs::create_dir;
+use std::env::{current_dir, set_current_dir};
+
+fn main() {
+    let dir = current_dir().unwrap();
+    let name = "a";
+    for i in 0..2200 {
+        if i % 100 == 0 {
+            println!("Create dir at level {}.", i);
+        }
+        current_dir().unwrap(); // this line shows that rust can handle it
+        create_dir(name).unwrap();
+        set_current_dir(name).unwrap();
+    }
+
+    for r in walkdir::WalkDir::new(dir) {
+        let entry = r.unwrap(); // this gives an error for long paths
+        let len = entry.path().to_string_lossy().len();
+        if len > 4090 {
+            println!("{}", len);
+        }
+    }
+}
+```
+```
+...
+Create dir at level 2100.
+4091
+4093
+4095
+4097
+thread 'main' panicked at 'called `Result::unwrap()` on an `Err` value: Error { depth: 2042, inner: Io { path: Some("/home/walkdir/a/a/.../a/a/a"), err: Error { repr: Os { code: 36, message: "File name too long" } } } }', src/libcore/result.rs:788
+note: Run with `RUST_BACKTRACE=1` for a backtrace.
+```

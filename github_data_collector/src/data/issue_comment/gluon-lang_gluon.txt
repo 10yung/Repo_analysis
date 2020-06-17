@@ -1,0 +1,271 @@
+Running the following example:
+```rust
+use gluon::vm::{primitive, record, ExternModule};
+use gluon::{import, new_vm, ThreadExt};
+use gluon_codegen::{Getable, VmType};
+
+#[derive(Getable, VmType)]
+#[gluon(vm_type = "shared_type.SharedType")]
+pub enum SharedType {
+    One(Box<SharedType>),
+    Zero,
+}
+fn fun(_t: SharedType) {}
+pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let vm = new_vm();
+    vm.load_script(
+        "shared_type",
+        r#"
+        type SharedType = | One SharedType | Zero
+        { SharedType }
+        "#,
+    )?;
+    import::add_extern_module(&vm, "native_fun", |vm| {
+        ExternModule::new(
+            vm,
+            record! {
+                fun => primitive!(1, fun),
+            },
+        )
+    });
+    vm.load_script(
+        "first_fun_import",
+        r#"
+        let { fun } = import! native_fun
+        27
+        "#,
+    )?;
+    // NOTE: This call is required HERE not before the previous load_script!
+    vm.run_io(true);
+    vm.run_expr::<()>(
+        "second_fun_import",
+        r#"
+        let { SharedType } = import! shared_type
+        let { fun } = import! native_fun
+        fun Zero
+        "#,
+    )?; //Causes unification error
+    Ok(())
+}
+
+fn main() {
+    if let Err(e) = run() {
+        panic!("{}", e);
+    }
+}
+```
+Results in the following error message:
+```
+thread 'main' panicked at 'error: Expected the following types to be equal
+Expected: shared_type.SharedType
+Found: shared_type.SharedType
+1 errors were found during unification:
+The use of self recursion in type `shared_type.SharedType` could not be unified.
+- <second_fun_import>:4:13
+  |
+4 |         fun Zero
+  |             ^^^^
+  |
+', src/main.rs:50:9
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace.
+```
+
+It seems like enabling IO between imports of the native function somehow causes the unification to fail. Are the "pre-io" and "post-io" Types internally different somehow?
+
+If anyone else encounters this, moving the `run_io` up (e.g., directly after creation) seems work around this bug.
+Gluon seems to deadlock when deserializing serialized values in some circumstances.
+
+Minimal reproduction: https://github.com/omegablitz/gluon-bug
+Utilizes some changes to salsa to perform all module compilation in
+parallel as long as a parallel future executor is supplied
+Running `gluon fmt` over the same file multiple times may yield differing outputs. I'm aware of two examples:
+
+ ## 1
+`gluon fmt` inserts an empty line after each line of some multi-line type signatures, even if an empty line is already present -- increasing the number of empty lines on every run. I haven't figured out the exact circumstances that trigger the bug, but it only occurs with multi-line type signatures and seems to occur more often when the constituent lines are long.
+
+For example
+```
+let gectvbzppia : alrkvbjaklbvapouhvgtbvvnaipryrbipajlkm
+        vhieurabrlvikbnvliaejnbae
+        vhieurabrlvikbnvliaejnbaeoribfhknjeanhbtbaejnbaetiekjnajkrhblbrfvbrkkajbevels
+        vhieurabrlvikbnvliaejnbaeoribfhknjeanhbtbaejnb
+        vhieurabrlvikbnvliaejn
+    =
+    x
+()
+```
+yields
+```
+let gectvbzppia : alrkvbjaklbvapouhvgtbvvnaipryrbipajlkm
+        vhieurabrlvikbnvliaejnbae
+        vhieurabrlvikbnvliaejnbaeoribfhknjeanhbtbaejnbaetiekjnajkrhblbrfvbrkkajbevels
+
+        vhieurabrlvikbnvliaejnbaeoribfhknjeanhbtbaejnb
+
+        vhieurabrlvikbnvliaejn
+
+    =
+    x
+()
+```
+
+## 2
+Applying `gluon fmt` to
+```
+let assert_success : [Show e] -> Eff [| error : Error e, writer : Test | r |] a -> Eff [| writer : Test | r |] ()
+    = run_error >> flat_map assert_ok
+()
+```
+once yields
+```
+let assert_success : [Show e]
+        -> Eff [| error : Error e, writer : Test | r |] a
+        -> Eff [| writer : Test | r |] ()
+
+    = run_error
+        >> flat_map assert_ok
+()
+```
+but twice yields
+```
+let assert_success : [Show e]
+        -> Eff [| error : Error e, writer : Test | r |] a
+        -> Eff [| writer : Test | r |] ()
+
+    = run_error >> flat_map assert_ok
+()
+```
+The interpreter fails to find implicit parameters in the REPL while interpreting files correctly.. Example below. The bug is present in ba66854b; I haven't checked earlier commits.
+
+```
+> let { map } = import! std.functor
+{ map: <map>, }
+> let list @ { functor = functor_list, ? } = import! std.list
+[cut for brevity...]
+> map (\x -> x + 4) (list.of [1,2,3,4])
+error: Implicit parameter with type `std.functor.Functor std.list.List` could not be resolved.
+- <line>:1:5
+  |
+1 | map (\x -> x + 4) (list.of [1,2,3,4])
+  |
+> map ?functor_list (\x -> x + 4) (list.of [1,2,3,4])
+Cons 5 (Cons 6 (Cons 7 (Cons 8 Nil)))
+```
+
+Since [operators](781) also seem to be malfunctioning, the issue may be with how the REPL handles attributes.
+The associativity of left-associative operators is being ignored in the REPL. Works properly when run from a file. The incorrect behavior occurs in ba66854b. I haven't checked any earlier commits.
+
+```
+> .\target\debug\gluon.exe -i
+gluon (:h for help, :q to quit)
+> let { (|>), (<|), id, flip, (>>), (<<), ? } = import! std.function
+[cut for brevity...]
+> let { map } = import! std.functor
+{ map: <map>, }
+> 4 |> (\x -> x + 4) |> (\x -> x * 2)
+error: Expected the following types to be equal
+Expected: Int -> Int
+Found: Int
+1 errors were found during unification:
+Types do not match:
+    Expected: Int -> Int
+    Found: Int
+- <line>:1:34
+  |
+1 | 4 |> (\x -> x + 4) |> (\x -> x * 2)
+  |
+
+error: Implicit parameter with type `std.num.Num (Int -> Int)` could not be resolved.
+- <line>:1:30
+  |
+1 | 4 |> (\x -> x + 4) |> (\x -> x * 2)
+  |
+> (4 |> (\x -> x + 4)) |> (\x -> x * 2)
+16
+```
+
+Since [implicits](782) also seem to be malfunctioning, the issue may be with how the REPL handles attributes.
+## Description
+Adds a `time` module to the standard library which exposes the functionality of Rust's `std::time`.
+
+## Status
+
+**In Development**
+
+### Outstanding design questions
+- [x] ~~How should `std.time` be structured -- `std.time.Instant.now`, `std.time.instant_now`, `std.instant.now`, or something else?~~ (`std.time.Instant.now`)
+- [x] ~~Should `std.time` be behind a feature? Should that feature be default?~~ (not behind feature)
+
+### To Do
+- [x] Implement all functionality in `std::time`
+  - [x] Implement types
+  - [x] Implement functions
+  - [x] Implement implicit interfaces (`Eq` and `Ord`)
+- [ ] Add documentation
+  - [ ] Generated std lib docs
+  - [ ] Examples
+  - [x] ~~In Rust code?~~ (no need)
+- [x] ~~Add tests~~ (no need)
+
+## Future Directions
+- Add more full-featured date-and-time functionality to the standard library? [Chrono](https://github.com/chronotope/chrono)?
+Is there a reason that `vm::api::Function::call` (and `call_async` and `call_fast_async`) take a mutable reference to `self`? The code compiles fine if they take immutable references.
+Constructing a type alias inside a record gives an "Undefined variable" error.
+
+# Example
+```gluon
+// This doesn't work
+{ MyInt = Int }
+
+// But this does
+type MyInt = Int
+{ MyInt }
+```
+# Error message
+```
+error: Undefined variable `Int`
+```
+Having more than 29 fields in the `record!` macro gives this error:
+```
+error: recursion limit reached while expanding the macro `stringify`
+...
+   = help: consider adding a `#![recursion_limit="128"]` attribute to your crate
+```
+
+Increasing the recursion limit as suggested by the compiler makes the error go away, but I assume the macro can be re-written in a non-recursive way to avoid this (I'm not well-versed in rust macros, though, so maybe not). On one hand though, having more than 29 fields is probably a good indication that it's time to split up modules, so maybe this should just stay as it is :).
+
+## Code Example
+```
+record! {
+    value1 => 1,
+    value2 => 2,
+    value3 => 3,
+    value4 => 4,
+    value5 => 5,
+    value6 => 6,
+    value7 => 7,
+    value8 => 8,
+    value9 => 9,
+    value10 => 10,
+    value11 => 11,
+    value12 => 12,
+    value13 => 13,
+    value14 => 14,
+    value15 => 15,
+    value16 => 16,
+    value17 => 17,
+    value18 => 18,
+    value19 => 19,
+    value20 => 20,
+    value21 => 21,
+    value22 => 22,
+    value23 => 23,
+    value24 => 24,
+    value25 => 25,
+    value26 => 26,
+    value27 => 27,
+    value28 => 28,
+    value29 => 29,
+    value30 => 30, // Having this triggers the error
+}
+```

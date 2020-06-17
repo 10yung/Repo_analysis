@@ -1,0 +1,75 @@
+This should improve the efficiency a bit, and the code readability in the `resolve()` function, with one less tab.
+
+There's no reason it shouldn't work with the stdlib hashset. Perhaps we can add a second method for this?
+The `serde-1` feature is still always compiled with its std feature, meaning that indexmap's serde feature is not no_std compatible.
+In some of the benchmarks, if I replace `.insert()` with code based on entry, the benchmarks run slower. If we could get these to performance parity, then we can delete the `.insert()` code, since it is duplicated by the functionality in `.entry()`.
+
+To test this, you can update insert to be like this (note `insert_full` uses `entry` right now):
+
+```rust
+    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+        self.insert_full(key, value).1
+    }
+```
+
+The following is the benchmark difference I see when using `entry` in `insert`.
+
+The hashmap benchmarks can be ignored - ordermap is the interesting part. (The hashmap benchmarks are controls.)
+
+Change from before to after. 
+```
+ name                                   63 ns/iter  62 ns/iter  diff ns/iter  diff % 
+ insert_hashmap_100_000                 2,488,863   2,504,113         15,250   0.61% 
+ insert_hashmap_10_000                  214,543     221,693            7,150   3.33% 
+ insert_hashmap_150                     3,210       3,339                129   4.02% 
+ insert_hashmap_int_bigvalue_10_000     262,701     264,518            1,817   0.69% 
+ insert_hashmap_str_10_000              236,377     247,805           11,428   4.83% 
+ insert_hashmap_string_10_000           1,117,104   1,148,170         31,066   2.78% 
+ insert_hashmap_string_oneshot_10_000   1,078,875   1,085,733          6,858   0.64% 
+ insert_orderedmap_100_000              2,727,119   3,874,446      1,147,327  42.07% 
+ insert_orderedmap_10_000               267,361     363,741           96,380  36.05% 
+ insert_orderedmap_150                  3,956       5,664              1,708  43.17% 
+ insert_orderedmap_int_bigvalue_10_000  359,582     413,168           53,586  14.90% 
+ insert_orderedmap_str_10_000           305,463     312,993            7,530   2.47% 
+ insert_orderedmap_string_10_000        1,066,189   1,091,526         25,337   2.38%
+```
+Add iterators that iterate a sliced key-value range (sliced in the
+order/index space).
+
+Before merging, we'll look at if it's not better to express using views (from #47).
+
+The main infidelity of the interface is the need to handle
+Bound::Exclusive(std::usize::MAX) which does not have an equivalent in
+the i..j or i..=j and slices can't handle it natively.
+
+The scaffolding in src/util to create the .slice() and .slice_mut()
+methods is somewhat verbose, but it allows us to write neat code where
+it is used.
+
+
+Fixes #103 
+I was hacking on the compiler and I wrote:
+```rust
+                    // We've rejected overlap in each product in the sum.
+                    // Now we must account for the possibility that or-pattern is a factor
+                    // in a product. A basic case to reject here is `(V1(a) | V2(a), a)`.
+                    let last_id = *prod_ids.last().unwrap();
+                    bindings.values_mut().skip(len_before).for_each(|val| *val = last_id);
+```
+which is nice.
+
+Maybe `bindings.values_mut_range(len_before..).for_each(..)` would be nicer?
+I would like to use ```IndexMap``` as a ```BTreeMap``` with faster reads and slower writes.
+But calling ```sort_keys()``` after every ```insert()``` is pretty slow.
+Would it be possible to have a ```insert_sorted()``` method that would just insert the element before the next bigger one?
+Instead of `#[cfg(features = "serde-1")]` which is bit counter-intuitive and not in consistency with rust ecosystem.
+This PR adds operations to `IndexMap` (and `IndexSet`) that allow an entry to be moved to a specific position in the iteration order, while preserving the order of all other entries. The operation's average computation time is proportional to the distance between the entry's current position and the new position, assuming that probing the hash table takes constant time on average.
+
+The PR requires an upgrade to Rust version 1.26, because it relies on the `rotate_left` and `rotate_right` methods of the slice type. If upgrading to 1.26 is deemed inappropriate at this time, it may be necessary to delay merging this PR.
+
+The new operations also may allow for an alternative implementation of `ordered_remove` (from PR #15), in which the element being removed is first moved to the end of the ordering, then `IndexMap::pop()` is called. This might be more efficient if the element to be removed is already close to the end. I haven't included that idea in the PR, but it could be considered if the PR is accepted.
+
+Please let me know if you find any problems in the PR that I need to fix. One thing I am unsure about is whether returning `Option<()>` is or is not an appropriate/idiomatic way of supporting error detection in a method that wouldn't normally return anything.
+
+### Use Case
+My use case for this PR is that I am planning to create a GUI application where the user can manage a list of items, including reordering the items by dragging and dropping an item in the list. Internally, the items may reference each other by a unique key. Ideally, I want to be able to look up an item efficiently by both its numerical index and its unique key. IndexMap seems like a good fit for this use case, and this PR would make it easier for me to implement the reordering through drag and drop.

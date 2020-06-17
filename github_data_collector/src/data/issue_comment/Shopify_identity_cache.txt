@@ -1,0 +1,217 @@
+@gmcgibbon Here is the CacheKeyLoader.batch_load implementation I mentioned https://github.com/Shopify/identity_cache/pull/420
+
+It can be used to replace load_multi, which I have done temporarily for testing, however, we can keep the load_multi implementation from https://github.com/Shopify/identity_cache/pull/420 as an optimization for the case where we are loading for a single cache fetcher.
+## Problem
+
+We want to be able to fetch cache keys across cache fetchers to reduce round trips for id embedded associations.  This means we need a common IdentityCache.fetch_multi, but then different cache keys will need to be resolved by different cache fetchers.
+
+## Solution
+
+Document a common interface for cache fetchers so that they can be used to batch load they cache key fetching together while also being able to resolve misses.  I've moved the generic cache key loading logic into a CacheKeyLoader singleton object, which can be extended with a `batch_load` method once we have some code to use it.
+
+I've opened up the draft PR https://github.com/Shopify/identity_cache/pull/421 showing an implementation of CacheKeyLoader.batch_load.
+##  Problem
+
+I would like a common cache fetcher interface that can be implemented for the primary index and cache attribute fetches.  However, loading by a single key or a multiple key works differently for cached attributes, since it doesn't support a fetch multi by a composite key. 
+
+## Solution
+
+Split Cached::Attribute into Cached::AttributeByOne and Cached::AttributeByMulti, sharing a common base class.  Only Cached::AttributeByOne of these supports fetch_multi.
+I have made a new rails app with these models on the latest master of identity_cache:
+
+`models/item.rb`
+```ruby
+class Item < ApplicationRecord
+  include IdentityCache
+
+  belongs_to :widget, polymorphic: true
+
+  cache_belongs_to :widget
+  cache_index :widget
+end
+```
+
+`models/foo_widget.rb`
+```ruby
+class FooWidget < ApplicationRecord
+  include IdentityCache
+
+  has_many :items, as: :widget
+
+  cache_has_many :items, inverse: :widget
+end
+```
+
+`models/bar_widget.rb`
+```ruby
+class BarWidget < ApplicationRecord
+  include IdentityCache
+
+  has_many :items, as: :widget
+
+  cache_has_many :items, inverse: :widget
+end
+```
+
+schema:
+```ruby
+class AddTables < ActiveRecord::Migration[5.2]
+  def change
+    create_table :items do |t|
+      t.bigint :widget_id, null: false
+      t.string :widget_type, null: false
+    end
+
+    create_table :foo_widgets
+
+    create_table :bar_widgets
+
+    add_index :items, %i[widget_type widget_id]
+  end
+end
+```
+
+I would like to be able to run this:
+
+```ruby
+widgets = FooWidget.fetch_multi([1, 2, 3])
+items = Item.fetch_multi_by_widget(widgets)
+```
+
+But, that generates an invalid SQL query:
+
+```
+ActiveRecord::StatementInvalid (SQLite3::SQLException: no such column: widget: SELECT widget, "items"."id" FROM "items" WHERE "items"."widget_type" = ? AND "items"."widget_id" IN (?, ?))
+```
+
+I can't change my cache_index to `cache_index :widget_id, :widget_type` because `fetch_multi_by` methods are only generated for cache_indexes with only one field.
+
+I used to be able to pass in arrays into the `fetch_by_widget_id_and_subject_type` methods in 0.5.1, but now that doesn't work on master (e.g. an array of widget_ids generates a SQL query with NULL as the widget_id value). [I guess was never the way those methods were intended to be used](https://github.com/Shopify/identity_cache/issues/356#issuecomment-332834251), but now I don't have a way to bulk fetch Items in a way that won't make N+1 queries when the cache is missed.
+I have a model where I'm including `IdentityCache`, let's call it `Foo`.  I don't necessarily want this model and all of its attributes cached, but I do want its relationship cached.  I have a relationship defined like:
+```
+cache_belongs_to :thing
+```
+The cache works just fine for doing things like calling `foo.fetch_thing`, but I noticed that when an attribute for the `Foo` model is updated, I get logging that looks like:
+```
+[IdentityCache] expiring=Foo expiring_id=2342 ...
+```
+and then more output saying that a `delete failed for IDC:7:blob:Foo:...`.
+So I guess my questions are:
+* By including the module, is `Foo` and its attributes being stored into cache whenever its called?
+* Any ideas why a `delete failed` would be consistently called when updating one of `Foo`'s attributes?
+* Is there a way to prevent `Foo` from being cached (since I only want it's association to be cached)?
+Given the following classes:
+
+```ruby
+class A < AR::Base
+  has_many :bs, inverse: :a
+  cache_has_many(:bs, embed: true)
+end
+
+class B < AR::Base
+  belongs_to :a, inverse: :bs
+
+  has_one :c
+  cache_has_one(:c, embed: true)
+end
+
+class C < AR::Base
+  has_many :b, inverse: :c
+end
+```
+when saving an instance of `C`, `B` gets removed from the cache, but not `A`. Thus, `B#fetch_c` returns the latest version but `A#fetch_bs` return a stale collection.
+
+
+I could reproduce this scenario as a failing test: https://github.com/Shopify/identity_cache/compare/ancestor-invalidation-failing
+
+Am I missing something or is this a bug?
+The issues here that talk about redis support are a little confusing.  Now that Rails includes `RedisCacheStore`, can that be used "out of the box" with `identity_cache`?
+
+Alternatively: we're already using the `redis-rails` gem for our caching; can we use this as a backend for `identity_cache`?
+While debugging N+1 queries, I found an unusual behaviour in IDC: when fetching records using a cached attribute, IDC produces two queries instead of one. The first query uses the cached attribute, while the second uses the primary key.
+
+After some investigation and some very helpful tips from coworkers, I managed to boil the issue down to this snippet:
+
+### 
+```ruby
+# migration file
+class CreateSampleRecords < ActiveRecord::Migration[5.2]
+  mark_as_podded_migration!
+
+  def up
+    create_table :sample_records do |t|
+      t.string :key
+      t.timestamps
+    end
+  end
+
+  def down
+    drop_table :sample_records
+  end
+end
+
+# ActiveRecord model
+class SampleRecord < ApplicationRecord
+  include IdentityCache
+  cache_index :key
+end
+```
+
+Then, on `rails console`:
+
+```
+[1] pry(main)> SampleRecord.create(key: '123')
+   (1.6ms)  BEGIN
+  SampleRecord Create (1.0ms)  INSERT INTO `sample_records` (`key`) VALUES ('123')
+   (2.3ms)  COMMIT
+=> #<SampleRecord:0x00007fa11061a158 id: 1, key: "123">
+[2] pry(main)> SampleRecord.fetch_by_key('123')
+   (1.4ms)  SELECT `sample_records`.`id` FROM `sample_records` WHERE `sample_records`.`key` = '123'
+  SampleRecord Load (0.9ms)  SELECT `sample_records`.* FROM `sample_records` WHERE `sample_records`.`id` = 2
+=> [#<SampleRecord:0x00007fa0f5169a70 id: 1, key: "123">]
+```
+
+I also tried with `unique: true`, it produces the same result.
+
+I might be wrong, but I would expect only one query to be produced by this snippet. The first query already fetches the desired record, I see no reason to search for the object again using the primary key.
+
+Thoughts?
+cc @csfrancis
+
+## Problem
+
+Currently there is a thundering herd problem when a cache key is invalidated and multiple readers get a cache miss before the first one fills the cache.  All the readers after the first one are redundant and this can cause a lot of load on the database, especially for records with a lot of embedded associations.
+
+## Solution
+
+Add support for using a fill lock when using the `fetch` and `fetch_by_id` class methods so the first cache miss takes a lock before filling the cache and following clients getting a cache miss do a lock wait for a short duration for the cache to be filled so they can read from the cache rather than from the database.
+
+This feature is opt-in through specifying the `fill_lock_duration` option to control how long to wait on the fill lock before reading the cache key again.  This should be set to just over the typical amount of time it takes to do a cache fill.  This way we typically will only have a single client fill the cache.
+
+After a lock wait, if the lock is still present (e.g. hasn't been replaced by the value) then the client doing the lock wait will try to take the lock and fill the cache value.  If the original lock is replaced by another client's lock, then that can cause other clients to do another lock wait to avoid a slow cache fill from resulting in a thundering herd problem.  The `lock_wait_limit` option controls how many times a client should wait for different locks before raising an IdentityCache::LockWaitTimeout exception.  It should be set to the maximum amount of time it would take for the cache to be filled outside of a service disruption causing the database to be excessively slow, so that we don't waste server capacity when there are unexpected delays.
+
+There is no performance impact for cache hits or cache invalidations.  There is no impact on performance for cache misses when not using the fill lock.  When using the fill lock, the client getting the first cache miss will make an extra `cas` memcached operation take the lock and an extra `get` operation that is needed to get the CAS token as part of the cache fill.  However, during a thundering herd scenario, most of the clients will only do 2 `get` memcached operations to read the lock then read the value after the lock wait.
+
+Cache invalidations could happen while a cache miss is being resolved which could prevent clients that are in a lock wait from reading the value after the lock wait.  In this case, a fallback key is used so that the client resolving the cache miss can store the value someplace where waiting clients can read it.  A data version that is stored in the lock value is used to derive the fallback key so that it isn't filled with stale data from the perspective of the client reading it.  The fallback key isn't normally written to during a cache fill, so a cache invalidation might also overwrite the value before the lock wait finishes, but this will just cause the waiting clients to take a fill lock on the fallback key which won't be overwritten by further cache invalidations.  If a key happens to be both read and write heavy, then the number of concurrent cache fills is still limited by the frequency of cache invalidations due to the fill lock being taken on the fallback key.
+
+If memcached is down, then lock waits are avoided and the database will be used without a cache fill.  If database exceptions interrupt the cache fill, then the fill failure is marked on the lock so other clients don't wait on the lock when they would otherwise fail fast by querying the database themselves.
+
+## Backwards compatibility
+
+This could be rolled out in a backwards and forwards compatible way by first deploying a commit to bump the gem so that it can handle the lock values, then using a following deploy to start using the fill lock.
+
+## Alternatives
+
+The lock wait was implemented by just using a sleep, so clients could sleep longer than necessary after the cache is filled.  One alternative would be to use redis which supports blocking operations (e.g. `BRPOPLPUSH`) so the value can be returned to other clients as soon as its available.  However, this could put a lot of additional load on redis to write to it for all cache fills and would add a new dependency that we would have to worry about failures for.
+
+Another alternative would be to keep stale values around after a cache invalidation so that we could fallback to stale data on a cache miss when the fill lock is taken.  This is what we do in the cacheable gem.  However, we would need to be careful with stale reads to make sure we don't fill another cache from the stale read (e.g. page cache) and to make sure we don't do stale reads where we can't tolerate stale data.  This would also reduce where we could use this solution.  There would also be a performance trade-off on cache invalidations if we needed to preserve the stale data while also marking it as stale.
+
+Write-through caching is another alternative.  However, this could add a lot of overhead to writes in order to fill the cache, especially when there are embedded associations.  If there are concurrent writes, then this could interrupt the `cas` operation needed to set the new value in the cache, which would need to be resolved by retrying using freshly queried database data.  This could have significant impact on models that are sometimes written heavily, even if in other cases they are read-heavy.  The significantly different trade-offs seem like they would reduce where we could use this solution.  Write-through caching seems like something that could be done a lot more efficiently by using the mysql binlog, which is a longer term project.
+
+## Not Implemented
+
+This PR doesn't implement support for `fetch_multi` and doesn't expose a way to provide a fill lock in all methods that do fetching.  However, we could expand support for this feature on an as needed basis.
+Hi,
+I'm trying to integrate kaminari with identity_cache. As the fetch_ method returns the records in Array I can't able to restrict the records on page-wise. Any good practices to implement it. 
+
+Thank you

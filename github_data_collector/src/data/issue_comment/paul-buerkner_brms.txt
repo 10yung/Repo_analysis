@@ -1,0 +1,99 @@
+Hi,
+
+(Config: Windows 10, `R` 3.6.2, `rstan` 2.19.2, `brms` 2.11.0)
+
+I've recently updated `brms` to the most recent CRAN version, and noticed it causes a problem that didn't exist before. When you have a multivariate model and you use `fitted.brmsfit` to get predictions while specifiying a `re_formula` argument, you can only get back predictions for the "first" response, and you now get an error for the second one (and presumably the third, fourth...).
+
+Here is an example using the blue tit dataset:
+
+``` r
+data("BTdata", package = "MCMCglmm")
+bf1 <- bf(back~(1|1|fosternest))
+bf2 <- bf(tarsus~(1|1|fosternest))
+mod <- brm(mvbf(bf1 + bf2),data=BTdata,iter=100,chains=2)
+fitted(mod,re_formula=~(1|fosternest),resp="back")
+fitted(mod,re_formula=~(1|fosternest),resp="tarsus")
+```
+The `fitted()` call for tarsus results in the following error:
+
+```
+Error in (function (A, x, max_level = max(x), weights = 1)  : 
+  length(x) == nrow(A) is not TRUE
+```
+Inverting bf1 and bf2 in mvbf() makes `fitted()` fail for back instead of tarsus; the error only appears if a re_formula argument is given.
+
+
+Anyway, thanks again for your great work on this package!
+
+Maxime
+This PR implements issue #708 which provides a major milestone in improving the consistency of the brms modelling interface.
+The model summary uses `l-95% CI` and `u-95% CI`; bayes_R2 uses `Q2.5` and `Q97.5`; loo_R2 doesn't show the CIs at all. I think I have seen something like `upper CI` and `lower CI` used too, but I cannot find where right now. Also, it might be worth reporting the R2 values to 2 decimal places, as are all the values in the main model summary.
+Looking at posterior predict is most of the time spent in the lapply [here](https://github.com/paul-buerkner/brms/blob/d34c3d3a36005fddabfb6b8c991e6127e4eeacba/R/posterior_predict.R#L131)?
+
+```R
+out <- lapply(seq_len(N), pp_fun, draws = object, ...)
+```
+
+could we just use mclapply there if `getOption("mc.cores", 2L)` is > 1?
+This is a suggestion that is a bit open on the details on the implementation, but it would be good if smooths could be used in the multilevel syntax, like this: 
+```
+y ~ s(x) + (s(x)|id)
+```
+I suppose that it will be the smoothness parameter (i.e. the standard deviation in the random effect formulation of smooths) that will be the parameter that is pooled.
+
+The reason for this suggestion is that it is very unintuitive how to specify the most similar model with mgcv syntax. mgcv just supports the same smoothness or unpooled different smoothness for group-level smooths.
+Distributional models are already well-implemented in brms (models allowing prediction of mean and variance parameters). Multivariate models are also well-implemented. It would be great if brms could also make it easy to implement covariance regressions, such as in this paper: https://doi.org/10.1177/0049124119882449. Example Stan code (for two outcomes) is provided by the authors in the Supplemental Material section (https://journals.sagepub.com/doi/suppl/10.1177/0049124119882449).
+It might be useful to model the scale parameter (for distribution families with such parameters) as an observation-level random effect (OLRE) as a way to enable "residual" correlation between different distribution familes. (Albeit I am not sure whether this is a flawed reasoning or not).
+
+As an example, one might want to model the correlation between the Poisson OLRE and the standard deviation of a gaussian model, like this:
+bf(poisson_mean ~ 1 + x + (1|c|obs))+poisson()+
+bf(gaussian_mean ~ 1 + x + (1|c|obs))+gaussian()
+
+One workaround today is to fix the gaussian sigma to 1 (adding sigma ~ 1). I suppose that this is a valid approach since the correlation is independent of the size of the standard deviations of both random intercepts. 
+
+My suggestion is to add some kind of special response term for the sigma to note that the correlation between that parameter and the random intercept for the Poisson model should be modeled, something like this:
+bf(poisson_mean ~ 1 + x + (1|c|obs))+poisson()+
+bf(gaussian_mean ~ 1 + x, sigma|cor(c)~1)+gaussian()
+
+I suppose that would be possible to extend to correlation of other response terms as well. 
+Both rstanarm and brms have `posterior_predict` with different arguments, and sometimes do the same.
+It would be useful that when I use `draws`, for example, instead of `nsamples` in `posterior_predict`, it would either accept it or throw an error. Now, it silently ignores it.
+
+The ability to fix parameters has been requested in several places, for instance, in https://discourse.mc-stan.org/t/fixing-gp-parameters-in-brms/10928/4. 
+
+Fixing parameters to certain values is a special case of prior specification with a point mass (delta distribution basically) and so the prior argument seems a natural place to put this feature in.
+
+@bbbales2 proposed to use the `fixed()` prior name as in
+
+```R
+set_prior("fixed(1.5)", class = "sd")
+```
+
+which seems reasonable to me. As this feature touches a lot of other features, the internal interface created for this purpose needs to be carefully designed and take special cases into account where we want to fix only certian values of a parameter vector, for example.
+Say we are modeling a distributional parameter, like the example in the vignette:
+
+```
+zinb <- read.csv("https://paul-buerkner.github.io/data/fish.csv")
+
+fit_zinb2 <- brm(bf(count ~ persons + child + camper,
+                       zi ~ child), 
+                 data = zinb,
+                 family = zero_inflated_poisson())
+```
+and we want to get a fitted value for the distributional parameter for a particular predictor value:
+
+```
+fitted(fit_zinb2,
+       newdata = data.frame(child = 2),
+       dpar = "zi")
+```
+we get the following error:
+
+`Error: The following variables are missing in 'data':
+'persons', 'camper'`
+
+even though the model for zi does not include those variables, which are only in the model for the count response. 
+
+This is a very minor issue, but it would be ideal if the code checked the variables in the newdata dataframe against the model for the dpar. 
+
+

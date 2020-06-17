@@ -1,0 +1,141 @@
+I am sure I must have a problem in my `pom.xml` or similar. If I override any number of tests and run them individually, every test works. When I run them as a suite I get 21 or so failures.
+
+See the overrides (commented out) here:
+
+https://github.com/vlingo/vlingo-streams/blob/a51e7a107e9218077c74203e7377351557f0a74f/vlingo-streams-tck/src/test/java/io/vlingo/reactivestreams/StreamPublisherCompatibilityTest.java#L167
+
+If I test as follows it passes:
+
+```
+mvn -Dtest=StreamPublisherCompatibilityTest#required_spec317_mustSupportACumulativePendingElementCountUpToLongMaxValue clean test
+````
+
+If I test as follows it fails several tests:
+
+```
+mvn -Dtest=StreamPublisherCompatibilityTest clean test
+````
+
+I have attempted to adjust the timeouts to allow potentially slow tests, but it makes no difference.
+
+https://github.com/vlingo/vlingo-streams/blob/a51e7a107e9218077c74203e7377351557f0a74f/vlingo-streams-tck/src/test/java/io/vlingo/reactivestreams/StreamPublisherCompatibilityTest.java#L25
+
+Any pointers in running TestNG or whatever is much appreciated.
+When the publisher is subscribed to, and an ```onSubscribe``` signal is to be scheduled, the executor can reject the drain task. It appears that ```tryScheduleToExecute``` anticipates this failure, but it assumes that the subscriber's ```onSubscribe``` has been called and calls ```onError``` directly. As stated above this might not be the case. For example, the following tck test fail: 
+```java
+@Test
+public class AsyncIterablePubisherTest extends PublisherVerification<Long> {
+
+  public AsyncIterablePubisherTest() {
+    super(new TestEnvironment());
+  }
+
+  @Override
+  public Publisher<Long> createPublisher(long elements) {
+    return new AsyncIterablePublisher<>(LongStream.range(0, elements)::iterator,
+        ForkJoinPool.commonPool());
+  }
+
+  @Override
+  public Publisher<Long> createFailedPublisher() {
+    return new AsyncIterablePublisher<>(List.of(1L, 2L, 3L), r -> {
+      throw new RejectedExecutionException("Sorry but I'm really busy");
+    });
+  }
+}
+```
+The failed tests are ```optional_spec104_mustSignalOnErrorWhenFails``` and ```required_spec109_mayRejectCallsToSubscribeIfPublisherIsUnableOrUnwillingToServeThemRejectionMustTriggerOnErrorAfterOnSubscribe```.
+I think simply using a ```subscribed``` flag fixes the issue; The flag is set to true in ```doSubscribe``` and checked in ```terminateDueToError```, passing a NOOP subscription downstream if not set. But I'm interested as to what really should happen on that case when the executor throws. Doesn't this mean that the publisher can no longer hold the contract of passing downstream signals on the supplied executor ? Shouldn't this be considered as fatal and the subscription should indicate that by rethrowing ?
+I've skimmed through Java 9's ```SubmissionPublisher``` and it looks like any ```RuntimeException``` or ```Error``` thrown from the executor is directly rethrown after cancelling the subscription.
+I'm interested to know what is the wisest thing to do as i'm implementing an async publisher with a similar setup.
+Thanks for any help in advance!
+The examples do not compile. Instead of createSubscriber(), the classes need to implement
+createFlowSubscriber. There are still some issues left.
+The examples in the documentation regarding black box and white box testing for subscribers don't compile.
+I could fix a couple of small issues, and we could discuss a bigger change required to have a real example, and put it in another ticket.
+
+
+There are two tests in `SubscriberBlackboxVerification` that verify conformance to Rule 2.3:
+
+> `Subscriber.onComplete()` and `Subscriber.onError(Throwable t)` MUST NOT call any methods on the `Subscription` or the `Publisher`.
+
+I can see that this is done by examining the call stack, looking for the specific methods' names:
+```java
+        final Subscription subs = new Subscription() {
+          @Override
+          public void request(long n) {
+            Throwable thr = new Throwable();
+            for (StackTraceElement stackElem : thr.getStackTrace()) {
+              if (stackElem.getMethodName().equals("onError")) {
+                env.flop(String.format("Subscription::request MUST NOT be called from Subscriber::onError (Rule 2.3)! (Caller: %s::%s line %d)",
+                                       stackElem.getClassName(), stackElem.getMethodName(), stackElem.getLineNumber()));
+              }
+            }
+          }
+
+          @Override
+          public void cancel() {
+            Throwable thr = new Throwable();
+            for (StackTraceElement stackElem : thr.getStackTrace()) {
+              if (stackElem.getMethodName().equals("onError")) {
+                env.flop(String.format("Subscription::cancel MUST NOT be called from Subscriber::onError (Rule 2.3)! (Caller: %s::%s line %d)",
+                                       stackElem.getClassName(), stackElem.getMethodName(), stackElem.getLineNumber()));
+              }
+            }
+          }
+        };
+```
+
+It seems to do the job, however, the approach might be brittle. The reason is that approach is not specific enough. It might produce false positives as it disregards the objects on which `onError` and `onComplete` are called. A method can be similarly named, but otherwise unrelated. Or the method can be called on a different `Subscriber` (i.e. calling `subscription1.cancel()` from `subscriber2.onComplete()`).
+
+Could a `ThreadLocal<Boolean>` flag solution be any better? Before calling `onError` on `onComplete` on `Subscriber` the test sets that flag. Upon exit from those methods the flag is cleared. Inside `Subscription`'s `cancel` and `request(long)` the flag is being checked.
+```java
+      @Override
+      public void run(BlackboxTestStage stage) throws InterruptedException {
+        triggerRequest(stage.subProxy().sub());
+        final long requested = stage.expectRequest();// assuming subscriber wants to consume elements...
+        final long signalsToEmit = Math.min(requested, 512); // protecting against Subscriber which sends ridiculously large demand
+
+        // should cope with up to requested number of elements
+        for (int i = 0; i < signalsToEmit && sampleIsCancelled(stage, i, 10); i++)
+          stage.signalNext();
+
+        // we complete after `signalsToEmit` (which can be less than `requested`),
+        // which is legal under https://github.com/reactive-streams/reactive-streams-jvm#1.2
+        stage.sendCompletion();
+      }
+
+      /**
+       * In order to allow some "skid" and not check state on each iteration,
+       * only check {@code stage.isCancelled} every {@code checkInterval}'th iteration.
+       */
+      private boolean sampleIsCancelled(BlackboxTestStage stage, int i, int checkInterval) throws InterruptedException {
+        if (i % checkInterval == 0) return stage.isCancelled();
+        else return false;
+      }
+```
+I have a question about the use of the `sampleIsCancelled` method in the snippet above. It seems strange that the `for` loop uses that method's (naked) return value rather than a negation thereof. As far as I can see in the typical scenario it leads to the loop's body being executed at most once. Was it by design?
+## Question
+
+Currently Reactive Streams dependency has a license of [CC0](https://creativecommons.org/publicdomain/zero/1.0/)
+
+**Issue** - Due to some reason the place where I work have some legal issue with the license. 
+
+> Main concern regarding the license is that patent rights are expressly reserved. The license is only for copyright which eventually creates a risk of an IP claim.
+
+Is there any way if reactive-streams can be offered under Apache-2.0 license?? 
+
+Based on Supplier, for the case you don't know the count of elements
+(for example streaming from a file, etc).
+
+Publisher is controlled by the null value - enf of stream.
+I think the following tests could be meaningfully implemented:
+
+- `untested_spec107_mustNotEmitFurtherSignalsOnceOnErrorHasBeenSignalled`
+  - Ask for a error publisher, let it fail, then request(10) and check for no further events
+- `untested_spec108_possiblyCanceledSubscriptionShouldNotReceiveOnErrorOrOnCompleteSignals`
+  - Ask for a 0 length `Publisher` and cancel from within `onSubscribe`, then see if `onComplete` was emitted or not. If not, pass the test, if it was emitted, skip the test.
+  - Ask for a 1 length `Publisher`, cancel in `onNext` after the first item, etc.
+  - Ask for an error `Publisher`  and cancel from within `onSubscribe`, etc.
+
+(Also it depends on #354).

@@ -1,0 +1,69 @@
+This PR aims to resolve issues in high packet loss network reported in #4472 
+
+On one hand, this PR aims to reduce invalid SRV_DATA.ntf, for example
+First commit is used to clear cached CoAP message when RLOC changes in case before successfully register SRV_DATA, the child server switches to a different parent.
+Second commit ensures the SRV_DATA.ntf intervals when detecting network data inconsistence after hearing neighboring Mle Advertisemennt
+
+On the other hand, this PR aims to remove stable network data. In the high packet loss network, there is chance that both SRV_DATA.ntf from the server child after switching parent and the SRV_DATA.ntf from old parent for deregister and lost, when the child tries to register again (without old child rloc16 now), the old child rloc16 server entry would be still there. This PR introduce a feedback mechanism - the parent
+of the old child rloc16 would explicitly deregister the service again if destiantion unreachable when receiving ALOC destined packet.
+However as to how long would it take to recover fresh network data, it may depend on Service Aloc destined traffic. 
+This is the second of 3 PRs addressing the efr32mg12 radio driver.
+
+PR# 2: Implements correctly setting `mAckedWithFramePending` (See #4358).
+
+**The idea is the following:** when receiving an IEEE802.15.4 Data Request Command, RAIL generates an event and calls `RAILCb_Generic` as early as possible (even before the packet is fully received; i.e. the CRC could be still wrong), from interrupt context.
+
+In `RAILCb_Generic`, the driver calls `ieee802154DataRequestCommand`, which in turn decides whether to set the Frame Pending flag for the outgoing ACK, by analysing the soft source match table. If the Frame Pending flag is set, we have to report `mAckedWithFramePending = true` when we pass the Data Request Command packet to the upper layers.
+
+Since the Data Request Command packet is held in the callback and passed to the upper layers in `processNextRxPacket`, and the Parent can receive multiple Data Request Commands from different children back-to-back before calling `processNextRxPacket`, one cannot simply set a flag in the callback to signal `processNextRxPacket` that the Data Request Command was acked with Frame Pending.
+
+The proposed solution is to insert a "unique identifier" of the Data Request Command packet into a FIFO when the ACK was sent with the Frame Pending flag is set. Then, for each Data Request Command packet that `processNextRxPacket` will pass to the upper layer, it will pop the "unique identifiers" from the FIFO searching for a match. If the identifier is found, `mAckedWithFramePending` will be set to `true`.
+
+The "unique identifier" is actually the contents of the packet being received (PHR + MAC Header), because the `RAIL_GetRxIncomingPacketInfo` does not return a `RAIL_RxPacketHandle_t`.
+
+When `processNextRxPacket` pops a unique identifier from the FIFO:
+- It pops the Data Request Command packets in sync with the RAIL RX FIFO, so that the packets are correctly matched.
+- It discards the packets which could be inserted to the FIFO without passing the CRC check.
+
+The FIFO size is set to 16 entries, which should be the maximum that RAIL can hold in its internal metadata FIFO (see https://docs.silabs.com/rail/latest/efr32-main).
+
+Note: I think this method (with some modifications) could be compatible with the Thread 1.2 Enhanced Frame Pending feature.
+
+Without this PR (empty data packets):
+![image](https://user-images.githubusercontent.com/17166563/72649213-cf3e5f80-395b-11ea-85d4-1d6ee4f13dad.png)
+
+With this PR (no empty data packets):
+![image](https://user-images.githubusercontent.com/17166563/72649252-eaa96a80-395b-11ea-997f-69eb79f01c5e.png)
+
+@andrasbiro-silabs please review. If you have a better idea on how to uniquely identify the packets, please let me know; you are the RAIL expert.
+
+Thanks!
+
+This PR adds the possibility of specifying per-message transmission parameters to CoAP requests/responses.
+
+See #4470 
+
+@sjlongland @jwhui please review. When everything is ok, I'll try to update Secure CoAP.
+
+Thanks.
+In openthread stack, by default child supervision is disabled.
+So how or when does mtd re-attach process is enabled in case child supervison is disabled.
+
+
+SED sends one data point every 30 seconds if it is connected and increments the counter, but if it is detached or disabled, it does nothing.
+Polling period is of 15 seconds, and child timeout is 30 seconds.
+I am facing the issue that SED don't send data for sometime but when it again starts sending data , its counter is continuous.
+So what does it mean to be in connected state for a SED?
+
+Fixes #4442 
+Add a new `OPENTHREAD_CONFIG_ENABLE_BUILTIN_MBEDTLS_MANAGEMENT` flag to configure builtin mbedtls buffer/debug management separately from the existing flag which configures the inclusion of the builtin mbedtls library in the build.
+
+This adjusts the conditional compilation sections added in [#3575](https://github.com/openthread/openthread/pull/3575) to use the new config flag so that it may be controlled separately from the existing flag. The default behavior should remain unchanged: if `--enable-builtin-mbedtls=yes` is used then builtin mbedtls management is enabled by default, and if `--enable-builtin-mbedtls=no` is used then builtin mbedtls management is disabled by default.
+Lately an issue with Service ALOCs was found and fixed #4424 
+
+Currently we observe second part of the same problem. 
+A child service registers its RLOC in the Leader and it is added to the list but all old RLOCs are not removed. As a result we have 1 server node but multiple Server TLV (0d 02 RLOC16) entries in the network data mostly pointing to some old RLOCs.
+
+During ALOC routing some routers route packet to a valid RLOC but some pick an invalid one and packets are lost.
+
+Im missing something or specification is not addressing this problem too.

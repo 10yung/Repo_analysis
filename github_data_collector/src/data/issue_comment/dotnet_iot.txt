@@ -1,0 +1,206 @@
+I have an application which drives a bunch of i2c chips on the same bus. I create an instance of I2cDevice for each chip. Sometimes I experience, that the try-catch around I2CDevice.Write() logs exception and sometimes I can kill the whole panel (I need to power cycle it). So the question is the implementation of write method thread-safe, or I have to ensure it manually?
+Some devices are connected using Bluetooth Low Energy (BLE). This is supported in Xamarin for example on the diverse platforms. Is there any plan to have similar support for .NET Core?
+It doesn't seem to be used anywhere and breaks Stylecop
+
+
+I've just run (Linux Release) CI tests 50 times in a row and out of 50 runs 6 failed with following failures:
+
+5x (Fix pending https://github.com/dotnet/iot/pull/945):
+
+```
+    System.Device.Gpio.Tests.RaspberryPiDriverTests.InputPullResistorsWork [FAIL]
+      Assert.Equal() Failure
+      Expected: Low
+      Actual:   High
+      Stack Trace:
+        /_/src/System.Device.Gpio.Tests/RaspberryPiDriverTests.Linux.cs(34,0): at System.Device.Gpio.Tests.RaspberryPiDriverTests.InputPullResistorsWork()
+```
+
+1x:
+
+```
+    System.Device.Gpio.Tests.SysFsDriverTests.AddCallbackFallingEdgeNotDetectedTest [FAIL]
+      Assert.False() Failure
+      Expected: False
+      Actual:   True
+      Stack Trace:
+        /_/src/System.Device.Gpio.Tests/GpioControllerTestBase.cs(176,0): at System.Device.Gpio.Tests.GpioControllerTestBase.AddCallbackFallingEdgeNotDetectedTest()
+```
+
+cc: @pgrawehr @joperezr
+
+We should try to understand the failures and if this is by design then retry or remove the test
+This might not actually be a bug but it's something that we might need to discuss.
+
+I was testing the framework, and created the following scenario:
+- Have an app that deals with turning a light on and off
+- Have another app that checks if a led is on, and if so do something else.
+
+Essentially, we will have 2 controllers that will use the same pin.
+
+From my understanding, 1 controller should only work with a set of pins, and it should not "play around" with pins used by another controller. 
+
+**Steps to reproduce**
+
+```csharp
+using System;
+using System.Device.Gpio;
+using System.Threading;
+
+namespace temp
+{
+    class Program
+    {
+        static void Main(string[] args)
+        {
+			GpioController controller1 = new GpioController();
+			controller1.OpenPin(10, PinMode.Output);
+			controller1.Write(10, PinValue.High);
+			Thread.Sleep(5000);
+			GpioController controller2 = new GpioController();
+			controller2.OpenPin(10, PinMode.Input);
+			controller2.Read(10);
+
+			controller1.ClosePin(10);
+			controller2.ClosePin(10);
+        }
+    }
+}
+
+```
+
+**Expected behavior**
+I would expect to be able to read the value and the pin keep the same state (High - meaning the led is on).
+
+**Actual behavior**
+The LED turns on, but when I read the value from it, it reports as LOW and the LED turns off, although it was expected to be HIGH.
+
+If I try to simplify (this might actually be another issue, let me know if I should create another)  and do:
+- First app turns ON the LED and exits (closes the pin and ends)
+- As soon as I close the Pin, the LED turns off because the state is set to LOW. (why does this even happen?)
+- Second app will always read low, since the first app set it to LOW when closed the pin
+
+**Versions used**
+
+Add following information:
+
+- `dotnet --info` on the machine being used to build
+```
+.NET Core SDK (reflecting any global.json):
+ Version:   2.2.402
+ Commit:    c7f2f96116
+
+Runtime Environment:
+ OS Name:     Windows
+ OS Version:  10.0.18363
+ OS Platform: Windows
+ RID:         win10-x64
+ Base Path:   C:\Program Files\dotnet\sdk\2.2.402\
+
+Host (useful for support):
+  Version: 2.2.7
+  Commit:  b1e29ae826
+
+.NET Core SDKs installed:
+  2.2.402 [C:\Program Files\dotnet\sdk]
+
+.NET Core runtimes installed:
+  Microsoft.AspNetCore.All 2.2.7 [C:\Program Files\dotnet\shared\Microsoft.AspNetCore.All]
+  Microsoft.AspNetCore.App 2.2.7 [C:\Program Files\dotnet\shared\Microsoft.AspNetCore.App]
+  Microsoft.NETCore.App 2.2.7 [C:\Program Files\dotnet\shared\Microsoft.NETCore.App]```
+
+- `dotnet --info` on the machine where app is being run (not applicable for self-contained apps)
+```
+  It was not possible to find any installed .NET Core SDKs
+  Did you mean to run .NET Core SDK commands? Install a .NET Core SDK from:
+      https://aka.ms/dotnet-download
+
+Host (useful for support):
+  Version: 3.0.0
+  Commit:  7d57652f33
+
+.NET Core SDKs installed:
+  No SDKs were found.
+
+.NET Core runtimes installed:
+  Microsoft.AspNetCore.App 3.0.0 [/home/pi/dotnet/shared/Microsoft.AspNetCore.App]
+  Microsoft.NETCore.App 3.0.0 [/home/pi/dotnet/shared/Microsoft.NETCore.App]
+
+To install additional .NET Core runtimes or SDKs:
+  https://aka.ms/dotnet-download```
+- Version of `System.Device.Gpio` package: Version="1.0.0"
+
+SoftwarePwm implementation is currently failing on Windows. The implementation is platform independent and when I tried it locally on Linux against #758 it was passing all tests (possibly they were flaky - I've tried maybe 3 times). On Windows the values on ADC input (or PWM output after low pass filter) were close to expected value but slightly outside of the expected range. We should try to improve the implementation as much as possible.
+
+I know at minimum room for improvement:
+- frequency is slightly lower than the set frequency, i.e. setting freq to 10kHz actually produces around 9.7kHz
+- possibly duty cycle is not exactly accurate - we should verify how much off we are and if there is something we can do to improve
+
+As part of this work pwm should be re-enabled on Windows or in simpler words following lines should be removed:
+https://github.com/dotnet/iot/pull/758/files#diff-8ac02b215975e2d4379aff2ff01fcf52R49-R50
+
+Note: hardware PWM is currently not supported by default by Windows IoT Core on Raspberry PI (it's possible to do it with external libraries only)
+DCMotor should have namespace which is different than the type name. Having same name causes that in many scenarios it's required to type DCMotor.DCMotor in order to make sure the expression is non-ambigious.
+
+Perhaps DCMotor and Servo should be in the same namespace: `Iot.Device.Motor(s)`
+By default SoftwarePwm does not use precision timer (precise while loop) which is causing that you can't exactly get reliably frequency - that is fine for servo motors but not exactly for any other use. Under oscilloscope I'm getting around 50Hz (shifts between 47.2Hz - 50Hz with most time spent exactly on 50Hz) by default even though it should be 400Hz.
+
+We should consider removing this argument and automatically pick the right method based on the passed in frequency since for anything other than servo motor this is likely not satisfactory.
+
+cc: @Ellerbach
+**Describe the bug**
+The variable at will never be in "pressed" state, as **the waitResult.EventTypes does not returns the type of the current event**, but it returns the events we're listening to, so it's value is a [Flag] value: PinEventTypes.Rising | PinEventTypes.Failing see: https://github.com/dotnet/iot/blob/ae9ba984e1b637807185d648cb1c208d13f8db3e/tools/DevicesApiTester/Commands/Gpio/GpioButtonWait.cs#L76
+
+For starters is there a HOW TO PDF?
+
+For anyone interesting in any button event, keep this in mind:
+1. pressing and releasing the button will fire both events
+2. some HW might behave weird (like mine is able to fire one of the events twice if pressed in quick sequence, but the touch sensor works as expected)
+
+A clear and concise description of what the bug is.
+Just a wrong output to console, but it's a misleading stuff for starters.
+
+**Steps to reproduce**
+Just see the console output when pressing/releasing the button.
+
+**Expected behavior**
+So while the current code does behave as expected and just the output is not correct (expectations from some lines in the code are simply not fulfilled)...a proper way to check if button was just pressed can be achieved with a callback, see code below:
+```csharp
+                    controller.RegisterCallbackForPinValueChangedEvent(
+                        buttonPin,
+                        inputEvents,
+                        (object sender, PinValueChangedEventArgs pinValueChangedEventArgs) =>
+                        {
+                            Debug.WriteLine($"{DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff")} Btn event: {pinValueChangedEventArgs.ChangeType}");
+
+                            if (pinValueChangedEventArgs.ChangeType == PinEventTypes.Rising)
+                            {
+                                isOn = !isOn;
+                                controller.Write(ledPin, isOn ? PinValue.High : PinValue.Low);
+                            }
+                        }
+                        );
+```
+
+**Actual behavior**
+Just wrong output and well, bad expectations (badly set pressedOrReleased variable).
+
+**Versions used**
+Latest 2020/01
+RPI 3B+
+.NET Core 3.1
+
+After upgrading `System.Device.Gpio` and `Iot.Device.Bindings` from `0.1.0-prerelease.19307.2` to `1.0.0`, I noticed my `Ssd1306` no longer resets the position correctly when attempting to use the [SendMessage](https://github.com/dotnet/iot/blob/master/src/devices/Ssd13xx/samples/Ssd13xx.Sample.cs#L140-L150) method like I was using before.
+
+First call, should just be the time with milliseconds, but notice the odd leading character
+![image](https://user-images.githubusercontent.com/177476/71773869-e1b7a280-2f32-11ea-8b60-5770cd9d542e.png)
+
+Second call, should have again just been the time with milliseconds "written over" the first call but it was instead "appended" (with an odd character prefix) even though Column and Page addresses were set.
+![image](https://user-images.githubusercontent.com/177476/71773871-f2681880-2f32-11ea-8df1-3f2ea0e63845.png)
+
+Looking closer at the supplied [sample](https://github.com/dotnet/iot/tree/master/src/devices/Ssd13xx/samples), it appears the use of `SendMessage` has been [commented out](https://github.com/dotnet/iot/blob/master/src/devices/Ssd13xx/samples/Ssd13xx.Sample.cs#L43-L44) which leads me to the following questions:
+
+- Will this be re-supported at some point?  My assumption is this was broken when [Ssd1327](https://github.com/dotnet/iot/commit/b39333e181c9539758cc62173e8f9d82f86476b0#diff-66a06fbfbf3cf0bfef923d8740c29161) support was added, but I could be wrong.
+- I noticed [DisplayClock](https://github.com/dotnet/iot/blob/master/src/devices/Ssd13xx/samples/Ssd13xx.Sample.cs#L209-L240) uses `SixLabors.Fonts` / `SixLabors.ImageSharp` packages to render with more than the basic font.  While I'm not overly keen on using another package, is this the approach I should use now to rendering text to the OLED?  It does enable more functionality (more fonts, graphics, etc)
+
+Btw, I can run the full [sample](https://github.com/dotnet/iot/blob/master/src/devices/Ssd13xx/samples/Ssd13xx.Sample.cs) as is and get expected results, but if I uncomment the `SendMessage` calls, I get shifted results for the full demo (images, etc)

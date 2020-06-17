@@ -1,0 +1,211 @@
+Part of a fix for andywer/threads-plugin#13.
+Hi, I'm trying to use threads.js in a project bootstrapped with vue-cli and [Vue CLI Plugin Electron Builder](https://github.com/nklayman/vue-cli-plugin-electron-builder). To start, I'm creating a minimal example:
+
+1. Bootstrap the vue-cli Hello World project with `vue create threadtest`
+2. `vue add electron-builder`
+3. Configure webpack:
+```js
+// vue.config.js
+const ThreadsPlugin = require("threads-plugin");
+
+module.exports = {
+  configureWebpack: {
+    externals: {
+      "tiny-worker": "tiny-worker"
+    },
+    plugins: [new ThreadsPlugin()]
+  }
+};
+```
+4. Add imports for threads usage (I don't need anything beyond the import to trigger the error)
+```js
+// src/App.vue
+import { spawn, Thread, Worker } from "threads";
+```
+
+**The problem:** Webpack compiles the app without issue, but I get a runtime error:
+
+```
+Uncaught TypeError: Object(...) is not a function
+    at eval (index.js?25f1:6)
+    at Module../node_modules/threads/dist-esm/master/index.js (chunk-vendors.js:1411)
+    at __webpack_require__ (app.js:786)
+    at fn (app.js:151)
+    at eval (index.js?833b:1)
+    at Module../node_modules/threads/dist-esm/index.js (chunk-vendors.js:1363)
+    at __webpack_require__ (app.js:786)
+    at fn (app.js:151)
+    at eval (cjs.js?!./node_modules/babel-loader/lib/index.js!./node_modules/cache-loader/dist/cjs.js?!./node_modules/vue-loader/lib/index.js?!./src/App.vue?vue&type=script&lang=js&:3)
+    at Module../node_modules/cache-loader/dist/cjs.js?!./node_modules/babel-loader/lib/index.js!./node_modules/cache-loader/dist/cjs.js?!./node_modules/vue-loader/lib/index.js?!./src/App.vue?vue&type=script&lang=js& (app.js:875)
+```
+
+Following stack trace into index.js...
+```
+// index.js
+import { selectWorkerImplementation } from "./implementation";
+export { Pool } from "./pool";
+export { spawn } from "./spawn";
+export { Thread } from "./thread";
+/** Worker implementation. Either web worker or a node.js Worker class. */
+export const Worker = selectWorkerImplementation(); // error happens on this line: Uncaught TypeError: Object(...) is not a function
+```
+
+I've tried all of the suggestions in somewhat-similar looking https://github.com/andywer/threads.js/issues/194 but no luck. Any suggestions?
+We should manually shutdown process if `SIGTERM`/`SIGINT` listeners are installed
+
+nodejs docs (https://nodejs.org/dist/latest-v12.x/docs/api/process.html#process_signal_events)
+> 'SIGTERM' and 'SIGINT' have default handlers on non-Windows platforms that reset the terminal mode before exiting with code 128 + signal number. **If one of these signals has a listener installed, its default behavior will be removed** (Node.js will no longer exit).
+
+tiny-worker docs (https://github.com/avoidwork/tiny-worker#faq)
+> In your core script register a listener for SIGTERM or SIGINT via process.on() which terminates (all) worker process(es) and then gracefully shutdowns via process.exit(0);
+
+**Example:**
+Problem: `cluster` workers don't shutdown because `theads.js` has invalid SIGTERM listener.
+
+```js
+// cluster.js
+
+const cluster = require('cluster');
+
+if (cluster.isMaster) {
+    console.log(`Master ${ process.pid } is running`);
+
+    cluster.fork();
+
+    cluster.on('exit', (worker, code, signal) => {
+        console.log(`worker ${ worker.process.pid } died`);
+    });
+} else {
+    const { spawn, Worker } = require('threads');
+
+    spawn(new Worker('./worker.js'));
+    console.log(`Worker ${ process.pid } started`);
+}
+
+```
+
+```js
+// worker.js
+
+const { expose } = require('threads/worker');
+
+expose(() => 'hello from worker');
+```
+
+Run
+```
+$ node --version
+v12.14.1
+$ node cluster.js
+Master 64701 is running
+Worker 64702 started
+```
+
+```
+$ kill 64702
+# nothing happens... But we should see "worker 64702 died"
+# PR fixes this problem
+```
+I can't call worker and transfer function, for example. `worker.postMessage` will throw DataCloneError
+
+https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Structured_clone_algorithm
+Add fromScript function to use script directly.
+Hi,
+
+I am trying to import a worker in electron (I am using electron-webpack) main thread and I get the following error:
+Error: Cannot find module '0.bundle.worker.js'.
+
+Does this library support electron main thread and electron renderer thread?
+
+ 
+Hello, @andywer , thanks to develop `threads.js`. I want to use it for implementing web worker into my web app.
+
+I want to move redux offline store initialization into web worker using `threads.js`. Although it can be achieved in [this tutorial](https://dassur.ma/things/react-redux-comlink/) with `comlink` and `rollup`, I want to implement it with `webpack` and `threads.js`.
+
+Unfortunately, I got error like this
+```sh
+Error: Failed to execute 'postMessage' on 'DedicatedWorkerGlobalScope': function (action) {
+        if (typeof action === 'function') {
+          return action(dispatch, getState, ext...<omitted>... } could not be cloned.
+    at Object.postMessageToMaster (implementation.browser.js:9)
+    at postJobResultMessage (index.js:73)
+    at eval (index.js:107)
+    at Generator.next (<anonymous>)
+    at fulfilled (index.js:5)
+``` 
+
+If I dont use `redux-thunk` as one of redux middleware, I still get same error with different message
+```sh
+Error: Failed to execute 'postMessage' on 'DedicatedWorkerGlobalScope': function dispatch(action) {
+    if (!isPlainObject(action)) {
+      throw new Error('Actions must be plain obje...<omitted>... } could not be cloned.
+    at Object.postMessageToMaster (implementation.browser.js:9)
+    at postJobResultMessage (index.js:73)
+    at eval (index.js:107)
+    at Generator.next (<anonymous>)
+    at fulfilled (index.js:5)
+```
+
+Here is source codes of worker
+```js
+import { createStore, applyMiddleware } from 'redux'
+import { persistStore } from 'redux-persist'
+import { composeWithDevTools } from 'redux-devtools-extension'
+import thunk from 'redux-thunk'
+import { expose } from 'threads/worker'
+
+import { appReducer } from './reducers'
+
+const composeEnhancer = composeWithDevTools({})
+
+const appMiddleware = applyMiddleware(thunk);
+
+expose(function initStore () {
+  const store = createStore(
+    appReducer,
+    process.env.NODE_ENV === 'production'
+      ? compose(appMiddleware)
+      : composeEnhancer(appMiddleware)
+    )
+  const persistor = persistStore(store)
+  return {
+    store,
+    persistor
+  }
+})
+
+```
+
+And here is source codes for main thread (`spawn` and `Worker` has been imported)
+```js
+async componentDidMount () {
+    try {
+      const initStore = await spawn(new Worker("../path/to/worker"));
+      const { store, persistor } = await initStore()
+      this.setState({ store, persistor })
+      await initLiff();
+    } catch (error) {
+      console.log(error)
+    }
+  }
+```
+Version 1.0 comes without a UMD build, so you cannot just use threads.js via a good old 1997-style `<script src="..."></script>` tag.
+
+Do you feel we should still provide one? Vote here 😉
+Hi there,
+
+This looks like a fantastic library.  However I really need to support IE11 and I cannot find a browser support matrix in your docs...  Am I missing it?
+
+Thanks!
+Kind regards,
+Jack
+Allow exposing a worker's functionality to other workers using [MessageChannel](https://developer.mozilla.org/en-US/docs/Web/API/MessageChannel).
+
+Workers must handle a new meta message transferring a pair of message ports and listen on it / send to it, too, not just the main thread.
+
+# To Do
+
+- Allow communication using arbitrary MessagePort instances
+- Allow passing a MessagePort to spawn() (maybe rather create a new function)
+- Add Thread.isTerminatable()
+- Export MessageChannel & MessagePort

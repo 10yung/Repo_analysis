@@ -1,0 +1,104 @@
+stubbee -> stubba_object, mock_owner -> stubbee
+
+stubbee is the thing that's stubbed - more specifically, the object on
+which .stubs or .mocks is called. Therefore, it's also the object that
+holds a reference to mocha. That's why it was called mock_owner earlier.
+
+stubba_object is the object through which we get hold of the
+stubba_class on which stubbed methods reside. In case of AnyInstance,
+that class is the stubba_object itself, while in case of Instance, it's
+the singleton class of the stubba_object.
+
+This is consistent with the meaning and usage of stubba_object and
+stubba_class methods in ObjectMethods and AnyInstance.
+This is my attempt to fix https://github.com/freerange/mocha/issues/461
+Although _mocha_ does not claim to be thread-safe; this change slowly
+makes it more resilient to race conditions through use of mocha.
+
+A method on an object/class may be stubbed & invoked prior to the
+expectation being added to the list. In such a scenario, the
+method_missing in `mock.rb` would raise an exception for unknown
+invocation.
+
+Smply add a if-guard that checks that the expectation list is not empty.
+
+fixes #461
+A common example of using _mocha_ is to stub Time to return a fixed time.
+For instance,
+```ruby
+now = Time.now
+Time.stubs(:now).returns(now)
+```
+
+However if there is a separate thread running which tries to invoke the stubbed method (specifically on non-GIL interpreters like JRuby), we've encountered a race condition in that the mocha will raise an exception that the expectations have not been met.
+
+here is a simple example:
+
+```ruby
+  def test_mocha_thread_safety
+    Thread.new do
+      500.times do
+        # just loop and call Time#now a bunch while the thread above keeps stubbing
+        Time.now
+      end
+    end
+
+    now = Time.now
+    500.times do
+      # the two mechanisms involve different stubbing code, wso lets test both
+      Time.stubs(:now).returns(now)
+    end
+
+  end
+```
+
+Looking through the code; the result seems to be due to the `mock.rb` not being protected with a critical section.
+
+```ruby
+    def stubs(method_name_or_hash, backtrace = nil)
+      iterator = ArgumentIterator.new(method_name_or_hash)
+      iterator.each do |*args|
+        method_name = args.shift
+        ensure_method_not_already_defined(method_name)
+        expectation = Expectation.new(self, method_name, backtrace)
+        expectation.at_least(0)
+        expectation.returns(args.shift) unless args.empty?
+        @expectations.add(expectation)
+      end
+    end
+```
+
+Specifically if `@expectations.add(expectation)` is not executed but the method has been _stubbed_, then the `method_missing` in _mock_ will raise an exception since there is no expectation to match against.
+
+stubs + method_missing need to share the same mutex and become a critical section
+or
+method_missing should not raise if expectations is empty
+
+
+Very similar to #468. In fact, there's overlap between the two that can be cleaned up once/if we merge both of them.
+
+The idea behind both of these PRs is to reveal
+ - the underlying themes and similarities/variations on a number of axes - method owner (class, superclass, module, etc.), stubbee/stub_owner (class, instance, any_instance) and visibility (public, protected, private), and configuration/treatment (allow, warn, prevent) of various stubbing actions (non-existent method, non-public method, method on nil, etc.)
+ - that the purpose of the whole bunch of tests if to really check a small number of things for a larger number of scenarios combining elements of the axes mentioned above.
+
+Also, the two PRs together get rid of all the rubocop Lint/DuplicateMethod disables.
+Extract StubMethodSharedTests module to check stubbing of public, protected and private methods on Module, Class, Instance, and AnyInstance under various conditions. The only difference in each case is the `method_owner` and the `callee`, and sometimes the `stubbee` or `alias_method?`. The shared module allows us specify just the varying parts of the fixture and makes the commonality of the checks more apparent and easier to understand, and to reason about scenarios across all types of stubbees more easily.
+
+Rubocop approves, too, since we could get rid of most of Lint/DuplicateMethod disables.
+- https://github.com/freerange/mocha/blob/master/test/acceptance/stub_class_method_defined_on_active_record_association_proxy_test.rb
+- https://github.com/freerange/mocha/blob/master/test/acceptance/stub_instance_method_defined_on_active_record_association_proxy_test.rb
+- https://github.com/freerange/mocha/blob/master/test/acceptance/stub_module_method_test.rb
+- https://github.com/freerange/mocha/blob/master/test/acceptance/stub_any_instance_method_test.rb
+
+Note that the last two files contain the active record association proxy checks, which is inconsistent structurally with the first two.
+
+I'm not sure that these tests are checking anything useful anymore. They rely on overridden definitions of `{public,protected,private}_methods`, but code relying directly on those methods was removed here: https://github.com/freerange/mocha/pull/370/files#diff-7add531727acb1fd9092b0285edac68aL163-L173.
+
+Not sure if the overrides still indirectly affect the SUT in a meaningful way, which is possible if `{public,protected,private}_method_defined?` internally rely on them (which I doubt).
+
+... and nowhere to catch it
+
+
+Display deprecation warning when adding an expectation if the expectation list
+already contains any expectations. The intent is to change method dispatch
+behavior to that of jMock v2 as suggested in #173 in a major version release.

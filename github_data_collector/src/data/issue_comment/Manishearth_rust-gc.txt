@@ -1,0 +1,132 @@
+i128 is now stable.
+The following code doesn't work
+
+```rust
+use gc::Trace;
+use gc_derive::{Finalize, Trace};
+
+#[derive(Trace, Finalize)]
+struct X(Box<dyn Trace>);
+```
+
+This is because `gc_derive` doesn't support `dyn` keyword.
+Similar to `std::cell::Ref::map`.
+Hi, it would be really neat if some more arrays sizes than just the numbers 0 to 31 implemented Trace and Finalize. Would you be open to adding the next few powers of two as well?
+
+(I actually only need `[T; 32]`, having to wrap these in a newtype when the crate supports arrays up to 31 is oddly frustrating. And `[T; 32]`, `[T; 64]` etc are probably more common than, say, `[T; 29]`.)
+Can you wrap a trait object in a `Gc`? I would like to be able to write something like [this](https://play.integer32.com/?version=stable&mode=debug&edition=2018&gist=36a9cb1379e33a97ba0a21a1b5c93c20). As a workaround, I am currently creating a `Gc<Box<dyn MyTrait>>`, but I don't really like the indirection. I am trying to use `Gc` the way you would use a `Box` or `Rc` with trait objects.
+Is there a way to ergonomically add impls for other crates? Possibly via optional deps on e.g. `either`, `void`, `smallvec`, etc.
+I've got a type `Expr<C>`, where `C` is a phantom type, that I'm trying to GC. The derive generates:
+
+```rust
+        unsafe impl<C: 'static + Context> ::gc::Trace for Expr<C>
+        where
+            Gc<Expr<C>>: ::gc::Trace,
+            C: ::gc::Trace,
+            Vec<Gc<Expr<C>>>: ::gc::Trace,
+            Gc<Args<C>>: ::gc::Trace,
+            Gc<Value<C>>: ::gc::Trace,
+// ...
+```
+
+The `C: ::gc::Trace` bound is incorrect; I'd like there to be an attribute to disable it, for example:
+
+```rust
+#[derive(Finalize, Trace)]
+#[gc_derive(phantom = "C")]
+pub enum Expr<C: 'static + Context> {
+// ...
+```
+
+I think this is a case of https://xkcd.com/1172/, because it used to work (while now I get a compiler stack overflow).
+
+---
+
+**EDIT**: Confirmed as a regression from gc_derive 0.3.1; setting the Cargo.toml version to `=0.3.1` resolves this, as a short term fix.
+```
+error[E0599]: no function or associated item named `new_unchecked` found for type `std::ptr::Shared<_>` in the current scope
+  --> /home/kevincox/.cargo/registry/src/github.com-1ecc6299db9ec823/gc-0.3.2/src/lib.rs:87:37
+   |
+87 |                 ptr_root: Cell::new(Shared::new_unchecked(ptr.as_ptr())),
+   |                                     ^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no function or associated item named `new_unchecked` found for type `std::ptr::Shared<_>` in the current scope
+   --> /home/kevincox/.cargo/registry/src/github.com-1ecc6299db9ec823/gc-0.3.2/src/lib.rs:101:5
+    |
+101 |     Shared::new_unchecked(ptr)
+    |     ^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no function or associated item named `new_unchecked` found for type `std::ptr::Shared<_>` in the current scope
+   --> /home/kevincox/.cargo/registry/src/github.com-1ecc6299db9ec823/gc-0.3.2/src/lib.rs:112:27
+    |
+112 |         self.ptr_root.set(Shared::new_unchecked(ptr));
+    |                           ^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no function or associated item named `new_unchecked` found for type `std::ptr::Shared<_>` in the current scope
+   --> /home/kevincox/.cargo/registry/src/github.com-1ecc6299db9ec823/gc-0.3.2/src/gc.rs:114:44
+    |
+114 |             st.boxes_start = Some(unsafe { Shared::new_unchecked(gcbox) });
+    |                                            ^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no function or associated item named `new_unchecked` found for type `std::ptr::Shared<_>` in the current scope
+   --> /home/kevincox/.cargo/registry/src/github.com-1ecc6299db9ec823/gc-0.3.2/src/gc.rs:120:22
+    |
+120 |             unsafe { Shared::new_unchecked(gcbox) }
+    |           
+```
+I started using this crate for my prolog interpreter (it's great, thank you for making it!).
+
+I'd to make my interpreter do hash consing of the terms. Actually, I already made this change, but since there is no weak version of the `Gc` type, my interpreter now never collects anything. The reason is because the `HashSet` I use to store terms has a strong reference so once a term is inserted into my heap, it lives forever. Normally, when implementing hash-consing you store weak references in the hashset.
+
+Basically, I want to write code like this:
+```rust
+type TermSet   = HashSet<WeakGc<Term>>;
+pub struct Heap {
+    terms:   TermSet,
+}
+// Check if `t` is already in the HashSet. If it is, then return
+// a strong reference to it.
+// if `t` is not in the HashSet, add it and return a strong reference to it.
+fn insert_thing<A>(heap: &mut HashSet<Gc<A>>, t: A) -> Gc<A>
+    where A: Trace,
+          Gc<A>: Eq,
+          Gc<A>: Hash
+{
+        let gc_thing = Gc::new(t);
+        match heap.get(&gc_thing.downgrade()) {
+            Some(gc) => return gc.upgrade().unwrap_or(gc_thing.clone()),
+            None     => ()
+        }
+        heap.insert(gc_thing.downgrade());
+        gc_thing
+}
+impl Heap {
+    pub fn new() -> Self {
+        Heap {
+            terms:   HashSet::new(),
+        }
+    }
+
+    pub fn insert_term(&mut self, t: Term) -> Gc<Term>
+    {
+        insert_thing(&mut self.terms, t)
+    }
+}
+```
+
+I tried something similar using `Rc` and `Weak` from `std` (even though cycles would cause issues), but I noticed `Weak` doesn't implement `Hash` and `Eq` so they can't be used as keys in a `HashMap` (and by extension, a `HashSet`). I don't know if that is due to the way dereferening `Weak` works or what. Perhaps I'll also need a custom collection type. Anyway, do you think that would be an issue here as well?
+
+Would a weak version of `Gc` be hard to add? I haven't looked at the code yet, but if it's not too hard I might try adding one.
+
+Would there be significant downsides/dangers to having methods:
+
+```rust
+fn into_raw(gc: Gc<T>) -> *const T { ... }
+unsafe fn from_raw(ptr: *const T) -> Gc<T> { ... }
+```
+
+analogously to [`Rc::into_raw`](https://doc.rust-lang.org/std/rc/struct.Rc.html#method.into_raw), [`Rc::from_raw`](https://doc.rust-lang.org/std/rc/struct.Rc.html#method.from_raw)?
+
+I want to store a `Gc`'d value across an FFI boundary (for use in a callback), while keeping it rooted; are there any huge dangers here versus doing the same with an `Rc`?
+
+The alternative would be boxing up the `Gc`, then going `Box<Gc<T>> -> *const Gc<T>` and converting it back to a `Box<Gc<T>>` once I'm on the Rust side, I suppose. Either way, it'd be nice to have the `{into,from}_raw` functions.

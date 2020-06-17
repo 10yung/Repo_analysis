@@ -1,0 +1,294 @@
+In the ["releasing" section of the docs](https://www.python-httpx.org/contributing/#releasing) we mention maintainers should go over the changes and add entries to the changelog.
+
+I noticed [other projects](https://github.com/hynek/structlog/blob/master/CHANGELOG.rst) add entries to it [as part of PRs](https://github.com/hynek/structlog/pull/240/files) which seemed like an idea we could adopt to reduce the amount of work on a release?
+
+I realize that exact example this doesn't play very well with SemVer as it forces us to write a version number that might be change depending on other PRs that are merged. Though we could simply state `## UNRELEASED` or something until we actually cut the release.
+
+Thoughts?
+Fixes https://github.com/encode/httpx/issues/779
+
+Use the [same logic from `proxy_http`](https://github.com/encode/httpx/blob/master/httpx/dispatch/proxy_http.py#L83-L96) in the `Proxy` config, e.g. detects if credentials are present in the proxy URL and adds the authorization header accordingly. Also remove the credentials for the URL.
+When doing something like this
+
+```
+proxy = {
+     'http' : 'http://user:pass@X.X.X.X:YY',
+     'https' : 'http://user:pass@X.X.X.X:YY'
+}
+
+def run_sync(url):
+    with httpx.Client(verify=False, proxies=proxy) as client:
+        response = client.get(url)
+        print(response)
+```
+
+```
+>>> run_sync('http://www.google.com')
+<Response [407 Proxy Authentication Required]>
+```
+
+For a private proxy that includes authentication, the request will fail with a "Proxy Authentication Required" error. I think httpx is doing something like this:
+
+```
+>>> from urllib3 import ProxyManager
+>>> proxy = urllib3.ProxyManager('http://user:pass@x.x.x.x:yy')
+>>> x = proxy.request('GET', 'http://google.com/')
+>>> x.status
+407
+```
+
+instead of this
+
+```
+>>> from urllib3 import ProxyManager, make_headers
+>>> default_headers = make_headers(proxy_basic_auth='user:pass')
+>>> proxy = urllib3.ProxyManager('http://x.x.x.x:yy', headers=default_headers)
+>>> x = proxy.request('GET', 'http://google.com/')
+>>> x.status
+200
+```
+I slept some more on #765, and I think I've come up with something quite nice.
+
+Main changes compared to #765:
+
+- We always use an exponential backoff, so no more `Schedule` API. Just a `backoff_factor` know on the retries config class.
+- The default behavior is to retry on connection failures. No more `RetryableError` base class — which of our exceptions are retryable is hard-coded in the default behavior.
+- Being able to override `.retry_flow()` isn't really useful *in itself*, because *extending a retry flow* (even by copy-pasting our code) *really isn't easy*, due to many generator gotchas to watch for. So this PR implements *some* extension capability, mainly via the `RetryLimits` interface and being able to pass . I guess **in an incremental approach we could restrict this PR** to `retries=<int>` and `retries=Retries(<int>[, backoff_factor=<float>])`, and move the extension mechanism to a separate/future PR. I'm putting everything in here first to get some more feedback on the direction.
+
+Things still to do:
+
+- Per-request `retries`.
+- Sync `retries`.
+- Add tests. (This won't be easy, as there are *many* code paths to account for! Hence probably the motivation for splitting this in two steps...)
+
+Notes to reviewers:
+
+- Read the new docs for an overview of the functionality.
+- Use this script to try things out... Usage:
+  - `HTTPX_LOG_LEVEL=debug python example.py` *without starting the server*, to try the behavior on connection failures.
+  - Start the dummy server: `uvicorn example:app`
+  - Re-run the script, to try the custom behavior implemented by `RetryOnStatusCodes`.
+  - While retries are ongoing, you can turn off the server, and see that it switches to retrying on connection failures again. If you get the server back up, it will retry on status codes, etc. This continues until either policy runs out of retries. Which I think is quite nice/resilient. :-)
+
+```python
+import asyncio
+import typing
+
+import httpx
+from starlette.responses import PlainTextResponse
+
+
+class RetryOnStatusCodes(httpx.RetryLimits):
+    def __init__(self, limit: int, status_codes: typing.Container[int]) -> None:
+        self.limit = limit
+        self.status_codes = status_codes
+
+    def retry_flow(
+        self, request: httpx.Request
+    ) -> typing.Generator[httpx.Request, httpx.Response, None]:
+        retries_left = self.limit
+
+        while True:
+            response = yield request
+
+            if response.status_code not in self.status_codes:
+                return
+
+            if retries_left == 0:
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPError as exc:
+                    raise httpx.TooManyRetries(exc, response=response)
+                else:
+                    raise httpx.TooManyRetries(response=response)
+
+            retries_left -= 1
+
+
+async def main() -> None:
+    url = "http://localhost:8000"
+    retries = httpx.Retries(
+        4, RetryOnStatusCodes(limit=4, status_codes={413, 429, 503}), backoff_factor=1,
+    )
+    async with httpx.AsyncClient(retries=retries) as client:
+        r = await client.get(url)
+        print(r)
+
+
+async def app(scope, receive, send):
+    response = PlainTextResponse(status_code=503)
+    await response(scope, receive, send)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+`async def http_upload():
+    async with httpx.AsyncClient(verify=False) as client:
+        data_path = os.path.join(PARENT_PATH, 'data_file/blob/data')
+        index_path = os.path.join(PARENT_PATH, 'data_file/blob/index')
+        files = {
+            "upload_file": [
+                open(data_path, 'rb'),
+                open(index_path, 'rb'),
+            ]
+        }
+        # files = [
+        #     ("upload_file", open(data_path, 'rb')),
+        #     ("upload_file", open(index_path, 'rb'))
+        # ]
+        params = {
+            "requestId": "10001",
+            "sdkVersion": "V1.2.3",
+            "area": "CH"
+        }
+
+        response = await session.post(url, data=params, files=files)`
+
+self = <httpx.content_streams.MultipartStream.FileField object at 0x7f503c22ea60>
+
+    def render_data(self) -> bytes:
+        if isinstance(self.file, str):
+            content = self.file
+        else:
+>           content = self.file.read()
+E           AttributeError: 'list' object has no attribute 'read'
+
+or
+    def iter_fields(
+        self, data: dict, files: dict
+    ) -> typing.Iterator[typing.Union["FileField", "DataField"]]:
+        for name, value in data.items():
+            if isinstance(value, (list, dict)):
+                for item in value:
+                    yield self.DataField(name=name, value=item)
+            else:
+                yield self.DataField(name=name, value=value)
+
+>       for name, value in files.items():
+E       AttributeError: 'list' object has no attribute 'items'
+
+Excuse me, how should I use。
+I was reading the excellent https://medium.com/@shnatsel/smoke-testing-rust-http-clients-b8f2ee5db4e6 and wanted to test the awesome httpx just for fun
+
+It mentions this issue https://github.com/algesten/ureq/issues/28 about setting a timeout for request completion, which would make sense for both the sync and the async case, which I think would be a nice addition the the high level api (I think it can already be done with the stream api and read_timeouts, I was wondering if there was a higher level way)
+
+
+Edit: see how aiohttp handles timeouts https://docs.aiohttp.org/en/stable/client_quickstart.html#timeouts
+Currently httpx only provides the requests equivalent `.elapsed` property on `Response` objects.
+
+It would be very useful if more fine grained timing information would be available.
+From working with curl the following have been helpful:
+- name resolution
+- tcp connected
+- protocol connected (e.g. TLS done)
+- request last byte sent
+- response first byte arrived
+- total (e.g. what `.elapsed` is now)
+
+Of course this all becomes a bit more complicated with pooled connections, keep-alive, http2, etc.
+I've noticed a couple of projects lately which use private module names inside the package...
+
+* https://github.com/python-hyper/h11/tree/master/h11
+* https://github.com/oremanj/tricycle/tree/master/tricycle
+
+I'd initially found it an odd style, but actually it's a really smart approach, that helps you enforce that only the top-level API that you're exposing is actually public API.
+
+For example, right now users might do something like...
+
+```python
+from httpx.config import SSLConfig
+from httpx.models import Origin
+from httpx.auth import FunctionAuth
+```
+
+None of which are actually considered public API by us, but that's not immediately obvious to the user.
+ 
+We've mentioned in chat or elsewher (I don't recall) that we really want to ensure our users are only ever using `import httpx` or `from httpx import <SOMETHING>`, and *yes* we could simply mention that in our documentation. But *actually* it'd be far clearer if we actually used private module names, and *enforced* that users would be aware if they choose to import and use non-public API.
+
+This isn't *strictly* a breaking API change, but we *would* only want to make it on a median version bump (0.12.0 or 1.0.0), since it's likely that at least *some* of our users are currently using sub-module import styles.
+
+We'd also want to update our test cases so that we're using public API wherever possible, and so that it's clearer where there are cases that we're using private API (which would either indicate unit-testing to an extent, or that we've got some part of API that we're planning to expose, but haven't yet finalised on.)
+
+I think we might also want to do a bit of rejigging of how we handle `__all__` with this too. We probably don't *actually* want to support `from httpx import *`.
+
+Somewhat related to this is that we've got a bunch of methods on classes that we don't document, aren't treating as public API, and probably ought to move into private methods. (Eg. on the `Client` everything "below" `.build_request` and `.send` should probably be private API.) However, let's treat that as a seperate issue to be discussed.
+*This issue isn't neccessarily something that I think we ought to do, or not do. However, since we've got our public API pretty squared away now, and are starting to think about a 1.0 release, it's something that we really ought to discuss, and make sure we're absolutely happy with whatever we land on.*
+
+Something that's come up as a *possible?* point of design contention has been if `AsyncClient` ought to strictly only provide a context-managed interface, or if we're okay with supporting `__init__` and, optionally calling `.aclose()`.
+
+Currently we're supporting either style, and that's working fine for our users, but...
+
+* If we ever wanted to support background tasks, then structured concurrency means we'd want the client instances to be context-managed, so that we've got well defined lifetimes for any background running tasks.
+* The context managed style also means strictly managed resource managment. Connections have well-scoped lifetimes, rather than "cleanup on interpreter exit". 
+
+Do we *need* to be able to support background tasks. Well, *possibly*.
+
+We don't strictly need background tasks to support our HTTP/2 implementation, so long as we're using HTTP/1.1 shortish timeouts, on connections that have no activity. (If we're not running a background task on it, then if there's no request/response activity progressing the connection, then we won't respond to HTTP/2 pings, and servers will time us out.)
+
+However, if we *did* have background tasks then...
+
+* We could have nicer HTTP/1.1 keep-alive timeouts, where we actually properly expire connections in the background after their timeout period.
+* We could optionally support long-lived HTTP/2 connections, holding onto a connection for longer periods of time in order to provide lower latency when the next request *is* made.
+
+Also, I've *no* idea how this ties in with HTTP/3.
+
+Other relevant factors here:
+
+* It's also possible that some limited kinds of global tasks *might* at some point be supported by `trio` https://github.com/python-trio/hip/issues/125
+* One reason I was initially reticant about strictly enforcing context managed async clients is that I wasn't clear how that'd fit in with the ASGI style, but having put some more thought in there it's clear that it can fit in with ASGI's lifespan messaging. Eg: https://github.com/encode/starlette/pull/799
+* We'd be suggesting a deliberate disparity with the sync case, which is a bit odd. I don't think we'd want to / be able to enforce context managed sync clients. It wouldn't work with WSGI, and anyways we'd like folks to be able to switch over from using `requests` to using `httpx`, and we wouldn't be able to justify the constraint. It's also less valuable since we wouldn't be running background tasks in the sync case *anyways*, so it'd only be relevant wrt. clean connection lifetimes.
+* Simply having an async context managed class doesn't actually tie in fully with "And we'd like a nursery available within this context" See conversation around https://gitter.im/python-trio/general?at=5e20aa33ad195a0f671cc071 - You *can* do it with some clever metaclassing, or you can potnentially call directly into the nursery `__aenter__` and `__aexit__`, but it might not *neccessarily?* be the API we'd want to adopt if we wanted a nusery available within `AsyncClient`. (I think we'd *probably?* on ok ground here tho' - there's options available.)
+
+I don't have any clear answer on this. What we've got at the moment is working fine for our users, but it's feasible that adopting the more constrained option could prevent issues further down the line?
+
+
+**What is the dispatcher API, and why is it useful?...**
+
+The dispatcher is the part of the system that's responsible for actually sending the request and returning a response to the client. Having an API to override the dispatcher used by the client allows you to take complete control over that process, and switch out the default behaviour with something else.
+
+For instance the "plug in to a WSGI app" and "plug in to an ASGI app" cases that we support are implemented as dispatcher classes, that send the request to a Python web application, rather than sending a network request.
+
+**Currently the dispatchers are considered private API, but really we'd like a public API here at some point. This issue is for discussing what we think that API should be.**
+
+Right now the API is...
+
+```python
+ def send(request: Request, timeout: Timeout = None) -> Response:
+    ...
+
+def close():
+    ...
+```
+
+With`async` equivelents for the async case.
+
+That's actually pretty okay, but if we're looking at a public API, we ought to figure out if it's actually what we want to expose. There's a case to be made for making the dispatcher API just take plain primitive datastructures, rather than dealing with `Request`/`Response` models. That'd make for a more portable interface, that could be used in other packages without importing `httpx`.
+
+That might look *something* like this...
+
+```python
+def send(self, verb: bytes, url: bytes, headers: List[Tuple[bytes, bytes]], body: Iterator[bytes], timeout: Timeout = None):
+    ...
+    return (protocol, status_code, status_message, headers, response_body)
+
+def close():
+    ...
+```
+
+Both the request and response bodies would be byte-iterable, closable interfaces (or byte async-iterable, closable interfaces). Everything else would be plain ol' Python datastructures.
+
+Thoughts:
+
+* It's feasible that `url` *could* be defined as a tuple or url components instead, so that we can keep pass a *parsed* url objects from the client to a dispatcher interface?
+* We *do* need to have the timeout be part of the dispatch interface, since we want to be able to support configured-per-request timeout values - I'd guess we'd need to define that as an optional four-tuple of connect/read/write/pool float timeout values.
+* We might want to think about defining expected exception types.
+* There's no support for HTTP trailing headers in this interface. Perhaps we don't care about that, or could the `ContentStream.close()` perhaps optionally return a list of headers, maybe?
+
+Something that'd potentially be interesting about defining this interface in a really strict, primitive datastructures way, would be that we *could* pull out our dispatcher implementations into a really tightly scoped package `httpcore`, that'd just provide the plain network dispatchers, without any client smarts around them. (Interesting amongst other things because it'd provide a nice just-the-network-backend for other client libs to potentially use too / switch too.)
+
+**I think a useful first take onto all of this might? be an exploratory pull request that switches us over to using a plainer dispatch API, just to get a feel for how that'd look**. A very first initial take on that could still use the `URL`, `ContentStream`, and `Timeout` primitives.
+
+(This also potentially ties in with whatever the `hip` team's plans are. For instance, right now we're using our own dispatcher implementation - currently in the async case only, but planned for both cases - but we *would* have the option of using the `hip` backend, once it's available. It's not obvious to me if we'd want to do that, or if we'd prefer to continue with our existing backend, which is looking pretty nice now, but it *could* be a point of collaboration, or something to discuss.)
+
+*Alternately, we might decide that this falls into architecture astronauting territory, and that the existing API is "just fine thankyouverymuch".*

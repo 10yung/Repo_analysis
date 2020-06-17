@@ -1,0 +1,157 @@
+error:
+1 Header 'RxDataSources-Swift.h' not found
+2 Could not build Objective-C module 'RxDataSources'
+add `configureCellSize` for custom cell size
+
+usage:
+
+```
+        let dataSource = RxCollectionViewSectionedReloadDataSource<<#SectionModelType#>>(
+            configureCell: { (datasource, collectionView, indexPath, item) in
+                return UICollectionViewCell()
+            },
+            configureCellSize: { (dataSource, collectionView, indexPath, item) in
+                return CGSize(width: 100, height: 100)
+            }
+        )
+```
+
+Since Xcode 11 includes Swift Package Manager, it would be nice to support it
+**The situation:**
+
+I have "paging" mechanism for a user who scrolls down the catalog of goods. When new data is received I append it. I expect a user to never see the bottom of the catalog and all inserts should be as smooth as possible. To make it worse I have a complex layout with an invalidation on bounds change, _levitating_ headers footers etc... (_levitating_ != _sticky_, _sticky_ has predictable position, _levitating_ has unpredictable position which depends on user scroll directions). Since I have layout invalidation and some _levitating_ views - `reloadData()` is not a solution because the state of all the _levitating_ views will be dropped.
+
+**The problem:**
+
+Everything works fine for me, but I've found that `try Diff.differencesForSectionedView(initialSections: ...` might be a slow one. I'm 100% sure that the layout is efficient enough to provide a 60fps. In my case it takes up to ~0.2sec to calculate the differences when the data set is very big (on iPhone 6S). On modern devices the lag is also noticeable. So, it's important for me to remove the ~0.2sec lag.
+
+**The solution:**
+
+Since `RxCollectionViewSectionedAnimatedDataSource` is the only source of data for a view, I believe it won't be a big deal to move the Diff calculation to a non main thread. And when we know the Diff we go back to the main thread and apply them.
+
+**The implementation:**
+
+I've added two params to init method with default values:
+```
+asyncDiffing: Bool, disableBatchUpdatesAnimation: Bool
+```
+Nobody will get the async implementation if `asyncDiffing` default value is `false`. So it won't be a breaking change. The code is quite "dirty", I don't expect it to be merged right away. I just wanted to attract your attention to the problem and a possible solution.
+I have a table view with a viewmodel generating the data for it. I would like to be able to send along an extra info with my section data, telling wether the datasource should be forced to use deviceViewTransition.
+
+To simplify, imaging some code like this:
+
+```
+let tableData: ([SectionOfCustomData], Bool) = ([
+    SectionOfCustomData(header: "First section", items: [CustomData(anInt: 0, aString: "zero", aCGPoint: CGPoint.zero), CustomData(anInt: 1, aString: "one", aCGPoint: CGPoint(x: 1, y: 1)) ]),
+    SectionOfCustomData(header: "Second section", items: [CustomData(anInt: 2, aString: "two", aCGPoint: CGPoint(x: 2, y: 2)), CustomData(anInt: 3, aString: "three", aCGPoint: CGPoint(x: 3, y: 3)) ])
+    ],true)
+
+static func dataSource(withReload: Bool) -> RxTableViewSectionedAnimatedDataSource<SectionOfCustomData> {
+    
+    if withReload {
+        return RxTableViewSectionedReloadDataSource<SectionOfCustomData>(
+            decideViewTransition: { _, _, _ in .reload },
+            configureCell: { datasource, tableView, index, element in
+        // returns a UITablViewCell
+        })
+    } else {
+        return RxTableViewSectionedReloadDataSource<SectionOfCustomData>(
+            configureCell: { datasource, tableView, index, element in
+        // returns a UITablViewCell
+        })
+    }
+}
+```
+
+Can this be done and how do I make the binding to my tableView? Usually I would do something like this:
+
+```
+Observable.just(tableData)
+    .bind(to: tableView.rx.items(dataSource: dataSource))
+    .disposed(by: disposeBag)
+```
+
+But in my case, the tableData isn't only an array of SectionOfCustomData, but also has a parameter, which should be used as input to the `datasource` - something like;
+```
+tableView.rx.items(dataSource: dataSource(reload: tableData.1)
+```
+
+Hope someone can help my out on how make this binding to my tableview - if possible at all.
+One of the arguments of `dataSource.titleForFooterInSection`, `indexPath` is not correct.
+`index` is right and also used in closure.
+Hi guys, first let me say that I really appreciate what you do. I love using RxDataSources! 
+
+I am working on an application that uses collection view to display educational courses. To simplify things up, the model of the course looks like this: 
+```swift
+struct CourseModel {
+    let id: String
+    let fullName: String
+    var bookmarked: Bool
+    var completed: Bool
+    var completedDate: Date?
+}
+```
+And the section model for RxDataSources looks like this: 
+```swift
+import RxDataSources
+
+struct CourseSectionModel: AnimatableSectionModelType {
+    typealias Item = CourseModel
+
+    var items: [Item]
+    var header: String
+
+    init(items: [Item], header: String) {
+        self.items = items
+        self.header = header
+    }
+
+    init(original: CourseSectionModel, items: [Item]) {
+        self = original
+        self.items = items
+    }
+}
+
+extension CourseSectionModel: IdentifiableType {
+    typealias Identity = String
+
+    var identity: String { return header }
+}
+
+extension CourseModel: IdentifiableType {
+    typealias Identity = String
+
+    var identity: String { return id }
+}
+
+extension CourseModel: Equatable {
+
+    static func == (lhs: CourseModel, rhs: CourseModel) -> Bool {
+        return lhs.id == rhs.id
+            && lhs.bookmarked == rhs.bookmarked
+            && lhs.completedDate == rhs.completedDate
+    }
+}
+
+```
+The courses are downloaded from API and saved to Realm. Afterwards, from the collection view, they are fetched from Realm, mapped via `CourseEntity` protocol to `CourseModel` and bound to collection view data source. 
+
+As you can see, the courses can be bookmarked or completed (indicated by the "Completed" badge over the course). 
+
+If the course is completed (=> completed badge is visible), when the data are bound to the collection view (the completion status is received from the API) and user clicks on the bookmark icon, everything works just fine. The bookmark icon nicely animates due to the `Equatable` difference in `bookmarked` property, `cellConfiguration` function gets called once. 
+
+However, if the course is not completed, when the data are bound to the collection view and user completes it in the app (=> the Realm db entity is updated and the "Completed" badge is shown), then, when user clicks on the bookmark icon, the `cellConfiguration` function gets called twice - once with the original model (completed = false) and once with the newly updated model (completed = true). Since the section model is `AnimatedSectionModel`, the "Completed" badge fades out and then fades in again. 
+
+If you want, I can post more source code, but everything is quite straight forward:
+```
+getDataFromDB() -> mapToModel() -> mapToSectionModel() -> bindToDataSource()
+```
+
+Thanks in advance for any help! 
+After integrate `RXDataSources` via pod or `SPM` receive error: 
+<img width="556" alt="Screenshot 2019-11-01 at 12 08 52" src="https://user-images.githubusercontent.com/10995774/68014452-b4374a00-fca0-11e9-8b90-53021c4021e6.png">
+
+Maybe for now no support `Catalyst`?
+If i only use the RxTableViewSectionedReloadDataSource to do the databinding on tableview,
+will it also calculate the diff before and after the datasource change? or just reload the tableview every time?
+Hi, is there a plan to add support for non-sectioned data sources animations? IMO it's a common case when we don't need sections in a table, but we need animations when source changes. At the moment I'm doing it with one section without header, but it's overhead.

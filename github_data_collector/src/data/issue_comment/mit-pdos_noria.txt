@@ -1,0 +1,205 @@
+Automatically merges adjacent filters and aggregations into a single operator when possible, so that a single traversal of the data performs both functions. Goes with the nom-sql commit adding syntax for COUNT/SUM(CASE WHEN x THEN y ELSE z END).
+
+Adds various tests for the operator and for the automatic merging. Also refactors the way we store condition vectors, and adds support for generating such a vector for the AND of two condition trees.
+## Setup
+
+I am trying to run a query that computes an average. The graph and the operators are generated from a different language by a compiler, but in SQL it would look something like this
+
+```sql
+SELECT sum(x) / count(*)
+FROM Tab
+```
+
+## Error
+
+**The query itself runs fine**, but I wanted to test how the performance would be if `count(*)` and `sum(x)` were **computed on different domains**. So I hacked into `assignment` to force these operators on their own domains.
+
+When I do that however the join after the two calculations tries to access a non existent index in its right ancestor. I expanded the error message (see below) which says that the right ancestor with id `4` was short (tries accessing index `2` in the `other` slice, which only has two elements, in the `generate_row` function.
+
+This is the error message for the two domains case, in the case of four domains its the same but the id is different (because more generated ingress/egress operators)
+
+```
+'right (4) was short', noria-server/dataflow/src/ops/join.rs:181:21
+```
+
+## Questions
+
+Is there something i am missing about domains? Can I not just make any operator into its own domain? Are there any invariants around what can go on a domain and what cant?
+
+## Runtime graphs
+
+Here are the dot graphs for [two domains](https://github.com/mit-pdos/noria/files/3783074/part-connected.dot.pdf) and [four domains](https://github.com/mit-pdos/noria/files/3783077/completely-separate.dot.pdf) and for good measure the original (working) [singe domain](https://github.com/mit-pdos/noria/files/3783086/unseparated.dot.pdf).
+
+The relevant operators here are `ohua.generated/op_s_acc_0_0` (`count(*)`) and `ohua.generated/op_s_acc_1_0` (`sum(x)`) and the `join` afterwards. (The rest is just generated code that does some column renaming)
+
+## How to reproduce
+
+I uploaded a branch ([`join-after-domain-error-reproduction`](https://github.com/JustusAdam/noria/tree/join-after-domain-error-reproduction)) to my fork that should contain the complete state of the system necessary (including generated operators) to reproduce the error. 
+
+In the `udf-benchmarks` directory run `cargo run --bin features avg-split-domain/two-domainsf.toml`
+
+This will run the two domain scenario. For one or four use the `one-domain.toml` and `four-domains.toml` config respectively
+So I am trying to run this query (follows at the end), which I split into multiple subviews to circumvent some of the current quirks of the SQL noria supports.
+
+Its rather long, I apologize, but because I don't really understand what the error is trying to tell me I am unable to reduce the example.
+
+The actual failure occurs in `noria-server/src/controller/migrate/materialization/mod.rs:606:41` and reads
+
+```
+Oct 29 10:58:28.895 CRIT partially overlapping partial indices, conflict: 1, cols: [Some(0), Some(1)], child: 16, pcols: [0], parent: 16
+```
+
+The part of the query affected is the aggregation node produced by the `count(*)` in `pageview_counts`.
+
+And here is the query graph, as dumped by the system:
+[fail.dot.pdf](https://github.com/mit-pdos/noria/files/3782925/fail.dot.pdf)
+
+I previously had the error that it could not find a bogokey to aggregate the `count(*)` over. I then changed `pageview_counts1` to also `SELECT` `ts2`, which I believe is what it is now using for the `count(*)`.
+
+It may also be that the conflict is between the `GROUP BY`, which is over `user_id` ts1` and the actual key used for result lookups which is just `user_id`.
+
+Let me know if you have any idea how to fix this or what I could be using as a workaround.
+
+```sql
+CREATE TABLE clicks
+(user_id int,
+ pagetype int,
+ ts int);
+
+-- Workaround because tables cant join on themselves
+clicks2:
+SELECT *
+FROM clicks;
+
+candidate_paths0:
+SELECT
+  c1.user_id,
+  c1.ts as ts1,
+  c2.ts as ts2, 
+FROM
+  clicks c1 JOIN
+  clicks2 c2 ON c1.user_id = c2.user_id
+WHERE
+  c1.pagetype = 0 AND
+  c2.pagetype = 1;
+
+candidate_paths:
+SELECT
+  user_id,
+  ts1,
+  ts2
+FROM
+  candidate_paths0
+WHERE
+  ts1 < ts2
+ORDER BY
+  user_id, ts1, ts2
+;
+
+matching_paths:
+SELECT
+  user_id, max(ts1) as ts1, ts2
+FROM candidate_paths
+GROUP BY user_id, ts2;
+
+pageview_counts0:
+SELECT c.user_id, ts1, ts2, ts
+FROM
+  clicks c JOIN
+  matching_paths ON c.user_id = matching_paths.user_id;
+
+pageview_counts1:
+SELECT
+  user_id,
+  ts1,
+  ts2
+FROM
+  pageview_counts0
+WHERE
+  ts1 <= ts AND
+  ts2 >= ts;
+
+pageview_counts:
+SELECT
+  user_id,
+  count(*) as pageview_count
+FROM
+  pageview_counts1
+GROUP BY
+  user_id, ts1;
+
+VIEW
+clickstream_ana:
+SELECT
+  user_id,
+  sum(pageview_count)
+FROM pageview_counts
+WHERE user_id = ?;
+```
+In #111 I have seen mention of user defined functions. I think for Noria it probably makes sense that there are two kinds of them:
+
+* Some which are defined in terms of data-flow primitive operations. I think existing internal views you can make are a case of that. But probably/maybe having some slightly richer way to express those (or just more basic operations) would be useful.
+* An opaque imperative functions one could define from the app. For those, I would suggest that maybe Noria simply uses wasm as the language to define those. Instead of getting into the hell of supporting a wide range of custom languages. One would then have to define just what are some properties of this opaque function (deterministic vs. not) for dataflow to be able to be computed correctly.
+
+Am I missing something here? Are there some fundamental issues with providing support for UDF? What metadata about a function would Noria need? Typing information for inputs and outputs?
+I am moving this into a separate issue from a broad issue of #111.
+
+@mjjansen [mentioned push notifications](https://github.com/mit-pdos/noria/issues/111#issuecomment-441750655). And @jonhoo [replied](https://github.com/mit-pdos/noria/issues/111#issuecomment-441761475):
+
+> Push notifications (basically, pushing parts of the data-flow to the client) is something that's definitely on our radar, and was actually one of the motivations for using data-flow in the first place. Data-flow is so amenable to distribution that in theory this should just be a matter of moving some of the data-flow nodes to a client machine. In practice it gets a little more tricky though. We don't have an implementation of it currently, and it's not at the top of our roadmap, but it is a feature we'd love to see!
+
+I [commented](https://github.com/mit-pdos/noria/issues/111#issuecomment-546784059):
+
+> So +1 for push notifications (or I would say live query, I think this is the [more common term](https://github.com/hasura/graphql-engine/blob/master/architecture/live-queries.md)). I do not think Noria has to provide any web API here, just expose things through Rust API, and then users can hook their own logic in Rust to push them to websockets or whatever.
+
+And @jonhoo [replied](https://github.com/mit-pdos/noria/issues/111#issuecomment-546952884):
+
+> So, push notifications are tricky because they imply full materialization everywhere, which comes at a steep cost. There might be a good way to register interest in keys and then subscribe to updates for those keys, but that's not something we're actively working on. Might be a neat additional feature to add eventually though — it shouldn't be too hard, as most of the infrastructure is already there.
+I could not find documentation for which exactly SQL syntax is being used/supported?
+I would like to request some additional data types:
+
+* Timezone aware timestamps.
+* Binary blobs.
+* Compound data types: allowing nested sub-objects: list of others objects or objects themselves. This would allow Noria to work with more document-oriented data where fields have sub-documents or arrays of values or other sub-documents. One could potentially represent this with highly-normalized tables, but then it would still be useful for one to be able to create views where you could aggregate values into lists, for example. like PostgreSQL `array_agg` function. What I would like is that my app's state represented in materialized views contain such arrays. I have found out that this is often much more efficient for many common cases like 1:N relations. In regular SQL many rows are duplicated (N rows for each 1 row) which makes all those values duplicated: both in memory an on-wire between server and client. Being able to represent that as an array is both more efficient and more natural.
+Noria seems not to allow for a select query with two simultaneous aggregations.
+
+I set up this very simple table:
+
+```
+CREATE TABLE tab (x int, y int, PRIMARY KEY(x));
+```
+
+And a query with two aggregations:
+
+```
+VIEW test: 
+    SELECT count(y), sum(y) 
+    FROM tab 
+    WHERE x = ? 
+    GROUP BY x;
+```
+
+Which throws a `cannot group by aggregation column` in
+`noria-server/dataflow/src/ops/grouped/aggregate.rs:27:9`.
+
+By contrast if the select is only `count(x)` or `sum(x)` it works just fine.
+I should also note that it also errors on `count(*), sum(y)`.
+
+My question would be whether this query is correct actually should work?
+
+My guess is that it doesn't due to how the query graph is constructed. (One
+aggregate becomes the successor of the other and does not get the initial set of
+records/has its automatic group/state key include the computed column from the
+ancestor.)
+
+I learned about Noria from the TwoSigma talk and I find Noria extremely interesting and it can potentially for a great fit for my use case. 
+
+If I understand correctly, the materialized view (cache) is eventually consistent with the new writes but not atomically i.e. the re-calculation of the materialized view is being done async to the write operation (with the machine's best effort)? If this is the case, may I ask if every (transaction of) write operation will trigger a re-calc of the cache? Or the re-calc inside Noria actually has its own interval (if there is, how long?) to check if a re-calc is required i.e. doing it in its own pace - to avoid the "backlog" which can happen (e.g. peak-time) when the write operation is more frequent than the time it takes to do the re-calc of the materialized view? 
+
+I understand from another GitHub issue that Noria at the moment is still a research-prototype and probably not as mature as MySQL etc for a general production use case, but may I ask which subset of the system/feature is actually mature enough to use with production data? thank you very much!
+
+Was looking at #111 and am assuming it's still current. I am interested in contributing, and was wondering if you had any progress on the roadmap since 2018 and/or a contributions guide.
+
+I was specifically thinking about the availability and fault-tolerance considerations mentioned in the above issue. Was there any dev work done on either that or #105 that already covered this use case?
+
+Please let me know if there's anything I can do!

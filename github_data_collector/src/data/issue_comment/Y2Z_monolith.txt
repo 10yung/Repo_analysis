@@ -1,0 +1,211 @@
+Hi, I added refactorings and fixes to `main.rs`
+
+Addressed issues:
+
+- when specified URL was invalid, it exited successfully with doing nothing. Users could not know what happened and why it did not work
+- it exited successfully even if invalid User-Agent value is specified
+- it created file twice on `--output` option specified. It may cause an issue when some file watcher (e.g. FsEvents on macOS) is watching the directory
+
+Improvements:
+- handle errors with `Result::expect` consistently it correctly exits with non-zero status on error and it leaves a helpful error message for users
+- define `Output` enum for handling both stdout and file outputs in the same way in `main()` logic
+
+Note:
+
+These changes would make some conflicts with #100. I can resolve them so please let me know if some help is necessary.
+Would be great if it supported HTTP_PROXY/HTTPS_PROXY environment variable to make it work with a proxy server. Thanks!
+Currently, monolith leaves very little trace of where a page came from, or any other record of the conditions under which a page was saved.
+
+It's very likely that, after a page is saved, a user needs to recall where that page originally came from, possibly because they didn't save a complicated page URL.  They might also need other information about how the page was recorded, such as the date the page was saved (useful if you're trying to determine if/when a page changed, or trying to figure out why a page and its monolith differ) and the version of monolith that was used to save it (useful if you're trying to decide whether or not to redownload a page with an updated version of monolith, for example).
+
+This pull request prepends a short comment to the beginning of each downloaded page noting the page URL, the current date, and the version of monolith.  For example:
+```html
+<!--- Downloaded from https://example.com/ on Wed, 08 Jan 2020 19:22:30 using monolith v2.1.1 -->
+```
+This comment is added to all pages by default, but in the event that a user wants their page modified only minimally, this option can be disable via the `-C/--no-comment` option, which applies monolith's current behavior.
+
+This change adds another direct dependency (`time-0.1.42`) in order to render the timestamp.  However, I don't think this is itself worth avoiding, since `time` is already a requirement of several other dependencies.  Because of this, the release binary only grows by ~14.8 kB (0.15%).
+# ADR-XXXX: Use OOP for parsing framework #
+**Date:** 2020-01-07
+
+## Status ##
+Proposed
+
+## Context ##
+Currently, `monolith`'s architecture is a bit, well, monolithic.  The vast majority of functionality is all packed together in very few functions.  On top of this, these functions are the same functions responsible for making HTTP requests, which makes them very difficult to test.  Most functions are also recursive, which means that asynchronous behavior is not a simple thing to implement.  And of course, the wide scope of functions makes documentation not super useful and a bit of a chore.  If anyone were to use monolith as a library in its current state, they'd basically be forced to use the whole program exactly like it's used here.
+
+On top of this, as the functionality monolith grows, the current architecture is rather averse to extension.  For instance, take the recent addition of CSS parsing: Instead of conforming to any generalizable frameworks, this addition requires calling an ad-hoc method that's kinda sloppily joined with the main HTML parser (with no bridge in-between to allow for testability).  If monolith ever adds SVG parsing, or a custom processor for images (#89), this process will be repeated, leaving a tangled mess of methods with no clear organization, masturbating all the other problems mentioned.
+
+![Current Flow][1]
+
+This diagram is a simplified representation of the call graph.  Functions in grey call (either directly or indirectly) a method of `reqwest` that makes an external HTTP request, and are thus difficult to test and isolate.
+
+**TLDR:**
+* Monolithic API
+* HTTP requests make testing near-impossible
+* Recursion makes async difficult
+* Wide scope of functions makes documentation rough
+* rigid, ad hoc methods make extension difficult
+* Growth requires making all of the above worse
+
+## Decision ##
+
+I propose a complete architectural overhaul.
+
+What we need is a comprehensive framework that can be used to fit multiple purposes, and provides a way for many parsers (and potentially end-user-added parsers) to co-operate without direct knowledge of each other.  This framework needs to be able to provide all the logic needed for HTTP requests, without requiring parsing code to get mixed up in those details, leaving it completely testable.  Finally, the framework should support the new async functionality in Rust, which means that recursion should be avoided where async code is involved.
+
+In short, we need a framework that is:
+* Generalizable
+* Modular
+* Asynchronous
+* Capable of isolating IO logic
+
+Specifically, I propose the following architecture:
+
+The framework shall consist of two key components, Resource and Asset.
+
+Resource shall be a trait that denotes a parser for a certain type of resource.  Resources shall receive some data, produce a list of needed remote assets, and once those assets have been provided, shall render the completed document.
+
+Asset shall be a structure wrapping some potentially undownloaded Resource.  Assets will store the location and type of a resource.  When given an empty Resource (that is, a specific instance that has yet to be fed any data), Assets will offer methods for downloading data and feeding it into the Resource.
+
+Instead of recursive calls to fetch child assets, when a Resource has requisite child assets, it shall internally create Assets to represent them.  It will then offer mutable references to these Assets such that the user or method working with the resource can download them in the same way (and stack level) as the original resource was downloaded.
+
+In order to enable the modularity of parsers, Assets do not necessarily present a specific implementation of Resource that must be used to parse that Asset, as this would prevent end users from swapping in and out Resources without re-writing all parsing code.  Instead, Assets provide a partial or complete MIME type, and allow the user to decide based on that MIME type what kind of Resource to use to parse the data.
+
+By making all of this customization possible, however, we risk making basic use over complicated.  In order to avert this, we shall include several methods that generalize or provide default behavior.  Importantly, the `Asset::auto_select_resource_type` method shall provide a default logic for the selection of Resources, and the `Asset::download_complete` method shall provide the logic for downloading an Asset and all child Assets.
+
+![Proposed Flow][2]
+
+## Consequences ##
+* The implementation of this will require a considerable amount of review, and the reconciliation of this design with the current architecture will likely take a sizable amount of work.
+* Such a large change opens up lots of opportunity for the development of bugs and other problems.
+* If this design is unsatisfactory, or we end up wanting a different architecture, or even just a change in this architecture, it will be even more work to develop that change after (and if) this is finalized.
+* This implementation, (and pretty much all async implementations) requires putting resources on the heap instead of on the stack, which may have consiquences
+
+## Notes ##
+* I've put the ADR for this change in an issue rather than a PR adding it to the collection for now, since ADRs aren't finalized for use on master yet.
+* I've already created a functioning proof-of-concept for this design, with a complete framework, currently branch [Alch_Emi/redesign][3] on commit 27534a.  This implementation doesn't have any complex parsers or options implemented yet, and requires a significant amount more work to reconcile with the current code, but does demonstrate the functionality of this approach.  The docs for this code (and thus this design) are located temporarily at https://alchemi.dev/doc/monolith.  That said, I'm open to making any changes to the design, or throwing it away completely if necessary.
+* Sorry these graphs aren't hosted on GitHub (GH didn't like the SVGs), but the `dot` source code used to render them is available in the above repository.
+* I'd be willing to but in the work to merge this in, but I want to make sure it's definitely something we'd want and to make any needed changes before I continue.
+* This issue affects:
+   - Issue #20 / #72: This change exposes a less monolithic API that is more suitable for documentation and export.
+   - Issue #4 (even though it's closed): This change is already asynchronous
+   - Issue #89: Having a framework for handling assets by MIME type makes this task a lot easier
+
+[1]: https://matrix.alchemi.dev/_matrix/media/r0/download/alchemi.dev/NzwxjvVsfHccGfnsFmtoZBPA "Current Flow Diagram"
+[2]: https://matrix.alchemi.dev/_matrix/media/r0/download/alchemi.dev/nNuFalSVtyurnHpknKfMDbqg
+[3]: https://github.com/Alch-Emi/monolith/tree/redesign
+Let me know what you think @Alch-Emi 
+
+If we accept and implement this, #60 will be <b>r</b>esolved
+
+Are you planning to add an option to minimize/optimize images in addition to turning them off completely?
+
+Thanks for creating this, by the way, it's super useful!
+error: linker `link.exe` not found
+  |
+  = note: 系统找不到指定的文件。 (os error 2)
+
+note: the msvc targets depend on the msvc linker but `link.exe` was not found
+
+note: please ensure that VS 2013, VS 2015, VS 2017 or VS 2019 was installed with the Visual C++ option  
+
+error: aborting due to previous error
+
+error: could not compile `log`.
+warning: build failed, waiting for other jobs to finish...
+error: linker `link.exe` not found
+  |
+  = note: 系统找不到指定的文件。 (os error 2)
+
+note: the msvc targets depend on the msvc linker but `link.exe` was not found
+
+note: please ensure that VS 2013, VS 2015, VS 2017 or VS 2019 was installed with the Visual C++ option
+
+error: aborting due to previous error
+
+error: linker `link.exe` not found
+  |
+  = note: 系统找不到指定的文件。 (os error 2)
+
+note: the msvc targets depend on the msvc linker but `link.exe` was not found
+
+note: please ensure that VS 2013, VS 2015, VS 2017 or VS 2019 was installed with the Visual C++ option   
+
+error: aborting due to previous error
+
+error: could not compile `serde`.
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `syn`.
+warning: build failed, waiting for other jobs to finish...
+error: linker `link.exe` not found
+  |
+  = note: 系统找不到指定的文件。 (os error 2)
+
+note: the msvc targets depend on the msvc linker but `link.exe` was not found
+
+note: please ensure that VS 2013, VS 2015, VS 2017 or VS 2019 was installed with the Visual C++ option
+
+error: aborting due to previous error
+
+error: could not compile `maybe-uninit`.
+warning: build failed, waiting for other jobs to finish...
+error: linker `link.exe` not found
+  |
+  = note: 系统找不到指定的文件。 (os error 2)
+
+note: the msvc targets depend on the msvc linker but `link.exe` was not found
+
+note: please ensure that VS 2013, VS 2015, VS 2017 or VS 2019 was installed with the Visual C++ option   
+
+error: aborting due to previous error
+
+error: could not compile `libc`.
+warning: build failed, waiting for other jobs to finish...
+error: linker `link.exe` not found                                                                       
+  |
+  = note: 系统找不到指定的文件。 (os error 2)
+
+note: the msvc targets depend on the msvc linker but `link.exe` was not found
+
+note: please ensure that VS 2013, VS 2015, VS 2017 or VS 2019 was installed with the Visual C++ option   
+
+error: aborting due to previous error
+
+error: could not compile `proc-macro2`.
+warning: build failed, waiting for other jobs to finish...
+error: linker `link.exe` not found
+  |
+  = note: 系统找不到指定的文件。 (os error 2)
+
+note: the msvc targets depend on the msvc linker but `link.exe` was not found
+
+note: please ensure that VS 2013, VS 2015, VS 2017 or VS 2019 was installed with the Visual C++ option   
+
+error: aborting due to previous error
+
+error: could not compile `byteorder`.
+warning: build failed, waiting for other jobs to finish...
+error: linker `link.exe` not found
+  |
+  = note: 系统找不到指定的文件。 (os error 2)
+
+note: the msvc targets depend on the msvc linker but `link.exe` was not found
+
+note: please ensure that VS 2013, VS 2015, VS 2017 or VS 2019 was installed with the Visual C++ option   
+
+error: aborting due to previous error
+
+error: failed to compile `monolith v2.0.23 (C:\Users\cheng\monolith)`, intermediate artifacts can be found at `C:\Users\cheng\monolith\target`
+
+Caused by:
+  could not compile `winapi`.
+
+To learn more, run the command again with --verbose.
+This PR addresses #32 about resolving `srcset` fields. 
+
+The logic is the same as for the `img src="..."` .
+
+We might decide to store only one secret value, to reduce the size of the bundle.
+Aside from being a CLI tool, monolith has potential to be used as a library and published on crates.io. For this feature to be implemented we first need to design API for monolith, for the most part how we provide options (instead of parameters via CLI).
+Would be great if there was an ability to save all the pages that website links to as well

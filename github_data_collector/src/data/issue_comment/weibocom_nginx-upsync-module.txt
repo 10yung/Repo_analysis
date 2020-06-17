@@ -1,0 +1,230 @@
+I notices in ngx_http_upsync_event_init, detele event will delay NGX_DELAY_DELETE msec. 
+https://github.com/weibocom/nginx-upsync-module/blob/e67784cfa2b8e1ec44bfe4233c06ac60b457b93e/src/ngx_http_upsync_module.c#L3261
+In addtion, add some tcp connection check logic, but not every tcp connection was checked.   
+https://github.com/weibocom/nginx-upsync-module/blob/e67784cfa2b8e1ec44bfe4233c06ac60b457b93e/src/ngx_http_upsync_module.c#L3288 so it may cause some tcp connects still use old peer info.
+https://github.com/weibocom/nginx-upsync-module/blob/e67784cfa2b8e1ec44bfe4233c06ac60b457b93e/src/ngx_http_upsync_module.c#L3319
+this while loop will be cause nginx crash.
+```
+#0  ngx_event_connect_peer (pc=pc@entry=0x561fcc2ff3b8) at src/event/ngx_event_connect.c:41
+
+warning: Source file is more recent than executable.
+41          s = ngx_socket(pc->sockaddr->sa_family, type, 0);
+(gdb) bt
+#0  ngx_event_connect_peer (pc=pc@entry=0x561fcc2ff3b8) at src/event/ngx_event_connect.c:41
+#1  0x0000561fc4ab07fb in ngx_http_upstream_connect (r=0x561fcb9f8860, u=0x561fcc2ff3a8) at src/http/ngx_http_upstream.c:1520
+#2  0x0000561fc4ab13ec in ngx_http_upstream_init_request (r=0x561fcb9f8860) at src/http/ngx_http_upstream.c:801
+#3  0x0000561fc4aa46a0 in ngx_http_read_client_request_body (r=r@entry=0x561fcb9f8860, post_handler=0x561fc4ab2960 <ngx_http_upstream_init>)
+    at src/http/ngx_http_request_body.c:147
+#4  0x0000561fc4aea791 in ngx_http_proxy_handler (r=0x561fcb9f8860) at src/http/modules/ngx_http_proxy_module.c:930
+#5  0x0000561fc4a95c32 in ngx_http_core_content_phase (r=0x561fcb9f8860, ph=<optimized out>) at src/http/ngx_http_core_module.c:1169
+#6  0x0000561fc4a901cd in ngx_http_core_run_phases (r=0x561fcb9f8860) at src/http/ngx_http_core_module.c:858
+#7  0x0000561fc4a996d6 in ngx_http_run_posted_requests (c=0x7ff1beff79f8) at src/http/ngx_http_request.c:2285
+#8  0x0000561fc4a82b5c in ngx_epoll_process_events (cycle=0x561fc9dc0760, timer=<optimized out>, flags=<optimized out>) at src/event/modules/ngx_epoll_module.c:902
+#9  0x0000561fc4a77b3a in ngx_process_events_and_timers (cycle=cycle@entry=0x561fc9dc0760) at src/event/ngx_event.c:242
+#10 0x0000561fc4a80955 in ngx_worker_process_cycle (cycle=cycle@entry=0x561fc9dc0760, data=data@entry=0x0) at src/os/unix/ngx_process_cycle.c:750
+#11 0x0000561fc4a7ed6f in ngx_spawn_process (cycle=cycle@entry=0x561fc9dc0760, proc=proc@entry=0x561fc4a80900 <ngx_worker_process_cycle>, data=data@entry=0x0,
+    name=name@entry=0x561fc4b6b163 "worker process", respawn=respawn@entry=-4) at src/os/unix/ngx_process.c:199
+#12 0x0000561fc4a80000 in ngx_start_worker_processes (cycle=cycle@entry=0x561fc9dc0760, n=4, type=type@entry=-4) at src/os/unix/ngx_process_cycle.c:359
+#13 0x0000561fc4a81952 in ngx_master_process_cycle (cycle=0x561fc9dc0760) at src/os/unix/ngx_process_cycle.c:244
+#14 0x0000561fc4a55918 in main (argc=<optimized out>, argv=<optimized out>) at src/core/nginx.c:382
+
+```
+openresty 1.15.8.2 etcd同步时，如果upstream ip发生了变化，配置信息是更新了 但是请求到此应用的时候，openresty 还是会请求已经替换了的ip 
+从我们测试的结果来看
+当upstream ip发生变化时，发出10个请求 ，会有部分请求访问之前老的ip，但是也会有部分请求访问新的ip，这样就会造成，当请求落到老ip的时候就会502，当请求到新ip的时候，就正常。
+请问这种情况是什么原因导致的呢？
+HTTP/1.1 200 OK
+Server: openresty
+Date: Thu, 19 Dec 2019 02:27:45 GMT
+Content-Type: text/plain
+Content-Length: 932
+Connection: keep-alive
+
+Upstream name: exam; Backend server count: 1
+        server 10.13.95.128:8090 weight=1 max_fails=2 fail_timeout=10s;
+
+Upstream name: idmservice; Backend server count: 1
+
+Upstream name: idrservice; Backend server count: 1
+        server 10.13.185.250:28342 weight=1 max_fails=2 fail_timeout=10s;
+
+Upstream name: demo; Backend server count: 2
+        server 10.13.31.101:8501 weight=1 max_fails=2 fail_timeout=10s;
+        server 10.13.31.101:8500 weight=1 max_fails=2 fail_timeout=10s;
+
+Upstream name: questionnaire; Backend server count: 2
+        server 10.13.31.101:9416 weight=1 max_fails=2 fail_timeout=10s;
+        server 10.13.31.101:9493 weight=1 max_fails=2 fail_timeout=10s;
+
+Upstream name: training; Backend server count: 1
+        server 10.13.31.101:9405 weight=1 max_fails=2 fail_timeout=10s;
+
+Upstream name: upm-service; Backend server count: 1
+        server 10.13.95.128:9166 weight=1 max_fails=2 fail_timeout=10s;
+
+此情况出现环境和状况：
+新增一个upstream后，配置consul的key和地址，配置strong_dependency=off
+进行nginx reload, 此时文件内容和upstream_show均正常，再次进行nginx reload后，出现upstream_show显示有一个，但是实际没有server信息，文件中也没有，再次nginx reload，又恢复正常，再一次nginx reload又出现没有server信息，但是显示有一个server可用，以此类推循环出现
+配置如下：
+upstream idmservice {
+        server 10.13.185.250:28342;
+        upsync consul-dev.2haohr.com:8500/v1/kv/upstreams/idm-service/ upsync_timeout=6m upsync_interval=500ms upsync_type=consul strong_dependency=off;
+        upsync_dump_path /etc/nginx/upstreams/dump/idmservice.conf;
+        include /etc/nginx/upstreams/dump/idmservice.conf;
+}
+执行nginx -s reload过程中出现文件写入竞争问题
+堆栈如下：
+#0  0x00000000004234a7 in ngx_write_fd (n=74, buf=0x7ffc56c75d50, fd=<error reading variable: Cannot access memory at address 0x10>) at src/os/unix/ngx_files.h:147
+#1  ngx_log_error_core (level=8, log=0x1776fd0, err=<optimized out>, fmt=<optimized out>) at src/core/ngx_log.c:195
+#2  0x000000000055202e in ngx_event_del_timer (ev=<optimized out>) at src/event/ngx_event_timer.h:45
+#3  ngx_http_upsync_clear_all_events (cycle=0x7ffc56c75d99) at /home/yuanqing/openresty/openresty-1.15.8.2/bundle/nginx-upsync-module/src/ngx_http_upsync_module.c:3617
+#4  0x00000000005521a4 in ngx_http_upsync_need_exit () at /home/yuanqing/openresty/openresty-1.15.8.2/bundle/nginx-upsync-module/src/ngx_http_upsync_module.c:3562
+#5  0x00000000005547b8 in ngx_http_upsync_recv_handler (event=0x1763230) at /home/yuanqing/openresty/openresty-1.15.8.2/bundle/nginx-upsync-module/src/ngx_http_upsync_module.c:2777
+#6  0x00000000004337d5 in ngx_close_idle_connections (cycle=cycle@entry=0x178cac0) at src/core/ngx_connection.c:1333
+#7  0x000000000044b593 in ngx_worker_process_cycle (cycle=cycle@entry=0x178cac0, data=data@entry=0x0) at src/os/unix/ngx_process_cycle.c:833
+#8  0x0000000000449e08 in ngx_spawn_process (cycle=cycle@entry=0x178cac0, proc=proc@entry=0x44b480 <ngx_worker_process_cycle>, data=data@entry=0x0, name=name@entry=0x560cbd "worker process", 
+    respawn=respawn@entry=-4) at src/os/unix/ngx_process.c:199
+#9  0x000000000044b844 in ngx_start_worker_processes (cycle=0x178cac0, n=1, type=-4) at src/os/unix/ngx_process_cycle.c:397
+#10 0x000000000044c834 in ngx_master_process_cycle (cycle=0x178cac0) at src/os/unix/ngx_process_cycle.c:251
+#11 0x0000000000421969 in main (argc=<optimized out>, argv=<optimized out>) at src/core/nginx.c:382
+1、环境
+系统： centos7
+openresty版本： openresty-1.15.8.2
+nginx_upstream_check_module版本： check_1.12.1+.patch，check_1.14.0+.patch， check_1.16.1+.patch
+
+2、编译流程
+cd openresty-1.15.8.2/bundle/nginx-1.15.8/
+patch -p1 < ../../../nginx_upstream_check_module/check_1.14.0+.patch #分别测试了3个补丁
+
+./configure --with-http_ssl_module --with-http_realip_module --with-http_addition_module --with-http_sub_module --with-http_gzip_static_module --with-http_random_index_module --with-http_secure_link_module --with-http_stub_status_module --with-ld-opt="-L/usr/local/lib/" --with-cc-opt="-L/usr/local/include/" --add-module=../nginx-module-vts --add-module=../nginx_upstream_check_module --add-module=../nginx-upsync-module
+
+编译出错：
+![image](https://user-images.githubusercontent.com/10548716/69809795-6c66fc80-1225-11ea-875f-ae6a9aa3a51a.png)
+
+
+nginx1.8.1 或者 nginx 1.14.2 2个版本测试编译进这个模块以后，nginx进程占用内存一直增加不下降。
+去掉这个模块以后业务低峰期nginx内存会自动释放。
+在upstream文件中，这么配置 ,但是没有生效ip_hash不起作用，请帮忙看下
+
+upstream backend_xxx_xxx {
+
+            upsync xx-xxxx-etcd-xxx.xxx.org:2335/v2/keys/xxx/xxx/xxx/config/upstream/backend_xxx_xxx upsync_timeout=6m upsync_interval=5000ms upsync_type=etcd strong_dependency=off;
+            upsync_dump_path /opt/xxx/xxx/upsync-upstream/backend_xxx_xxx.conf;
+            upsync_lb ip_hash;
+            include /opt/xxx/xxx/upsync-upstream/backend_xxx_xxx.conf;
+}
+2019/11/12 15:41:23 [error] 17824#17824: [WARN] upsync_timeout: timed out reading upsync_server: 192.168.120.80:8500 
+2019/11/12 15:41:24 [error] 17817#17817: [WARN] upsync_timeout: timed out reading upsync_server: 192.168.120.80:8500 
+2019/11/12 15:41:24 [error] 17822#17822: [WARN] upsync_timeout: timed out reading upsync_server: 192.168.120.80:8500 
+2019/11/12 15:41:25 [error] 17820#17820: [WARN] upsync_timeout: timed out reading upsync_server: 192.168.120.80:8500
+
+
+nginx 超时时间设置
+         proxy_connect_timeout 600s;
+         proxy_send_timeout 600s;
+         proxy_read_timeout 600s;
+
+upstream配置
+       upsync 192.168.120.80:8500/v1/kv/upstreams/gkid-backend-stage/ upsync_timeout=1m 
+       upsync_interval=2000ms upsync_type=consul strong_dependency=off;
+
+
+NGINX 错误日志中每隔一段时间出现 这种timeout的 日志 ，是正常的情况吗？ 还是哪里配置问题？
+问题描述：如标题
+
+环境配置：版本v2.1.0
+upsync类型：consul_services
+
+新增节点：
+[root@alybjf-sys-test-v02 ~]# curl -X PUT -d '{"id":"111","name":"testnginx","address":"127.0.0.1","port":8001, "tags":["weight=4", "max_fails=19"]}' http://monitor-127.0.0.1:8500/v1/agent/service/register
+
+注册结果：
+[root@alybjf-sys-test-v02 ~]# curl http://127.0.0.1/upstream_list
+Upstream name: testnginx; Backend server count: 1
+        server 127.0.0.1:8001 weight=4 max_fails=19 fail_timeout=10s;
+
+以上是正常操作，如果非法注册("weight=abc")：
+[root@alybjf-sys-test-v02 ~]# curl -X PUT -d '{"id":"111","name":"testnginx","address":"127.0.0.1","port":8001, "tags":["weight=abc"]}' http://monitor-127.0.0.1:8500/v1/agent/service/register
+
+按源码来看应该有error日志输出，但是没有任何打印
+![image](https://user-images.githubusercontent.com/19743705/67359323-8f9eec00-f595-11e9-9e7a-59a174a6a848.png)
+
+希望fix。
+Tengine version: Tengine/2.3.0 (nginx/1.15.9)
+built by gcc 4.8.5 20150623 (Red Hat 4.8.5-16) (GCC)
+built with OpenSSL 1.1.0g  2 Nov 2017
+
+nginx-upsync-module 使用的是master分支代码
+
+有时进程会出现segfault error
+gdb如下
+
+
+
+
+GNU gdb (GDB) Red Hat Enterprise Linux 7.6.1-64.el7
+Copyright (C) 2013 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.  Type "show copying"
+and "show warranty" for details.
+This GDB was configured as "x86_64-redhat-linux-gnu".
+For bug reporting instructions, please see:
+<http://www.gnu.org/software/gdb/bugs/>...
+Reading symbols from /usr/sbin/nginx...Reading symbols from /usr/lib/debug/usr/sbin/nginx.debug...done.
+done.
+[New LWP 7004]
+[New LWP 8731]
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib64/libthread_db.so.1".
+Core was generated by `nginx: worker pr'.
+Program terminated with signal 11, Segmentation fault.
+#0  ngx_http_upstream_get_peer (rrp=0x14c5d84b04c8) at src/http/ngx_http_upstream_round_robin.c:626
+626	        if (peer->down) {
+Missing separate debuginfos, use: debuginfo-install glibc-2.17-222.el7.x86_64 jemalloc-3.6.0-1.el7.x86_64 libgcc-4.8.5-28.el7_5.1.x86_64 nss-softokn-freebl-3.16.2.3-9.el7.x86_64 pcre-8.32-14.el7.x86_64 sssd-client-1.12.2-58.el7.x86_64 zlib-1.2.7-13.el7.x86_64
+(gdb) list
+621
+622	        if (rrp->tried[n] & m) {
+623	            continue;
+624	        }
+625
+626	        if (peer->down) {
+627	            continue;
+628	        }
+629
+630	#if (NGX_HTTP_UPSTREAM_CHECK)
+(gdb) bt
+#0  ngx_http_upstream_get_peer (rrp=0x14c5d84b04c8) at src/http/ngx_http_upstream_round_robin.c:626
+#1  ngx_http_upstream_get_round_robin_peer (pc=0x14c5db8989e8, data=0x14c5d84b04c8) at src/http/ngx_http_upstream_round_robin.c:520
+#2  0x00000000004ee4ca in ngx_http_upstream_get_keepalive_peer (pc=0x14c5db8989e8, data=0x14c5d84b0490) at src/http/modules/ngx_http_upstream_keepalive_module.c:241
+#3  0x0000000000478728 in ngx_event_connect_peer (pc=pc@entry=0x14c5db8989e8) at src/event/ngx_event_connect.c:34
+#4  0x00000000004ab87a in ngx_http_upstream_connect (r=r@entry=0x14c5dbc64050, u=u@entry=0x14c5db8989d8) at src/http/ngx_http_upstream.c:1611
+#5  0x00000000004acb42 in ngx_http_upstream_init_request (r=r@entry=0x14c5dbc64050) at src/http/ngx_http_upstream.c:871
+#6  0x00000000004ad63d in ngx_http_upstream_init (r=r@entry=0x14c5dbc64050) at src/http/ngx_http_upstream.c:549
+#7  0x000000000049ff07 in ngx_http_read_client_request_body (r=r@entry=0x14c5dbc64050, post_handler=0x4ad623 <ngx_http_upstream_init>) at src/http/ngx_http_request_body.c:77
+#8  0x00000000004db181 in ngx_http_proxy_handler (r=0x14c5dbc64050) at src/http/modules/ngx_http_proxy_module.c:946
+#9  0x0000000000493bb8 in ngx_http_core_content_phase (r=0x14c5dbc64050, ph=<optimized out>) at src/http/ngx_http_core_module.c:1314
+#10 0x000000000048e6b3 in ngx_http_core_run_phases (r=r@entry=0x14c5dbc64050) at src/http/ngx_http_core_module.c:937
+#11 0x000000000048e7c2 in ngx_http_handler (r=r@entry=0x14c5dbc64050) at src/http/ngx_http_core_module.c:920
+#12 0x000000000049769d in ngx_http_process_request (r=r@entry=0x14c5dbc64050) at src/http/ngx_http_request.c:2204
+#13 0x00000000004c763b in ngx_http_v2_run_request (r=0x14c5dbc64050) at src/http/v2/ngx_http_v2.c:3789
+#14 0x00000000004c76c7 in ngx_http_v2_state_header_complete (h2c=h2c@entry=0x14c5d8476a20, pos=pos@entry=0x14c5dc94f1cf "\240\361\356Ke\370\211\t\032mDF\222\006\232\023\256\064\333\357\066",
+    end=end@entry=0x14c5dc94f1cf "\240\361\356Ke\370\211\t\032mDF\222\006\232\023\256\064\333\357\066") at src/http/v2/ngx_http_v2.c:1704
+#15 0x00000000004c7f6e in ngx_http_v2_state_process_header (h2c=h2c@entry=0x14c5d8476a20, pos=0x14c5dc94f1cf "\240\361\356Ke\370\211\t\032mDF\222\006\232\023\256\064\333\357\066",
+    end=end@entry=0x14c5dc94f1cf "\240\361\356Ke\370\211\t\032mDF\222\006\232\023\256\064\333\357\066") at src/http/v2/ngx_http_v2.c:1675
+#16 0x00000000004c86cd in ngx_http_v2_state_header_block (h2c=0x14c5d8476a20, pos=0x14c5dc94f1cf "\240\361\356Ke\370\211\t\032mDF\222\006\232\023\256\064\333\357\066", end=0x14c5dc94f1cf "\240\361\356Ke\370\211\t\032mDF\222\006\232\023\256\064\333\357\066")
+    at src/http/v2/ngx_http_v2.c:1273
+#17 0x00000000004c665f in ngx_http_v2_read_handler (rev=rev@entry=0x14c5e544d028) at src/http/v2/ngx_http_v2.c:413
+#18 0x00000000004c6b7c in ngx_http_v2_idle_handler (rev=0x14c5e544d028) at src/http/v2/ngx_http_v2.c:4536
+#19 0x0000000000481ff5 in ngx_epoll_process_events (cycle=<optimized out>, timer=<optimized out>, flags=<optimized out>) at src/event/modules/ngx_epoll_module.c:973
+#20 0x0000000000476ee2 in ngx_process_events_and_timers (cycle=cycle@entry=0x14c60bcae050) at src/event/ngx_event.c:255
+#21 0x00000000004801ee in ngx_worker_process_cycle (cycle=0x14c60bcae050, data=<optimized out>) at src/os/unix/ngx_process_cycle.c:811
+#22 0x000000000047c6bb in ngx_spawn_process (cycle=cycle@entry=0x14c60bcae050, proc=proc@entry=0x48017d <ngx_worker_process_cycle>, data=data@entry=0xb, name=name@entry=0x71b4e7 "worker process", respawn=respawn@entry=-3) at src/os/unix/ngx_process.c:199
+#23 0x000000000047f45b in ngx_start_worker_processes (cycle=cycle@entry=0x14c60bcae050, n=20, type=type@entry=-3) at src/os/unix/ngx_process_cycle.c:395
+#24 0x00000000004808ee in ngx_master_process_cycle (cycle=cycle@entry=0x14c60bcae050) at src/os/unix/ngx_process_cycle.c:138
+#25 0x0000000000457ae4 in main (argc=<optimized out>, argv=<optimized out>) at src/core/nginx.c:418
+(gdb) print peer
+$1 = (ngx_http_upstream_rr_peer_t *) 0x0
+
+
+

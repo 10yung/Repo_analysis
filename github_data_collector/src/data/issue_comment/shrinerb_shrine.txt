@@ -1,0 +1,227 @@
+Hi @janko 👋 
+
+Before writing the issue details, I wanna say thank you for this amazing gem! Helps out a bunch every day!
+
+And now:
+
+### Brief Description
+I believe that [uppy](https://www.npmjs.com/package/uppy) isn't compatible with Shrine with versions [1.3.0](https://www.npmjs.com/package/uppy/v/1.3.0) and newer.
+
+### Expected behavior
+Direct upload to S3 with uppy & Shrine.
+
+### Actual behavior
+Uppy sends a OPTIONS preflight request to _/s3/params_ and the response is Method Not Allowed (405)
+
+### Simplest self-contained example code to demonstrate issue
+```
+const fileInput = this.fileTarget # file input from HTML
+fileInput.style.display = 'none'
+
+const uppy = Uppy({
+  autoProceed: false,
+  restrictions: {
+    maxFileSize: 10737418240,
+    maxNumberOfFiles: 1,
+    allowedFileTypes: ['video/*']
+  }
+})
+
+uppy.use(Dashboard, {
+  inline: true,
+  target: '.drag-drop-area',
+  showProgressDetails: true,
+  browserBackButtonClose: true
+})
+
+uppy.use(AwsS3, {
+  companionUrl: '/'
+})
+
+uppy.on('upload-success', function(file, response) {
+  var uploadedFileData = JSON.stringify({
+    id: file.meta['key'].match(/^cache\/(.+)/)[1],
+    storage: 'cache',
+    metadata: {
+      size:      file.size,
+      filename:  file.name,
+      mime_type: file.type
+    }
+  })
+
+  var hiddenInput = fileInput.parentNode.querySelector('.upload-hidden')
+  hiddenInput.value = uploadedFileData
+})
+```
+
+The exact same code passes when using uppy `< 1.3.0`
+
+### System configuration
+**Ruby version**: 2.6.5
+
+**Shrine version**: 3.0.1
+
+Ability to do some kind of `ls`-like behavior in storage-agnostic way on a storage. 
+
+Use cases:
+
+* Iterate through entire storage contents, to find "orphans" files not currently being pointed to by a model (perhaps left around by a bug or backup recovery).  In storage-agnostic way.  (Maybe you want to do this on just a portion of a very large storage using a prefix, instead of on the whole storage at once?)
+
+* Provide a UI to let user navigate/list contents of a storage, in storage agnostic way, for various purposes, such as selecting a file. 
+
+## API suggestion
+
+### Storage#list yields/returns string paths
+
+We can have that Storage#list method, which would yield file paths.  (May also take a `prefix` to list at just a certain "directory")
+
+    some_storage.list do |path|
+        path # => "some/path/file.jpg"
+    end
+
+    some_storage.list(prefix: "some/path/") { |path| ... }
+
+"Directories" would not be yielded (because they don't really exist as "things" on some storage systems), only individual files. 
+
+Should there be a way to get an array returned instead of using a block arg? Or actually, if we use the `Enumerable` stuff if no block is given, to support chaining, we can get that and more I think? So that should be encouraged/required in API?
+
+### Shrine.list yields/returns UploadedFile objects
+
+Then we could have a Shrine#list/Shrine.list method which would wrap this into an enumerable of Shrine::UploadedFile objects.  An UploadedFile object is our general abstraction for storage-located files, already letting us do various things with it like get a url or delete. 
+
+    Shrine.list(:store) { |uploaded_file| ... }
+    Shrine.list(:store, prefix: "some/path/") { |uploaded_file| ... }
+
+    an_uploader.list { |uploaded_file| ... }
+    an_uploader.list(prefix: "some/path") { |uploaded_file| }
+
+Similar to above, should probably return `Enumerator` if no block given, to support chaining and other useful things. 
+
+## Implementation sketch
+
+```ruby
+class Shrine::Storage::S3
+  def list
+    bucket.objects(prefix: prefix).each do |object|
+      yield object.key[/^(#{prefix}\/)?(.+)/, 2]
+    end
+  end
+end
+```
+
+```ruby
+class Shrine::Storage::FileSystem
+  # we already have this as #list_files
+  def list
+    Pathname("#{directory}/") # add trailing slash to make it work with symlinks
+      .find
+      .each { |path| path.relative_path_from(directory).to_s if path.file? }
+  end
+end
+```
+
+```ruby
+module Shrine
+  module Plugins
+    module List
+      module ClassMethods
+        def list(storage_key, &block)
+          new(storage_key).list(&block)
+        end
+      end
+
+      module InstanceMethods
+        def list
+          return enum_for(__method__) unless block_given?
+
+          storage.list do |id|
+            yield self.class::UploadedFile.new(id: id, storage_key: storage_key)
+          end
+        end
+      end
+    end
+
+    register_plugin(:list, List)
+  end
+end
+```
+
+## This is "Optional" Storage API
+
+All storages are not required to implement `list`, as shrine itself does not actually use it for basic functionality. 
+
+But it should be encouraged, to allow storage-agnostic listing. 
+
+The Linter should test if if the relevant method is present, but allow it not to be present. 
+
+When testing, Linter makes sure `prefix` arg works, and makes sure if no block is given you get an `Enumerator`/`Enumerable` returned that behaves appropriately. 
+
+(Possible future Linter "maximal mode" where it requires this and various other non-mandatory but recommended features, so you can see if a given storage lints under 'maximal mode' with all recommended features). 
+### Brief Description
+How can we use Shrine for S3 KMS encrypted uploads?
+
+This had a workaround until recently so I didn't bother reporting, but with the latest changes starting v2.14 (62705baf928bc7709ed8f88b48cdd7a4b4e9266c) it's no longer an option so I'm reaching out for help.
+
+Thanks in advance!
+
+### Expected behavior
+
+We are using the KMS encryption support to upload/download files from S3. I managed to make it work by overwriting the S3 client to let the storage use the `Aws::S3::Encryption::Client` instead.
+
+It would look like this:
+```ruby
+require 'shrine/storage/s3'
+
+class S3Storage < Shrine::Storage::S3
+  attr_writer :client
+
+  def object(id)
+    Aws::S3::Object.new(
+      # The S3 encryption client is a thin wrapper to generic s3 client.
+      client: client.try(:client) || client,
+      bucket_name: bucket.name,
+      key: [*prefix, id].join('/')
+    )
+  end
+end
+
+Shrine.storages[:encrypted] = S3Storage.new(prefix: 'encrypted', bucket: ENV['MY_ENC_BUC'])
+Shrine.storages[:encrypted].client = Aws::S3::Encryption::Client.new(
+    kms_client: Aws::KMS::Client.new(region: 'us-east-1'),
+    kms_key_id: ENV['KMS_ID']
+)
+```
+
+This little patch, allowed us to have a pretty clean KMS support for Shrine.
+
+### Actual behavior
+
+With the latest changeset, we're getting errors while trying to download the file, due to (I believe) the different APIs for AWS S3 clients.... 
+
+### Simplest self-contained example code to demonstrate issue
+```ruby
+> upload.asset.read
+NoMethodError: undefined method `head_object' for #<Aws::S3::Encryption::Client:0x000055b916c75a18>
+    from /usr/local/bundle/gems/shrine-2.14.0/lib/shrine/storage/s3.rb:576:in `load_data'
+    from /usr/local/bundle/gems/shrine-2.14.0/lib/shrine/storage/s3.rb:383:in `open'
+    from /usr/local/bundle/gems/shrine-2.14.0/lib/shrine/uploaded_file.rb:96:in `open'
+    from /usr/local/bundle/gems/shrine-2.14.0/lib/shrine/uploaded_file.rb:254:in `io'
+    from /usr/local/bundle/gems/shrine-2.14.0/lib/shrine/uploaded_file.rb:156:in `read'
+    from (irb):17
+   ...
+```
+
+### System configuration
+**Ruby version**: 2.3
+
+**Shrine version**: 2.14
+
+Rom-rb uses dry-struct as in its [entity objects](https://rom-rb.org/current/learn/core/structs/index.html). We cannot create instances of these struct classes just by calling `new` method. We have to supply the values of all the attributes in the `new` method calls. In the `backgrounding` plugin, new method is [called](https://github.com/shrinerb/shrine/blob/9977435e4036d955f8117783c5a38fb911edd11c/lib/shrine/plugins/backgrounding.rb#L208) [on](https://github.com/shrinerb/shrine/blob/9977435e4036d955f8117783c5a38fb911edd11c/lib/shrine/plugins/backgrounding.rb#L213) the record_class (dry-struct class in case of rom-rb) without passing any attribute so it fails with the following error:
+
+```shell
+undefined method default? ...
+```
+
+Hence, file deletion fails.
+
+It's unfeasible to set default values for all attributes in rom entity structs. As an alternative to `record_class.new`, we can call `OpenStruct.new` which works for all cases including rom-rb.

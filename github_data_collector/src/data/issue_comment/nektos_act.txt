@@ -1,0 +1,334 @@
+It didn't work with the new yaml syntax (https://help.github.com/en/github/automating-your-workflow-with-github-actions/workflow-syntax-for-github-actions). 
+
+When running `act -f .github/workflows/main.yml -l`, I got: 
+
+```
+Error: unable to parse
+  Line 1: illegal char
+```
+
+https://github.com/ant-design/ant-design
+Just to keep track of the work here :)
+
+Thanks for you awesome tool !
+I have a project which creates local `*.so` on compilation.
+These are never git commited (naturally). They appear to be gitignored because of a system (default?) `.gitignore`.
+
+It would be good if `act` could similarly respect any local or global/default `.gitignore`s.
+
+Otherwise, this can lead to thorny problems, in this case, a bad ELF header.
+
+Perhaps act should simply commit whatever is on the working tree as a first step, maybe in a tempdir and run from there.
+By relying on the local `git add/commit` we'd automatically respect whatever `.gitignore` action was in place
+it appears that even when the working tree is unclean, act sets the `GITHUB_SHA` env var to whatever the last  git commit on that branch was.
+
+This seems friendly, but can lead to some pretty unexpected behavior, because AFAIK act *actually* runs with the unclean working tree, so the `GITHUB_SHA` is actually kind of wrong.
+
+In any kind of situation where you're referencing something via `GITHUB_SHA` this can get weird (e.g. I am `FROM:`ing Docker images in the version of the `GITHUB_SHA`).
+
+I think it would be safer behavior to either:
+- don't set a `GITHUB_SHA` when the working tree is unclean
+- do not allow act to run on an unclean working tree (safest of them all maybe, because that's how github actions actually works, it never runs on unclean trees).
+This simple tuning can lead to at least 30% gain in action execution time, up to twice faster than without it 😉 
+
+https://github.com/nektos/act/blob/308162e2eb938f4eba6f887bb921b88167174439/actions/runner_exec.go#L157
+
+```go
+if runtime.GOOS == "darwin" {
+    // add `:delegated` at the end of the workspace volume string
+    // see https://docs.docker.com/docker-for-mac/osxfs-caching/#tuning-with-consistent-cached-and-delegated-configurations
+}
+act interprets Branch names (the `@master` portion in `uses = "/abc/def@master"`) as case insensitive, which differs from GitHub.
+
+This results in different behavior between local and GitHub environment.
+
+Any Repository/Action should be fine for testing, but for the sake of completeness:
+* Create an action as described in this [README.md](https://github.com/jakobgalbavy/github-actions/blob/master/README.md)
+* run the action -> **success**
+* change the case in `uses = "jakobgalbavy/github-actions/slack-message@master"` to `@Master` and run the action -> **succeeds locally, fails on GitHub**
+it appears that currently, `act` cannot deal with multi-workflow setups (i.e. >1 `workflow` statements with `on = "push"`), though these *are* supported by GitHub Actions.
+
+Here's an (unfortunately not minimal) example:
+
+```
+workflow "Build and Check" {
+  on = "push"
+  resolves = [
+    "Check Package",
+    "Build Website"
+  ]
+}
+
+workflow "Deploy" {
+  on = "push"
+  resolves = [
+    "Upload Cache",
+    "Code Coverage",
+    "Deploy Website"
+  ]
+}
+
+action "GCP Authenticate" {
+  uses = "actions/gcloud/auth@04d0abbbe1c98d2d4bc19dc76bcb7754492292b0"
+  secrets = [
+    "GCLOUD_AUTH"
+  ]
+}
+
+action "Download Cache" {
+  uses = "actions/gcloud/cli@d124d4b82701480dc29e68bb73a87cfb2ce0b469"
+  runs = "gsutil -m cp -r gs://ghactions-cache/lib.tar.gz /github/home/"
+  needs = [
+    "GCP Authenticate"
+  ]
+}
+
+action "Decompress Cache" {
+  uses = "actions/bin/sh@5968b3a61ecdca99746eddfdc3b3aab7dc39ea31"
+  runs = "tar -zxf /github/home/lib.tar.gz --directory /github/home"
+  needs = [
+    "Download Cache"
+  ]
+}
+
+action "Install Dependencies" {
+  uses = "./actions/install-deps"
+  needs = [
+    "Decompress Cache"
+  ]
+}
+
+action "Compress Cache" {
+  uses = "actions/bin/sh@5968b3a61ecdca99746eddfdc3b3aab7dc39ea31"
+  runs = "tar -zcf lib.tar.gz --directory /github/home lib"
+  needs = [
+    "Install Dependencies"
+  ]
+}
+
+action "Upload Cache" {
+  uses = "actions/gcloud/cli@d124d4b82701480dc29e68bb73a87cfb2ce0b469"
+  runs = "gsutil -m cp lib.tar.gz gs://ghactions-cache/"
+  needs = [
+    "Compress Cache",
+    "Filter Not Act"
+  ]
+}
+
+action "Build Package" {
+  uses = "./actions/build"
+  needs = [
+    "Install Dependencies"
+  ]
+}
+
+action "Filter Not Act" {
+  uses = "actions/bin/filter@3c0b4f0e63ea54ea5df2914b4fabf383368cd0da"
+  args = "not actor nektos/act"
+}
+
+action "Code Coverage" {
+  uses = "./actions/covr"
+  needs = [
+    "Check Package",
+    "Filter Not Act"
+  ]
+  secrets = [
+    "CODECOV_TOKEN"
+  ]
+}
+
+action "Check Package" {
+  uses = "./actions/check"
+  needs = [
+    "Build Package"
+  ]
+}
+
+action "Install Package" {
+  uses = "./actions/install"
+  needs = [
+    "Build Package"
+  ]
+}
+
+action "Build Website" {
+  uses = "./actions/pkgdown"
+  needs = [
+    "Install Package"
+  ]
+}
+
+action "Master Branch" {
+  uses = "actions/bin/filter@c6471707d308175c57dfe91963406ef205837dbd"
+  needs = [
+    "Check Package", 
+    "Build Website"
+  ]
+  args = "branch master"
+}
+
+action "Deploy Website" {
+  uses = "maxheld83/ghpages@v0.1.1"
+  env = {
+    BUILD_DIR = "docs"
+  }
+  secrets = ["GH_PAT"]
+  needs = [
+    "Master Branch",
+    "Filter Not Act"
+  ]
+}
+```
+
+On `act`, this fails *both workflows* pretty soon with `error: exit with `NEUTRAL`: 78`, even though only *one* of the workflows even includes any kind of `filter` action.
+
+This presumably imperfect parsing of the `main.workflow` is also (?) reflected in `act -l` output:
+
+```
+                    ╔═════════════╗
+                    ║ EVENT: push ║
+                    ╚═════════════╝
+                           ⬇
+        ╭──────────────────╮ ╭────────────────╮
+        │ GCP Authenticate │ │ Filter Not Act │
+        ╰──────────────────╯ ╰────────────────╯
+                           ⬇
+                   ╭────────────────╮
+                   │ Download Cache │
+                   ╰────────────────╯
+                           ⬇
+                  ╭──────────────────╮
+                  │ Decompress Cache │
+                  ╰──────────────────╯
+                           ⬇
+                ╭──────────────────────╮
+                │ Install Dependencies │
+                ╰──────────────────────╯
+                           ⬇
+          ╭───────────────╮ ╭────────────────╮
+          │ Build Package │ │ Compress Cache │
+          ╰───────────────╯ ╰────────────────╯
+                           ⬇
+ ╭─────────────────╮ ╭──────────────╮ ╭───────────────╮
+ │ Install Package │ │ Upload Cache │ │ Check Package │
+ ╰─────────────────╯ ╰──────────────╯ ╰───────────────╯
+                           ⬇
+          ╭───────────────╮ ╭───────────────╮
+          │ Build Website │ │ Code Coverage │
+          ╰───────────────╯ ╰───────────────╯
+                           ⬇
+                   ╭───────────────╮
+                   │ Master Branch │
+                   ╰───────────────╯
+                           ⬇
+                   ╭────────────────╮
+                   │ Deploy Website │
+                   ╰────────────────╯
+                    ╔═════════════╗
+                    ║ EVENT: push ║
+                    ╚═════════════╝
+                           ⬇
+        ╭────────────────╮ ╭──────────────────╮
+        │ Filter Not Act │ │ GCP Authenticate │
+        ╰────────────────╯ ╰──────────────────╯
+                           ⬇
+                   ╭────────────────╮
+                   │ Download Cache │
+                   ╰────────────────╯
+                           ⬇
+                  ╭──────────────────╮
+                  │ Decompress Cache │
+                  ╰──────────────────╯
+                           ⬇
+                ╭──────────────────────╮
+                │ Install Dependencies │
+                ╰──────────────────────╯
+                           ⬇
+          ╭────────────────╮ ╭───────────────╮
+          │ Compress Cache │ │ Build Package │
+          ╰────────────────╯ ╰───────────────╯
+                           ⬇
+ ╭─────────────────╮ ╭───────────────╮ ╭──────────────╮
+ │ Install Package │ │ Check Package │ │ Upload Cache │
+ ╰─────────────────╯ ╰───────────────╯ ╰──────────────╯
+                           ⬇
+          ╭───────────────╮ ╭───────────────╮
+          │ Build Website │ │ Code Coverage │
+          ╰───────────────╯ ╰───────────────╯
+                           ⬇
+                   ╭───────────────╮
+                   │ Master Branch │
+                   ╰───────────────╯
+                           ⬇
+                   ╭────────────────╮
+                   │ Deploy Website │
+                   ╰────────────────╯
+```
+
+Apparently, `act` here mushes the two workflows together.
+### Steps to reproduce
+
+1. Use some workflow with 3 actions, one local, several remote, like so:
+
+```
+workflow "Test Action" {
+  on = "push",
+  resolves = ["Shellcheck", "Test dependency installation"]
+}
+
+action "Shellcheck" {
+  uses = "actions/bin/shellcheck@1b3c130914f7b20890bf159306137d994a4c39d0"
+  args = "*.sh"
+}
+
+action "Install Dependencies" {
+  uses = "./"
+}
+
+action "Test dependency installation" {
+  uses = "maxheld83/ghactions_check@master"
+  args = "testthat::test_dir(path = \"tests/testthat/\", stop_on_failure = TRUE)"
+  needs = "Install Dependencies"
+}
+```
+
+2.  run `act`. Everything works as intended.
+
+3. `git commit` `git push` to the **third** action `"maxheld83/ghactions_check@master"`
+
+4. run `act` again.
+
+
+### Observed behavior
+
+`act` uses the old, now outdated version of `"maxheld83/ghactions_check@master"` and does not float to the latest commit of `master`.
+
+
+### Expected behavior:
+
+`act` should always use the latest commit to master; this is how github actions behaves.
+
+
+### Fix
+
+Hardcoding a commit `"maxheld83/ghactions_check@78652ea60553d2fd92d256876cd2873264cb9233"` solves the problem, but defeats the purpose.
+
+
+### Hunch
+
+maybe a caching problem?
+You can use short SHAs like this:
+```
+action "run tests" {
+  uses = "actions/docker/cli@04185cf"
+  args = "build ."
+}
+```
+
+This works fine in Github, but it does not using act:
+
+```
+[run tests] Unable to resolve 04185cf: reference not found
+Error: reference not found
+```

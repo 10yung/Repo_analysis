@@ -1,0 +1,178 @@
+So, iam new to metrics maybe i'm doing something wrong here. Let me describe the problem.
+I am reporting metrics data to influxDb. I am measuring time of api request calls like so in c#
+
+```csharp
+using (_metrics.Measure.Timer.Time(options.TimerOptions))
+{
+       response = await base.SendAsync(request, cancellationToken);
+}
+```
+And reporting metrics every 5 seconds like so
+```csharp
+await Task.WhenAll(_metrics.ReportRunner.RunAllAsync());
+```
+It  looks all good when there are calls going to api's. Data reported looks correct. Here is an example of what is being reported
+`http_request_duration_seconds,Role=API,URL=api/security/login/,HttpMethod=GET,app=Unify.Server,server=MyServer,env=release,mtype=timer,unit=req,unit_dur=s,unit_rate=s count.meter=7i,rate1m=7.89087548867864E-07,rate5m=0.000455053073491107,rate15m=0.000615312011926536,rate.mean=0.000102034933717057,samples=1i,last=0.031571,count.hist=1i,sum=0.031571,min=0.031571,max=0.031571,mean=0.031571,median=0.031571,stddev=0,p999=0.031571,p99=0.031571,p98=0.031571,p95=0.031571,p75=0.031571 1578649585000774700`
+
+After a while of inactivity(when there are no call to api), something like 10 minutes or so it resets some of the values which results in reporting data like this
+`http_request_duration_seconds,Role=API,URL=api/security/login/,HttpMethod=GET,app=Unify.Server,server=MyServer,env=release,mtype=timer,unit=req,unit_dur=s,unit_rate=s count.meter=7i,rate1m=4.33916453437943E-40,rate5m=1.0141874626533E-10,rate15m=3.7306180615082E-06,rate.mean=9.56232490178115E-05,samples=0i,last=0.031571,count.hist=0i,sum=0,min=0,max=0,mean=0,median=0,stddev=0,p999=0,p99=0,p98=0,p95=0,p75=0 1578654185000805700`
+
+Notice the following values have been reset to 0
+`samples=0i,count.hist=0i,sum=0,min=0,max=0,mean=0,median=0,stddev=0,p999=0,p99=0,p98=0,p95=0,p75=0`
+
+I am using this data in Grafana to show mean time of api calls. When they are being reset my grafs look all wrong.
+How can i force metrics not to reset data?
+
+
+
+We're using AppMetrics v1.3 and in the process of upgrading our app to .NET Core 3.1
+
+The latest nuget v3.2 doesn't seem to have this extension `services.AddMetrics();`
+
+Also we're now using Endpoint Routing instead of MVC Routing as per suggestions from .NET Core team.
+
+What's the likely ETA for .NET Core 3.1 upgrade to be released if it's already not supported?
+See #396. when trying to run App Metrics & Prometheus Plain text without Syncronous IO (which is the default now) nothing is reported, only after explicitly allowing Syncronous IO will Prometheus Plain Text work.
+During our microservice performance test after migrating all stuff to netcore 3.0 we saw not observed  before issue with low CPU saturation. After searching we concluded that the actual problem was inside one of your components, that was misbehaving.
+
+https://github.com/AppMetrics/AppMetrics/blob/dev/src/AspNetCore/src/App.Metrics.AspNetCore.Mvc.Core/MvcRouteTemplateResolver.cs
+
+
+    try {
+    // *IMPORTANT* this hack is throwing exception for every request.
+    // It's hack to catch TypeLoadException
+        Func<IList<IRouter>, ActionDescriptor[]> func = routersList =>
+        {
+            var attributeRouteHandler = routersList.FirstOrDefault(r => r.GetType().Name == nameof(MvcAttributeRouteHandler))
+                as MvcAttributeRouteHandler;
+                
+            return attributeRouteHandler?.Actions;
+        };
+                
+        return func(routers);
+    }
+    catch (TypeLoadException)
+    {
+        return null;
+    }
+
+`
+
+As described in comment, we always get TypeLoadException due to MvcAttributeRouteHandler changed location in netcore packages. And when exception is thrown on every request it has a negative effect.
+
+Either way I suggest to do either of things:
+1) port this lib to netcoreapp3.0
+2) not use this code at all (we used this approach to have our own IRouteNameResolver for netcoreapp3_0 which did nothing, as route was built by different part of code as before, but without exceptions)
+3) as everything inside this class has dependency on routeData.Routers - you can just check for routeData.Routers.Any() in the beginning. It is bad, but still better that what you currently have
+
+To check that this was not done due to our incorrect usage of libraries, I tried the same on your MetricsSandboxMvc project with same results.
+
+I have some investigation data if you need any. 
+I noticed then when using UDP reporter the max send buffer size on application size exceeds OS default and UDP reporter backs off.
+Should UDP reporter use lower flush interval of 2 secs or less? I know default is 5 secs. 
+Or UDP based reporting needs a feature to send the metrics immediately?
+
+The success of an HTTP response is defined incorrectly right now:
+
+```cs
+public static bool IsSuccessfulResponse(this HttpResponse httpResponse)
+{
+    return httpResponse.StatusCode >= StatusCodes.Status200OK && httpResponse.StatusCode < StatusCodes.Status300MultipleChoices;
+}
+```
+
+3xx status codes are considered "unsuccessful", but they should not.
+E.g. there is nothing unsuccessful about a `304 Not Modified` response.
+
+Maybe this was implemented to be consistent with [HttpResponseMessage.IsSuccessStatusCode](https://github.com/dotnet/corefx/blob/master/src/System.Net.Http/src/System/Net/Http/HttpResponseMessage.cs#L143), but I think it does not have to be. On the client we may want to have a stricter check of the status code (200..299), e.g. to make sure we are safe to read the body, but on the server the notion of success should less strict, otherwise the metric `OneMinErrorPercentageRate` and the like give false alarms.
+
+I propose to change the above method to
+```cs
+public static bool IsSuccessfulResponse(this HttpResponse httpResponse)
+{
+      return httpResponse.StatusCode < StatusCodes.Status400BadRequest;
+}
+```
+The sample link [here](https://www.app-metrics.io/samples/metrics-code/#net452-metrics-console-sln) points to a non existent url. https://github.com/AppMetrics/Samples.V2/tree/master/Net452.Metrics.Console.QuickStart
+
+I'm also looking for an example of using v3 with a .net 4.5.2 console application, I can get the reporter to send `appmetrics.internal__report_success` just fine, but none of my metrics.
+Hello!
+What do you think about new dotnet trace strategy with etw? https://devblogs.microsoft.com/dotnet/introducing-diagnostics-improvements-in-net-core-3-0/
+Stupid question: Can AppMetrics uses this EventPipe ? :) Does it make sense?
+![image](https://user-images.githubusercontent.com/4228072/69038732-544fdb80-09e2-11ea-9f17-b11dac0c2a0f.png)
+
+When selecting the second overload on the Increment method the text displays "The amount to decrement the counter", I am hoping is the wrong help text :)
+I think it would be nice to be able to configure AppMetrics only from the `Startup.cs` class.
+
+Instead of...
+```cs
+public static void Main(string[] args)
+    => CreateHostBuilder(args).Build().Run();
+
+public static IHostBuilder CreateHostBuilder(string[] args)
+    => Host.CreateDefaultBuilder(args)
+           .ConfigureMetricsWithDefaults((ctx, builder) => {
+               builder.Configuration.Configure(config => {
+                   config.AddAppTag(ApplicationConstants.APPLICATION_NAME);
+                   config.AddEnvTag(ctx.HostingEnvironment.EnvironmentName);
+               });
+               builder.OutputMetrics.AsPrometheusPlainText();
+           })
+           .UseMetricsEndpoints()
+           .UseMetricsWebTracking()
+           .ConfigureWebHostDefaults(webBuilder =>
+           {
+               webBuilder.UseStartup<Startup>();
+           });
+```
+
+Something like this:
+```cs
+public class Program
+{
+    public static void Main(string[] args)
+        => CreateHostBuilder(args).Build().Run();
+
+    public static IHostBuilder CreateHostBuilder(string[] args)
+        => Host.CreateDefaultBuilder(args)
+               .ConfigureWebHostDefaults(webBuilder =>
+               {
+                   webBuilder.UseStartup<Startup>();
+               });
+}
+
+public class Startup
+{
+
+    // This method gets called by the runtime. Use this method to add services to the container.
+    public void ConfigureServices(IServiceCollection services)
+    {
+        services.AddMetrics(config => {
+            config.AddAppTag(ApplicationConstants.APPLICATION_NAME);
+            config.AddEnvTag(ctx.HostingEnvironment.EnvironmentName);
+        });
+        services.AddMetricsEndpoints();
+        services.AddMetricsTrackingMiddleware();
+    }
+
+    // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
+    public void Configure(IApplicationBuilder app, IWebHostEnvironment environment, ILogger<Startup> logger)
+    {
+        app.UseMetricsAllMiddleware();
+
+        app.UseRouting();
+
+        app.UseAuthentication();
+        app.UseAuthorization();
+
+        app.UseEndpoints(endpoints =>
+        {
+            // endpoints.MapMetricsEndpoints();
+            endpoints.MapMetricsEndpoints().RequireHost("*:10240");
+            endpoints.MapControllers();
+        });
+    }
+}
+```
+
+I think this approche is much cleaner than adding AppMetrics to the hostBuilder. I generally don't like modifying the `Program.cs` because I'd like to have all my configuration at one place in one file.

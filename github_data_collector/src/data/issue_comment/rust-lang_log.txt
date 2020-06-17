@@ -1,0 +1,147 @@
+The only problem on the build is on the dependency `cfg-if 0.1.10`
+It would be really nice to have a specialized way of logging errors that implement `std::error::Error`. 
+
+This would allow automatically capturing detailed information about an error, including the `Display` and `Debug` representations, and especially backtraces via the new `Error::backtrace`, which has an open PR.
+
+The main purpose is to give the backend implementation the option to extract all desired information about an error and use it as appropriate for the output.
+
+Not sure how this could fit into the current design, but I'd imagine an additional method on `Log` and a macro. 
+
+```rust
+trait Log {
+  ...
+  // The record serves the purpose of providing the location, and optionally an additional error message / metadata.
+  // Question: Should the record be optional or required?
+  fn error(&self, error: &dyn std::error::Error,  record: Option<&Record>);
+}
+```
+
+
+
+Plus a macro. 
+
+Naming for that macro would of course be somewhat awkward, considering `error!` exists.  Maybe `with_error!()`. Also there could be a variant of `error!` that allows specifying an error value.
+
+One could of course ask if this is really necessary, since you could already write a custom macro or method that captures the required information as a `Record`. But I'd like to see a standardized way of doing this that gives the logger implementation the power to do what it wants, without forcing the user to make a decision here up-front.
+Since 0.4..8, log can provide static string if it's available, so 0.3.x can utilize it to avoid annoying unknown string when they are using together.
+Found by clippy
+https://rust-lang.github.io/rust-clippy/master/#derive_hash_xor_eq
+Continuation of https://github.com/rust-lang-nursery/log/issues/328#issuecomment-513588521.
+
+## Description
+
+`kv_unstable` is available in `log` and provides a `key_values` field on the `Record` to capture key-value pairs. However currently in order to write data to loggers `Record` types need to be constructed manually, rather than being able to use the log macros. As per [RFC#296](https://github.com/rust-lang-nursery/log/blob/master/rfcs/0296-structured-logging.md) we should experiment with logging macros out of tree, and use it to inform how to add key-value logging to log's macros.
+
+## Constraints
+[tbi]
+
+@KodrAus could you perhaps clarify what the constraints are?
+
+## Prior Art
+### Slog
+The [slog crate](https://docs.rs/slog/2.5.1/slog/macro.log.html) uses `;"key" => "value"` pairs in the macros:
+```rust
+#[macro_use]
+extern crate slog;
+
+fn main() {
+    let drain = slog::Discard;
+    let root = slog::Logger::root(
+        drain,
+        o!("key1" => "value1", "key2" => "value2")
+    );
+    info!(root, "test info log"; "log-key" => true);
+}
+```
+
+### Tracing
+[tracing](https://docs.rs/tracing/0.1.3/tracing/macro.info.html) supports two kinds of log styles: "a message + key-value pairs", and "only key-value pairs":
+```rust
+use tracing::field;
+
+let addr = Ipv4Addr::new(127, 0, 0, 1);
+let conn = Connection { port: 40, speed: 3.20 };
+
+info!({ port = conn.port }, "connected to {}", addr);
+info!(
+    target: "connection_events",
+    ip = %addr,
+    conn.port,
+    ?conn.speed,
+);
+```
+_Update this section with more examples_
+
+## Creating a manual record
+For reference, this is how to create a manual record with key-value pairs:
+```rust
+use log::kv::{Error, Visitor, Source};
+
+struct Pair {
+    val: String
+}
+
+impl Source for Pair {
+    fn visit(&self, visitor: &mut dyn Visitor<'_>) -> Result<(), Error> {
+        visitor.visit_pair("some key".into(), self.val.into())
+    }
+}
+
+log::logger().log(&log::Record::builder()
+    .args(format_args!("hello world!"))
+    .key_values(&Pair { val: "some value".to_string() })
+    .level(log::Level::Info)
+    .target(module_path!())
+    .module_path(Some(module_path!()))
+    .file(Some(file!()))
+    .line(Some(line!()))
+    .build());
+```
+
+## Conclusion
+We should experiment with logging macros that can capture key-value pairs and report back with our findings in this issue. It'd be great if we could discuss their tradeoffs, and eventually come up with a design that's suitable for an RFC.
+When writing command line programs, I often find myself wanting two distinct "info"-like log levels: one for regular output and one when a `--verbose` flag is requested by the user. Then implementing `--verbose` is simply a matter of changing the log level. I think the `Debug` level is wrong for this purpose because it's oriented towards developers, whereas `--verbose` is typically intended for troubleshooting by users.
+
+There would be two ways to go about it:
+* `Warn > Notice > Info > Debug`
+* `Warn > Info > Verbose > Debug`
+
+I realize that similar things have been requested before (#240, #229), but I think my use case is actually a quite helpful one.
+
+If your consideration is to keep the number of built-in log levels low, I actually don't find a distinct `Trace` level to be useful; seems like debug output to me. But perhaps other people do? What was the justification for that in the first place? :)
+
+The `core::fmt` have a big impact on code size, and @japaric  has developed a smaller and faster alternative [ufmt](https://github.com/japaric/ufmt). Can `log` consider supporting it?
+Tracking issue for the implementation of #296. See also #149 
+
+- [x] Initial implementation (#324)
+- [ ] Integration with frameworks and loggers:
+  - [ ] [`slog`](https://github.com/slog-rs/slog)
+    - [ ] Zero-allocation conversion between `slog::Value` and `log::kv::Value`. We should be able to do zero-allocation conversion from `log` to `slog`, but may need to allocate from `slog` to `log`.
+  - [ ] [`tracing`](https://github.com/tokio-rs/tracing) (https://github.com/tokio-rs/tracing/issues/341)
+    - [x] Zero-allocation conversion between `tracing::Value` and `log::kv::Value` in the `event!` macro (#339)
+  - [ ] [`fern`](https://github.com/daboross/fern)
+  - [ ] [`async-log`](https://github.com/rustasync/async-log)
+  - [ ] [`std-logger`](https://github.com/Thomasdezeeuw/std-logger) (https://github.com/Thomasdezeeuw/std-logger/pull/14)
+    - [x] Some way to tell whether a `Source` has any key-value pairs (#329)
+  - [ ] [`femme`](https://github.com/lrlna/femme)
+  - [ ] [`env_logger`](https://github.com/sebasmagri/env_logger) (https://github.com/sebasmagri/env_logger/pull/137)
+  - [ ] [`antlog`](https://github.com/KodrAus/antlog) (an experimental wrapper to prove out requirements)
+    - [x] A way to get specific values (#335)
+  -  _Please suggest others to track!_
+- [ ] Explore macro support (#343)
+  - [x] `log!("msg {}", interpolated, { key: value })` (#353)
+- [ ] Integration with serialization frameworks:
+  - [ ] `serde`
+    - [x] Conversion between `serde::Serialize` and `std::fmt::Debug` (https://github.com/rust-lang/rfcs/pull/2696). See [`serde_fmt`](https://github.com/KodrAus/serde_fmt).
+  - [x] `sval` (#342)
+- [ ] Micro benchmarks
+- [ ] Documentation and examples
+- [ ] Stabilization review
+- [ ] Open questions
+  - [ ] Should `Source::count` return a `Result<usize>` instead of a plain `usize`?
+Hello all, I was wondering if this crate would be open to a PR that adds `pub fn deinitialize() -> Option<&'static Log>`.  The goal is that I'd like to be able to write a crate for composing loggers, but currently loggers aren't constrained to expose the loggers they generate publicly, so the only way to reliably compose them would be to have some means of pulling them out of your `&'static mut LOGGER`.
+there is nothing prints out:
+
+        warn!("but this is not implemented yet!")
+
+i got nothing on terminal

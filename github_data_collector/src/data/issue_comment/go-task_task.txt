@@ -1,0 +1,570 @@
+Hi,
+
+I had some behavior I was not expecting using Task under Windows and git bash on a project that was originally on a Mac.
+
+### System information
+- Windows 10
+- Task 2.8.0 (task_windows_amd64.zip extracted and added to PATH)
+
+### Problem
+I was expecting my .sh scripts to be able to run in the same way in Task or Git Bash but Task threw an error.
+
+Example Task File
+```
+version: '2'
+
+tasks:
+  test:
+    cmds:
+      - ./test.sh
+```
+
+test.sh
+```
+#!/usr/bin/env bash
+
+echo 'test'
+```
+Note: `#!/bin/bash` produced the same result
+
+Executing from git bash `./test.sh` gives the output `test`
+
+Executing from task `task test` gives the following error:
+`task: Failed to run task "test": fork/exec D:\test\test.sh: %1 is not a valid Win32 application.`
+
+### Workaround
+The workaround I ended up with was to add `bash` to the command
+
+Fixed Task File
+```
+version: '2'
+
+tasks:
+  test:
+    cmds:
+      - bash ./test.sh
+```
+
+Which then gives the correct output `test`.
+
+Running the Task with just `./test.sh` works directly on a Mac but not under git bash on Windows. Is this a bug / limitation, or is there something I should have set up before?
+### System and Task version information:
+- Task version: `2.8.0`
+- System-Version: `macOS 10.15.1 (19B88)`
+   Kernel-Version: `Darwin 19.0.0`
+
+## Description:
+Migrated a make file to Taskfile to execute Terratest, but Task fails to download vendors with `dep ensure`; dep seems to think it is in the root directory with Taskfile, not honouring the `dir` flag of a `cd` to temp `.gopath/src/go-task-example` folder.
+
+To reproduce the issue I have created a sample project [go-task-example](https://github.com/kevinneufeld/go-task-example) 
+
+Steps from `test/src`:
+- `make test` &  `make clean` 
+- `task test` & `task clean`
+
+The MakeFile:
+```make
+PACKAGE := go-task-example
+GOEXE 	?= $(which go)
+GOPATH  := $(CURDIR)/.gopath
+GOBIN   := $(GOPATH)/bin
+BASE    := $(GOPATH)/src/$(PACKAGE)
+##PATH 	= $(PATH):$(GOBIN)
+
+export TF_DATA_DIR ?= $(CURDIR)/.terraform
+export TF_CLI_ARGS_init ?= -get-plugins=true
+export GOPATH
+
+.PHONY: all
+## Default target
+all: test
+
+ifneq (,$(wildcard /sbin/apk))
+## Install go, if not installed
+$(GOEXE):
+	apk add --update go
+endif
+
+ifneq ($(OS),Windows_NT)
+## Install all `dep`, if not installed
+$(GOBIN)/dep:
+	@mkdir -p $(GOBIN)
+	@curl https://raw.githubusercontent.com/golang/dep/master/install.sh | sh
+endif
+
+## Prepare the GOPATH
+$(BASE): $(GOEXE)
+	@mkdir -p $(dir $@)
+	@ln -sf $(CURDIR) $@
+## init and download vendor dependencies to vendor/
+base-vendor-init: $(BASE) $(GOBIN)/dep
+	cd $(BASE) && dep init
+
+## Download vendor dependencies to vendor/
+$(BASE)/vendor: $(BASE) $(GOBIN)/dep
+	cd $(BASE) && dep ensure
+
+.PHONY : init
+## Initialize tests
+init: $(BASE)/vendor
+
+.PHONY : test
+## Run tests
+test: init
+	cd $(BASE) && go test -v -timeout 30m -run TestExamplesComplete
+
+.PHONY : clean
+## Clean up files
+clean:
+	rm -rf .gopath/ vendor/ $(TF_DATA_DIR) terraform.tfplan ../../examples/complete/terraform.tfstate ../../examples/complete/terraform.tfstate.backup
+```
+
+The Taskfile.yml
+```yml
+version: "2"
+
+vars:
+  PACKAGE: go-task-example
+  CURDIR:
+    sh: echo "$(PWD)"
+  GOPATH_VAR:
+    sh: echo "$(PWD)/.gopath"
+  GOEXE:
+    sh: which go
+  GOBIN: "{{.GOPATH_VAR}}/bin"
+  BASE: "{{.GOPATH_VAR}}/src/{{.PACKAGE}}"
+
+env:
+  TF_DATA_DIR: "./.terraform"
+  TF_CLI_ARGS_init: "-get-plugins=true"
+  GOBIN: "{{.GOBIN}}"
+  GOPATH: "{{.GOPATH_VAR}}"
+  PATH:
+    sh: echo "{{.GOBIN}}:$PATH"
+
+tasks:
+  go-exe:
+    desc: Is go installed
+    cmds:
+      - |
+        echo "You need to install GO"
+    status:
+      - test -f {{.GOEXE}}
+
+  go-bin-dep:
+    desc: Download and install Golang Dep
+    cmds:
+      - mkdir -p {{.GOBIN}}
+      - curl https://raw.githubusercontent.com/golang/dep/master/install.sh | sh
+    status:
+      - test -f .gopath/bin/dep{{exeExt}}
+
+  base:
+    desc: "Create a symlink to of the current ./test/src to {{.BASE}}"
+    deps: [go-exe]
+    cmds:
+      - |
+        mkdir -p {{.GOPATH_VAR}}/src
+        ln -sf {{.CURDIR}} {{.BASE}}
+    status:
+      - test -d "{{.BASE}}"
+
+  base-vendor-init:
+    desc: Initialize Dep to create and download Terratest project dependecies of Gopkg.toml does not exists
+    dir: "{{.BASE}}"
+    deps: [go-bin-dep]
+    cmds:
+      - dep init
+    status:
+      - test -f "{{.BASE}}/Gopkg.toml"
+
+  base-vendor:
+    desc: Dep esure, downloads all require go dependecies
+    deps: [base, go-bin-dep]
+    dir: "{{.BASE}}"
+    cmds:
+      - |
+        echo ""
+        export PATH=$GOBIN:$PATH
+        echo "PATH='$PATH'"
+        echo ""
+        export GOPATH={{.GOPATH_VAR}}
+        echo "GOPATH='$GOPATH'"
+        echo ""
+        echo "PWD='$PWD'"
+        echo ""
+        #cd {{.BASE}}
+        dep ensure
+
+  init:
+    desc: Initialize terratest project environment
+    deps: [base-vendor]
+
+  test:
+    desc: Run tests
+    deps: [init]
+    dir: .gopath/src/terraform-windows-application-cluster
+    cmds:
+      - go test -v -timeout 30m -run TestExamplesComplete
+
+  clean:
+    desc: Cleans up all files and foders inorder to run terratest
+    cmds:
+      - "rm -rf ./.gopath/ ./vendor/ ./.terraform terraform.tfplan ../../examples/complete/terraform.tfstate ../../examples/complete/terraform.tfstate.backup"
+```
+
+## Task output:
+```Shell
+task test
+mkdir -p /Users/kneufeld/Documents/Development/terraform/go-task-example/test/src/.gopath/bin
+task: Task "go-exe" is up to date
+curl https://raw.githubusercontent.com/golang/dep/master/install.sh | sh
+mkdir -p /Users/kneufeld/Documents/Development/terraform/go-task-example/test/src/.gopath/src
+ln -sf /Users/kneufeld/Documents/Development/terraform/go-task-example/test/src /Users/kneufeld/Documents/Development/terraform/go-task-example/test/src/.gopath/src/go-task-example
+
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100  5230  100  5230    0     0   100k      0 --:--:-- --:--:-- --:--:--  100k
+ARCH = amd64
+OS = darwin
+Will install into /Users/kneufeld/Documents/Development/terraform/go-task-example/test/src/.gopath/bin
+Fetching https://github.com/golang/dep/releases/latest..
+Release Tag = v0.5.4
+Fetching https://github.com/golang/dep/releases/tag/v0.5.4..
+Fetching https://github.com/golang/dep/releases/download/v0.5.4/dep-darwin-amd64..
+Setting executable permissions.
+Moving executable to /Users/kneufeld/Documents/Development/terraform/go-task-example/test/src/.gopath/bin/dep
+echo ""
+export PATH=$GOBIN:$PATH
+echo "PATH='$PATH'"
+echo ""
+export GOPATH=/Users/kneufeld/Documents/Development/terraform/go-task-example/test/src/.gopath
+echo "GOPATH='$GOPATH'"
+echo ""
+echo "PWD='$PWD'"
+echo ""
+#cd /Users/kneufeld/Documents/Development/terraform/go-task-example/test/src/.gopath/src/go-task-example
+dep ensure
+
+
+PATH='/Users/kneufeld/Documents/Development/terraform/go-task-example/test/src/.gopath/bin:/opt/chefdk/bin:/Users/kneufeld/.chefdk/gem/ruby/2.6.0/bin:/opt/chefdk/embedded/bin:/opt/chefdk/bin:/Users/kneufeld/.chefdk/gem/ruby/2.6.0/bin:/opt/chefdk/embedded/bin:/opt/chefdk/embedded/bin:/usr/local/bin/pwsh:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/chefdk/bin:/Users/kneufeld/.chefdk/gem/ruby/2.6.0/bin:/opt/chefdk/embedded/bin:/usr/local/bin/pwsh:/Users/kneufeld/Documents/Development/go-workspace/bin:/usr/local/opt/go/libexec/bin:/opt/chefdk/gitbin:/Users/kneufeld/Documents/Development/go-workspace/bin:/usr/local/opt/go/libexec/bin:/opt/chefdk/gitbin:/opt/chefdk/gitbin'
+
+GOPATH='/Users/kneufeld/Documents/Development/terraform/go-task-example/test/src/.gopath'
+
+PWD='/Users/kneufeld/Documents/Development/terraform/go-task-example/test/src/.gopath/src/go-task-example'
+
+/Users/kneufeld/Documents/Development/terraform/go-task-example/test/src is not within a known GOPATH/src
+task: Failed to run task "base-vendor": exit status 1
+```
+
+## MAKE output:
+```shell
+make test
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100  5230  100  5230    0     0  83015      0 --:--:-- --:--:-- --:--:-- 83015
+ARCH = amd64
+OS = darwin
+Will install into /Users/kneufeld/Documents/Development/terraform/go-task-example/test/src/.gopath/bin
+Fetching https://github.com/golang/dep/releases/latest..
+Release Tag = v0.5.4
+Fetching https://github.com/golang/dep/releases/tag/v0.5.4..
+Fetching https://github.com/golang/dep/releases/download/v0.5.4/dep-darwin-amd64..
+Setting executable permissions.
+Moving executable to /Users/kneufeld/Documents/Development/terraform/go-task-example/test/src/.gopath/bin/dep
+cd /Users/kneufeld/Documents/Development/terraform/go-task-example/test/src/.gopath/src/go-task-example && dep ensure
+cd /Users/kneufeld/Documents/Development/terraform/go-task-example/test/src/.gopath/src/go-task-example && go test -v -timeout 30m -run TestExamplesComplete
+=== RUN   TestExamplesComplete
+=== PAUSE TestExamplesComplete
+=== CONT  TestExamplesComplete
+TestExamplesComplete 2019-12-16T11:23:29-08:00 retry.go:72: terraform [init -upgrade=true]
+TestExamplesComplete 2019-12-16T11:23:29-08:00 command.go:87: Running command terraform with args [init -upgrade=true]
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: Upgrading modules...
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: - label1 in ../..
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: 
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: Initializing the backend...
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: 
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: Terraform has been successfully initialized!
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: 
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: You may now begin working with Terraform. Try running "terraform plan" to see
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: any changes that are required for your infrastructure. All Terraform commands
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: should now work.
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: 
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: If you ever set or change modules or backend configuration for Terraform,
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: rerun this command to reinitialize your working directory. If you forget, other
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: commands will detect it and remind you to do so if necessary.
+TestExamplesComplete 2019-12-16T11:23:30-08:00 retry.go:72: terraform [get -update]
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:87: Running command terraform with args [get -update]
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: - label1 in ../..
+TestExamplesComplete 2019-12-16T11:23:30-08:00 retry.go:72: terraform [apply -input=false -lock=false -auto-approve]
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:87: Running command terraform with args [apply -input=false -lock=false -auto-approve]
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: 
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: Apply complete! Resources: 0 added, 0 changed, 0 destroyed.
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: 
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: Outputs:
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: 
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: label1 = {
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158:   "attributes" = "1-2-3"
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158:   "delimiter" = "-"
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158:   "id" = "namespace-stage-name-1-2-3"
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158:   "name" = "name"
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158:   "namespace" = "namespace"
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158:   "stage" = "stage"
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: }
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: label1_attributes = 1-2-3
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: label1_id = namespace-stage-name-1-2-3
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: label1_name = name
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: label1_namespace = namespace
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: label1_stage = stage
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: label1_tags = {
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158:   "Key" = "Value"
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158:   "Name" = "namespace-stage-name-1-2-3"
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158:   "Namespace" = "namespace"
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158:   "Stage" = "stage"
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: }
+TestExamplesComplete 2019-12-16T11:23:30-08:00 retry.go:72: terraform [output -no-color -json label1]
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:87: Running command terraform with args [output -no-color -json label1]
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: {"attributes":"1-2-3","delimiter":"-","id":"namespace-stage-name-1-2-3","name":"name","namespace":"namespace","stage":"stage"}
+TestExamplesComplete 2019-12-16T11:23:30-08:00 retry.go:72: terraform [destroy -auto-approve -input=false -lock=false]
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:87: Running command terraform with args [destroy -auto-approve -input=false -lock=false]
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: 
+TestExamplesComplete 2019-12-16T11:23:30-08:00 command.go:158: Destroy complete! Resources: 0 destroyed.
+--- PASS: TestExamplesComplete (0.81s)
+PASS
+ok      go-task-example 0.914s
+```
+
+I'm trying to set up nvm and node using go-task, but the gosh the tasks are running in is giving me some trouble. 
+
+You can see the task I'm trying to run below, where the first command works fine, $SHELL is zsh in my case, and the scripts installs correctly. But nvm is installed as a shell function, not a binary, so the commands "which nvm" and "nvm install node" fail to find "nvm".
+
+```
+  setup:
+    desc: setup common tools
+    cmds:
+      - "[ ! -d ~/.nvm ] && curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.35.1/install.sh | $SHELL || echo nvm installed, skipping..."
+      - which nvm
+      - nvm install node
+    silent: no
+```
+
+nvm also adds some things to my .zshrc when the install script runs, and it requires to set some environment variables in order to immediately use nvm, or to restart your terminal to load those vars from .zshrc:
+
+```
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
+[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
+```
+Is this possible to do with go-task or am I outside the scope of the application?
+It would be really great to be able to set this task up so that I can install nvm and node (npm) so that I can install some common tools that we use in one task. Would putting these installation commands for nvm and node into a script be a better approach?
+
+If relevant, include the following information:
+- Task version: Task version: 2.8.0
+- OS: darwin
+- Example Taskfile showing the issue
+
+
+```
+
+version: '2'
+
+vars:
+  Repo: blah
+  Tag: confd
+  Version: v0.16.0
+  FullName: "{{ .Repo }}/{{ .Tag }}:{{ .Version }}"
+
+tasks:
+  container:build:
+    desc: |
+     This will build "{{ OS }}"
+    cmds:
+      - docker build . -t "{{ .FullName }}"
+    silent: true
+
+```
+
+Variable interpolation works well, but it seems that desc does not support auto generating content. I am looking for this to try to make my tasks a little more generic.. 
+
+
+{{ OS }} or other golang templates should be executed for desc (Description). 
+
+In order to make a project dependencies update tools, I'm interested by the  `preconditions` options.
+
+It allow me to run the different dependencies managers if the condition are met:
+
+```yaml
+version: '2'
+
+silent: true
+
+tasks:
+  default:
+    deps:
+      - composer
+      - npm
+
+  composer:
+    preconditions:
+      - test -f composer.lock
+    cmds:
+      - composer update
+
+  npm:
+    preconditions:
+      - test -f package-lock.json
+    cmds:
+      - npm update
+```
+
+But the way this option is working does not fit my needs. It fail immediately if one of the task as unmet condition:
+
+```
+❯ task
+task: `test -f package-lock.json` failed
+task: `test -f composer.lock` failed
+task: precondition not met
+❯ touch composer.lock
+❯ task
+task: `test -f package-lock.json` failed
+task: precondition not met
+```
+
+I didn't find any option to solve this issue, so I guess it was designed for.
+
+Would you consider an evolution about this?
+
+Regards
+It would be great to be able to set an option to avoid having to call the tasks using the `task includename:task` syntax when including a taskfile.
+
+So this example assumes you have files like:
+./Taskfile.yml
+./common/Taskfile.yml
+
+The use case for this is when creating a main Taskfile for a repository and importing some common tasks, lets say "list", "clean" and "version", right now I need to then call `task common:clean` etc to run them.
+
+Instead I would like to be able to do something like this in my main taskfile:
+
+```
+includes:
+  common: ./common
+    flatten:true
+    override: false
+```
+
+Where the 'flatten' property would define that the tasks from 'common' should be available as if they were present in the main taskfile, so "task clean" would actually call "task common:clean". This would probably have to throw a conflict error if the "clean" task exists in both the main taskfile and the 'common' one, meaning that anything from an included taskfile that would be flattened out needs to be unique. Possibly an "override" property could be added instead, to let the included task take precedence over any task with the same name in the main taskfile.
+
+This kind of functionality would allow you to add taskfiles as a submodule to a repository, create a main taskfile for that repo where you include the submodule taskfiles, and still be able to run common tasks with a short syntax without having to point out the sub-taskfile. Or in other words include other taskfiles as transparent "libraries".
+```yaml
+version: '2'
+
+tasks:
+  ehrbase:
+    cmds:
+      - java -jar application/target/application-0.9.0.jar > log &
+      - grep -m 1 "Started EhrBase in" <(tail -f log)
+      - echo EHRbase started and ready to be used.
+```
+results in error
+
+```
+task -t task.yml ehrbase
+java -jar application/target/application-0.9.0.jar > log &
+grep -m 1 "Started EhrBase" <(tail -f log)
+panic: unhandled word part: *syntax.ProcSubst
+
+goroutine 1 [running]:
+mvdan.cc/sh/v3/expand.(*Config).wordFields(0xc00018a500, 0xc0001aa880, 0x1, 0x1, 0xc000184080, 0x12, 0x0, 0x0, 0x0)
+	/Users/andrey/code/andrey/GOPATH/pkg/mod/mvdan.cc/sh/v3@v3.0.0-alpha3/expand/expand.go:585 +0x128a
+mvdan.cc/sh/v3/expand.Fields(0xc00018a500, 0xc00012a580, 0x5, 0x8, 0xc0000e53e8, 0x1014da8, 0x424db00, 0xc0000e53a8, 0x1166a0c)
+	/Users/andrey/code/andrey/GOPATH/pkg/mod/mvdan.cc/sh/v3@v3.0.0-alpha3/expand/expand.go:374 +0x15b
+mvdan.cc/sh/v3/interp.(*Runner).fields(0xc00015d200, 0xc00012a580, 0x5, 0x8, 0xffffffffffffffff, 0xc0000e5418, 0x10b8758)
+	/Users/andrey/code/andrey/GOPATH/pkg/mod/mvdan.cc/sh/v3@v3.0.0-alpha3/interp/interp.go:136 +0x5a
+mvdan.cc/sh/v3/interp.(*Runner).cmd(0xc00015d200, 0x14140e0, 0xc00012a000, 0x1412b60, 0xc0001b5500)
+	/Users/andrey/code/andrey/GOPATH/pkg/mod/mvdan.cc/sh/v3@v3.0.0-alpha3/interp/interp.go:806 +0x10e8
+mvdan.cc/sh/v3/interp.(*Runner).stmtSync(0xc00015d200, 0x14140e0, 0xc00012a000, 0xc00019a800)
+	/Users/andrey/code/andrey/GOPATH/pkg/mod/mvdan.cc/sh/v3@v3.0.0-alpha3/interp/interp.go:739 +0x2b6
+mvdan.cc/sh/v3/interp.(*Runner).stmt(0xc00015d200, 0x14140e0, 0xc00012a000, 0xc00019a800)
+	/Users/andrey/code/andrey/GOPATH/pkg/mod/mvdan.cc/sh/v3@v3.0.0-alpha3/interp/interp.go:720 +0x1ce
+mvdan.cc/sh/v3/interp.(*Runner).stmts(0xc00015d200, 0x14140e0, 0xc00012a000, 0xc0001b1020, 0x1, 0x4)
+	/Users/andrey/code/andrey/GOPATH/pkg/mod/mvdan.cc/sh/v3@v3.0.0-alpha3/interp/interp.go:1067 +0x56
+mvdan.cc/sh/v3/interp.(*Runner).Run(0xc00015d200, 0x14140e0, 0xc00012a000, 0x140f7e0, 0xc00012a540, 0x0, 0xc00013cc00)
+	/Users/andrey/code/andrey/GOPATH/pkg/mod/mvdan.cc/sh/v3@v3.0.0-alpha3/interp/interp.go:659 +0x170
+github.com/go-task/task/v2/internal/execext.RunCommand(0x14140e0, 0xc00012a000, 0xc0000e5af0, 0x1c, 0x7)
+	/Users/andrey/code/andrey/task/internal/execext/exec.go:59 +0x2fd
+github.com/go-task/task/v2.(*Executor).runCommand(0xc0000a02c0, 0x14140e0, 0xc00012a000, 0xc000144000, 0x7fff5fbffb29, 0x7, 0x0, 0x2, 0x0, 0x0)
+	/Users/andrey/code/andrey/task/task.go:327 +0x3e4
+github.com/go-task/task/v2.(*Executor).RunTask(0xc0000a02c0, 0x14140e0, 0xc00012a000, 0x7fff5fbffb29, 0x7, 0x0, 0xc000096600, 0x140fea0)
+	/Users/andrey/code/andrey/task/task.go:242 +0x218
+github.com/go-task/task/v2.(*Executor).Run(0xc0000a02c0, 0x14140e0, 0xc00012a000, 0xc000090860, 0x1, 0x1, 0x0, 0x13ad2db)
+	/Users/andrey/code/andrey/task/task.go:81 +0x139
+main.main()
+	/Users/andrey/code/andrey/task/cmd/task/task.go:156 +0xb75
+```
+
+Moreover it is strange that the java process is not started at all in above example. The java process starts only if do not try to put it into background or if I add a sleep after the `java -jar ... &` command.
+
+
+---
+<!--
+If relevant, include the following information:
+- Task version
+- OS
+- Example Taskfile showing the issue
+-->
+
+```
+Task version: 2.7.1
+Darwin Kernel Version 15.6.0: Thu Jun 21 20:07:40 PDT 2018; root:xnu-3248.73.11~1/RELEASE_X86_64 x86_64
+```
+
+
+
+
+In order to allow shorthand notation for tasks, consider allowing a task to be referenced by multiple values. For example, and equivalent in `shell` would be...
+
+
+```sh
+#!/usr/bin/env bash
+
+case "$1" in
+dt | do | do-thing | do-the-thing )
+  ...
+;;
+```
+
+perhaps in a Taskfile.yml it _could_ be...
+
+```yml
+tasks:
+  do-thing:
+    cmds:
+      - ...
+    aliases:
+      - dt
+      - do
+      - do-the-thing
+```
+
+Just an idea, just putting it out there. Feel free to close whenever, etc. Thanks for your time 👍
+<!--
+If relevant, include the following information:
+- Task version
+- OS
+- Example Taskfile showing the issue
+-->
+
+It would be nice to see a `lint` or `-lint` option that you can pass to task so you can check your file against your proposed [Styleguide](https://taskfile.dev/#/styleguide).  Would be useful for CI/CD checks as well.
+
+Now that we have bash & zsh autocomplete scripts in this repo, we can install them as part of installation with homebrew.
+
+I've noticed that we have this formula already: https://github.com/go-task/homebrew-tap/blob/master/Formula/go-task.rb
+
+Adding 2 lines to the formula, will do that for us:
+```
+    bash_completion.install "completion/bash/task.bash" => "task"
+    zsh_completion.install "completion/zsh/_task" => "_task"
+```
+I was just testing this on my machine today. Happy to raise a PR for that if it's fine.
+
+Thanks

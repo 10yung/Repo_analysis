@@ -1,0 +1,105 @@
+We have an occasional issue where using not-perf crashes profiled process in AArch64 HW.
+Don't have much data yet, but the callstack is as follows:
+```
+  - tid: 23863 # --------------------------------------------------
+    proc_dump: ~
+    user_time: 4.170000
+    system_time: 2.450000
+    registers: [
+      0x0000000000000000, 0x0000007ff4cdfdf0, 0x0000000000000000, 0x0000000000000008,
+      0x0000000000000000, 0x0000007ff4cdfdf0, 0xffffffffffffffff, 0xffffffffffffffff,
+      0x0000000000000087, 0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff,
+      0xffffffffffffffff, 0xffffffffffffffff, 0x0000000000000000, 0x0000000000000035,
+      0x0000007f7d2b2a60, 0x0000007f78d08ec8, 0x0000007f78e3a7f4, 0x0000000000000006,
+      0x0000007f783b2020, 0x0000007f783b2720, 0x0000000000000100, 0x0000007f77f66028,
+      0x0000007ff4ce0618, 0x0000007ff4ce06b0, 0x0000007ff4ce0638, 0x0000000000000000,
+      0x0000000000000000, 0x0000007ff4cdfdd0, 0x0000007f78d07f0c, 0x0000007ff4cdfdd0,
+      0x0000007f78d07f0c, 0x0000000000000000 ]
+    backtrace: [
+      { a: 0000007f78d07f0c, s: gsignal,              o:  0x9c, l:  0xcc, e: 0, S: 0, f: "/usr/lib64/libc-2.28.so" },
+      { a: 0000007f78d09000, s: abort,                o: 0x138, l: 0x22c, e: 0, S: 0, f: "/usr/lib64/libc-2.28.so" },
+      { a: 0000007f7d1b5e1c, s: _ZN5nwind15local_unwinding5abort17h255a5769eb294e0dE,                        o:  0xcc, l:  0xd0, e: 0, S: 0, f: "/opt/memprof/aarch64/libmemory_profiler.so" },
+      { a: 0000007f7d1b6a4c, s: nwind_on_exception_through_trampoline,                        o: 0x444, l: 0x448, e: 0, S: 0, f: "/opt/memprof/aarch64/libmemory_profiler.so" },
+      { a: 0000007f7d27c1f8, s: nwind_ret_trampoline, o:  0x44, l:  0x50, e: 1, S: 0, f: "/opt/memprof/aarch64/libmemory_profiler.so" } ]
+```
+Unfortunately I don't know yet if it's first or second abort() in said function :(
+
+Did this happen before? Could it be issue of application (e.g. memory corruption), or some corner case bug in not-perf as this seems to be during exception handling (?).
+This STOP/CONT pattern is used to avoid data-race between reading /proc and handling things like mmap events from the kernel, isn't it? Anyway, we are profiling some apps that don't take it very well since STOP causes syscalls to return abnormally. It should be fixed but you know, it is not always that easy. Therefore I'm proposing a switch to disable this behavior.
+hi, any chance for adding windows support / removing unix dependencies? 
+
+Hi,
+
+So I was trying to profile [rav1e](https://github.com/rav1e) using not-perf, so after few seconds it stops, its saying `thread 'main' panicked at 'attempt to subtract with overflow'` [here](https://github.com/nokia/not-perf/blob/master/nwind/src/dwarf.rs#L179)
+
+``` bash 
+vibhoothiiaanand@coneBox:~/not-perf$ RUST_BACKTRACE=1 sudo /home/vibhoothiiaanand/not-perf/target/debug/nperf record -P rav1e -w -o datafile
+[2019-08-16T05:54:14Z INFO  nperf::ps] Waiting for process named 'rav1e'...
+[2019-08-16T05:54:14Z INFO  nperf::ps] Process 'rav1e' found with PID 4032!
+[2019-08-16T05:54:14Z INFO  nperf::profiler] Opening "datafile" for writing...
+[2019-08-16T05:54:14Z INFO  nperf::cmd_record] Opening perf events for 4032...
+[2019-08-16T05:54:14Z INFO  nperf::profiler] Ready to write profiling data!
+[2019-08-16T05:54:15Z INFO  nperf::cmd_record] Enabling perf events...
+[2019-08-16T05:54:15Z INFO  nperf::cmd_record] Running...
+thread 'main' panicked at 'attempt to subtract with overflow', /home/vibhoothiiaanand/not-perf/nwind/src/dwarf.rs:179:56
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace.
+[2019-08-16T05:54:42Z INFO  nperf::profiler] Collected 27445 samples in total!
+vibhoothiiaanand@coneBox:~/not-perf$
+```
+Device Specs:
+Device: Raspberry Pi 3 B+
+RAM: 1 GB 
+Arch: aarch64
+Processor: Cortex-A53 (ARMv8) 64-bit SoC @ 1.4GHz
+OS: Ubuntu 18.04.2 LTS
+
+Hi!
+
+I am looking for a profiling tool for [rust-analyzer](https://github.com/rust-analyzer/rust-analyzer), and I wonder if `not-perf` could be of help. I have some very specific requirements, but I am not a profiling expert, so I don't know if what I ask is at all possible, hence this feature-request/support issue :) Feel free to just close with "out of scope" if I ask for something silly!
+
+rust-analyzer relies heavily on incremental computation, and I'd love to profile the incremental case. The interesting benchmark looks like this:
+
+```rust
+load_data_from_disk(); // 200ms of IO
+compute_completion(); // triggers initial analysis, 10 seconds
+{
+    change_single_file();
+    compute_completion(); // re computation after a change, 300 ms
+}
+```
+
+I am **only** interested in profiling the block. Although the running-time of the benchmark is dominated by initial analysis, I explicitly don't care much about its performance.
+
+So, what I like is to do
+
+* sampling profiling (so that I don't have to instrument my code / bias times)
+* of fairly short-lived blocks of CPU-heavy code (hundreds of milliseconds)
+* from withing the application itself (so that I can start/stop profiling for specific section of code)
+* without depending on C code (just because building C is a pain)
+
+Is this possible at least in theory (ie, are there sampling tools than can give such data)? Could not-perf be of help here? My dream API would look like this:
+
+```rust
+load_data_from_disk();
+compute_completion();
+{
+    let _p = not_perf::record("~/tmp/profile_data.perf")
+        .append(); // append to the data file, so that I can run this in a loop
+    change_single_file();
+    compute_completion();
+    // stops profiling on Drop
+}
+```
+
+Hi,
+
+Currently, with this tool after doing profiling of a process, we can only get the details in a flame graph which is in SVG Format, the main issue of the flame which is a good option but the main issue is, it is really hard to read and do rapid analysis due to nearly not readable flame graphs.
+So if we could provide a good way to profile the same after generating the data, it will be really helpful.
+
+
+Best,
+Vibhoothi
+
+Currently `nwind` does not support PowerPC, from what I could see to support a new architecture `src/arch/${arch}.rs` and `src/arch/${arch}_get_regs.s` are the main components.
+
+[here](http://openpowerfoundation.org/wp-content/uploads/resources/leabi/content/ch_preface.html) the ABI specification.

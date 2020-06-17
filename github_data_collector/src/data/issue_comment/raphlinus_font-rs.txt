@@ -1,0 +1,73 @@
+https://github.com/raphlinus/font-rs/blob/ad0b79ea9b76cc80687ad4363d4fa692fbd0ddf8/src/raster.rs#L82
+
+`x0i` can be `-1` in this case, and casting it to `usize` will give `usize` max. The addition with `linestart` will cause an arithmetic overflow. Wrapping add should be used.  
+Also some minor cleanups, plus fixes to compound glyph transforms. Note
+that point-matching is not implemented yet.
+What should I do with the output of `cargo build --release`? I only get a libfont_rs.rlib
+Parsing the [hhea table](https://developer.apple.com/fonts/TrueType-Reference-Manual/RM06/Chap6hhea.html), to get some general information about the font : 
+* MaxAscent
+* MaxDescent
+* LineGap
+* AdvanceWidthMax
+
+As I understand it, this is needed to get the distance between two baselines (MaxAscent + MaxDescent + LineGap)
+When the CMap tests are run against Roboto-Regular.ttf from fuchsia/garnet/bin/fonts/third_party fails with the following message:
+
+~~~
+---- font::tests::test_cmap_format_4 stdout ----
+thread 'font::tests::test_cmap_format_4' panicked at 'assertion failed: `(left == right)`
+  left: `37`,
+ right: `36`', src/font.rs:1073:9
+note: Run with `RUST_BACKTRACE=1` for a backtrace.
+~~~
+
+This is the first time I've messed with conditional no_std, so I'm sure there are cleaner ways to get some of this stuff. Very open to suggestions - I'd like to try using this myself.
+
+~~I only learned after writing this that there's a no_std-safe math crate which provides safe floating point wrappers, so it might be worth pulling that in to get rid of all these unsafe intrinsics calls.~~
+
+I also changed the font "tables" structure from a HashMap to a BTreeMap simply because BTreeMap exists in `alloc`. I wonder, though, if the map structure is needed at all. It looks like it's not actually used outside of the `parse` constructor, so perhaps that for-loop should just be rewritten to find and set aside each table as it goes?
+Stable Rust now has an [is_x86_feature_detected](https://doc.rust-lang.org/std/macro.is_x86_feature_detected.html) macro, which should be used to switch between SSE and fallback implementations based on runtime detection of the SSE capability.
+Would you be interested in testing font.rs through [Unicode text rendering tests](https://github.com/unicode-org/text-rendering-tests)?
+
+I’d volunteer to do the integration into the test suite on the Unicode side, if somebody familiar with Rust writes a command-line tool that can be called like this:
+
+```
+path/to/some-command --font=fonts/TestCMAP14.otf --testcase=Foo-5/6 --render=≩≩
+```
+
+writing an SVG file to stdout like this:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<svg version="1.1"
+    xmlns="http://www.w3.org/2000/svg"
+    xmlns:xlink="http://www.w3.org/1999/xlink"
+    viewBox="0 -120 1446 1200">
+  <symbol id="Foo-5/6.uni2269" overflow="visible"><path d="M100,334 L623,563 L623,619 L100,880 L100,793 L518,594 L100,420 Z M100,208 L622,208 L622,287 L100,287 Z M100,38 L622,38 L622,117 L100,117 Z M282,-93 L508,379 L436,413 L211,-59 Z"/></symbol>
+  <use xlink:href="#Foo-5/6.uni2269" x="0" y="0"/>
+  <use xlink:href="#Foo-5/6.uni2269" x="723" y="0"/>
+</svg>
+```
+
+For test cases on variable fonts, your tool would be called with an additional argument for the variation settings, such as `--variation=wght:481.3;wdth:70`. Initially, you could ignore this.
+
+The test fonts are [here](https://github.com/unicode-org/text-rendering-tests/tree/master/fonts). If you write a command-line tool that can be called as described, the generated test report will look like [this](https://rawgit.com/unicode-org/text-rendering-tests/master/reports/FreeStack.html), [this](https://rawgit.com/unicode-org/text-rendering-tests/master/reports/CoreText.html), [this](https://rawgit.com/unicode-org/text-rendering-tests/master/reports/fontkit.html), or [this](https://rawgit.com/unicode-org/text-rendering-tests/master/reports/OpenType.js.html).
+The Rust code has SIMD and non-SIMD versions of this conversion
+(255.0 \* y) as u8
+from an f32 in the range [0.0, 1.0] to a u8 in the range [0, 255].
+
+Due to rounding errors, this sometimes means that a pixel well inside a glyph ends up with an 0xfe value instead of 0xff, since its floating point value is slightly less than 1.
+
+In my Go port, I embiggened the constant from 255.0 to 255.99998, or 0x437fffff as a float32 bit pattern, which eliminated these central "0xfe"s. See the comment at the bottom of https://github.com/google/font-go/commit/7c31afdef0ec8d074834b29413aa097de0d51197
+
+I think that the Rust code should do the same.
+
+For well formed TrueType glyph data, the bounding box should contain all of the nodes. However, malicious data might lead to out-of-bounds nodes, so more bounds checking is necessary for a production quality rasterizer.
+
+Even with well formed data, I suspect (based on my Go port) that the Rust version will panic at a line like
+
+self.a[linestart + (x0i + 1) as usize]
+
+when the glyph being rendered has an on-curve point at the bottom right corner of the rasterization buffer. You should be able to see this with the capital-'I' glyph from a sans-serif font.
+
+In my Go port, I tightened this up in https://github.com/google/font-go/commit/568cda65618dfe210268a93e399db6c9ca409104

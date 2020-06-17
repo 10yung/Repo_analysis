@@ -1,0 +1,84 @@
+I've rebased the `hc-jp-bridge-module` branch onto `master` from last week-ish, and now in this PR I've make some changes to make the pallet compile. The two main things are using the new `decl_error!` changes introduced by Basti, and updating dependencies to use their 2.0.0 versions.
+
+This slightly refactors how client processes fork_blocks/bad_blocks internally, and also puts those under tests
+Some fixes after: https://github.com/paritytech/substrate/pull/4502
+
+This removes the unwanted `expect`s from `MultiSigner`. Instead we
+convert from full to compressed in `TryFrom` and can return an error on
+invalid input.
+
+This PR removes the `NetworkSpecialization` from the network service.
+`NetworkSpecialization` was an early attempt at customizing the node's network behavior for Polkadot, but there are now better APIs for doing so (`register_notifications_protocol`).
+
+At the moment, this PR introduces network backwards-incompatibility. This can be fixed, at which point the `breakseverything` label will be removed. I will do this in separate PRs:
+  1. Polkadot: begin to ignore the `chain_status` parameter: https://github.com/paritytech/polkadot/issues/779
+  2. Substrate: begin to ignore the `chain_status` in the handshake when decoding, and send a `Vec<u8>` no matter what.
+  3. A few releases down the road, remove the `chain_status` member from the handshake.
+
+*Breaking API Changes*:
+The service API is no longer the same. The `construct_simple_protocol` macro `with_network_protocol` function have been removed. Invocations of the macro and function should be deleted without loss of functionality (except when `NetworkSpecialization` was non-empty - then you need to port to the `register_notifications_protocol`).
+For [substraTEE](https://github.com/scs/substraTEE) to be able to run as a parachain, we'll need to be able to verify certificates (of the Intel attestation service) within a runtime call.
+
+Right now we do that with custom host_calls:
+* https://github.com/scs/substraTEE-node/tree/master/host_calls
+
+This is not allowed for parachains because relay-chain validators just know the wasm runtime, not the custom host calls.
+
+The following primitives would be needed for substraTEE (maybe we could settle on a smaller set. but that's what substraTEE supports right now):
+```
+static SUPPORTED_SIG_ALGS: SignatureAlgorithms = &[
+    &webpki::ECDSA_P256_SHA256,
+    &webpki::ECDSA_P256_SHA384,
+    &webpki::ECDSA_P384_SHA256,
+    &webpki::ECDSA_P384_SHA384,
+    &webpki::RSA_PSS_2048_8192_SHA256_LEGACY_KEY,
+    &webpki::RSA_PSS_2048_8192_SHA384_LEGACY_KEY,
+    &webpki::RSA_PSS_2048_8192_SHA512_LEGACY_KEY,
+    &webpki::RSA_PKCS1_2048_8192_SHA256,
+    &webpki::RSA_PKCS1_2048_8192_SHA384,
+    &webpki::RSA_PKCS1_2048_8192_SHA512,
+    &webpki::RSA_PKCS1_3072_8192_SHA384,
+];
+```
+Moreover, we'd need **base64** decoding
+
+Our minimum requirement is the [actual Intel certificate](https://github.com/scs/substraTEE-node/blob/master/host_calls/AttestationReportSigningCACert.pem) which has these properties:
+```
+...
+hashAlgo: 1.2.840.113549.1.1.11 (sha256WithRSAEncryption)
+keyType: 3072 bit RSA
+....
+
+```
+
+This would fix the main obstacles in https://github.com/scs/substraTEE-node/issues/17
+
+
+
+Original comment about the source of the issue: https://github.com/paritytech/cumulus/pull/42#discussion_r367934842
+
+In this particular case we want to add text in the description that shows how to use the command line to pass parameters to the relay chain and the para chain. To do that it would be best if we know the name of the executable.
+
+Unfortunately Version takes static str so it is not possible to format at runtime.
+
+cc @bkchr 
+The trait Time is supposed to give the current time for the current block, however there is no other way to set this time than using an inherent. Thus we can precise in which context we expect the value to be correct.
+
+Maybe in some context like offchain worker this trait could be implemented differently but then I would suggest providing a different trait.
+`LockableCurrency` trait provides set/extend/remove locks api, but no methods to do locks query.
+
+In our case of working on a [vesting module](https://github.com/laminar-protocol/open-runtime-module-library/issues/73), it is needed to ensure while adding a new vesting schedule, the account has no locks, or only has locks with `vesting_lock_identifier`. It would be great if `LockableCurrency` trait added methods to query existing locks.
+Addresses some of #3623. 
+
+This PR tries to improve several issues in the consensus engines:
+
+* Currently, if users pass on an incompatible `BlockImport` with a `Verifier`, consensus will silently fail.
+* Because `Verifier` does not assume parents, it is not always possible for it to return the correct fork choice rule, but currently it is forced to do so.
+* Methods to pipe-line data downwards from `Verifier` to all subsequent `BlockImport`s is not obvious.
+
+In this PR:
+
+* Changed `ForkChoiceStrategy` to be `Option`. If `None`, it indicates that the `BlockImport` or `Verifier` cannot currently make a decision on the fork choice rule. Subsequent `BlockImport` should properly modify the value. If the value is passed all the way down to the bottom `BlockImport`, then the block will not be imported.
+* Added `intermediates` in `BlockImportParams`. This indicates values that should be processed by subsequent `BlockImport`s. If a value in `intermediates` is not processed, the block import fails. As an example usage of this, in PoW engine, `Verifier` uses `intermediates` to pass the calculated difficulty (if available) and the full block hash down to `BlockImport`, who will then use them to calculate the block auxiliary.
+* Updated PoW engine to have proper separation of `BlockImport` and `Verifier`.
+Closes #4613 

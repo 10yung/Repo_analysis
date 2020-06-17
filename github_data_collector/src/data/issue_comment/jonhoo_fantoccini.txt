@@ -1,0 +1,111 @@
+Hi all, I need to run a script every time i load a page that occurs before the page actually loads. I am currently looking into a solution for this but if anyone knows how its done I would love to know how. I have currently tried running client.execute() before client.goto() but that doesn't seem to do the trick (which makes sense). Will continue searching for a way to do this and will update here if I find one.
+_Full disclaimer: I'm not a web expert and I'm new to using WebDriver so this might be possible using functionality that lives outside of Fantoccini, so feel free to close if that's the case_
+
+Currently, the Client does not support an easy way to interact with the current Session's cookie store unless you make a raw request and interact with the request builder/response which will only give you the cookies for that particular domain.
+
+It would be nice to be able to interact with a Session's cookie store from the high level API to enable things like serializing/deserializing persistent cookies in applications where you may want to remember things like user log-in state. Examples of where this could be useful might include improving CI/CD test times by not requiring repeated log-ins. It could also be useful in scraper-backed user-facing applications that use technologies like OAuth instead of Basic Auth, so that the user doesn't have to repeatedly authorize the login every time they launch the application (even if it's automated).
+I have the geckodriver running on port 4444 but  `cargo run` in the `example/basic_setup` gives the following errors:
+
+```sh
+~/tmp/fan/exa/basic_setup:master> cargo run
+    Finished dev [unoptimized + debuginfo] target(s) in 0.03s
+     Running `target/debug/basic_setup`
+thread 'thread 'tokio-runtime-worker-2tokio-runtime-worker-0' panicked at '' panicked at 'not yet implemented: failed to connect to WebDriver: SessionNotCreated(WebDriverError { error: SessionNotCreated, message: "Expected browser binary location, but unable to find binary in default location, no \'moz:firefoxOptions.binary\' capability provided, and no binary flag set on the command line", stack: "", delete_session: false })called `Option::unwrap()` on a `None` value', ', src/main.rssrc/libcore/option.rs::16378::2621
+```
+
+I have tried it on macOS and linux and I got the same error. Any idea what is wrong here? Thx
+
+```sh
+nightly-x86_64-apple-darwin (default)
+rustc 1.39.0-nightly (f0b58fcf0 2019-09-11)
+```
+I don't think this is implemented yet, and I also don't really need it yet, but it would be nice to have; in my project, I may want to re-use the same session if the long-running process controlling it is restarted at some point.
+
+At the moment, if I persist a session with `Client::persist` and then try to reconnect to the session (using `Client::with_capabilities` or `Client::new`), I get a `SessionNotCreated(WebDriverError { error: SessionNotCreated, message: "Session is already started", stack: "", delete_session: false })`.
+
+I suppose the way to handle this would be adding a method like `Client::with_existing_session(webdriver: &str, session_id: &str)` and a corresponding `Session::from_id(webdriver: &str, id: &str)` or similar, which tries to connect to the given session using its ID (no idea how that's gonna work internally right now, but that would likely be the API). Then we can store the session ID and reconnect later.
+
+I'll look into implementing this when I can find the time :)
+I'm currently trying out fantoccini, and this is one (most likely easily fixable) issue I've found: When working with HTML elements that don't have any clear identifier attached, it can be kind of hard to impossible to find their child elements while still keeping context.
+
+Example:
+
+```html
+<div class="table">
+  <div class="row">
+    <div class="col name-col">Thing 1</div>
+    <div class="col action-col"><button>Some action for Thing 1</button></div>
+  </div>
+  <div class="row">
+    <div class="col name-col">Thing 2</div>
+    <div class="col action-col"><button>Some action for Thing 2</button></div>
+  </div>
+</div>
+```
+
+Now what I want is:
+
+1. Find each `div.row`. That is easily done with `find_all`.
+2. Now, get each row's `div.name-col` text and `div.action-col > button` while keeping their relation and an `Element` on the button so I can invoke events on it.
+
+At the moment, I can't see how I would perform the second step without falling back to invoking jQuery or something and parsing the result, or relying on indices (which is never a good idea).  
+I think the right WebDriver API call would be [Find Element From Element](https://w3c.github.io/webdriver/#dfn-find-element-from-element); the `webdriver` crate has it as `WebDriverCommand::FindElementElement`.
+
+API idea: Most WebDriver clients expose this call by having a "find element" method on their web element type; that would be `fantoccini::Element::find` here (and `fantoccini::Element::find_all` for "Find Elements From Element" to stay consistent with the `Client` API), which would internally invoke something like `fantoccini::Client::find_from`/`fantoccini::Client::find_all_from`. Those could also be pub in fantoccini, they work like find/find_all, but take a `fantoccini::Element` as the first argument.
+
+It would work like this:
+
+```rust
+let rows = client.find_all(Locator::Css("div.table > div.row")).await?;
+let mut col_groups = Vec::new();
+for row in rows.iter() {
+    let name = row.find(Css("div.name-col")).await?.text().await?;
+    let button = row.find(Css("div.action-col > button")).await?;
+    col_groups.push((name, button));
+}
+// Now I can present the user with the options and they can choose what to click on
+```
+
+I would really like to contribute and implement this myself as well, but as I only want to work with the `.await` API, I'd prefer to start working on it when the await PR is merged :)
+Starting implementation of synchronous client and element
+Hi I want to use `with_capabilities` to create a new client, but not sure if doing it right. This is what I'm doing:
+
+```rust
+extern crate tokio;
+extern crate futures;
+extern crate fantoccini;
+extern crate webdriver;
+extern crate serde_json;
+
+use fantoccini::{Client, Locator};
+use futures::future::Future;
+use webdriver::capabilities::Capabilities;
+
+fn main() {
+    let mut cap = Capabilities::new();
+    let arg = serde_json::from_str("{\"args\": [\"-headless\"]}").unwrap();
+    cap.insert("moz:firefoxOptions".to_string(), arg);
+    let c = Client::with_capabilities("http://localhost:4444", cap);
+   
+   // rest of the code down here...
+}
+```
+
+If this is the right way to do it I was wondering if we could receive in the capabilities in another way that didn't involve me knowing about `webdriver` and `serde_json` and having to add them to my dependencies. 
+
+I'm open to making a PR if you prefer to discuss over actual code.
+As observed [here](https://www.reddit.com/r/rust/comments/aqgsxk/announcing_the_headless_chrome_crate_puppeteer/eghmzig/), there are some pretty good reasons to make the interface to interact with browsers synchronous. Or at least give the *option* of having the nicer synchronous interface when you don't need the async. We should be able to provide synchronous wrapper types for most operations pretty easily, so that would be a good addition!
+I think it'd be useful if it the docs made it obvious which fields can have untrusted input in them, because otherwise users might set themselves up for injection attacks.
+Originally reported in https://github.com/jonhoo/fantoccini/issues/36.
+Running fantoccini against [WebKitDriver](https://trac.webkit.org/browser/webkit/trunk/Source/WebDriver) currently fails with
+```
+SessionNotCreated(WebDriverError {
+  error: SessionNotCreated,
+  message: "Failed to match capabilities",
+  stack: "",
+  delete_session: false
+})
+```
+
+This seems to stem from [this line](https://trac.webkit.org/browser/webkit/trunk/Source/WebDriver/WebDriverService.cpp?rev=234837#L628) in the WebKitDriver source ([GH mirror link](https://github.com/WebKit/webkit/blob/48b3b6748f3a65d95ffd3a5633e1093299cba14b/Source/WebDriver/WebDriverService.cpp#L628)), but I cannot for the life of me see why `matchedCapabilitiesList` would be empty. Setting `browserName` or other parameters in the `alwaysMatch` capabilities list does not seem to make a difference. I _think_ this might be a bug in WebKitDriver, but some more investigation is probably warranted.
+

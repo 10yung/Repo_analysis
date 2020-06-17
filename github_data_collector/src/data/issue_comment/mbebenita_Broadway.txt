@@ -1,0 +1,149 @@
+127.0.0.1/:1 Uncaught (in promise) abort({}). Build with -s ASSERTIONS=1 for more info.
+  | Promise.catch (async) |   |  
+-- | -- | -- | --
+  | instantiateArrayBuffer | @ | Decoder.js:66
+  | (anonymous) | @ | Decoder.js:66
+  | Promise.catch (async) |   |  
+  | doNativeWasm | @ | Decoder.js:66
+  | (anonymous) | @ | Decoder.js:66
+  | getModule | @ | Decoder.js:66
+  | Decoder | @ | Decoder.js:217
+  | Player | @ | Player.js:189
+  | (anonymous) | @ | test.js:1
+
+
+Hi all! Probable a silly error here but I am getting this error right now with Broadway:
+
+"Player.js:43 Uncaught TypeError: Cannot read property 'nowValue' of undefined"
+
+Here's my js code:
+
+```
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="utf-8">
+
+        <script src="http://ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js"></script>
+		<script type="text/javascript" src="Player.js"></script>
+		<script type="text/javascript" src="Decoder.js"></script>
+		<script type="text/javascript" src="YUVCanvas.js"></script>
+        <script type="text/javascript">
+            $(function() {
+                window.WebSocket = window.WebSocket || window.MozWebSocket;
+                var websocket = new WebSocket('ws://127.0.0.1:9000',
+                                              'dumb-increment-protocol');
+
+				const player = new Player({
+					useWorker: true,
+					workerFile: "Decoder.js"
+				});
+
+				//document.body.appendChild(player.canvas);
+
+				websocket.onopen = function () {
+                    $('h1').css('color', 'green');
+                };
+                websocket.onerror = function () {
+                    $('h1').css('color', 'red');
+                };
+
+				websocket.binaryType = 'arraybuffer';
+			     websocket.addEventListener('message',function(event) {
+			          player.decode(new Uint8Array(event.data));
+					  console.log("WebSocket message received:", event);
+			     });
+
+                $('button').click(function(e) {
+                    e.preventDefault();
+                    websocket.send($('input').val());
+                    $('input').val('');
+                });
+            });
+        </script>
+        </head>
+    <body>
+        <h1>WebSockets test</h1>
+        <form>
+            <input type="text" />
+            <button>Send</button>
+        </form>
+        <div></div>
+    </body>
+</html>
+```
+
+Using Broadway JS over a LAN, I've been able to choose higher resolutions and quality/bitrate settings than would be recommended for a web application.
+
+As such I've ran into issues overflowing the Decoder.streamBuffer with huge frames.
+
+Directly increasing MAX_STREAM_BUFFER_LENGTH in Decoder.js seems to correctly fix the overflow issue, as such I was wondering if it would be possible to make it configurable rather than a hard-coded constant.
+
+The change seems pretty trivial from my understanding of the source code, could changing MAX_STREAM_BUFFER_LENGTH have any weird side-effects elsewhere in the library? I'm also asking this because of the other issue I've raised ( #205 ), since it's hard to tell as a new user of the library whether those could be related or not!
+
+Just as with the other issue, I'd be willing to prepare and submit a PR, especially if you can confirm the triviality of the change!
+Hello,
+
+I've have a video that, after decoding with Broadway JS, sometimes results in correct frames, sometimes results in a uniformly gray frame.
+
+My process is:
+Constrained Baseline level 3.0 video encoded with ffmpeg (libx264) v4.1.1, unpacked into a file per Annex-B specs, and streamed through a websocket into a client-side Player object after having split the stream into NALUs.
+
+Here are the command lines used with ffmpeg:
+h264 encoding:
+`ffmpeg -i <input> -c:v libx264 -vf format=yuv420p -flags +cgop -coder vlc -g 1 -sc_threshold 0 -preset veryslow -crf 15 -movflags +faststart+empty_moov+isml -tune fastdecode -profile:v baseline -level 3.0 <output.mp4>`
+Annex B extraction:
+`ffmpeg -i <output.mp4> -c:v copy -bsf h264_mp4toannexb <output.h264>`
+
+Stepping through the code, trying to figure out what was going wrong and where, I've noticed that the height/width deduced by the Player are wrong: the video is 1080x1920, and the Player detects 1088x1920. Most applications I have can't parse the raw Annex B stream, but ffprobe can, and detects the correct dimensions, and both VLC and MediaInfo (and ffprobe) detect the correct dimensions in the .mp4 file.
+
+Here is the SPS packet in hex values, Annex B start code included:
+00 00 01 67 42 C0 1E DC 04 40 3C 79 7C 04 40 00 00 03 00 40 00 00 0C 83 C5 8B E0 00
+
+Parsing it by hand I've gotten those values:
+pic_width_in_mbs_minus1 == 67 (so 68)
+frame_crop_left_offset == 4
+frame_crop_right_offset == 0
+68 * 16 = 1088
+SubWidthC == 2 (because 4:2:0)
+If we take frame_crop_left_offset into account we get the correct value:
+(1088 - SubWidthC * (frame_crop_left_offset + frame_crop_right_offset)) = 1080
+
+It is also my (possibly wrong) understanding that this 8 offset represents a single macroblock (according to an SO reply I stumbled upon, the macroblock width is 16 / SubWidthC ?), and thus means the Decoder is working with the wrong picSizeInMbs and picWidthInMbs values for my video since, after checking the source code, those values seem to be assigned without checking frame_cropping_flag and the associated offsets.
+
+So I have two questions:
+Can this be the cause of my incorrectly decoded frames? If that is the case, how come some frames come out looking ok (they might have errors I haven't noticed though...) ?
+I'd be interested in preparing and submitting a pull request to correctly factor in left and right offsets when calculating frame size, however it is my understanding that the Decoder's C code is a fork of an older Android library. Should I still submit a patch to this project, or should I rather look into submitting a PR to the original Android project and then notify you when you can update this project's fork? Also, honestly, if we go forward with this I'll need assistance with testing on all supported videos and formats, so as to make sure I don't introduce a regression just to fix it for my video.
+
+Edit: I think the only place that should require a change would be h264bsdDecodeSeqParamSet() in src/h264bsd_seq_param_set.c, the crop flag and offset values seem to be correctly parsed there, but just aren't calculated back into picWidthInMbs and picHeightInMbs.
+
+P.S. References used for SPS parsing and dimension calculations:
+[ITU H264 specs](https://www.itu.int/rec/dologin_pub.asp?lang=e&id=T-REC-H.264-201704-I!!PDF-E&type=items)
+[H264 getting frame height and width from SPS](https://stackoverflow.com/questions/31919054/h264-getting-frame-height-and-width-from-sequence-parameter-set-sps-nal-unit?noredirect=1&lq=1)
+I used VideoTool on MacOS to generate a H264 file and it can be played by VLC. 
+I send each frame's compressed H264 data (which is consists of several NALUs) to an web client and try to decode the frames by player.decode() ,but the player doesn't work and canvas stays black and doesn't show any picture. 
+I work with raw H264 instead of MP4 file ,thus I use Player directly.
+Is that due to certain parameters for the encoder which is VideoTool in my scenario?
+You can see the demo video isn't really finished, because it was a fixed sample number.
+Hey there! I've had a lot of success using your decoder, but would love to keep up to date as any improvements are made. I saw that an issue was created previously asking for the code to be published to npm. Have you given it any more thought? 
+
+Would you be open to me making a pull request to add some tooling around publishing?
+* Pause the video: `player.pause()`
+* Seek to a specific time: `player.currentTime = 30` or `player.seekTo(30)`
+Hello everyone,
+
+I have a question just to undestand if what I would achieve have sense or not. The idea is to open many broadway player per browser tab, but using webGL, after 16 instances I receive some warnings from browser and next players crashes.
+
+Could be reasonable to use one decoder or webGL context per n players? Is it something feasible putting hands on broadway implementation?
+
+Thanks in advance for help.
+Hello, @mbebenita 
+Could you please help to understand: 
+i tried to use the Broadway and it works good almost everywhere, but for UCBrowser Android.
+the user 131 is applied your Broadway approach to live streaming https://github.com/131/h264-live-player and his build of the Broadway is playing there. 
+But when I use the vanilla Broadway the error is
+`no native wasm support detected`
+with the cause
+`abort("Assertion failed: no binaryen method succeeded."). Build with -s ASSERTIONS=1 for more info.`
+
+But as I understand those version is using asm.js (as it logs `increasing TOTAL_MEMORY to X to be compliant with the asm.js spec`) for cases when no wasm available, is it possible? Can I achieve the same with the fresh version of vanilla Broadway?

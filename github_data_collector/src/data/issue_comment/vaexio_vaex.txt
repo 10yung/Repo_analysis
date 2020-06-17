@@ -1,0 +1,175 @@
+The data in many domains, such as scRNA, is sparse. 
+I would like to summarize each grid element by the mode and the purity (fraction of top category in bin)
+My code fails when trying to open a single hdf5 file into a dataframe:
+
+`df = vaex.open('data/chat_history_00.hdf5')`
+
+Here's the rest of the code:
+
+```
+import re
+import glob
+import vaex
+import numpy as np
+
+def tryint(s):
+    try:
+        return int(s)
+    except:
+        return s
+
+def alphanum_key(s):
+    """ Turn a string into a list of string and number chunks.
+        "z23a" -> ["z", 23, "a"]
+    """
+    return [ tryint(c) for c in re.split('([0-9]+)', s) ]
+
+hdf5_list = glob.glob('data/*.hdf5')
+hdf5_list.sort(key=alphanum_key)
+hdf5_list = np.array(hdf5_list)
+
+assert len(hdf5_list) == 11, "Incorrect number of files"
+
+# Check how the single file looks like:
+df = vaex.open('data/chat_history_10.hdf5')
+df
+```
+
+Here's the whole traceback:
+
+> ERROR:MainThread:vaex:error opening 'data/chat_history_00.hdf5' --------------------------------------------------------------------------- ValueError Traceback (most recent call last) in 1 # Check how the single file looks like: ----> 2 df = vaex.open('data/chat_history_10.hdf5') 3 df
+> 
+> /usr/local/anaconda3/lib/python3.7/site-packages/vaex/init.py in open(path, convert, shuffle, copy_index, *args, **kwargs) 207 ds = from_csv(path, copy_index=copy_index, **kwargs) 208 else: --> 209 ds = vaex.file.open(path, *args, **kwargs) 210 if convert and ds: 211 ds.export_hdf5(filename_hdf5, shuffle=shuffle)
+> 
+> /usr/local/anaconda3/lib/python3.7/site-packages/vaex/file/init.py in open(path, *args, **kwargs) 39 break 40 if dataset_class: ---> 41 dataset = dataset_class(path, *args, **kwargs) 42 return dataset 43
+> 
+> /usr/local/anaconda3/lib/python3.7/site-packages/vaex/hdf5/dataset.py in init(self, filename, write) 84 self.h5table_root_name = None 85 self._version = 1 ---> 86 self._load() 87 88 def write_meta(self):
+> 
+> /usr/local/anaconda3/lib/python3.7/site-packages/vaex/hdf5/dataset.py in _load(self) 182 def _load(self): 183 if "data" in self.h5file: --> 184 self._load_columns(self.h5file["/data"]) 185 self.h5table_root_name = "/data" 186 if "table" in self.h5file:
+> 
+> /usr/local/anaconda3/lib/python3.7/site-packages/vaex/hdf5/dataset.py in _load_columns(self, h5data, first) 348 self.add_column(column_name, self._map_hdf5_array(data, column['mask'])) 349 else: --> 350 self.add_column(column_name, self._map_hdf5_array(data)) 351 else: 352 transposed = shape1 < shape[0]
+> 
+> /usr/local/anaconda3/lib/python3.7/site-packages/vaex/dataframe.py in add_column(self, name, f_or_array, dtype) 2929
+> if len(self) == len(ar): 2930 raise ValueError("Array is of length %s, while the length of the DataFrame is %s due to the filtering, the (unfiltered) length is %s." % (len(ar), len(self), self.length_unfiltered())) -> 2931 raise ValueError("array is of length %s, while the length of the DataFrame is %s" % (len(ar), self.length_original())) 2932 # assert self.length_unfiltered() == len(data), "columns should be of equal length, length should be %d, while it is %d" % ( self.length_unfiltered(), len(data)) 2933 valid_name = vaex.utils.find_valid_name(name)
+> 
+> ValueError: array is of length 2578961, while the length of the DataFrame is 6
+
+Any guidance is appreciated.
+Inspired by @maartenbreddels , this PR adds `.features_` property to the vaex Transformers, which is list of output feature names. The main idea is to simplify the feature combining process during ML pipeline prototyping. 
+
+- [x] Implement a `.features_` property to the base Transformer class
+- [x] Implement a general function and private function `_get_output_features()` for populating the `.features_` list
+- [x] Implement custom `_get_output_features()` the `PCA` and `OneHotEncoder` Transformers since their functionality is different compared to the majority
+- [x] Update tests so that they test the new element (check test for pca!)
+- [ ] Update the Changelog
+- [ ] Review: Discuss and agree on implementation details, issues and changes (see text below)
+
+This change brings some level of "awkwardness" in the implementation of (some of) the transformers:
+
+1. Currently, `._get_output_features()` method is called during the `.fit()` method of each transformer. One idea is to introduce a `.fit()` method in the base Transformer class where `_get_output_features` will be called prior to calling a `._fit()` method. Thus we should rename the `.fit()` method of each transformer to `._fit()`. 
+This will help to reduce code duplication. I am not sure how such a change would impact readability and maintainability of the code. This is similar to what `scikit-learn` does, but is this the right path for us @maartenbreddels ? Also, if we do this, the docstrings of all `.fit()` methods will be identical (maybe we can get away with this?), unless we re-define `.fit` which is defeating the point of this strategy. I am fine leaving things as they are, but i thought to mention this just in case.
+
+2. PCA: our implementation of `_get_output_features` is tricky here, since we are not overwriting output columns but just shifting the component identifier (see `.transform` method of PCA). So, do we want the PCA implementation to change in a way that, if columns of those names already exist, an exception should be raised?
+How often is one expected to re-calculate the PCA on the same features without any other changes (@xdssio). Right now, the `.features_` lists the "naive" output, i.e. the features that should be there without overwriting during `.transform` time.
+
+3. There is some duplication/redundancy when determining the feature names. During `.fit` right now we get the list of output features (`features_`). Then, during `.transform` we still determine the output feature names just before calculating the expressions, in more or less the same way. 
+Do we need to spend time in reducing this redundancy, or somehow re-factoring (the way was not obvious to me). Maybe keeping things as they are is fine for now, it looked a bit weird to me, so I thought to bring it up (@maartenbreddels).
+
+I don't plan to actively remove python27 code, but we should not test for it anymore. Maybe we should merge this for vaex 3 (very appropriate).
+This POC solves several issues:
+ * ALL operations can be recorded in the df.operation members: opening, joining, groupby etc
+ * a dataframe can be serialized better, since it knows completely how it was constructed.
+
+The state is still useful, but how they work together is something I need to think about. 
+
+Example operations serialized to json:
+```
+{
+  "type": "transformation",
+  "name": "add_virtual_column",
+  "parameters": {
+    "name": "r",
+    "expression": "(__r + y)",
+    "column_position": 10
+  },
+  "child": {
+    "type": "transformation",
+    "name": "rename_column",
+    "parameters": {
+      "old": "r",
+      "new": "__r"
+    },
+    "child": {
+      "type": "transformation",
+      "name": "add_virtual_column",
+      "parameters": {
+        "name": "r",
+        "expression": "(x + y)",
+        "column_position": 10
+      },
+      "child": {
+        "type": "source",
+        "name": "open",
+        "parameters": {
+          "path": "/Users/maartenbreddels/src/vaex/data/helmi-dezeeuw-2000-10p.hdf5"
+        }
+      }
+    }
+  }
+}
+```
+
+Which reflects this code:
+```python
+df = vaex.open(path, execute=False)
+df['r'] = df.x + df.y
+df['r'] = df.r + df.y
+```
+
+
+Hi,
+
+Is it currently even possible to evaluate a list comparison on a column of data frame? I am looking for something like 
+`df.select('col1 in (1, 2, 5, 9)')`
+
+I am getting the following error on calling the evaluate function
+`ValueError: The truth value of an array with more than one element is ambiguous. Use a.any() or a.all()`
+
+Thanks
+This handles the non-standard behaviour explained in #538: the behaviour of vaex when on attempts to do the non-permitted addition between a string and a numeric column.
+
+- [x] Test for illegal addition between string and numeric type
+- [ ] Fix
+
+I just made the stupid mistake of writing a frame of virtual columns to a hdf5 file. 
+
+This results in a file that can't be opened (`vaex.open()` throws a `TypeError: 'NoneType' object cannot be interpreted as an integer`).
+
+Since the original error is a bit obscure to debug from that, would it be a good idea for `export_hdf5` to throw a warning/error when a dataframe of only virtual columns is being exported with parameter `virtual=False`?
+I've used conda to install python 3.8, jupyterlab, vaex ... on a Windows 10 machine. I have the following code in a cell:
+```
+# From [Interactive-widgets](https://vaex.readthedocs.io/en/latest/tutorial.html#Interactive-widgets)
+import vaex
+import vaex.jupyter
+import numpy as np
+import pylab as plt
+%matplotlib inline
+df = vaex.example()
+df.select(df.x > 0)
+@vaex.jupyter.interactive_selection(df)
+def plot(x, y):
+    print("Mean x for the selection is:", df.mean(df.x, selection=True))
+    df.plot(df.x, df.y, what=np.log(vaex.stat.count()+1), selection=[None, True])
+    plt.show()
+```
+And when I `run` the cell the output is "Mean x ..", and a warning plus the plot:
+```
+Mean x for the selection is: 5.135720157108026
+C:\Users\wink\Anaconda3\envs\vispy38\lib\site-packages\vaex\image.py:113: FutureWarning: Using a non-tuple sequence for multidimensional indexing is deprecated; use `arr[tuple(seq)]` instead of `arr[seq]`. In the future this will be interpreted as an array index, `arr[np.array(seq)]`, which will result either in an error or a different result.
+  rgba_dest[:, :, c][[mask]] = np.clip(result[[mask]], 0, 1)
+``` 
+As suggested by the message, if I change the problem line of code above to use `tuple([mask])` there is no warning:
+```
+  rgba_dest[:, :, c][tuple([mask])] = np.clip(result[tuple([mask])], 0, 1)
+```
+I may have something installed incorrectly and this solution could be totally wrong. Let me know if any other information is needed.

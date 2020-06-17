@@ -1,0 +1,200 @@
+It would be great if the default `StreamLogHandler` would honour LOGLEVEL environment variables.
+
+To change the loglevel I currently have to do this dance, right?:
+```swift
+LoggingSystem.bootstrap { label in
+  var handler = StreamLogHandler.standardOutput(label: label)
+  handler.logLevel = .trace
+  return handler
+}
+```
+
+Because `StreamLogHandler` hardcodes its level to `.info`:
+```swift
+public var logLevel: Logger.Level = .info
+```
+ It would be nice if that would at least default to the setting of the `LOGLEVEL` environment variable, ideally w/ supporting `LOGLEVEL_$label` as well.
+Essentially:
+```swift
+public var logLevel: Logger.Level = {
+  let env = ProcessInfo.processInfo.environment
+  return Logger.Level(rawValue: "LOGLEVEL_" + label)
+         ?? Logger.Level(rawValue: "LOGLEVEL")
+         ?? .info
+}()
+```
+Maybe w/ a little more caching.
+### Expected behavior
+Currently MultiplexLogHandler mutates all registered handlers to the same log level; permitting fallthrough granularity would be useful for distributed systems.
+
+Example:
+1st Handler: logLevel: .trace  ... // -> stdout pipe, local storage
+2nd Handler: logLevel: .info  ... // -> external endpoint, analytic processing backend
+3rd Handler: logLevel: .critical .. // -> external endpoint, urgent sysadmin alert gateway
+
+### SwiftLog version/commit hash
+swift-log 1.1.1
+
+I experience a Catalyst problem - is there a solution or workaround?
+
+### Expected behavior
+I expected the library to work also in a combined iOS/macOS project (Catalyst).
+
+### Actual behavior
+I created a lightweight wrapper around the lib and put it into a "Log" Swift Package. 
+For "import Logging", the compiler tells: 
+`"Logging is not available when building for Mac Catalyst. Consider using `#if !targetEnvironment(macCatalyst)` to conditionally import this framework."`
+
+### SwiftLog version/commit hash
+The `Package.swift` content for the `Log` wrapper:
+```
+import PackageDescription
+
+let package = Package(
+    name: "Log",
+    products: [
+        // Products define the executables and libraries produced by a package, and make them visible to other packages.
+        .library(
+            name: "Log",
+            targets: ["Log"]),
+    ],
+    dependencies: [
+        // Dependencies declare other packages that this package depends on.
+        // .package(url: /* package url */, from: "1.0.0"),
+		.package(url: "https://github.com/apple/swift-log.git", from: "1.0.0"),
+    ],
+    targets: [
+        // Targets are the basic building blocks of a package. A target can define a module or a test suite.
+        // Targets can depend on other targets in this package, and on products in packages which this package depends on.
+        .target(
+            name: "Log",
+            dependencies: []),
+        .testTarget(
+            name: "LogTests",
+            dependencies: ["Log"]),
+    ]
+)
+```
+
+### Swift & OS version (output of `swift --version && uname -a`)
+Xcode 11.0 (11A419c) / Swift 5 / macOS 10.15 / iOS 13.0
+### Expected behavior
+
+Milestones should be in sync with released versions.
+
+### Actual behavior
+
+We released https://github.com/apple/swift-log/releases 1.1.1 but no such milestone exists.
+
+1.1.0 exist and is not closed. etc.
+
+### Proposal
+
+When closing tickets, always assign a milestone;
+When releasing a version, ensure tickets or PRs if no ticket present for PR are assigned to milestone; Close milestone, link to it from release notes.
+
+I think it matters a lot to be clean and consistent here.
+
+We should start with cleaning up the existing issues / releases.
+I can take this on.
+
+WDYT @tomerd @weissi 
+Let's link to https://github.com/Brainfinance/StackdriverLogging by @jordanebelanger 
+
+Would you want to submit a PR adding a link to it to the https://github.com/apple/swift-log#selecting-a-logging-backend-implementation-applications-only section @jordanebelanger?
+I'd like to use `Lock` in a custom LogHandler implementation but am unable to because `Lock` is declared as `internal` in `Locks.swift`. Was `Lock` intended to be used like this?
+
+### Expected behavior
+
+Under "Special cases" in the API docs [here](https://apple.github.io/swift-log/docs/current/Logging/Protocols/LogHandler.html), the example implementation `LogHandlerWithGlobalLogLevelOverride` has a property `overrideLock = Lock()`.
+
+### Actual behavior
+
+This is not possible if the custom LogHandler implementation (e.g. `LogHandlerWithGlobalLogLevelOverride`) is defined in another module as `Lock` is internal and not visible there.
+
+### SwiftLog version/commit hash
+
+`version: 0.0.0`
+
+### Swift & OS version (output of `swift --version && uname -a`)
+
+`Apple Swift version 4.2.1 (swiftlang-1000.11.42 clang-1000.11.45.1)
+Target: x86_64-apple-darwin18.6.0`
+
+Title and end goal of ticket changed to add some examples, see discussion below for detail (edit: ktoso)
+
+---
+
+I was looking into creating a `FileLogHandler` but I am unsure of a safe and convenient way to go about doing that due to issues inherent with logging to files vs something like stdout with the current limitations of this framework.
+
+For example, there is no available throwable factory overload and nowhere is it documented that a logger _requires_ an initializer that takes a single String argument. Looking through the code it becomes much easier to see that you need some kind of an initializer that takes a single string argument. Why is there no official protocol requirement for the initializer if this is clearly a requirement?
+
+I want to make a FileLogHandler, but with the current standard functionality, everyone would just be accustomed to passing in a label. I could just log in a common location like /var/log on linux, but people should be able to specify a custom file location if they so choose.
+
+The Logger initializer that takes a LogHandler argument is internal so I cannot use that and the restrictions on the factory signature are too restrictive to allow this. I could make the String parameter the path to the log file, but since it is not throwable or nullable I cannot do any sort of validation that the path exists or is writable by the current process. Do I just silently fail? Should I just `print` a message?
+
+Why are there no throwable/nullable overloads for the factory? or why is there no ability to use a custom factory signature? The fileprivate restrictions make it more difficult to provide my own handy extensions to achieve my desired functionality.
+
+Is there something I'm missing here or was there just massive oversight when designing this? From what I can tell it would be extremely difficult to set up a logger that sends logs to an external service requiring connection parameters and there's no way you could validate those parameters during initialization of the handler.
+`LoggingSystem.bootstrap` must only be called once per process. One might assume to bootstrap the logger in `XCTestCase.setUp`, but this can be called multiple times and will result in an assertion.
+
+To get around this, a global lazy variable can be used that is asserted in each `setUp` method. It will only be run once, the first time it is accessed, allowing for logging to be configured in XCTests:
+
+Declare the global variable like so:
+
+```swift
+let isLoggingConfigured: Bool = {
+    LoggingSystem.bootstrap { label in
+        var handler = StreamLogHandler.standardOutput(label: label)
+        handler.logLevel = .debug
+        return handler
+    }
+    return true
+}()
+```
+
+Then, in your `XCTestCase`s, use like so:
+
+```swift
+import XCTest
+
+final class FooTests: XCTestCase {
+    override func setUp() {
+        XCTAssert(isLoggingConfigured)
+        ...
+    }
+}
+```
+
+--- 
+
+We should consider documenting this or providing some sort of helper. 
+add link to cocoapod to readme (see #74 )
+Hello,
+
+This is more like a pitch, not an issue at all, and it’s probably too late. However, I’d like to have a custom handler for `os_log`, something like this works fine for debugging purposes, even though it’s using private API:
+
+```swift
+import os
+import _SwiftOSOverlayShims
+
+...
+
+func log(
+  level: Logger.Level, message: Logger.Message, metadata: Logger.Metadata?,
+  file: String, function: String, line: UInt, dso: UnsafeRawPointer, args: CVarArg...)
+{
+  let ra = _swift_os_log_return_address()
+  message.withUTF8Buffer { (buf: UnsafeBufferPointer<UInt8>) in
+    buf.baseAddress?.withMemoryRebound(to: CChar.self, capacity: buf.count) { str in
+      withVaList(args) { valist in
+        _swift_os_log(dso, ra, self.log_from_label(), self.type_from_level(level), message, valist)
+      }
+    }
+  }
+}
+```
+
+Unfortunately, the current `log` signature misses `#dsoHandle` and `args`, using `#file`, `#function` and `#line` instead. What do you think about adding two more arguments to the `log` function? Or maybe you have some alternative suggestion?
+
+Thanks in advance!

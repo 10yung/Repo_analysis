@@ -1,0 +1,259 @@
+How to configure the client to connect directly to the server without using a load balancer.
+We recently upgraded from open feign 10.0.1 to 10.7.0 and noticed a difference in behavior of @QueryMap when dealing with null values.
+
+Given the following client
+```java
+public interface DemoClient {
+    @RequestMapping(path = "/test", method = RequestMethod.GET)
+    String test(@QueryMap Map queryMap);
+}
+```
+
+And the following invocation
+```java
+Map queryMap = new HashMap();
+queryMap.put("key", null);
+demoClient.test(queryMap)
+```
+
+The 10.0.1 client results in the following request
+```
+GET http://localhost:10000/test 
+```
+While the 10.7.0 client results in the following request
+```
+GET http://localhost:10000/test?key
+```
+
+Is this change in behavior intended/correct?  
+Logging in Feign today is managed entirely behind our `Logger` abstraction.  This wrapper is a simplistic form of logging facade similar to Commons Logging and SLF4J. 
+  
+We should consider adopting a logging facade and replace the `Logger` with a more distinct `LogConfiguration` or other such abstraction.  This change will allow users to control with logging subsystem they want to use without the need to configure Feign separately.
+
+This will allow us to use the logger facade instances throughout the library, increasing our ability to log additional internal details while removing our current requirement to implement logger implementation specific `Logger` instances.
+
+Here is an example of what the resulting changes to `Feign.Builder` could look like:
+
+```java
+Feign.builder()
+   .log(LogConfiguration.Builder()
+      .withRequest()
+      .withResponse()
+      .withHeaders()
+      .build())
+   .build();
+```
+In addition, configuring what information is logged during Feign operations will become more explicit, leading to increased understanding and ease of use.  
+
+The potential draw backs here are that whatever facade we choose will require users to include that dependency in their project and we will need to include documentation on how to manage conflicts with Commons Logging for users whose projects intersect/conflict.  This information is readily available however and shouldn't be considered a major blocker to this approach.
+
+---
+
+The alternative is to adopt something similar to what Spring has done, which is to maintain the `Logger` abstraction and place ourselves in the middle, co-opting the detection of the logging framework and adapt accordingly.  More information can be found here: https://github.com/spring-projects/spring-framework/issues/19081
+
+While this does provide the most flexibility, it does mean that we will be explicitly choosing Commons Logging over SLF4J as SLF4J is more opinionated and expresses that users will need to configure SLF4J and the appropriate bridges.  Also, it does require that we, the Feign maintainers, also maintain our own mini-facade.  For this reason alone, I feel that the above suggestion of using SLF4J and adding it as a dependency, it worthwhile.
+In my project, I use the request interceptor to sign the request. I thought that there would be a corresponding response interceptor to verify the signature, but I didn't find it. Is there a better way?
+I see a feign-reactive-wrappers module, but the reactive execution support via Reactive Streams written in the medium-term plan, So can feign-reactive-wrappers use webflux? Support for webclient and non-blocking?
+first of all, I paste my code:
+```groovy
+import feign.okhttp.OkHttpClient
+import groovy.util.logging.Slf4j
+import okhttp3.Interceptor
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.logging.HttpLoggingInterceptor
+import org.jetbrains.annotations.NotNull
+import org.springframework.context.annotation.Bean
+
+@Slf4j
+class CustomFeignConfig {
+
+    @Bean
+    OkHttpClient feignClientConfig() {
+        HttpLoggingInterceptor interceptor = new HttpLoggingInterceptor(new HttpLoggingInterceptor.Logger() {
+            @Override
+            void log(String s) {
+                log.info(s)
+            }
+        })
+        interceptor.level(HttpLoggingInterceptor.Level.BODY)
+        HeadersInterceptor header = new HeadersInterceptor()
+        okhttp3.OkHttpClient client = new okhttp3.OkHttpClient.Builder().addInterceptor(header).addInterceptor(interceptor).build()
+        return new OkHttpClient(client)
+    }
+
+    class HeadersInterceptor implements Interceptor{
+
+        @Override
+        Response intercept(@NotNull Chain chain) throws IOException {
+            Request request = chain.request()
+            Request newRequest = request.newBuilder().removeHeader("cookie").addHeader("User-Agent","test").build()
+            return chain.proceed(newRequest)
+        }
+    }
+}
+```
+
+As the code say, I use okhttp's interceptor to add header `User-Agent` .
+
+In the http define interface file, I use  `feign.Response` for return type
+
+I log the response in my code, the code is `log.info("header:${response.request().headers()}")`
+
+I found log text is empty.
+
+By read the `feign-okhttp` code, the package `feign.okhttp` , the file `OkHttpClient` , I saw this:
+
+```java
+ @Override
+  public feign.Response execute(feign.Request input, feign.Request.Options options)
+      throws IOException {
+    okhttp3.OkHttpClient requestScoped;
+    if (delegate.connectTimeoutMillis() != options.connectTimeoutMillis()
+        || delegate.readTimeoutMillis() != options.readTimeoutMillis()) {
+      requestScoped = delegate.newBuilder()
+          .connectTimeout(options.connectTimeoutMillis(), TimeUnit.MILLISECONDS)
+          .readTimeout(options.readTimeoutMillis(), TimeUnit.MILLISECONDS)
+          .followRedirects(options.isFollowRedirects())
+          .build();
+    } else {
+      requestScoped = delegate;
+    }
+    Request request = toOkHttpRequest(input);
+    Response response = requestScoped.newCall(request).execute();
+    return toFeignResponse(response, input).toBuilder().request(input).build();
+  }
+``` 
+
+Why in `return toFeignResponse(response, input).toBuilder().request(input).build();` use feign's request, because in okhttp client, it can change request. 
+
+Maybe, add okhttp client's request is better
+
+It says like this in the documentation:
+> **Request Headers Expansion**
+> Headers and HeaderMap templates follow the same rules as Request Parameter Expansion with the  following alterations:
+> 
+> * Unresolved expressions are omitted. If the result is an empty header value, the entire header is removed.
+
+The problem is, I need to send empty POST message to a 3rd-party api, and that one returns a 411 error, which means they require a Content-Length to be set. 
+I tried many possibilities to force the "Content-Length: 0" to be sent to the client, but every time is ignored:
+Tried:
+- Setting @Headers 
+- Setting @Body("")
+- Writing a request interceptor and setting the header in that one
+
+Is there a way that I could send that header?
+I use Spring cloud Greenwich.M3 and spring-cloud-openfeign 2.1.0.M2
+
+interface define blew:
+```java
+    @RequestLine("POST /kunlun-kiosk-new/rest/gje/checkIn")
+    @Headers({"Content-Type: application/json", "Accept: application/json","Authorization: Bearer {token}"})
+    CheckInResponse checkIn(@Param("token") String token, CheckInRequest checkInRequest, Request.Options options);
+```
+
+error blow:
+```java
+
+java.lang.IllegalStateException: Method has too many Body parameters: public abstract com.veryqy.hotelclient.opera.model.CheckInResponse com.veryqy.hotelclient.opera.OperaInterface.checkIn(java.lang.String,com.veryqy.hotelclient.opera.model.CheckInRequest,feign.Request$Options)
+
+	at feign.Util.checkState(Util.java:128)
+	at feign.Contract$BaseContract.parseAndValidateMetadata(Contract.java:114)
+	at feign.Contract$BaseContract.parseAndValidatateMetadata(Contract.java:64)
+	at feign.ReflectiveFeign$ParseHandlersByName.apply(ReflectiveFeign.java:146)
+	at feign.ReflectiveFeign.newInstance(ReflectiveFeign.java:53)
+	at feign.Feign$Builder.target(Feign.java:198)
+	at feign.Feign$Builder.target(Feign.java:194)
+	at com.veryqy.hotelclient.opera.OperaClient.<init>(OperaClient.java:81)
+	at com.veryqy.HotelInterfaceManager.getInterfaceById(HotelInterfaceManager.java:27)
+	at com.veryqy.ClientTest.init(ClientTest.java:210)
+	at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.lang.reflect.Method.invoke(Method.java:498)
+	at org.junit.runners.model.FrameworkMethod$1.runReflectiveCall(FrameworkMethod.java:50)
+	at org.junit.internal.runners.model.ReflectiveCallable.run(ReflectiveCallable.java:12)
+	at org.junit.runners.model.FrameworkMethod.invokeExplosively(FrameworkMethod.java:47)
+	at org.junit.internal.runners.statements.RunBefores.evaluate(RunBefores.java:24)
+	at org.junit.runners.ParentRunner.runLeaf(ParentRunner.java:325)
+	at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:78)
+	at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:57)
+	at org.junit.runners.ParentRunner$3.run(ParentRunner.java:290)
+	at org.junit.runners.ParentRunner$1.schedule(ParentRunner.java:71)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:288)
+	at org.junit.runners.ParentRunner.access$000(ParentRunner.java:58)
+	at org.junit.runners.ParentRunner$2.evaluate(ParentRunner.java:268)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:363)
+	at org.junit.runner.JUnitCore.run(JUnitCore.java:137)
+	at com.intellij.junit4.JUnit4IdeaTestRunner.startRunnerWithArgs(JUnit4IdeaTestRunner.java:68)
+	at com.intellij.rt.execution.junit.IdeaTestRunner$Repeater.startRunnerWithArgs(IdeaTestRunner.java:47)
+	at com.intellij.rt.execution.junit.JUnitStarter.prepareStreamsAndStart(JUnitStarter.java:242)
+	at com.intellij.rt.execution.junit.JUnitStarter.main(JUnitStarter.java:70)
+```
+Will be great if Retrofit will generate interfaces implementation at compile time. Something like Micronaut does.
+
+https://github.com/micronaut-projects/micronaut-core
+Micronaut uses Ahead of Time (AOT) compilation to pre-compute your applications requirements at compile time. The result of this is significantly lower memory requirements, faster startup time, and reflection free framework infrastructure.
+
+This will also make possible to better integration with GraalVM.
+
+Another great example is Micronaut Data.icronaut Data is a database access toolkit that uses Ahead of Time (AoT) compilation to pre-compute queries for repository interfaces that are then executed by a thin, lightweight runtime layer.
+https://github.com/micronaut-projects/micronaut-data
+https://micronaut-projects.github.io/micronaut-data/latest/guide/
+Trying to use openFeign as our rest client. 
+Followed the various guides online to set up. Tried using slf4j plugin too.
+No matter what I try AppContext won't load and I see the following error:
+
+```Caused by: java.lang.IllegalStateException: Logback configuration error detected:
+
+ERROR in ch.qos.logback.core.joran.action.AppenderRefAction - Could not find an appender named [loggingAppender_IS_UNDEFINED]. Did you define it below instead of above in the configuration file?
+```
+
+application.yaml:
+
+```
+logging.level.com.moneysupermarket.energyrequoteconsumer.token.TokenServiceClient: DEBUG
+
+feign:
+  client:
+    config:
+      TokenServiceClient:
+        connectTimeout: 5000
+        readTimeout: 5000
+        loggerLevel: basic
+```
+
+service:
+```
+    public TokenService(...) {
+        ...
+        this.client = Feign.builder()
+                .decoder(new GsonDecoder())
+                .logger(new Slf4jLogger(TokenServiceClient.class))
+                .target(TokenServiceClient.class, baseURL);
+    }
+
+    public String getAutoLoginToken(...) {
+        ...
+        return client.getToken(request);
+    }
+```
+
+client:
+```
+@FeignClient(value = "tokenServiceClient")
+public interface TokenServiceClient {
+    @RequestMapping(method = RequestMethod.POST, value = "/tokens")
+    @Headers("Content-Type: application/json")
+    String getToken(AutoLoginTokenRequest request);
+}
+```
+
+build.gradle
+```
+...
+"org.springframework.cloud:spring-cloud-starter-openfeign:2.1.2.RELEASE",
+"org.springframework.cloud:spring-cloud-dependencies:Greenwich.SR2",
+"com.netflix.feign:feign-gson:7.2.1",
+"io.github.openfeign:feign-slf4j:10.3.0"
+```

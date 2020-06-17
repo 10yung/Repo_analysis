@@ -1,0 +1,134 @@
+我按照文档的说明，进行了如下修改：
+`
+leaf.snowflake.enable=true
+
+leaf.snowflake.zk.address=127.0.0.1:2181
+
+leaf.snowflake.port=8988
+`
+然后我启动了项目：mvn spring-boot:run
+
+**结果是**：我余下的工作不知道该怎么做了，我也不知道我获得了什么，我怎么能获得订单号，怎么维护。
+
+**我进行了如下操作：**
+1：http://localhost:8080/cache 
+ 1.1.1 结果报错，看异常，说明是支持号段模式。
+**我建议：**
+  1：将文档在现有基础上在补充下，如何操作，获得了什么。还有哪些补充方案等。
+
+
+如果leaf集群有俩台服务器，第一台号段是1-1000，第二台是1001-2000。获取id的时候第一次从第二台服务器获取，下一次从第一台服务器获取，那么id是不是就不是递增了。
+有这样一个场景：leaf服务运行一段时间，流量较大，此时的步长很长（假如一直维持在MAX_STEP,即10万）。当某时刻current segment的数据消费10%，系统会异步准备next segment。当current segment消费了10.01%数据时，此时leaf服务挂了。然后又重启服务。你会发现segment浪费很严重。如何去解决这个问题？
+首先诚挚地感谢每一位持续关注并使用Leaf的朋友。我们会持续投入，力图把Leaf 变得更好，把 Leaf社区变得更加繁荣。为了更好的聆听社区的声音，吸引更多的人使用和参与，我们期待您在此提交一条评论, 评论内容包括:
+
+- 您所在公司、学校或组织
+- 您所在的城市、国家
+- 您将 leaf 用于哪些业务场景
+- 您可以参考下面的样例来提供您的信息
+- 公司的LOGO
+
+公司：小美
+网址：https://meituan.com/ （方便用获取LOGO）
+地点：中国北京
+联系方式：leaf@meituan.com
+场景：支付码生成
+下面代码是截取双Buffer方案里更新号段的实现代码：
+public Result getIdFromSegmentBuffer(final SegmentBuffer buffer) {
+        while (true) {
+            buffer.rLock().lock();
+            try {
+                final Segment segment = buffer.getCurrent();
+                if (!buffer.isNextReady() && (segment.getIdle() < 0.9 * segment.getStep()) && buffer.getThreadRunning().compareAndSet(false, true)) {
+                    service.execute(new Runnable() {
+                        @Override
+                        public void run() {}
+          }
+
+上面这段代码的if 判断，在如下场景会有问题：
+ 1. 如果两个线程a，b同时开始执行if 语句，都执行完第一个条件，且都成立（认为下一个号段未准备好）。
+ 2. 线程a 执行完if 语句，条件成立，提交了更新号段的任务。
+ 3. 线程a提交的号段更新任务执行完成。
+ 4. 线程b 继续执行if 语句里剩下的两个条件，且都成立,又提交了一个更新号段的任务。
+
+上述场景就出现了提交两次号段更新任务
+这种多次更新号段的场景是不是可能出现？求大佬解答一下。
+  
+https://github.com/Meituan-Dianping/Leaf/blob/76301dcb45bcbcc594f55ece6b1c0a01886edf84/leaf-core/src/main/java/com/sankuai/inf/leaf/snowflake/SnowflakeZookeeperHolder.java#L85-L92
+
+workerID = Integer.parseInt(nodeKey[1]); 获取到的为leaf_name的值
+改为workerID = Integer.parseInt(nodeKey[nodeKey.length - 1]);
+通过自测没有问题
+这里给出原代码：
+```
+            List<String> dbTags = dao.getAllTags();
+            if (dbTags == null || dbTags.isEmpty()) {
+                return;
+            }
+            List<String> cacheTags = new ArrayList<String>(cache.keySet());
+            List<String> insertTags = new ArrayList<String>(dbTags);
+            List<String> removeTags = new ArrayList<String>(cacheTags);
+            //db中新加的tags灌进cache
+            insertTags.removeAll(cacheTags);
+            for (String tag : insertTags) {
+                SegmentBuffer buffer = new SegmentBuffer();
+                buffer.setKey(tag);
+                Segment segment = buffer.getCurrent();
+                segment.setValue(new AtomicLong(0));
+                segment.setMax(0);
+                segment.setStep(0);
+                cache.put(tag, buffer);
+                logger.info("Add tag {} from db to IdCache, SegmentBuffer {}", tag, buffer);
+            }
+            //cache中已失效的tags从cache删除
+            removeTags.removeAll(dbTags);
+            for (String tag : removeTags) {
+                cache.remove(tag);
+                logger.info("Remove tag {} from IdCache", tag);
+            }
+```
+------------------------------------------------------------------------------------------------------------------------
+　　楼下老哥提到这里利用removeAll时间复杂度为0(nm),修改为用hashmap。这里我帮助老哥
+hashset实现即可，省去确定value，具体看下面代码。
+
+```
+            List<String> dbTags = dao.getAllTags();
+            if (dbTags == null || dbTags.isEmpty()) {
+                return;
+            }
+            List<String> cacheTags = new ArrayList<String>(cache.keySet());
+            Set<String> insertTagsSet = new HashSet<>(dbTags);
+            Set<String> removeTagsSet = new HashSet<>(cacheTags);
+            //db中新加的tags灌进cache
+            for(int i = 0; i < cacheTags.size(); i++){
+                String tmp = cacheTags.get(i);
+                if(insertTagsSet.contains(tmp)){
+                    insertTagsSet.remove(tmp);
+                }
+            }
+            for (String tag : insertTagsSet) {
+                SegmentBuffer buffer = new SegmentBuffer();
+                buffer.setKey(tag);
+                Segment segment = buffer.getCurrent();
+                segment.setValue(new AtomicLong(0));
+                segment.setMax(0);
+                segment.setStep(0);
+                cache.put(tag, buffer);
+                logger.info("Add tag {} from db to IdCache, SegmentBuffer {}", tag, buffer);
+            }
+            //cache中已失效的tags从cache删除
+            for(int i = 0; i < dbTags.size(); i++){
+                String tmp = dbTags.get(i);
+                if(removeTagsSet.contains(tmp)){
+                    removeTagsSet.remove(tmp);
+                }
+            }
+            for (String tag : removeTagsSet) {
+                cache.remove(tag);
+                logger.info("Remove tag {} from IdCache", tag);
+            }
+```
+https://github.com/Meituan-Dianping/Leaf/blob/76301dcb45bcbcc594f55ece6b1c0a01886edf84/leaf-core/src/main/java/com/sankuai/inf/leaf/segment/SegmentIDGenImpl.java#L91-L115
+
+这里的insertTags可以直接利用hashmap筛选出来，即判断tag是否在hashmap中，这样复杂度为O（dbTags长度）。而不是使用列表的removeAll方法，这样的话复杂度为O（nm）。
+
+虽然可能性能提升不大，但是改一下也只需要几分钟。

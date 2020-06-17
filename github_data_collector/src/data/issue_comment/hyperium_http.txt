@@ -1,0 +1,97 @@
+
+Add headers `x-forwarded-for`, `x-forwarded-port`, and `x-forwarded-proto`, commonly used in load balancer setups.
+I'm sure if this is work the effort but about a year ago [I tried to add HTTP/3](https://github.com/hyperium/http/pull/294) to the `Version` enum and we hit the problem with exhaustive matching. That was independently fixed by adding a `__NonExhaustive` variant see https://github.com/hyperium/http/blob/master/src/version.rs#L52
+
+In Rust 1.40 the `#[non-exhaustive]` attribute was landed https://blog.rust-lang.org/2019/12/19/Rust-1.40.0.html#[non_exhaustive]-structs,-enums,-and-variants, so is there any benefit switching to that?
+I'll start by demonstrating that CI is broken (on latest master, due to a new deprecation) and go on to fix those things with edits here.
+
+It seems the URI parser stumbles with URNs. A simple test to reproduce:
+
+```rust
+fn main() {
+    use http::uri::Uri;
+    let uri = "urn:isbn:1238492".parse::<Uri>();
+    println!("{:?}", uri);
+}
+```
+
+Produces the output:
+
+```shell
+$ ./testcase
+Err(InvalidUri(InvalidAuthority))
+```
+
+The authority is only present when the scheme is followed by `//`, otherwise the parser should be parsing everything after the first `:` as the `path`. Python gets this right, and Go parses this as `Opaque` (instead of `Host`, but still successfully parses):
+
+Python:
+```python
+>>> urlparse('urn:isbn:0451450523')
+ParseResult(scheme='urn', netloc='', path='isbn:0451450523', params='', query='', fragment='')
+```
+
+Go:
+```go
+>>> url, _ := url.Parse("urn:isbn:0451450523")
+>>> fmt.Println("Host (Opaque):", url.Opaque)
+Host (Opaque): isbn:0451450523
+```
+This is question more than an issue ...
+
+How do I serialize the http::Request struct into its RFC-2616 byte array representation?
+https://fetch.spec.whatwg.org/#concept-header-value currently allows most bytes in the 1-31 range or 127, and https://github.com/web-platform-tests/wpt/blob/master/fetch/api/headers/header-values.html expects these bytes to roundtrip safely through request and response headers. The required code change is probably just to https://github.com/hyperium/http/blob/455f33e4d8a1e799c4081a08d912c516ce5b8680/src/header/value.rs#L557-L560 with more documentation lines to change than code lines.
+## Motivation
+
+- A few AWS services (like SQS, IAM, EC2) use `application/x-www-form-urlencoded`-based RPC calls. While this encoding is typically handled by the SDKs, this code needs to exist somewhere.
+- An off-by-default feature flag enabling a `TryFrom` conversion from `url::Url` allows for building complex queries using `url::Url`'s builder methods, but then converting to `http::Uri` at request construction time.
+- Since all of `http`'s builders implement accept a `TryFrom<T>` (in `http::request::Builder`'s case, [a `Uri: TryFrom<T>`](https://docs.rs/http/0.2.0/http/request/struct.Builder.html#method.uri)), this feature allows for passing a `url::Url` into a request builder.
+I have a crate with the following `http` dependencies (from `cargo tree | grep http`), after the update from `http` `0.1` to` 0.2`:
+
+```
+├── http v0.2.0
+│   │   ├── http v0.1.21
+│   ├── http v0.1.21 (*)
+│   ├── http-body v0.1.0
+│   │   ├── http v0.1.21 (*)
+│   ├── httparse v1.3.4
+│   │   ├── http v0.1.21 (*)
+│   ├── http v0.1.21 (*)
+│   │   ├── actix-http v0.2.11
+│   │   │   │   ├── http v0.1.21 (*)
+│   │   │   ├── http v0.1.21 (*)
+│   │   │   ├── httparse v1.3.4 (*)
+│   │   ├── actix-http v0.2.11 (*)
+│   │   │   ├── http v0.1.21 (*)
+│   │   │   └── http v0.1.21 (*)
+│   │   │   ├── actix-http v0.2.11 (*)
+│   │   │   ├── actix-http v0.2.11 (*)
+```
+
+
+When I compile my project I get the following error (one of many of the same type):
+
+```
+   |
+48 |             return Either::A(future::err(e.into()));
+   |                                            ^^^^ the trait `std::convert::From<http::uri::InvalidUri>` is not implemented for `error::Error`
+   |
+   = help: the following implementations were found:
+             <error::Error as std::convert::From<&std::io::Error>>
+             <error::Error as std::convert::From<failure::error::Error>>
+             <error::Error as std::convert::From<http::error::Error>>
+             <error::Error as std::convert::From<http::uri::InvalidUri>>
+           and 11 others
+   = note: required because of the requirements on the impl of `std::convert::Into<error::Error>` for `http::uri::InvalidUri`
+```
+
+(where `error::Error` is my error type) even though I clearly have the following implementation:
+
+```rust
+impl From<http::uri::InvalidUri> for error::Error {
+    fn from(e: http::uri::InvalidUri) -> Self {
+        Error::invalid_arg_msg(Entity::Uri, e)
+    }
+}
+```
+
+Is this due to the fact that some of my dependencies depend themselves on a previous version of `http` `0.1`? Is there a way to solve this?

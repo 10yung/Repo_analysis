@@ -1,0 +1,104 @@
+This file is only used in the development of the gem. Although it has been included in the released gem package it has no effect on the released artifact or environments where the stackprof gem is run.
+
+Each stackprof developer should be able to create a personal one of these via running `bundle install`.
+
+🤞 Hopefully, this fixes the CI build.
+Add `bug_tracker_uri`, `changelog_uri`, `documentation_uri`, and `source_code_uri` to the gemspec metadata.
+
+These [project metadata](https://guides.rubygems.org/specification-reference/#metadata) will facilitate easy access to project information. The URI will be available on the [Rubygems project page](https://rubygems.org/gems/stackprof), via the rubygems API, and the `gem` and `bundle` command-line tools with the next release.
+This addresses https://github.com/tmm1/stackprof/issues/125, a bug and/or undefined behavior when `interval` is > 1 million, the number of microseconds in a second.
+
+- raises `ArgumentError` with `interval >= 1000000`
+- raises same `ArgumentError` with `interval < 1` because this is also invalid
+
+An alternative would be to split `interval` into second and microsecond parts, but it's not clear that a sampling interval measured in _seconds_ would ever be useful. (Also, if that was a common use case, I presume this would have been fixed in that direction a long time ago.)
+The code to translate `interval` (set in microseconds) to a timer is implemented here,
+https://github.com/tmm1/stackprof/blob/b886c3c09ccaa2ed6bbb35fcea57210a589bfd3a/ext/stackprof/stackprof.c#L115-L116
+and (for forks) here,
+https://github.com/tmm1/stackprof/blob/b886c3c09ccaa2ed6bbb35fcea57210a589bfd3a/ext/stackprof/stackprof.c#L628-L629
+
+`it_interval` is a `timeval`, documented at https://www.gnu.org/software/libc/manual/html_node/Elapsed-Time.html says (emphasis mine),
+> `long int tv_usec`
+> This is the rest of the elapsed time (a fraction of a second), represented as the number of microseconds. **It is always less than one million.**
+
+**What is supposed to happen if `interval` (passed to `start` or `run`) is >= one million?**
+
+It looks like the `timeval` itself will take that value, but the behavior is undefined.
+
+Should StackProf error if the interval is larger than one million? Or should it split the interval over seconds + microseconds?
+
+Thank you
+This attempts to fix the bug described in #123, in which, when `interval` is faster than the time required to record and analyze stack frames, the job queue piles up faster than it's flushed and the program hangs.
+
+Pieces:
+- Moves the `in_signal_handler` lock to the global `_stackprof` struct, and adds a check, and escape hatch, in `stackprof_signal_handler`.
+- Adds a test which demonstrates the hanging behavior and the fix for it.
+- Adds helpers `timeval_to_usec` and `diff_timevals_usec` for working with time durations more easily as `long int`s of microseconds, rather than `timeval` structs.
+- Adds a `debug` mode with stdout+stderr output recording the internal timings and flow.
+- Adds some comments and renames some variables for clarity.
+
+More context on the underlying bug, and consideration of alternative approaches, is at https://github.com/tmm1/stackprof/issues/123.
+
+Motivation: 
+We would like to use StackProf on a large-scale Ruby application in production. The inability to set an interval that is both fast enough to produce useful data, and guaranteed to never hang the program, is a blocker to doing so.
+
+Caveats:
+- I am an amateur with C. It took a lot of trial and error with this code and https://repl.it/languages/c to get this working.
+- I have not yet analyzed what the escape hatch in `stackprof_signal_handler` does to the quality of the final results. (At the end of the day, it's a kind of user or program error if the interval is so fast that the escape hatch is necessary. The question is how to deal with it.)
+- I have mostly tested this with `wall` mode; I have not yet analyzed how this bug or fix work with `cpu` or `object` modes (though I suspect they're similar).
+
+cc @NickLaMuro, thank you for your engagement with #123!
+### Context
+We are trying to enable StackProf in production on a REST API service. We would like to use `mode: :wall, raw: true, aggregate: true`, but it has been challenging to calibrate the `interval`. The segfault bug described in #81 makes very low/fast sampling rates concerning (especially because our hypothesis about the causes of those segfaults, which we have not verified, centered on [overlapping signal handlers](http://man7.org/linux/man-pages/man7/signal-safety.7.html)). But at an interval of (e.g.) 20ms the data is not particularly useful.
+
+### Observed behavior
+At lower intervals, however, we encounter a separate bug in which the program doesn't crash, but rather it _hangs_ – the CPU is pegged to 100% and the program being profiled does not advance. This specifically seems to occur **when the time to capture a single sample is greater than the interval between samples.** (The time it takes to capture a sample fluctuates, I assume, based on the size of the stack, CPU load, etc, so it could take a bunch of samples successfully and then encounter this race.) What I suspect is occurring – and I am still in the process of debugging and verifying the details – is that it starts [piling up jobs with `rb_postponed_job_register_one`](https://github.com/tmm1/stackprof/blob/b886c3c/ext/stackprof/stackprof.c#L561-L570), and by the time it finishes one sample, it's started another, (and so on forever), blocking any other instructions.
+
+### Proposal
+I think some code needs to be added, to [`stackprof_record_sample`](https://github.com/tmm1/stackprof/blob/b886c3c/ext/stackprof/stackprof.c#L491) or [`stackprof_record_sample_for_stack`](https://github.com/tmm1/stackprof/blob/b886c3c/ext/stackprof/stackprof.c#L381), measuring the time it took to capture the sample. If that time is `>= interval`, it needs to handle that somehow. I can think of a few options at this point:
+
+1. Calculate how many sample(s)' time was borrowed and skip that number of next samples. (This seems complicated and risky.)
+1. Inject fake frames into the results, similar to GC frames, that make it clear (to the final report or flamegraph) that this situation was encountered. (I'm not sure how feasible this would be.)
+1. Internally stop profiling, and when `StackProf.results` is called, raise an exception that makes it clear that the profiling was stopped due to this situation. (We don't want to raise mid-profiling because that could bubble up anywhere in the program. This seems the easiest of the 3.)
+
+### Next steps for me
+- [x] Distill this bug down to a simple repro script.
+- [x] Confirm that the bug is in fact caused by a pile-on of signal handlers / postponed jobs.
+- [ ] Implement one of the 3 solutions (probably the 3rd) behind a param passed to `start` or `run` and confirm that it fixes the bug.
+
+_(I'll update this issue as I do these.)_
+
+In the meantime, I'd be interested in anyone else's thoughts – have you also encountered this, do you know why it might be occurring, and what fix do you propose?
+
+Thank you!
+Some viewers, e.g., speedscope, require raw data.
+This is a set of helper rake tasks are intended to make running tests locally in docker much streamline and simpler to pick up as a new-comer to the project.
+
+Requires a `docker` environment available in your shell environment.
+
+
+Quick Start
+-----------
+
+To simply run the rake tasks, you can run:
+
+```console
+$ rake test:docker
+```
+
+To specify a specific target ruby version:
+
+```console
+$ rake test:docker:2.1
+```
+
+
+@mame Curious about your thoughts on this one since you recently did the work https://github.com/tmm1/stackprof/pull/116 to start running tests on travis with `docker`.
+Like the other methods in the class, it allows for choosing a IO object to have the data written to.  This can allow for writing to a IO object in the current ruby process and then processing it in the same process without having to do crazy `STDOUT` constant overwriting to achieve it.
+This PR contains some minor changes, each in a separate commit so I can easily remove them if they are not wanted.
+
+Unrelated to this PR, but as for the CI, I saw #116, which looks very nice since it actually works :D, but is the added runtime for CI and complexity (debatable) something that's wanted? I get the frustration with ruby-head, but then again, it's a `HEAD` version — can't this be in the allowed-failures until 2.7 is officially released or Travis CI starts working again?
+
+A compromise could also be to use a separate build step for ruby-head and use Travis CI for everything else. https://docs.travis-ci.com/user/build-stages/define-steps/
+
+WDYT?

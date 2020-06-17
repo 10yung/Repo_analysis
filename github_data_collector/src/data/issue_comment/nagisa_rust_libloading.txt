@@ -1,0 +1,229 @@
+I'm kind of new to cross-compiling with rust, but I managed to set up a foreign rust-std, and also a gcc cross-compiler for linking. It's all in cargo's config: 
+
+$ cat >>~/.cargo/config
+> [target.armv7-unknown-linux-gnueabihf]
+> linker = "armv7a-unknown-linux-gnueabihf"
+
+how to reproduce:
+
+git clone https://github.com/nagisa/rust_libloading.git
+cd rust_libloading
+cargo build --target=armv7-unknown-linux-gnueabihf
+
+```
+    Updating crates.io index
+   Compiling cc v1.0.31
+   Compiling libloading v0.5.0 (/tmp/rust_libloading)                                                                                                                                   
+error: failed to run custom build command for `libloading v0.5.0 (/tmp/rust_libloading)`                                                                                                
+process didn't exit successfully: `/tmp/rust_libloading/target/debug/build/libloading-a41fce1a7453006f/build-script-build` (exit code: 101)
+--- stdout
+cargo:rustc-link-lib=dl
+TARGET = Some("armv7-unknown-linux-gnueabihf")
+OPT_LEVEL = Some("0")
+HOST = Some("x86_64-unknown-linux-gnu")
+CC_armv7-unknown-linux-gnueabihf = None
+CC_armv7_unknown_linux_gnueabihf = None
+TARGET_CC = None
+CC = None
+CROSS_COMPILE = None
+CFLAGS_armv7-unknown-linux-gnueabihf = None
+CFLAGS_armv7_unknown_linux_gnueabihf = None
+TARGET_CFLAGS = None
+CFLAGS = None
+CRATE_CC_NO_DEFAULTS = None
+DEBUG = Some("true")
+CARGO_CFG_TARGET_FEATURE = None
+running: "arm-linux-gnueabihf-gcc" "-O0" "-ffunction-sections" "-fdata-sections" "-fPIC" "-g" "-fno-omit-frame-pointer" "-march=armv7-a" "-Wall" "-Wextra" "-o" "/tmp/rust_libloading/target/armv7-unknown-linux-gnueabihf/debug/build/libloading-b5a400997b94cd58/out/src/os/unix/global_static.o" "-c" "src/os/unix/global_static.c"
+
+--- stderr
+thread 'main' panicked at '
+
+Internal error occurred: Failed to find tool. Is `arm-linux-gnueabihf-gcc` installed?
+
+', /home/user/.cargo/registry/src/github.com-1ecc6299db9ec823/cc-1.0.31/src/lib.rs:2367:5
+note: Run with `RUST_BACKTRACE=1` for a backtrace.
+```
+Could libloading provide a way to query a library to get the list of available symbols and functions? I’m working on a basic mage port to Rust, and it would help if I could reflect over library entries rather than hardcode them.
+
+As a workaround, I’m thinking of having my libraries adhere to a specific Rust trait, which would itself offer methods for registering and querying symbols and functions. But it would be cooler to do this dynamically rather than impose a structure on the plugins I use.
+Return values from functions that contain `'static` lifetimes are not reduced to the lifetime of the loaded library, and can outlive it.
+Preventing this is probably impossible (especially when the `'static` is hidden inside a type like `Wrapper(&'static u32)`), but the docs could warn about it.
+
+Here's one example that segfaults:
+
+Cargo.toml:
+```toml
+[package]
+name = "unsafe_libloading"
+version = "0.0.0"
+
+[lib]
+path = "lib.rs"
+name = "loadee"
+crate-type = ["dylib"]
+
+[[bin]]
+name = "loader"
+path = "main.rs"
+
+[dependencies]
+libloading = "0.5"
+```
+
+lib.rs:
+```rust
+#[no_mangle]
+pub fn get_str() -> &'static str {
+    "Hello, world"
+}
+```
+
+main.rs:
+```rust
+extern crate libloading;
+
+fn main() -> libloading::Result<()> {
+    let lib = libloading::Library::new("libloadee.so")?;
+    let return_value: &'static str = {
+        let fun: libloading::Symbol<extern fn()->&'static str> = unsafe{ lib.get(b"get_str") }?;
+        fun()
+    };
+    drop(lib);
+    println!("return value: {}", return_value);
+    Ok(())
+}
+```
+
+I assume this issue also applies to loaded global variables, but dereferencing those produced bogus values even without dropping `lib`:
+
+lib.rs:
+```rust
+#[no_mangle]
+pub static REF: &'static u16 = &19;
+```
+
+main.rs:
+```rust
+extern crate libloading;
+
+fn main() -> libloading::Result<()> {
+    let lib = libloading::Library::new("libloadee.so")?;
+    let var: libloading::Symbol<&'static u16> = unsafe{ lib.get(b"REF") }?;
+    let dereferenced: u16 = **ref;
+    println!("variable: {} = 0x{:x}", dereferenced, dereferenced);
+    Ok(())
+}
+```
+prints "variable: 27312 = 0x6ab0"
+Operating system is Fedora 27.
+```
+uname -r
+4.15.4-300.fc27.x86_64
+```
+
+When running ```cargo test``` multiple times, sometimes test fails raising a segmentation fault.
+```rust
+#[test]
+fn libloading() {
+    let lib = libloading::Library::new("libdltest.so").unwrap();
+    unsafe {
+        let test_fn: libloading::Symbol<unsafe extern fn(i32) -> i32> = lib.get(b"test").unwrap();
+        assert!(test_fn(100) == 200);
+    }
+}
+```
+```
+test test::libloading ... error: process didn't exit successfully: `/home/User/test_libloading/target/debug/deps/test_libloading-b3311c80df7834fd libloading` (signal: 11, SIGSEGV: invalid memory reference)
+```
+But when this code runs in an executable crate, It seems to run without the segfault even when I execute it multiple times.
+```rust
+fn main() {
+    let lib = libloading::Library::new("libdltest.so").unwrap();
+    unsafe {
+        let test_fn: libloading::Symbol<unsafe extern fn(i32) -> i32> = lib.get(b"test").unwrap();
+        assert!(test_fn(100) == 200);
+    }
+}
+```
+I'm using libloading in a work-in-progress large project; there's a part of the project's design which necessitates returning a raw os symbol. Unfortunately your library currently forces me to write the following:
+
+```
+#[cfg(not(windows))]
+use libloading::os::unix::Symbol as LibSymbol;
+#[cfg(windows)]
+use libloading::os::windows::Symbol as LibSymbol;
+```
+
+Which is messier than I'd like. Could you please add a generic export of os symbols (i.e. ::os::raw::*) to provide a cleaner import of the os symbols, just like std does. Thanks :)
+Most notably categories, such as FFI could be specified.
+
+macOS Sierra: 10.12.6 (16G29)
+
+This issue references the issue created for [rust-json](https://github.com/maciejhirsz/json-rust/issues/120)
+
+Sample Code is as follows:
+
+Code for the dynamic library function is as follows:
+
+    #[macro_use]
+    extern crate json;
+
+    use json::JsonValue;
+    
+    #[no_mangle]
+    pub fn methods() -> JsonValue
+    {
+    	let rt = array![
+    		object!{
+    			"fn" => "method 1"
+        		}
+    	];
+    	rt
+    }
+
+Code for my main.rs file is as follows:
+
+    extern crate json;
+    extern crate libloading as lib;
+    
+    use std::env;
+    use json::JsonValue;
+    
+    unsafe fn call_dynamic(libname: &String) -> lib::Result<()> {
+    	let dylib = try!(lib::Library::new(libname));
+    	let findmethods: lib::Symbol<fn() -> JsonValue> = dylib.get(b"methods")?;
+    	let funcs = findmethods();
+    	println!("{:#}", funcs);
+    	Ok(())
+    }
+    
+    fn main(){
+    	let args: Vec<String> = env::args().collect();
+    	unsafe {
+    		call_dynamic(&args[1]).unwrap();
+    	}
+    }
+Hello,
+
+Currently you can do `Library::new()` which loads a library.
+For my use case it would be create to have `Library::open` that opens an already existing library.
+- I'm trying to query optionally exported functions in preloaded shared library.
+
+Implementation can be accomplished with the RTLD_NOLOAD flag for dlopen on most unixes and GetModuleHandleEx in windows.
+
+I can write the code myself and submit a PR if that works for you.
+
+`cargo build --target asmjs-unknown-emscripten` gave me the following output :
+```
+   Compiling libloading v0.3.4
+error: failed to run custom build command for `libloading v0.3.4`
+process didn't exit successfully: `/home/yoon/git/trust/fate-rs/target/debug/build/libloading-b2c9bb378ef0f558/build-script-build` (exit code: 252)
+--- stderr
+Building for an unknown target_os=`emscripten`!
+Please report an issue 
+
+Build failed, waiting for other jobs to finish...
+error: build failed
+```
+Admittedly, loading dynamic libraries in Emscripten makes little to no sense, so this should be expected - I ran into this when trying to build my test project which depends on `al-sys` from `alto`.
+I'm wondering what the desired behavior would be here. My gut feeling is that `libloading` should still compile, but produce no-ops, but on the other hand, the actual fix would probably to set `libloading` as an optional dependency of `al-sys`.

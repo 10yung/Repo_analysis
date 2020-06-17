@@ -1,0 +1,195 @@
+Currently it's not possible to do:
+
+```rust
+lazy_static!{
+        static ref FOO: bar = MyFooStruct::new().await;
+}
+```
+I trying to build a project that uses [sdl2](https://github.com/Rust-SDL2/rust-sdl2) which depends on [lazy_static](https://github.com/Rust-SDL2/rust-sdl2/blob/master/Cargo.toml#L21), but I'm getting:
+
+```
+C:/tools/emsdk/upstream/bin\llvm-nm.exe:
+error: C:\Users\Leo\Projects\rust-snake\target\wasm32-unknown-emscripten\release\deps\liblazy_static-edee67263b918afb.rlib(rust.metadata.bin)
+The end of the file was unexpectedly encountered
+```
+
+Isn't this lib supported? I'm doing something wrong?
+rustc: 1.40.0
+lazy_static: 1.4.0
+
+I am calling a thread-unsafe unix libc function. So, I have a Mutex in my code to mitigate this issue. Linux provides a thread-safe version, so it's not needed on there.
+
+So, I have the following code:
+
+```rust
+lazy_static! {
+    #[cfg(all(unix, not(target_os = "linux")))]
+    static ref MY_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
+```
+
+This configuration predicate works fine on functions, types, and even normal statics, but when used inside `lazy_static!`, I instead get a rather unhelpful "expected type, found static `MY_MUTEX`" error.
+Quoting @bluejekyll at https://github.com/briansmith/ring/issues/921:
+
+> https://rustsec.org/advisories/RUSTSEC-2019-0031
+>
+> The spin dependency is no longer maintained it appears. This causes cargo audit to fail on downstream projects. I haven't had a chance to look into potential fixes.
+
+Some (probably many) projects have a `cargo audit --deny-warnings` job that will now fail if they depend on lazy-static.
+I have a use case that's similar to `lazy_static` but that cannot be solved nicely right now.
+
+If the default initializer to a `lazy_static` variable is something that wants arguments at initialization-time, or is something that can fail, then currently the usage is very awkward. Of course it's possible that I'm missing something obvious, I'm very new to Rust still, so apologies in advance if that's the case.
+
+You may well consider this out of scope for this project (wouldn't really be "lazy"), but I wanted to ask before I contemplate if it's worth forking the project.
+
+Basically, what I want would look something like this:
+```rust
+lazy_static! {
+    pub static ref QUOTES: QuoteLibrary;
+}
+fn main() {
+    let filename = "quotes.yaml";
+    match QuoteLibrary::load_file(filename) {
+        //                        ^^^^^^^^
+        // allows me to provide arguments to the initializer function
+        Ok(quotes) => lazy_static::initialize(&QUOTES, quotes); // assigned here
+        Err(err) => // allows reporting initialization failures nicely
+    }
+}
+```
+The semantics would be:
+* Any access to `QUOTES` before it's initialized would panic.
+* Attempting to set the value multiple times might possibly panic too?
+
+This saves me from writing:
+```rust
+lazy_static! {
+    static ref QUOTES: Mutex<Option<QuoteLibrary>> = Mutex::new(None);
+}
+```
+and also saves `.lock().unwrap()` calls every time I want to use the `QUOTES` value.
+
+
+For context, this is what I initially wrote, when attempting to use the current `lazy_static`:
+```rust
+lazy_static! {
+    pub static ref QUOTES: QuoteLibrary = QuoteLibrary::load_file_or_exit("quotes.yaml");
+    //              Note: cannot supply arguments from main() function.   ^^^^^^^^^^^^^
+}
+fn main() {
+    lazy_static::initialize(&QUOTES);
+    // other code
+}
+impl QuoteLibrary {
+    pub fn load_file_or_exit(filename: &str) -> QuoteLibrary {
+        match Self::load_file(filename) {
+            Ok(quotes) => quotes,
+            Err(err) => {
+                println!("Error loading {}: {}", filename, err);
+                exit(1);   // <-- Calling exit() from an initializer is awkward
+            }
+        }
+    }
+}
+```
+
+Hello, the current `rust-lang-nursery` organisation is considered deprecated, and the Rust Programming Language organisation is trying to consolidate managing Rust's GitHub organisations, as such we'd like you to consider moving your repository to the main `rust-lang` organisation instead. 
+
+### How Do I Move To `rust-lang`?
+You won't be able to transfer your repository directly, you'll need to transfer your repository to @Mark-Simulacrum, who will then move your repository to the `rust-lang` organisation.
+
+### Deprecating
+If you no longer intend to maintain this repository, please let us know and we will take of deprecating the project.
+Adding the attribute `#[allow(non_upper_case_globals)]` doesn't work, since attributes I provide are applied to the synthesized type but not to the actual `static` variable.
+
+```rust
+lazy_static! {
+    #[allow(non_upper_case_globals)]
+    static ref fooBar: i32 = 42;
+}
+```
+
+produces
+
+```
+warning: static variable `fooBar` should have an upper case name
+ --> src/lib.rs:6:16
+  |
+6 |     static ref fooBar: i32 = 42;
+  |                ^^^^^^ help: convert the identifier to upper case: `FOO_BAR`
+  |
+  = note: #[warn(non_upper_case_globals)] on by default
+```
+
+[Playground link](https://play.rust-lang.org/?version=stable&mode=debug&edition=2018&gist=ee41fdec36215ad07594f9a450ac467c)
+I have a tiny crate (really just a [crate to test miri](https://github.com/rust-lang/miri/tree/master/test-cargo-miri)) where I noticed that after a `cargo update`, `lazy_static` depends on `spin`. Or, at least, `spin` gets compiled. (If you want to reproduce, get that folder and do `cargo update`; I couldn't land the updated version yet due to other problems.)
+
+Isn't that a problem? The fact that `spin_no_std` is a feature means that if *any* create enables it, then globally *all* lazy statics will use a spin lock. Given that there is no way to know what kind of computation is done in the initializer, spinning instead of properly putting waiting threads to sleep seems like a huge waste of CPU cycles.
+
+I am not entirely sure what exactly is enabling the feature in my case, the reverse dependency graph of `spin` is not very big:
+```
+spin v0.5.0
+└── lazy_static v1.3.0
+    ├── c2-chacha v0.2.2
+    │   └── rand_chacha v0.2.0
+    │       └── rand v0.7.0
+    │           [dev-dependencies]
+    │           └── cargo-miri-test v0.1.0 (/home/r/src/rust/miri/test-cargo-miri)
+    └── getrandom v0.1.5
+        ├── rand v0.7.0 (*)
+        └── rand_core v0.5.0
+            ├── rand v0.7.0 (*)
+            ├── rand_chacha v0.2.0 (*)
+            ├── rand_hc v0.2.0
+            │   [dev-dependencies]
+            │   └── rand v0.7.0 (*)
+            └── rand_pcg v0.2.0
+                └── rand v0.7.0 (*)
+                [dev-dependencies]
+                └── rand v0.7.0 (*)
+```
+@Mark-Simulacrum on Zulip suggested that Cargo ignores `cfg` restrictions for feature flags, and thus `getrandom` is likely the trigger here. Cc @newpavlov
+
+FWIW, the fact that there is a negated term ("no") in the feature also indicates this is probably a bad approach, see [the feature name guidelines](https://rust-lang-nursery.github.io/api-guidelines/print.html#feature-names-are-free-of-placeholder-words-c-feature). Cargo features are additive; creates can only ask for a feature to be enabled but never ask for a feature to be disabled.
+When compiling the code below
+
+```rust
+#[macro_use]
+extern crate lazy_static;
+
+macro_rules! unit_like_struct {
+    ( $v:vis $name:ident) => {
+        $v struct $name;
+    }
+}
+
+unit_like_struct!(pub MyStruct);
+
+macro_rules! lazy_string {
+    ( $v:vis $name:ident, $s:expr) => {
+        lazy_static! {
+            $v static ref $name: String = format!($s);
+        }
+    }
+}
+
+lazy_string!(pub NOTHING, "nothing");
+```
+
+Cargo says,
+
+```
+error: no rules expected the token `pub `
+  --> src/main.rs:15:13
+   |
+15 |             $v static ref $name: String = format!($s);
+   |             ^^ no rules expected this token in macro call
+...
+20 | lazy_string!(pub NOTHING, "nothing");
+   | ------------------------------------- in this macro invocation
+```
+
+Thanks in advance!
+In my crate, [*ring*](https://github.com/briansmith/ring) I have use cases where I want to lazily initialize a value using only a spin lock (waiting for CPUID to finish) and where I want to lazily initialize a value using only libstd's synchronization primitives and never spin (opening a file lazily, where the file handle will be shared across threads). Currently this is impossible to do because the `spin_no_std` feature is all-or-none.
+
+I propose that `lazy_static!` be augmented with two new macros `lazy_static_spin!` and `lazy_static_std!` which, respectively, use `spin` or `libstd`. Then the existing `spin_no_std` feature would simply control which of those two macros `lazy_static!` is implemented in terms of.

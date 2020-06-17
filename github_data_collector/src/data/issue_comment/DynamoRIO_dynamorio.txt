@@ -1,0 +1,319 @@
+Like other standalone tools, we should add a page to the docs describing drdisas.
+
+Related issues: #2987 #4021
+Adds the -syntax options to drdisas along with tests.
+
+The PR also includes minor changes such as the mention of drdisas in the ReadMe.md file and a bug fix concerning drdisas's redzone bounds check.
+
+Fixes: #4021 
+Updates a now-stale detail in the rseq limitation docs: we no longer
+try to analyze read-write sequences for restoring state for the second
+rseq execution.  We do still limit our checkpointing to
+general-purpose registers.
+
+Issue: #2350
+Travis Mac keeps failing due to #3127, yet the test failures are ignored somehow:
+https://travis-ci.com/DynamoRIO/dynamorio/jobs/276424785
+
+This issue covers figuring out why and fixing the runsuite scripts.
+#2987 added the drdisas tool.  This is a feature request to add options for specifying the output syntax, and adding a test for each.
+#2350 added rseq support to DR using a run-twice scheme documented in the wiki.  On the native run, we can have the kernel abort and target the abort handler for a migration or context switch, with a resulting control flow redirection in the code stream seen by a client.  However, DR does not raise a kernel xfer event there.  This issue covers adding the event (and probably a new type of transfer).
+Xref related issues: #731, #3271, #3339
+This issue covers implementing automated binary re-relativization of AArch32 and AArch64 instructions.  We will need a different strategy than the x86 approach of storing the location of a 32-bit immediate, due to the varying immediate encodings.  For now, decode_from_copy() invalidates the raw bits to force a re-encoding as a workaround for not having this feature.
+-use_physical is only supported for online drcachesim today, but that is not made clear in the docs nor in actual usage.  The tool lets you run `-offline -use_physical` and ends up with a post-processed trace with physical data addresses but virtual PC fetches, due to an accident.  `instr_offline_t::get_entry_addr` blindly treats the entry as a data ref, so it tries to
+translate bogus addresses composed of module id + offset encodings.  
+And indeed we get warnings at -verbose 1+:
+```
+virtual2physical translation failure for <10,  0, 0x0004000c00000f30>
+virtual 140727803080432 => physical 3824
+virtual2physical translation failure for <10,  0, 0x002c000c00001d30>
+virtual2physical translation failure for <10,  0, 0x0016000c00001d85>
+virtual2physical translation failure for <10,  0, 0x0004000c00001de3>
+virtual2physical translation failure for <10,  0, 0x000a000c00001dd3>
+virtual 140346642070176 => physical 2720
+virtual 140346642067080 => physical 3720
+virtual2physical translation failure for <10,  0, 0x0004000c00001de3>
+...
+```
+Those are the instruction entries:
+```
+$ od -t x8 -A x `ls -1td drmemtrace.threadsig.*.dir | head -1`/raw/*.raw | head
+000000 c000000000000003 4000000000030385
+000010 6000000000030385 802efaa01299a30c
+000020 c203000000000003 2004000c00000f30
+000030 0000000000000ef0 202c000c00001d30
+000040 0000000000000ee8 0000000000000ee0
+000050 0000000000000ed8 0000000000000ed0
+000060 0000000000000ec8 0000000000000ec0
+000070 2016000c00001d85 2004000c00001de3
+000080 200a000c00001dd3 0000000000000aa0
+000090 0000000000000e88 2004000c00001de3
+```
+
+So we have two action items.  First, we should have the front-end refuse to combine `-use_physical` and `-offline` for now, and update the docs to reflect this.
+
+Next, we need to decide whether to try to support this combination.  Is it possible that future Linux distros will all shut down access to pagemap?  Although for research purposes running as sudo or something may still be feasible.
+
+How would we support this?  We'd either have to store extra info for each data ref plus
+an entry for each instr like for DGC (#2062), or have a custom solution just for offline
+where each block PC has 2 entries: one virtual and one physical.  The former will not work
+well w/ tools that want operands (like opcode_mix or micro-arch simulators): but that would be the same for DGC, so we might need an option to store the full instr bytes.
+
+Another limitation today (which perhaps should have its own issue) with `-use_physical` relates to static linking which we often use for offline tracing:
+```
+        /* Unfortunately the use of std::unordered_map in physaddr_t calls malloc
+         * and thus we cannot support it for static linking, so we override the
+         * DR_DISALLOW_UNSAFE_STATIC declaration.
+         */
+        dr_allow_unsafe_static_behavior();
+#ifdef DRMEMTRACE_STATIC
+        NOTIFY(0, "-use_physical is unsafe with statically linked clients\n");
+#endif
+```
+
+Xref #2912 but that issue has many confusing entries so it seemed better to start clean here.
+Today DR's IR considers the address in eax/rax for OP_monitor to just be a register source and not a memory reference.  Perhaps it should be considered a memref even if there would be no fault on a bad address (and thus all tools like Dr. Memory would be forced to special-case it just like prefetch instructions)?  The memory size would be read from cpuid, though that just gives a min and max monitor-line size.
+I'm trying to get VS2017-built tests to pass.  The drcachesim and drcpusim tests all crash on appveyor and fail locally.  Locally once I work around #4001 I hit this assert.
+
+```
+<Application D:\derek\dr\git\build_x64_dbg_tests\suite\tests\bin\simple_app.exe (6608).  Internal Error: DynamoRIO debug check failure: D:\derek\dr\git\src\core\win32\callback.c:6321 dcontext->whereami == DR_WHERE_FCACHE
+```
+```
+05 0000005b`a2af3990 00000000`153ad4bd dynamorio!d_r_internal_error+0x19d [d:\derek\dr\git\src\core\utils.c @ 193] 
+06 0000005b`a2af3b10 00000000`15558f2d dynamorio!intercept_callback_start+0x16d [d:\derek\dr\git\src\core\win32\callback.c @ 6321] 
+07 0000005b`a2af3bc0 0000005b`a2af3be0 dynamorio!interception_code_array+0xf2d
+08 0000005b`a2af3bc8 00000000`153e0e29 0x0000005b`a2af3be0
+09 0000005b`a2af3bd0 00000000`00000000 dynamorio!get_proc_address_common+0xc79 [d:\derek\dr\git\src\core\win32\module_shared.c @ 526] 
+0:000> .frame 6
+06 0000005b`a2af3b10 00000000`15558f2d dynamorio!intercept_callback_start+0x16d [d:\derek\dr\git\src\core\win32\callback.c @ 6321] 
+0:000> ?? dcontext->whereami
+dr_where_am_i_t DR_WHERE_APP (0n0)
+```
+Trying to look up the stack above get_proc_address_common I'm seeing a lot
+of ucrt crap dealing w/ msgboxes.  Seems like all this ucrt code in the
+client is making alertable calls, resulting in a callback!
+
+```
+0000005b`a2af3eb0  00007ffd`9ce914e4 win32u!NtUserGetProcessWindowStation+0x14
+0000005b`a2af3eb8  00007ff6`393e2320 drmemtrace!`string'
+0000005b`a2af3ec0  00007ff6`393e2318 drmemtrace!candidate_modules
+0000005b`a2af3ec8  0000005b`a2af3ed8
+0000005b`a2af3ed0  00000000`00000001
+0000005b`a2af3ed8  00007ff6`393ac75c drmemtrace!__acrt_is_interactive+0x5c [minkernel\crts\ucrt\src\appcrt\internal\winapi_thunks.cpp @ 899]
+0000005b`a2af3ee0  0000005b`00000001
+0000005b`a2af3ee8  00007ff6`393aba5a drmemtrace!try_get_MessageBoxW+0x2a [minkernel\crts\ucrt\src\appcrt\internal\winapi_thunks.cpp @ 397]
+<...>
+0000005b`a2af3f58  00007ff6`393a6749 drmemtrace!common_show_message_box<wchar_t>+0xd9 [minkernel\crts\ucrt\src\appcrt\misc\crtmbox.cpp @ 70]
+0000005b`a2af3f60  0000005b`a2af4000
+0000005b`a2af3f68  00007ff6`393a2379 drmemtrace!__acrt_getptd_noexit+0x9 [minkernel\crts\ucrt\src\appcrt\internal\per_thread_data.cpp @ 279]
+0000005b`a2af3f70  0000016a`0000016a
+0000005b`a2af3f78  00007ff6`3939ec1a drmemtrace!wcslen+0x1a [minkernel\crts\ucrt\src\appcrt\string\strnlen.cpp @ 219]
+0000005b`a2af3f80  0000015b`00014100
+0000005b`a2af3f88  00007ff6`39389e63 drmemtrace!_snwprintf_s+0x53 [minkernel\crts\ucrt\inc\corecrt_wstdio.h @ 1727]
+0000005b`a2af3f90  0000005b`a2af4350
+0000005b`a2af3f98  00007ff6`3938bbd9 drmemtrace!_errno+0x9 [minkernel\crts\ucrt\src\appcrt\misc\errno.cpp @ 173]
+0000005b`a2af3fa0  00000000`00000fff
+0000005b`a2af3fa8  00007ff6`393a6847 drmemtrace!__acrt_show_wide_message_box+0x27 [minkernel\crts\ucrt\src\appcrt\misc\crtmbox.cpp @ 94]
+0000005b`a2af3fb0  0000005b`a2af4350
+0000005b`a2af3fb8  00007ff6`393d84a0 drmemtrace!`string'
+0000005b`a2af3fc0  00000254`00012012
+0000005b`a2af3fc8  00000000`00000000
+0000005b`a2af3fd0  00000000`00000000
+0000005b`a2af3fd8  00007ff6`393899fb drmemtrace!common_message_w
+```
+Though it seems that ucrt is trying to report an error?
+
+Back to the kn callstack: if that is accurate and the callback came in
+here, we're in trouble:
+```
+0:000> U 153e0e29 -5
+dynamorio!get_proc_address_common+0xc74 [d:\derek\dr\git\src\core\win32\module_shared.c @ 525]:
+00000000`153e0e24 e8f7dcffff      call    dynamorio!convert_data_to_function (00000000`153deb20)
+0:000> U 153deb20
+dynamorio!convert_data_to_function [d:\derek\dr\git\src\core\arch\arch_exports.h @ 2349]:
+00000000`153deb20 48894c2408      mov     qword ptr [rsp+8],rcx
+00000000`153deb25 488b442408      mov     rax,qword ptr [rsp+8]
+00000000`153deb2a c3              ret
+```
+I think windbg got it wrong and we're really in the ucrt msgbox code.
+Snooping through strings on the stack seeing stuff like:
+```
+00007ff6`393d84a0  "Microsoft Visual C++ Runtime Lib"
+00007ff6`393d84e0  "rary"
+0:000> du 00007ff6`393d80a0
+00007ff6`393d80a0  "Debug %ls!..Program: %ls%ls%ls%l"
+00007ff6`393d80e0  "s%ls%ls%ls%ls%ls%ls%ls%ls..(Pres"
+00007ff6`393d8120  "s Retry to debug the application"
+00007ff6`393d8160  ")."
+0:000> du 00007ff6`393d7ea8
+00007ff6`393d7ea8  "Assertion Failed"
+0:000> du 00007ff6`393d4a18
+00007ff6`393d4a18  ""
+0:000> du 00007ff6`393d4a18
+00007ff6`393d4a18  ""
+0:000> du 00007ff6`393d8370
+00007ff6`393d8370  ".File: "
+0:000> du 00007ff6`393c86e0
+00007ff6`393c86e0  "C:\PROGRA~2\MIB055~1\2017\PROFES"
+00007ff6`393c8720  "~1\VC\Tools\MSVC\1412~1.258\incl"
+00007ff6`393c8760  "ude\vector"
+0:000> du 00007ff6`393d8360
+00007ff6`393d8360  ".Line: "
+0:000> du 00007ff6`393d8354
+00007ff6`393d8354  ".."
+0:000> du 00007ff6`393d8338
+00007ff6`393d8338  "Expression: "
+0:000> du 00007ff6`393d7ee0
+00007ff6`393d7ee0  "..For information on how your pr"
+00007ff6`393d7f20  "ogram can cause an assertion.fai"
+00007ff6`393d7f60  "lure, see the Visual C++ documen"
+00007ff6`393d7fa0  "tation on asserts."
+```
+Running in the debugger it shows the error:
+```
+0:000> g
+Breakpoint 0 hit
+dynamorio!privload_call_entry+0x10:
+00000000`153fd7d0 488b842430010000 mov     rax,qword ptr [rsp+130h] ss:000000c9`e4bced00=00000265ea4e8c30
+0:000> dt privmod
+Local var @ 0xc9e4bced00 Type _privmod_t*
+0x00000265`ea4e8c30 
+   +0x000 base             : 0x00000266`6a5f0000  "MZ???"
+   +0x008 size             : 0x2a3000
+   +0x010 name             : 0x00000266`6a8477ee  "KERNELBASE.dll"
+   +0x018 path             : [260]  "C:\WINDOWS/system32/KERNELBASE.dll"
+   +0x11c ref_count        : 0x7d
+   +0x120 externally_loaded : 0 ''
+   +0x121 is_client        : 0 ''
+   +0x128 next             : 0x00000265`ea4e6040 _privmod_t
+   +0x130 prev             : 0x00000265`ea4e8a10 _privmod_t
+   +0x138 os_privmod_data  : (null) 
+0:000> ?? reason
+unsigned int 2
+0:000> g
+Debug Assertion Failed!
+
+Program: ???????????????????????????????????
+File: C:\PROGRA~2\MIB055~1\2017\PROFES~1\VC\Tools\MSVC\1412~1.258\include\vector
+Line: 52
+
+Expression: vector iterator not dereferencable
+
+For information on how your program can cause an assertion
+failure, see the Visual C++ documentation on asserts.
+
+(Press Retry to debug the application)
+ModLoad: 00007ffd`9c850000 00007ffd`9c861000   AppCore.dll
+ModLoad: 00007ffd`9e770000 00007ffd`9e890000   RPCRT4.dll
+Breakpoint 0 hit
+```
+It doesn't pause there though: it keeps going and hits the RPCRT4
+privload_call_entry bp.
+
+Re-running: it happens in instrument_init's call to
+drmemtrace_client_main's call to droption_parser_t::parse_argv.
+It's the 1st deref of *opi.
+
+Having trouble using debugger:
+```
+drmemtrace!droption_parser_t::allops+0x62 [d:\derek\dr\git\build_x64_dbg_tests\ext\include\droption.h @ 334]:
+  334 00007ff6`39361212 488d058f500900  lea     rax,[drmemtrace!allops_vec (00007ff6`393f62a8)]
+  335 00007ff6`39361219 4883c428        add     rsp,28h
+  335 00007ff6`3936121d c3              ret
+0:000> dt drmemtrace!allops_vec
+Symbol drmemtrace!allops_vec not found.
+0:000> ?? (std::vector<droption_parser_t *>)00007ff6`393f62a8
+Ambiguous symbol error at 'std::vector<droption_parser_t *>)00007ff6`393f62a8'
+0:000> ?? (std::vector<droption_parser_t *>*)00007ff6`393f62a8
+Ambiguous symbol error at 'std::vector<droption_parser_t *>*)00007ff6`393f62a8'
+0:000> ?? (std::vector<drmemtrace!droption_parser_t *>*)00007ff6`393f62a8
+Couldn't resolve error at 'std::vector<drmemtrace!droption_parser_t *>*)00007ff6`393f62a8'
+```
+The error sounds like I'm at allops().end(): but the for loop should
+prevent that.  Probably it's some initializer that was supposed to run, but
+our private loader failed to call it.
+
+If I create a local vector of the same type, I can iterate it.
+
+Here's allops():
+```
+trace!`droption_parser_t::allops'::`2'::allops_vec = <no type information>
+0:000> Uf 72013ac0 
+drmemtrace!droption_parser_t::allops [d:\derek\dr\git\build_x64_dbg_tests\ext\include\droption.h @ 340]:
+  340 00000000`72013ac0 4883ec28        sub     rsp,28h
+  341 00000000`72013ac4 b804000000      mov     eax,4
+  341 00000000`72013ac9 8bc0            mov     eax,eax
+  341 00000000`72013acb 8b0d8f180a00    mov     ecx,dword ptr [drmemtrace!_tls_index (00000000`720b5360)]
+  341 00000000`72013ad1 65488b142558000000 mov   rdx,qword ptr gs:[58h]
+  341 00000000`72013ada 488b0cca        mov     rcx,qword ptr [rdx+rcx*8]
+  341 00000000`72013ade 8b0408          mov     eax,dword ptr [rax+rcx]
+  341 00000000`72013ae1 3905c9c90900    cmp     dword ptr [drmemtrace!TSS0<`template-parameter-2',droption_parser_t::llops,unsigned long,unsigned char &,void const std::vector<droption_parser_t * __ptr64,std::allocator<droption_parser_t * __ptr64> >::&,int, ?? &> (00000000`720b04b0)],eax
+  341 00000000`72013ae7 7e39            jle     drmemtrace!droption_parser_t::allops+0x62 (00000000`72013b22)  Branch
+
+drmemtrace!droption_parser_t::allops+0x29 [d:\derek\dr\git\build_x64_dbg_tests\ext\include\droption.h @ 341]:
+  341 00000000`72013ae9 488d0dc0c90900  lea     rcx,[drmemtrace!TSS0<`template-parameter-2',droption_parser_t::llops,unsigned long,unsigned char &,void const std::vector<droption_parser_t * __ptr64,std::allocator<droption_parser_t * __ptr64> >::&,int, ?? &> (00000000`720b04b0)]
+  341 00000000`72013af0 e89bd70100      call    drmemtrace!_Init_thread_header (00000000`72031290)
+  341 00000000`72013af5 833db4c90900ff  cmp     dword ptr [drmemtrace!TSS0<`template-parameter-2',droption_parser_t::llops,unsigned long,unsigned char &,void const std::vector<droption_parser_t * __ptr64,std::allocator<droption_parser_t * __ptr64> >::&,int, ?? &> (00000000`720b04b0)],0FFFFFFFFh
+  341 00000000`72013afc 7524            jne     drmemtrace!droption_parser_t::allops+0x62 (00000000`72013b22)  Branch
+
+drmemtrace!droption_parser_t::allops+0x3e [d:\derek\dr\git\build_x64_dbg_tests\ext\include\droption.h @ 341]:
+  341 00000000`72013afe 488d0d8bc90900  lea     rcx,[drmemtrace!allops_vec (00000000`720b0490)]
+  341 00000000`72013b05 e816aaffff      call    drmemtrace!std::vector<droption_parser_t * __ptr64,std::allocator<droption_parser_t * __ptr64> >::vector<droption_parser_t * __ptr64,std::allocator<droption_parser_t * __ptr64> > (00000000`7200e520)
+  341 00000000`72013b0a 488d0d2fa70600  lea     rcx,[drmemtrace!`droption_parser_t::allops'::`2'::`dynamic atexit destructor for 'allops_vec'' (00000000`7207e240)]
+  341 00000000`72013b11 e8ead40100      call    drmemtrace!atexit (00000000`72031000)
+  341 00000000`72013b16 488d0d93c90900  lea     rcx,[drmemtrace!TSS0<`template-parameter-2',droption_parser_t::llops,unsigned long,unsigned char &,void const std::vector<droption_parser_t * __ptr64,std::allocator<droption_parser_t * __ptr64> >::&,int, ?? &> (00000000`720b04b0)]
+  341 00000000`72013b1d e80ed70100      call    drmemtrace!_Init_thread_footer (00000000`72031230)
+
+drmemtrace!droption_parser_t::allops+0x62 [d:\derek\dr\git\build_x64_dbg_tests\ext\include\droption.h @ 342]:
+  342 00000000`72013b22 488d0567c90900  lea     rax,[drmemtrace!allops_vec (00000000`720b0490)]
+  343 00000000`72013b29 4883c428        add     rsp,28h
+  343 00000000`72013b2d c3              ret
+```
+gs:0x58 == TEB.ThreadLocalStoragePointer
+
+Maybe we didn't miss an initializer: maybe the TLS view for privlibs is not correct.
+TODO: compare to a native run using this same ucrt and vector code.
+
+
+If we bypass this assert we hit:
+
+CRASH debug code accessing PEB.KernelCallbackTable which is NULL
+
+```
+<Application D:\derek\dr\git\build_x64_dbg_tests\suite\tests\bin\simple_app.exe (9740).  DynamoRIO Cache Simulator Tracer internal crash at PC 0x00000000153ad4c2.  Please report this at http://dynamorio.org/issues.  Program aborted.
+0xc0000005 0x00000000 0x00000000153ad4c2 0x00000000153ad4c2 0x0000000000000000 0x00000000000002a0
+Base: 0x0000000015000000
+Registers: eax=0x0000000000000054 ebx=0x0000000000000000 ecx=0x0000000000000000 edx=0x0000007f2d4f41d0
+        esi=0x0000000000000000 edi=0x0000000000000000 esp=0x0000007f2d4f3e60 ebp=0x0000000000000000
+        r8 =0x0000007f2d4f41d0 r9 =0x0000000000000000 r10=0x0000000000000000 r11=0x0000000000000246
+        r12=0x0000000000000000 r13=0x0000000000000000 r14=0x0000000000000000 r15=0x0000000000000000
+        eflags=0x00000
+version 7.91.18261, custom build
+```
+```
+ # Child-SP          RetAddr           Call Site
+00 0000007f`2d4f3e60 00000000`15558f2d dynamorio!intercept_callback_start+0x172 [d:\derek\dr\git\src\core\win32\callback.c @ 6322] 
+01 0000007f`2d4f3f10 0000007f`2d4f3f30 dynamorio!interception_code_array+0xf2d
+02 0000007f`2d4f3f18 00000000`153e0de9 0x0000007f`2d4f3f30
+03 0000007f`2d4f3f20 00000000`00000000 dynamorio!get_proc_address_common+0xc79 [d:\derek\dr\git\src\core\win32\module_shared.c @ 526] 
+0:000> U rip
+dynamorio!intercept_callback_start+0x172 [d:\derek\dr\git\src\core\win32\callback.c @ 6322]:
+00000000`153ad4c2 488b04c1        mov     rax,qword ptr [rcx+rax*8]
+00000000`153ad4c6 4889842480000000 mov     qword ptr [rsp+80h],rax
+00000000`153ad4ce 48833d5253180000 cmp     qword ptr [dynamorio!d_r_stats (00000000`15532828)],0
+00000000`153ad4d6 0f8494000000    je      dynamorio!intercept_callback_start+0x220 (00000000`153ad570)
+00000000`153ad4dc 488b0545531800  mov     rax,qword ptr [dynamorio!d_r_stats (00000000`15532828)]
+00000000`153ad4e3 83b81001000002  cmp     dword ptr [rax+110h],2
+00000000`153ad4ea 0f8280000000    jb      dynamorio!intercept_callback_start+0x220 (00000000`153ad570)
+00000000`153ad4f0 488b0531531800  mov     rax,qword ptr [dynamorio!d_r_stats (00000000`15532828)]
+0:000> r
+Last set context:
+rax=0000000000000054 rbx=0000000000000000 rcx=0000000000000000
+rdx=0000007f2d4f41d0 rsi=0000000000000000 rdi=0000000000000000
+rip=00000000153ad4c2 rsp=0000007f2d4f3e60 rbp=0000000000000000
+ r8=0000007f2d4f41d0  r9=0000000000000000 r10=0000000000000000
+r11=0000000000000246 r12=0000000000000000 r13=0000000000000000
+r14=0000000000000000 r15=0000000000000000
+0:000> dt _PEB @$peb
+   +0x058 KernelCallbackTable : (null) 
+```

@@ -1,0 +1,210 @@
+closes #111 
+Hey there,
+
+I am trying to use this to serialize and deserialize a `Keypair` item. Serialization seems to work, however it fails to deserialize. Here's a short example that shows this with `serde_json`, `toml`, and `postcard` (a binary format):
+
+```rust
+use ed25519_dalek::Keypair;
+use serde::{Deserialize, Serialize};
+use rand::rngs::OsRng;
+use toml;
+use serde_json;
+use postcard;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Demo {
+    keypair: Keypair
+}
+
+fn main() {
+    println!("Make a key...");
+
+    let demo = Demo { keypair: Keypair::generate(&mut OsRng) };
+
+    println!("\n\nWrite to toml");
+    let demo_toml = toml::to_string(&demo).unwrap();
+    println!("{}", demo_toml);
+    let demo_toml_rebuild: Result<Demo, _> = toml::from_str(&demo_toml);
+    println!("{:?}", demo_toml_rebuild);
+
+    println!("\n\nWrite to json");
+    let demo_json = serde_json::to_string(&demo).unwrap();
+    println!("{}", demo_json);
+    let demo_json_rebuild: Result<Demo, _> = serde_json::from_str(&demo_json);
+    println!("{:?}", demo_json_rebuild);
+
+    println!("\n\nWrite to postcard");
+    let demo_postcard = postcard::to_stdvec(&demo).unwrap();
+    println!("{:?}", demo_postcard);
+    let demo_postcard_rebuild: Result<Demo, _> = postcard::from_bytes(&demo_postcard);
+    println!("{:?}", demo_postcard_rebuild);
+}
+```
+
+Result:
+
+```
+Make a key...
+
+Write to toml
+keypair = [103, 204, 156, 181, 222, 111, 170, 252, 203, 212, 196, 168, 70, 26, 213, 243, 233, 53, 57, 8, 206, 225, 35, 124, 56, 77, 142, 204, 29, 57, 188, 149, 192, 244, 71, 62, 116, 74, 38, 91, 132, 215, 236, 229, 208, 89, 150, 52, 14, 182, 180, 242, 67, 51, 151, 41, 239, 68, 30, 40, 56, 38, 145, 192]
+
+Err(Error { inner: ErrorInner { kind: Custom, line: Some(0), col: 0, at: Some(0), message: "invalid type: sequence, expected An ed25519 keypair, 64 bytes in total where the secret key is the first 32 bytes and is in unexpanded form, and the second 32 bytes is a compressed point for a public key.", key: ["keypair"] } })
+
+
+Write to json
+{"keypair":[103,204,156,181,222,111,170,252,203,212,196,168,70,26,213,243,233,53,57,8,206,225,35,124,56,77,142,204,29,57,188,149,192,244,71,62,116,74,38,91,132,215,236,229,208,89,150,52,14,182,180,242,67,51,151,41,239,68,30,40,56,38,145,192]}
+Err(Error("invalid type: sequence, expected An ed25519 keypair, 64 bytes in total where the secret key is the first 32 bytes and is in unexpanded form, and the second 32 bytes is a compressed point for a public key.", line: 1, column: 12))
+
+
+Write to postcard
+[103, 204, 156, 181, 222, 111, 170, 252, 203, 212, 196, 168, 70, 26, 213, 243, 233, 53, 57, 8, 206, 225, 35, 124, 56, 77, 142, 204, 29, 57, 188, 149, 192, 244, 71, 62, 116, 74, 38, 91, 132, 215, 236, 229, 208, 89, 150, 52, 14, 182, 180, 242, 67, 51, 151, 41, 239, 68, 30, 40, 56, 38, 145, 192]
+Err(DeserializeUnexpectedEnd)
+```
+
+I'll dig into this a bit more this week hopefully.
+I tried to uprev our version of ed25519-dalek but I ran into two issues:
+
+1: missing `#[cfg(feature = rand)]` in `secret.rs` ( I think this is a further case of #108 ), we are building with these features:
+
+```
+..., default-features = false, features = ["alloc", "nightly", "serde", "u64_backend"] }
+```
+
+2: we lost `Default` trait on `SecretKey`, I don't know if that was intentional API change? but atm we are using that anyways, please lmk! thank you
+```
+error[E0432]: unresolved import `rand::thread_rng`
+   --> /home/nxh/.cargo/registry/src/github.com-1ecc6299db9ec823/ed25519-dalek-0.9.1/src/ed25519.rs:974:9
+    |
+974 |     use rand::thread_rng;
+    |         ^^^^^^^^^^^^^^^^ no `thread_rng` in the root
+
+error: aborting due to previous error
+```
+
+This seems to have been fixed in `master`; could a fix be backported? If not, what's the ETA for 1.0?
+
+I tried using version 1 as recommended in the current README, but that isn't on crates.io yet.
+In `ExpandedSecretKey::sign_prehashed` [here](https://github.com/dalek-cryptography/ed25519-dalek/blob/master/src/secret.rs#L461), the `context` is required as reference to a static? Is it to prevent (to some extent) applications from accidentally using different contexts?
+ed25519_dalek::SignatureError does not implement std::error::Error, which makes it unergonomic to use with modern error libraries that rely on that impl for error types.
+
+```rust
+use anyhow::Result;
+use ed25519_dalek::SignatureError;
+
+fn f() -> Result<(), SignatureError> {
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    f()?;  // doesn't work
+    Ok(())
+}
+```
+
+```console
+error[E0277]: the trait bound `ed25519_dalek::errors::SignatureError: std::error::Error` is not satisfied
+ --> src/main.rs:9:8
+  |
+9 |     f()?;  // doesn't work
+  |        ^ the trait `std::error::Error` is not implemented for `ed25519_dalek::errors::SignatureError`
+  |
+  = note: required because of the requirements on the impl of `std::convert::From<ed25519_dalek::errors::SignatureError>` for `anyhow::Error`
+  = note: required by `std::convert::From::from`
+```
+The `ed25519` crate and the `signature` crates provide trait-based interoperability between Ed25519 libraries:
+
+https://github.com/RustCrypto/signatures
+
+This commit integrates the `ed25519::Signature` type, and changes the existing `sign` and `verify` methods to use the `Signer` and `Verifier` traits from the `signature` crate. Additionally, it replaces the current error types with an opaque one from the `signature` crate.
+
+This has the drawback of requiring the `Signer` and `Verifier` traits are in scope in order to create signatures, but the benefit of interoperable support for other Ed25519 signers and verifiers. Presently
+there are a number of these provided through the Signatory framework, along with support for HSM-backed Ed25519 signatures in the `yubihsm` crate:
+
+- https://github.com/tendermint/signatory
+- https://github.com/tendermint/yubihsm-rs
+Many users want a `verify_strict()` function which would reject signatures contain torsion components in the `R` portion of the signature, in the signer's corresponding public key, or in the product of `s` component and the basepoint, as well as those whose `s` component is non-reduced/non-canonical. This isn't strictly according to [the RFC](https://tools.ietf.org/html/rfc8032) which states [in §5.1.7 (3)](https://tools.ietf.org/html/rfc8032#section-5.1.7):
+
+> Check the group equation [8][S]B = [8]R + [8][k]A'.  It's
+> sufficient, but not required, to instead check [S]B = R + [k]A'.
+
+So, technically, by doing the full malleability checks for torsion components we're not RFC compatible, because the full checks themselves are not backwards compatible with the original definition of the ed25519 primitive, as well as earlier IETF standardised versions of the primitive. However, many modern users want this anyway, and this is quite sensible particularly for protocol designers lacking algorithmic agility but who desire added safety at the cost of backwards incompatibility.
+
+Note that it is **my very strong opinion** that if you want this, **you should be using a signature scheme which uses [Ristretto](https://ristretto.group)**.
+Reproduce:
+
+build the following minimal crate: 
+https://github.com/scs/test-no-std/tree/ed25519-dalek
+
+`cargo build --no-default-features` results in 
+```
+error: duplicate lang item in crate `std`: `f32_runtime`.
+  |
+  = note: first defined in crate `sgx_tstd`.
+
+error: duplicate lang item in crate `std`: `f64_runtime`.
+  |
+  = note: first defined in crate `sgx_tstd`.
+
+error: duplicate lang item in crate `std`: `panic_impl`.
+  |
+  = note: first defined in crate `sgx_tstd`.
+
+error: duplicate lang item in crate `std`: `begin_panic`.
+  |
+  = note: first defined in crate `sgx_tstd`.
+
+error: duplicate lang item in crate `std`: `oom`.
+  |
+  = note: first defined in crate `sgx_tstd`.
+
+error: aborting due to 5 previous errors
+
+error: Could not compile `test_no_std`.
+
+```
+## Problem
+
+Crates which use Ed25519 as part of a high-level protocol implementation or abstract signature functionality who want to enable the consumers of their crates to be able to use their choice of Rust Ed25519 libraries wind up writing their own abstractions to do so on a crate-by-crate basis.
+
+Here's an example from the Noise Protocol implementation [snow](https://crates.io/crates/snow), which does not (yet) use Ed25519 signatures, but I hope still illustrates the point:
+
+<img width="264" alt="Screen Shot 2019-03-24 at 5 02 24 PM" src="https://user-images.githubusercontent.com/797/54888071-0b498680-4e57-11e9-95bf-b93f35f5a682.png">
+
+Instead of every crate which wants to do this having to wrangle a silly zoo of optional crypto crates dependencies, a better approach would be to define a common set of traits for how to produce (Ed25519) signatures, and encourage algorithm "provider" crates to `impl` those traits. This makes it easy to, say, use `ed25519-dalek` as a software signing crate while also supporting the `yubihsm` crate for hardware-backed Ed25519 signatures.
+
+## `signature` crate
+
+I've been working with @newpavlov via the [RustCrypto](https://github.com/rustcrypto) GH org to create a crate which provides abstract digital signature functionality, which I plan on using to rewrite the internals of [Signatory](https://github.com/tendermint/signatory), an existing multi-provider digital signature library.
+
+Where Signatory provides a set of compatible "provider" crates, e.g. [signatory-dalek](https://github.com/tendermint/signatory/tree/master/signatory-dalek), what I would really love to do as part of a minimalist rewrite is also get crypto library authors to adopt the traits directly into their libraries instead of using "wrapper" crates which `impl` the relevant traits. And congratulations, you're the first project I'm pinging.
+
+I've just opened a PR to the `signature` crate which implements the initial set of signing traits:
+
+https://github.com/RustCrypto/signatures/pull/7
+
+(Sidebar: If you see anything you don't like there, please let us know! This is the first major non-boilerplate PR to the crate, so now is a great time to fix anything you don't like about it)
+
+Namely it has traits like these:
+
+```rust
+pub trait Sign<S: Signature>: Send + Sync {
+    fn sign(&self, msg: &[u8]) -> Result<S, Error>;
+}
+
+pub trait Verify<S: Signature>: Send + Sync {
+    fn verify(&self, msg: &[u8], signature: &S) -> Result<(), Error>;
+}
+```
+
+These traits provide equivalent methods to the existing [Keypair::sign](https://docs.rs/ed25519-dalek/1.0.0-pre.1/ed25519_dalek/struct.Keypair.html#method.sign) and [PublicKey::verify](https://docs.rs/ed25519-dalek/1.0.0-pre.1/ed25519_dalek/struct.PublicKey.html#method.verify) methods (the only difference being the `Sign` trait returns a `Result` for its `sign` method, in which case it might be worth considering separating `sign` from `try_sign` so people who don't care about things like HSM errors don't always need to call unwrap).
+
+Having people import an additional trait is, I will admit, mildly annoying, but I imagine most people are copying/pasting the relevant code, so adding an additional import is not that annoying. You can re-export the relevant traits [similar to what you're already doing for Digest](https://github.com/dalek-cryptography/ed25519-dalek/blob/ae8764fbeff32ac0fef41850864761226b670cdd/src/ed25519.rs#L29).
+
+## `ed25519` crate
+
+~~For true interop, crates need to agree on at least an `ed25519::Signature` type. That said, the [`ed25519` crate](https://crates.io/crates/ed25519) is [presently vaporware](https://github.com/RustCrypto/signatures/tree/master/ed25519) and these types don't yet exist.~~ Update: it's real, and used in production in a few crates, e.g. `yubihsm`.
+
+One option, if you are so inclined as authors of what is pretty much the definitive Rust Ed25519 crate, would be to upstream the existing `Signature` type into the `ed25519` crate.
+
+All that said, I'm happy to both make changes to the `signature` crate as well as put in a PR to `ed25519-dalek` to switch to using these traits once we publish the initial `signature` crate. Let me know if you're interested!

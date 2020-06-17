@@ -1,0 +1,239 @@
+For bugtracking and aggregation purposes we would like to put the service name and method called client side into the error meta. 
+
+This turns out to be a little tricky, Does anyone have thoughts on how this can be done?
+
+Possible changes that could be made to twirp to make this possible:
+
+### Solution 1: Add ability to return error from client hooks
+
+```go
+hooks := &twirp.ClientHooks{
+	Error: func(ctx context.Context, e twirp.Error) {
+		if sn, ok := twirp.ServiceName(ctx); ok {
+			e = e.WithMeta("twirp_service_name", sn)
+		}
+		if sn, ok := twirp.MethodName(ctx); ok {
+			e = e.WithMeta("twirp_method_name", sn)
+		}
+
+		return e // !!! we cant return from this hook with new error
+	},
+}
+```
+
+
+### Solution 2: Add a SetMeta method to Error
+
+This would allow us to easily mutate the existing error, but this feels a little wrong. I cant see any concurrency issues but I dont know the codebase very well.
+
+```go
+hooks := &twirp.ClientHooks{
+	Error: func(ctx context.Context, e twirp.Error) {
+		if sn, ok := twirp.ServiceName(ctx); ok {
+			e.SetMeta("twirp_service_name", sn)
+		}
+		if sn, ok := twirp.MethodName(ctx); ok {
+			e.SetMeta("twirp_method_name", sn)
+		}
+	},
+}
+````
+
+### Solution 3:  Write it out in the generated code
+
+I dont really like the look of this, its pretty gross as people who dont use would be allocating these maps on errors. But errors are pretty rare and its likely meta is sent to their bugtracking. Could end up helping someone else out :man_shrugging: 
+
+```go
+func (c *compatServiceJSONClient) Method(ctx context.Context, in *Req) (*Resp, error) {
+	ctx = ctxsetters.WithPackageName(ctx, "twirp.clientcompat")
+	ctx = ctxsetters.WithServiceName(ctx, "CompatService")
+	ctx = ctxsetters.WithMethodName(ctx, "Method")
+	out := new(Resp)
+	err := doJSONRequest(ctx, c.client, c.opts.Hooks, c.urls[0], in, out)
+	if err != nil {
+		twerr, ok := err.(twirp.Error)
+		if !ok {
+			twerr = twirp.InternalErrorWith(err)
+		}
+		twerr = twerr.SetMeta("twirp_service_name", "CompatService")
+		twerr = twerr.SetMeta("twirp_service_name", "Method")
+		callClientError(ctx, c.opts.Hooks, twerr)
+		return nil, err
+	}
+
+	callClientResponseReceived(ctx, c.opts.Hooks)
+
+	return out, nil
+}
+```
+
+
+Thoughts? I'm happy to PR if we can decide on a way forward.
+A recent change has been causing a bit of grief for our team. Hoping to start a discussion on bringing back prior functionality.
+
+Specifically, prior to #182, a client would get back an error message containing the _raw_ unmarshalling error.
+
+We found these errors to be _very_ useful, especially during development.
+
+https://github.com/twitchtv/twirp/pull/182/files#diff-a3a2b0741a88a528d33eb1f40bef6b04L1078
+
+So, the suggestion is to return unmarshalling errors for malformed requests.
+Current hooks can only inspect metadata, the can't be used for logging
+or validation. Add RequestDeserialized and ResponsePrepared hooks that
+have access to raw Go request and response objects.
+
+*Issue #, if available:*
+https://github.com/twitchtv/twirp/issues/212
+
+*Description of changes:*
+Added two more server hooks
+
+By submitting this pull request, I confirm that my contribution is made under the terms of the Apache 2.0 license.
+
+We'd like to log request and responses from Twirp services and also to validate the input parameters using https://github.com/envoyproxy/protoc-gen-validate . Right now this is not possible, because the callbacks have no access to deserialized request body.
+
+My proposal it to add ServerHooksExtended that would have two additional functions: `RequestUnmarshalled(context.Context, interface{}) error` and `ResponseReady(context.Context, interface{}) error`.
+*Issue #, if available:*
+#196 
+
+*Description of changes:*
+These are some subtle changes to how we map `.proto` files to package names. It should resolve the bug in #196 by correctly identifying when an imported `.proto` file has the same Go import path as the file we're generating.
+
+By submitting this pull request, I confirm that my contribution is made under the terms of the Apache 2.0 license.
+
+Command used for generating *twirp.go
+
+> protoc -I /usr/local/include/ \
+>   -I $GOPATH/src \
+>   -I $GOPATH/src/github.com/grpc-ecosystem/grpc-gateway/third_party/googleapis \
+>   -I . \
+>   -I tv_service \
+>   --go_out=plugins=grpc,paths=source_relative:. \
+>   --grpc-gateway_out=logtostderr=true,grpc_api_configuration=tv_service/tv_service.yaml,paths=source_relative:. \
+>   --twirp_out=paths=source_relative:. \
+>   tv_service/tv_service.proto
+
+
+When i am trying to build project this error occurs:
+
+> import cycle not allowed
+> package gitlab.sweet.tv/go/tv_service
+> 	imports gitlab.sweet.tv/proto/tv_service
+> 	imports gitlab.sweet.tv/proto/tv_service
+
+The reason is in generated file which contains this line, but it should not, because the package name is identical in both cases (tv_service)
+
+`import tv_service8 "gitlab.sweet.tv/proto/tv_service"`
+
+If i remove paths=source_relative:. the generated file does not contain this import line.
+I'll keep this pretty short for now (I also know we discussed this very briefly @spenczar) but just to get the conversation going since this is on my near-term radar:
+
+- It would be nice to be able to have twitchtv/twirp generated code in a different package than the golang/protobuf generated code. This in theory would allow you to have separation of your Protobuf definitions and the specific RPC protocol you use. For example, I'd love to have:
+
+- `foo/barpb` - Protobuf messages for package `foo.bar`
+- `foo/twitchbarpb` - Twirp client/servers for package `foo.bar`
+- `foo/grpcbarpb` - gRPC client/servers for package `foo.bar` - I'm not sure if this is will be allowed with the new `protoc-gen-go-grpc` via https://github.com/protocolbuffers/protobuf-go/blob/master/compiler/protogen/protogen.go but we can leave this out of it
+- `foo/magicbarpb` - My custom magical RPC implementation (not in reality but as an example)
+
+What this would require is `protoc-gen-twirp` recognizing when it was generating code in a different package than the package of the golang/protobuf generated code, and then generating imports, ie:
+
+```go
+// all shorthand, not even importing context
+import barpb "github.com/alice/bob/foo/barpb"
+
+type EchoService interface {
+  Echo(context.Context, *barpb.EchoRequest) (*barpb.EchoResponse, error)
+}
+```
+
+This might be able to be implemented with some combination of the `Mkey=value` (which would be annoying), `import_path`, and `import_prefix` options, but honestly it would be so much easier if there was just a `definition_path=github.com/alice/bob/foo/barpb` option or something similar to just denote this easily. There are Golang Protobuf plugin libraries that handle this kind of behavior, so there's a lot of work to pattern off of.
+
+Thoughts?
+Twirp version: 5.8.0
+
+It seems like that the generated python client does not allow us to pass custom http headers. See the following excerpt.
+
+```
+def __make_request(self, body, full_method):
+	req = Request(
+		url=self.__target + "/twirp" + full_method,
+		data=body,
+		headers={"Content-Type": "application/protobuf"},
+	)
+```
+
+Do you plan to add that feature or accept PR?
+
+Thank you.
+The current [v6_prerelease branch](https://github.com/twitchtv/twirp/tree/v6_prerelease) changes the URL scheme. It goes from `/twirp/<package>.<service>/<method>` to just `/<package>.<service>/<method>`.
+
+Unfortunately, this is difficult to upgrade into. Consider a service which has generated v5 code today, and which has a client which vendors that generated Go code. The service wants to upgrade to generating v6 code, and they currently register their Twirp service like this:
+
+If they regenerate their code and don't tell the client to upgrade their vendored copy, then all client calls immediately start failing, since the client is hitting the old URL, which 404s. If the client upgrade first, same thing - all 404s. The client and server need to deploy an upgrade version simultaneously. That's unacceptably painful. We need something better.
+
+What are the options?
+
+1. **Document code changes the service owner can make**
+
+We could tell service owners that they must run their service on two URL path prefixes if they are upgrading, at least until all their clients are updated. For example, they'd need to do this:
+```go
+mux := http.NewServeMux()
+mux.Handle(HaberdasherPathPrefix, svc)
+mux.Handle("/twirp" + HaberdasherPathPrefix, http.StripPrefix("/twirp", svc))
+```
+
+This is not very pleasant. It's gross legacy code, and hard to know you need to do this; I don't like solutions that require manual action from our users. It's hard to know when you can remove this code, as well. And if users already have a mux, they could get confused. 
+
+We could make this more visible by renaming the PathPrefix constant. That way, code won't compile, and hopefully the user goes and looks up what's wrong and learns that they need to make a code change. But this is a bad option; upgrading should be painless.
+
+2. **Leave /twirp as a default prefix, but allow it to be customized**
+
+We could change the branch to default to using the /twirp prefix. But if the user specifies, we could remove the prefix in generated code. This would make upgrading easy - the user would only run into trouble if they enabled a custom prefix, which is kind of their own fault. Most upgrades would be painless.
+
+But I already rejected this approach in https://github.com/twitchtv/twirp/issues/48, really. My argument there was that non-customizability is a feature, not a bug. It makes third-party generators harder to get right, and complicates the spec a bit. That said, it's worth looking at how we'd do this.
+
+Protobuf files support options. We could have something like this:
+
+```protobuf
+// this path depends on your local machine :(
+import "path/to/twitchtv/twirp/genconfig.proto" 
+
+service Haberdasher {
+  option (twitchtv.twirp.genconfig.prefix) = "/whatever/you/want"
+  rpc MakeHat(Size) returns (Hat)
+}
+```
+
+The challenge is really that the option must be defined in some other `.proto` file which gets imported by the user. Twirp would have to distribute that `.proto` file somehow, and provide instructions on how to import it. This is tricky - protoc is not a friendly tool. But perhaps this is alright, since we hope that custom prefixes are the exceptional case, not the common one, so it's alright for them to be a little difficult.
+
+3. **Go back to requiring /twirp prefix**
+
+Finally, we could revert this change entirely. This is appealing to me - it keeps Twirp simple and the upgrade is _really_ clean. I like that no third-party generators become incompatible, since the protocol remains the same.
+
+But there are a few people who are using the prerelease branch today because they hate that prefix. I'd like to hear from them on their needs, once again. We kind of touched on them in #55, but that covered other topics, and I don't think we have good written reasons that removing the /twirp prefix _specifically_ is worth the cost. I'd like to hear those arguments.
+
+---
+
+I lean towards option 3, in absence of clear reasons the /twirp prefix needs to be removed.
+Twirp should be able to support Go Modules for a few reasons: 
+
+1. Pinning dependencies correctly when GO111MODULE will be set to `on` by default in the next release of Go 1.13 
+
+2. It will make the onboarding experience to twirp a little bit easier because you'll be able to get binaries such as protoc-gen-twirp at an exact version without having to use `retool`. For example: `go get github.com/twitchtv/twirp/protoc-gen-twirp@v5.6.0` 
+
+3. There will be no need to vendor dependencies on both the twirp side as well as the user's side. 
+
+I noticed that there was already an issue about adding go.mod/go.sum and the reason for closing it was this comment: https://github.com/twitchtv/twirp/issues/140#issuecomment-452401108
+
+In particular: 
+
+> the transition will involve quite a bit more than just adding go.mod and go.sum files as import paths will need to change
+
+For that reason, I [created a tool](https://github.com/marwan-at-work/mod) to automatically upgrade import paths. 
+
+I have a draft PR to demonstrate that all import paths are upgraded and that the tests past (at least locally for me). 
+
+The PR is in draft because A. I'm not familiar with Twirp's roadmap and B. I imagine a lot of documentation needs to be updated to show the new flow of getting started. 
+
+Please feel free to keep this open until Twirp officially supports module, and also feel free to add all the TODOs that need to be accomplished before rendering this issue resolved. 
+

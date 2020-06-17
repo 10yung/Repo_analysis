@@ -1,0 +1,364 @@
+The current implementation skips this procedure for a given device
+object when a global symbol is found in the cache.  This is incorrect:
+
+ - There could be other undefined globals that have not been previously
+encountered further down the list
+ - If a symbol is found in the cache, it doesn't need to be pinned again
+but it still need to be defined for the current executable
+
+Added special case for the printf buffer symbol (already pinned by HCC)
+
+The bug was exposed by running printf on different GPUs.
+Fixes #1790 and #1791. hipMemcpy3D still requires further refactoring for different input and output combinations.
+I am currently running [PIConGPU](https://github.com/psychocoderHPC/picongpu/tree/topic-hip-clang-2019_3) for AMD GPUs accelerated with HIP and get `hipErrorRuntimeOther` from `hipMallocPitch`
+
+From the documentation of the error code https://github.com/ROCm-Developer-Tools/HIP/blob/df20c17f126d0e3dde9de8442424b269b2f6c072/include/hip/hip_runtime_api.h#L262-L263 it sound like the error should never happen on a system.
+
+What could be a reason for this error. By looking into the code I found only possible return codes from https://github.com/ROCm-Developer-Tools/HIP/blob/df20c17f126d0e3dde9de8442424b269b2f6c072/src/hip_memory.cpp#L2419-L2481
+I never call `hipIpcCloseMemHandle` explicit so I am not sure if it is coming from that part of the code.
+
+I get this error only on a development system with 2xRadeon VII.
+The system is now on Rocm 3.0 with HIP 3.1 but I saw this error also with Rocm 1.9. I am using **HIP-clang** to compile my application.
+On an other system from CRAY with 4xMi50 this error is not shown.
+**I am searching for a possible reason and would be happy about any suggestion**
+
+# short trace 
+alloc a buffer with `hipMallocPitch(..., 24576,1)`
+```
+// there is one other 3D malloc and a kernel call before
+  hip-api pid:106391 tid:1.529 hipDeviceSynchronize           ret= 0 (hipSuccess)>> +2410 ns
+alloc ew: 24576 eh: 1 ewb: 24576 ptr: 0 pitch: 24576
+<<hip-api pid:106391 tid:1.530 hipGetLastError () @95409829436224
+  hip-api pid:106391 tid:1.530 hipGetLastError                ret= 0 (hipSuccess)>> +1950 ns
+<<hip-api pid:106391 tid:1.531 hipMallocPitch (0x7fffb31bef00, 0x7fffb31beef8, 24576, 2) @95409829445294
+  hip-api pid:106391 tid:1.531 hipMallocPitch                 ret=1053 (hipErrorRuntimeOther)>> +6460 ns
+<<hip-api pid:106391 tid:1.532 hipGetErrorName (hipErrorRuntimeOther) @95409829457154
+<<hip-api pid:106391 tid:1.533 hipGetErrorString (hipErrorRuntimeOther) @95409829461164
+<<hip-api pid:106391 tid:1.534 hipGetErrorName (hipErrorRuntimeOther) @95409829465064
+/home/rwidera/workspace/picongpu/thirdParty/alpaka/include/alpaka/mem/buf/BufHipRt.hpp(421) 'hipMallocPitch( &memPtr, &pitchBytes, static_cast<std::size_t>(widthBytes), static_cast<std::size_t>(height))' returned error  : 'hipErrorRuntimeOther': 'hipErrorRuntimeOther'!
+```
+
+# Full log: 
+[hipMallocPitch.txt](https://github.com/ROCm-Developer-Tools/HIP/files/4071322/hipMallocPitch.txt)
+
+# hipconfig:
+<details><summary>click to see hipconfig result</summary>
+<p>
+
+```
+hipconfig 
+HIP version  : 3.1.20022-fae85cf
+
+== hipconfig
+HIP_PATH     : /opt/rocm/hip
+HIP_PLATFORM : clang
+Use of uninitialized value $CPP_CONFIG in print at /opt/rocm/hip/bin/hipconfig line 143.
+CPP_CONFIG   : 
+
+=== Environment Variables
+PATH=/opt/spack-modules/linux-ubuntu16.04-x86_64/gcc-5.4.0/hwloc-2.0.2-ugoji74jrv4jlidtiqswhidfgffkorpg/bin:/opt/spack-modules/linux-ubuntu16.04-x86_64/gcc-5.4.0/cmake-3.15.1-saw7nehnhdb5rgfclqkmtclywsc6jvwj/bin:/opt/rocm/hip/bin:/opt/rocm/llvm/bin:/opt/rocm/bin:/home/rwidera/bin:/home/rwidera/.local/bin:/opt/spack-modules/linux-ubuntu16.04-x86_64/gcc-5.4.0/environment-modules-3.2.10-4yznfzd2orfbj6ykprx3tg2dpb2ntkrr/Modules/bin:/opt/spack/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/opt/rocm/opencl//bin:/opt/rocm/hcc/bin/:/opt/rocm/hip/bin:/opt/rocm/llvm/bin
+HIP_CLANG_PATH=/opt/rocm/llvm/bin
+LD_LIBRARY_PATH=/opt/spack-modules/linux-ubuntu16.04-x86_64/gcc-5.4.0/hwloc-2.0.2-ugoji74jrv4jlidtiqswhidfgffkorpg/lib:/opt/rocm/lib:/opt/spack-modules/linux-ubuntu16.04-x86_64/gcc-5.4.0/boost-1.68.0-5o6jqkacrhkhpmvqhw3hjzi7ps3nczzx/lib:/opt/spack-modules/linux-ubuntu16.04-x86_64/gcc-5.4.0/zlib-1.2.11-5nus6knzumx4ik2yl44jxtgtsl7d54xb/lib:/opt/rocm/hip/lib:
+HIP_TRACE_API=0x3
+HIP_PLATFORM=clang
+HIP_PATH=/opt/rocm/hip
+HIP_LAUNCH_BLOCKING=1
+
+== Linux Kernel
+Hostname     : fwk388
+Linux fwk388 4.15.0-74-generic #83~16.04.1-Ubuntu SMP Wed Dec 18 04:56:23 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux
+No LSB modules are available.
+Distributor ID:	Ubuntu
+Description:	Ubuntu 16.04.6 LTS
+Release:	16.04
+Codename:	xenial
+```
+
+</p>
+</details>
+Package selects the correct CMAKE_VERSION depending on the type of build:
+- If hipify-clang is built along with HIP, it uses the HIP_VERSION (cmake produces a .hipversion file when HIP is built, extracting the HIP_VERSION data from it)
+- If hipify-clang is built stand-alone, it uses the LLVM version.
+
+`hipMemcpy3D` is not supporting positions and therefore behaves different to `cudaMemcpy3D`.
+This avoids to port cuda programs over to HIP.
+
+The missing implementation is marked as todo https://github.com/ROCm-Developer-Tools/HIP/blob/753277422a0637ff2bf541c7b43dfaaa2b12c9f6/src/hip_memory.cpp#L1670 
+
+This feature should IMO be implemented together with the fix for #1790
+
+# Test case
+
+The example is slicing a 4x4x4 integer *C pointer array*
+  - the offset is 3x1x0 and applied directly to the pointer addresses
+  - the extent is 1x3x3
+The destination array is initialized with the value `133` and the values in the source array are enumerated.
+```
+#include <stdio.h>
+#include <hip_runtime.h>
+
+
+__global__ void Fill(int* ptr, size_t pitch, const int numElements)
+{
+    for(int z = 0; z < numElements; ++z)
+    {
+        for(int y = 0; y < numElements; ++y)
+        {
+            for(int x = 0; x < numElements; ++x)
+            {
+                int idx = z * numElements * numElements + y * numElements + x;
+                ((int*)((char*)ptr + z * numElements * pitch + y * pitch))[x] = idx;
+            }
+        }
+    }
+}
+
+int main(int argc, char *argv[])
+{
+
+    hipPitchedPtr dPtr;
+
+    auto extent = make_hipExtent(4 * sizeof(int),4,4);
+
+    hipMalloc3D(&dPtr, extent);
+
+    int* hPtr;
+    hipMallocHost((void**)&hPtr, sizeof(int)*4*4*4);
+
+    for(int i = 0; i < 4 * 4 * 4; ++i)
+    {
+        hPtr[i] = 133;
+    }
+
+
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(Fill),1,1,0,0,(int*)dPtr.ptr,dPtr.pitch, 4);
+
+    auto srcColumn2 = make_hipPitchedPtr(
+        (char*)dPtr.ptr,
+        dPtr.pitch,
+        4,
+        4
+    );
+
+    auto dstColumn2 = make_hipPitchedPtr(
+        hPtr,
+        4 * sizeof(int),
+        4,
+        4
+    );
+
+    auto copyExtent2 = make_hipExtent(1*sizeof(int),3,3);
+
+    hipMemcpy3DParms window2;
+    window2.srcArray = nullptr;
+    window2.dstArray = nullptr;
+
+    window2.srcPtr = srcColumn2;
+    window2.srcPos = make_hipPos(3*sizeof(int),1,0);
+    window2.dstPtr = dstColumn2;
+    window2.dstPos = make_hipPos(3*sizeof(int),1,0);
+    window2.extent = copyExtent2;
+    window2.kind = hipMemcpyDeviceToHost;
+
+    hipMemcpy3D(
+        &window2
+    );
+
+    for(int z = 0; z < 4; ++z)
+    {
+        for(int y = 0; y < 4; ++y)
+        {
+            for(int x = 0; x < 4; ++x)
+            {
+                int idx = z * 4 * 4 + y * 4 + x;
+
+                printf("%i ", hPtr[idx]);
+            }
+            printf("\n");
+        }
+        printf("\n");
+        printf("\n");
+    }
+    return 0;
+}
+```
+`hipMemcpy3D` is working incorrectly. When I copy a array's with different pitch the destination offset is wrong.
+
+The example is slicing a 4x4x4 integer *C pointer array*
+  - the offset is 3x0x0 and applied directly to the pointer addresses
+  - the extent is 1x3x3
+The destination array is initialized with the value `133` and the values in the source array are enumerated.
+
+```C++
+#include <stdio.h>
+#include <hip_runtime.h>
+
+
+__global__ void Fill(int* ptr, size_t pitch, const int numElements)
+{
+    for(int z = 0; z < numElements; ++z)
+    {
+        for(int y = 0; y < numElements; ++y)
+        {
+            for(int x = 0; x < numElements; ++x)
+            {
+                int idx = z * numElements * numElements + y * numElements + x;
+                ((int*)((char*)ptr + z * numElements * pitch + y * pitch))[x] = idx;
+            }
+        }
+    }
+}
+
+int main(int argc, char *argv[])
+{
+
+    hipPitchedPtr dPtr;
+
+    auto extent = make_hipExtent(4 * sizeof(int),4,4);
+
+    hipMalloc3D(&dPtr, extent);
+
+    int* hPtr;
+    hipMallocHost((void**)&hPtr, sizeof(int)*4*4*4);
+
+    for(int i = 0; i < 4 * 4 * 4; ++i)
+    {
+        hPtr[i] = 133;
+    }
+
+
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(Fill),1,1,0,0,(int*)dPtr.ptr,dPtr.pitch, 4);
+
+    auto srcColumn = make_hipPitchedPtr(
+        (char*)dPtr.ptr + 3 * sizeof(int),
+        dPtr.pitch,
+        4,
+        4
+    );
+
+    auto dstColumn = make_hipPitchedPtr(
+        hPtr + 3,
+        4 * sizeof(int),
+        4,
+        4
+    );
+
+    auto copyExtent = make_hipExtent(1*sizeof(int),3,3);
+
+    hipMemcpy3DParms window;
+    window.srcArray = nullptr;
+    window.dstArray = nullptr;
+
+    window.srcPtr = srcColumn;
+    window.srcPos = make_hipPos(0,0,0);
+    window.dstPtr = dstColumn;
+    window.dstPos = make_hipPos(0,0,0);
+    window.extent = copyExtent;
+    window.kind = hipMemcpyDeviceToHost;
+    
+    hipMemcpy3D(
+        &window
+    );
+
+    hipError_t err = hipGetLastError();
+    if( hipSuccess != err) 
+       printf("error: %s\n", hipGetErrorString( err));
+
+    for(int z = 0; z < 4; ++z)
+    {
+        for(int y = 0; y < 4; ++y)
+        {
+            for(int x = 0; x < 4; ++x)
+            {
+                int idx = z * 4 * 4 + y * 4 + x;
+
+                printf("%i ", hPtr[idx]);
+            }
+            printf("\n");
+        }
+        printf("\n");
+        printf("\n");
+    }
+}
+```
+
+output is:
+```
+133 133 133 3 
+133 133 133 7 
+133 133 133 11 
+133 133 133 19 
+
+
+133 133 133 23 
+133 133 133 27 
+133 133 133 35 
+133 133 133 39 
+
+
+133 133 133 43 
+133 133 133 133 
+133 133 133 133 
+133 133 133 133 
+
+
+133 133 133 133 
+133 133 133 133 
+133 133 133 133 
+133 133 133 133
+```
+but should be
+
+```
+133 133 133 3 
+133 133 133 7 
+133 133 133 11 
+133 133 133 133 
+
+
+133 133 133 19 
+133 133 133 23 
+133 133 133 27 
+133 133 133 133 
+
+
+133 133 133 35 
+133 133 133 39 
+133 133 133 43 
+133 133 133 133 
+
+
+133 133 133 133 
+133 133 133 133 
+133 133 133 133 
+133 133 133 133
+```
+
+The bug is a wrong offset in the destination array.
+https://github.com/ROCm-Developer-Tools/HIP/blob/753277422a0637ff2bf541c7b43dfaaa2b12c9f6/src/hip_memory.cpp#L1673-L1674
+is must be
+```C++
+unsigned char* dst = (unsigned char*)dstPtr + i * p->dstPtr.ysize * dstPitch + j * dstPitch;
+```
+Should fix #1740 and the related internal bug. @jglaser, if you have time to verify it for HOOMD, it'd be greatly appreciated.
+Don't allow `HIP_PATH` to be propagated to `hipconfig`, when run by CMake to detect the package version, as it leads to the wrong version is detected: when there's already HIP of some different version installed in the system and `HIP_PATH` points to its location, `hipconfig` tends to return the version of the installed HIP, rather than the value defined for the distribution. The compiled results report wrong version and spoils the rest of the stack in this case.
+
+First found during the testing of the ebuild for HIP at https://github.com/justxi/rocm/pull/120 and fixed there with clearing `HIP_PATH` just before calling `cmake` as the first measure. But it looks, that the proper fix is like in this request.
+I don't know whether this should be a github issue or not, but what is the policy on unimplemented CUDA identifiers in HIP?
+
+Here are a few which I've encountered:
+
+```
+ warning: CUDA identifier is unsupported in HIP:
+   cudaMemoryTypeManaged,
+   cudaMemAdvise,
+   cudaMemAdviseSetAccessedBy,
+   cudaCpuDeviceId,
+   cudaMemPrefetchAsync,
+   cudaStreamPerThread,
+   cudaLimitStackSize
+```
+
+Are these on the roadmap?
+
+Also, if these do not make it into `hipify-clang`, do they have a natural translation into hip?

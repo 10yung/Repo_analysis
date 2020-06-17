@@ -1,0 +1,167 @@
+This PR implements the approach proposed in #485. It uses reflection to discover the case class properties and then uses the [manual derivation][1] for defining the `ConfigReader`. Reflection is only used once per case class to discover the property names at time of initializing the reader.
+
+### Usage
+Define a case class `MyClass`
+
+```scala
+package example
+
+case class MyClass(
+  boolean: Boolean,
+  port: Port,
+  adt: MyAdt,
+  list: List[Double],
+  map: Map[String, String],
+  option: Option[String])
+```
+
+Now define the `ConfigReader`. It can be either placed in companion object for `MyClass` or in package object
+
+```scala
+import pureconfig._
+import pureconfig.module.reflect.ReflectConfigReaders._
+
+package object example {
+  implicit val myClassConfigReader: ConfigReader[MyClass] = configReader6(MyClass)
+}
+```
+
+Here we use any of the `configReaderXXX` method (where xxx is based on arity of case class) to define the `ConfigReader`. Now one can simply do `source.load[MyClass]` to create `MyClass` instance from config.
+
+Key aspects
+
+1. Supports only case class. Does not support sealed traits, value classes and tuples
+2. No dependency on any other library like Shapeless
+3. Minimal impact on compilation time - As this module does not Shapeless there is no major impact on compilation timing. In our project we have seen 30%+ reduction in timing for compilation (Compilation time reduced from ~58 sec to ~38-40 secs, See apache/openwhisk#4783 for more stats)
+4. Currently does not support default values. Support for this can be added later if needed
+
+Test cases are based on tests done for `pureconfig-mangolia` module
+
+[1]: https://pureconfig.github.io/docs/non-automatic-derivation.html#manual
+Let's try out GitHub Actions as an alternative to Travis. The advantages are that have better integration with GitHub (duh!) and they are more flexible, allowing us to automate some more workflows in the future not strictly related to CI and not necessarily triggering on pushes and PRs.
+
+In this PR, the only things not on par with our Travis build are:
+- Cache dependencies: the mechanism to cache things is a bit more complex than in Travis. However, GitHub seems to be outperforming Travis anyway ([13m8s on GitHub](https://github.com/pureconfig/pureconfig/actions) vs [13m32s on Travis](https://travis-ci.org/pureconfig/pureconfig/jobs/628148882), with GitHub builds triggering earlier), so we can start without caching and iterate later if needed;
+- Upload coverage to Coveralls: see TODO on workflow definition. Since we haven't disabled Travis yet we'll continue to have coverage data;
+- PR comments on website changes: this would actually be easier now as GitHub provides us a token, but since jobs are shown separately in PR checks this is not needed anymore - we can simply make diff_website not push-blocking.
+
+Some other ideas to use GitHub Actions in the future:
+- Publish a snapshot JAR to Sonatype automatically each time we push to `master`;
+- Publish the website to pureconfig.github.io on every tag push (risky for now, the script is not foolproof).
+
+We can leave both GitHub Actions and Travis running for a while to evaluate whether we are good to move definitely (and whether we want it).
+This PR proposes a refactoring to `ProductHint`s and `CoproductHint`s in order to make them more general. The idea behind this is to allow better customization of derived readers and writers, regardless of the derivation code used to produce them. Incidentally, this moves a lot of repeated code between shapeless-based and magnolia-based derivation to the hints. This also enables #356 (which I leave for a future PR).
+
+This is obviously not binary compatible with older versions of PureConfig. However, only custom implementations of `ProductHint` (not created via `ProductHint.apply`) and `CoproductHint` need to be migrated.
+
+This also modifies the derivation of readers for case classes in `pureconfig-magnolia` to accumulate errors, at the expense of using the unsafe `rawConstruct`. I ended up doing so because the `constructMonadic` interface of Magnolia doesn't play very well with the proposed `ProductHint` interface of returning both the result of reading a field and the next `ConfigObjectCursor` to use.
+Hi,
+
+with version 0.12.1
+
+`ConfigSource.resources(resourceName)`   fails yet `ConfigSource.url(..)` works... specifically see this 
+[code gist ](https://gist.github.com/karlroberts/2ae14ce2b7b48b745d0cd3c5a3a5c620) 
+
+I can find the resource turn it into a URL and resolve it OK using `ConfigSource.url(theurl)` but if I use resources for an absolute resource it fails with the exception
+
+```
+[main] ERROR [2019-10-22 16:37:20,957] [c.s.t.MainServer$] Uncaught exception in main class. Exiting
+java.lang.ExceptionInInitializerError: null
+	at com.mycompany.foo.MainServer$.run(MainServer.scala:37)
+	at cats.effect.IOApp.$anonfun$main$3(IOApp.scala:67)
+	at cats.effect.internals.IOAppPlatform$.mainFiber(IOAppPlatform.scala:36)
+	at cats.effect.internals.IOAppPlatform$.main(IOAppPlatform.scala:24)
+	at cats.effect.IOApp.main(IOApp.scala:67)
+	at cats.effect.IOApp.main$(IOApp.scala:66)
+	at com.mycompany.foo.MainServer$.main(MainServer.scala:33)
+	at com.mycompany.foo.MainServer.main(MainServer.scala)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:566)
+	at com.intellij.rt.execution.application.AppMainV2.main(AppMainV2.java:131)
+Caused by: pureconfig.error.ConfigReaderException: Cannot convert configuration to a com.skyfii.tokeniser.config.Configuration. Failures are:
+  - Unable to read resource /application-dev.conf (resource not found on classpath: /application-dev.conf).
+
+	at pureconfig.ConfigSource.loadOrThrow(ConfigSource.scala:80)
+	at pureconfig.ConfigSource.loadOrThrow$(ConfigSource.scala:77)
+	at pureconfig.ConfigSource$$anon$2.loadOrThrow(ConfigSource.scala:315)
+	at mycompany.foo.config.Configuration$.forEnvironment(Configuration.scala:51)
+	at mycompany.foo.ServerStream$.<init>(MainServer.scala:58)
+	at mycompany.foo.ServerStream$.<clinit>(MainServer.scala)
+	... 13 common frames omitted
+```
+Currently, our modules are organized in a complex and tricky way:
+- We have test utilities (testkits) mixed with test suites and we have module tests depend on both of them;
+- Even though we define `generic` as a module, it has a special status since all tests and tut code depend on it - making it impossible for `pureconfig-generic` to have tests using `BaseSuite` and for us to generalize project definitions in `build.sbt`;
+- All tests depend heavily on generic derivation, even when we're only testing unrelated `pureconfig-core` classes;
+- The effort to have an alternative derivation module (#572) will create more special modules.
+
+Ideally, I see our project having a structure like this:
+- All documentation (including module-specific docs) in a single `docs` project that is rendered on the website (this is also required by #574);
+- A `testkit` project containing only test utilities. This could be elevated later to a public (published) module, if we decide to get it mature enough;
+- Test suites live in their related projects, like `core/src/test` or `modules/generic/src/test`.
+
+What do you think about this proposal, @jcazevedo and @leifwickland?
+Currently, every time our build detects a change in the website content on a PR from an external contributor (i.e. from a forked repo), the script fails.
+
+That is happening because of [this](https://github.com/pureconfig/pureconfig/pull/565#issuecomment-529198871). We need to find a workaround for these cases.
+The builds for our commits bumping to a stable version (automatic, issued by sbt-release) always fail because the example project cannot find the appropriate version. Example: 702250ca32bf9934f2f3e3e0cbd2ec6f2b684ccd, [Travis build](https://travis-ci.org/pureconfig/pureconfig/builds/584428026).
+
+We should probably set the PureConfig version in the example project dynamically by reading `version.sbt`.
+Tut is [being abandoned](https://github.com/tpolecat/tut/issues/246#issuecomment-519943218) in favor of [mdoc](https://github.com/scalameta/mdoc), so we should try to migrate our documentation. This would also allow us to start compiling the documentation against Scala 2.13.
+
+I tried to do this before and I hit some roadblocks at the time (https://github.com/scalameta/mdoc/issues/155). Some things might have changed, but we'll probably need some structural changes in our repo.
+
+Say I have a project with two `application.conf`, one in `main/resources` and the other in `test/resources`. Now when I use `pureconfig.loadConfig[SomeConfig]` in the test classes to load test configs, I find the main configs in the `main/resources` will also be merged in the following codes from `com.typesafe.config.impl.Parseable`:
+``` java
+protected AbstractConfigObject rawParseValue(ConfigOrigin origin, ConfigParseOptions finalOptions){
+...
+Enumeration<URL> e = loader.getResources(resource);
+...
+while (e.hasMoreElements()) { 
+  // Here both `application.conf` in `scala-2.12/classes` and `scala-2.12/test-classes` will be loaded and MERGED
+ }
+}
+```
+
+Because both `application.conf` in `scala-2.12/classes` and `scala-2.12/test-classes` are merged, some substitute values in `main/resources` will be also needed in the Config of test classes, which is not clean.
+
+Any idea?
+quick example
+
+model
+```
+case class Foo(
+   strictProp: String,
+   stringWithDefault: String = Foo.DefaultString,
+   optionWithDefault: Option[String] = Foo.DefaultOption)
+
+object Foo {
+   val DefaultString: String = "default-name"
+   val DefaultOption: Option[String] = None
+}
+```
+
+tryout
+```
+val raw = ConfigFactory parseString """strictProp = "foo""""
+val config = pureconfig.loadConfig[Foo](raw)
+```
+
+result
+```
+Right(Foo(foo, null, null))
+```
+
+it can be fixed by specifying default values in-place, like this
+```
+case class Foo(
+   strictProp: String,
+   stringWithDefault: String = "default-name",
+   optionWithDefault: Option[String] = None)
+```
+
+but can we have original example working as well?
+
+thanks!

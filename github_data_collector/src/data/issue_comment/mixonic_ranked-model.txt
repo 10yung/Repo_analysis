@@ -1,0 +1,320 @@
+Hello,
+
+I'm experiencing an issue when changing the scope and sending to the first position at the same time for 2 rows inside a transaction, and I'm suspecting it's because I'm around `MIN_RANK_VALUE`.
+
+I don't know if I'm doing something wrong of if this is a legitimate bug, here's the information I've gathered so far:
+
+### My situation:
+
+#### Table creation:
+`t.bigint :row_order, null: false`
+
+#### Model
+```rb
+include RankedModel
+ranks :row_order, with_same: %i[scope_1 scope_2]
+```
+
+#### All rows with scope_1 = 114
+```
+id      row_order   scope_1 scope_2
+12470	-2147483646	114     18
+12464	-2147483644	114     18
+12463	429496729	114     18
+12454	1288490188	114     18
+12462	-2147352576	114
+12460	-1879048192	114
+12459	-1610612736	114
+12465	-1342177280	114
+12458	-1073741824	114
+12445	-536870912	114
+14525	0           	114
+```
+
+### What I'm doing:
+Inside a transaction:
+ - Updating 12459 with `scope_2 = 18` and `row_order_position = :first`
+ - Updating 12462 with `scope_2 = 18` and `row_order_position = :first`
+
+#### My Code (renamed):
+
+```rb
+MyClass.transaction do
+  my_instances # [MyClass<#12462>, MyClass<#12459>]
+    .reverse_each do |my_instance|
+      my_instance.lock!
+      my_instance.update!(scope_2: Scope2<id: 18>, row_order_position: :first)
+    end
+end
+```
+
+#### The crash
+
+The first update (for `id: 12459`) seems to go through, but the second one fails here:
+(And then everything gets rolled back)
+```
+[211, 219] in /Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/ranked-model-0.4.4/lib/ranked-model/ranker.rb
+   211:       def rebalance_ranks
+   212:         if rank && instance.persisted?
+   213:           origin = current_order.index { |item| item.instance.id == instance.id }
+   214:           destination = current_order.index { |item| rank <= item.rank }
+=> 215:           destination -= 1 if origin < destination
+   216:
+   217:           current_order.insert destination, current_order.delete_at(origin)
+   218:         end
+   219:
+(byebug) current_order.map { |item| item.instance.id }
+[12459, 12470, 12464, 12463, 12454]
+(byebug) instance.id
+12462
+(byebug) origin
+nil
+(byebug) destination
+3
+(byebug) origin < destination
+*** NoMethodError Exception: undefined method `<' for nil:NilClass
+
+nil
+```
+
+### StackTrace
+<details>
+ <summary>Click to Reveal StackTrace</summary>
+
+```
+undefined method `<' for nil:NilClass
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/ranked-model-0.4.4/lib/ranked-model/ranker.rb:215:in `rebalance_ranks'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/ranked-model-0.4.4/lib/ranked-model/ranker.rb:169:in `rank_at_average'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/ranked-model-0.4.4/lib/ranked-model/ranker.rb:125:in `update_index_from_position'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/ranked-model-0.4.4/lib/ranked-model/ranker.rb:60:in `handle_ranking'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/ranked-model-0.4.4/lib/ranked-model.rb:33:in `block in handle_ranking'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/ranked-model-0.4.4/lib/ranked-model.rb:32:in `each'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/ranked-model-0.4.4/lib/ranked-model.rb:32:in `handle_ranking'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activesupport-6.0.2/lib/active_support/callbacks.rb:429:in `block in make_lambda'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activesupport-6.0.2/lib/active_support/callbacks.rb:201:in `block (2 levels) in halting'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activesupport-6.0.2/lib/active_support/callbacks.rb:607:in `block (2 levels) in default_terminator'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activesupport-6.0.2/lib/active_support/callbacks.rb:606:in `catch'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activesupport-6.0.2/lib/active_support/callbacks.rb:606:in `block in default_terminator'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activesupport-6.0.2/lib/active_support/callbacks.rb:202:in `block in halting'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activesupport-6.0.2/lib/active_support/callbacks.rb:514:in `block in invoke_before'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activesupport-6.0.2/lib/active_support/callbacks.rb:514:in `each'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activesupport-6.0.2/lib/active_support/callbacks.rb:514:in `invoke_before'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activesupport-6.0.2/lib/active_support/callbacks.rb:134:in `run_callbacks'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activesupport-6.0.2/lib/active_support/callbacks.rb:827:in `_run_save_callbacks'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activerecord-6.0.2/lib/active_record/callbacks.rb:328:in `create_or_update'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activerecord-6.0.2/lib/active_record/timestamp.rb:129:in `create_or_update'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activerecord-6.0.2/lib/active_record/persistence.rb:503:in `save!'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activerecord-6.0.2/lib/active_record/validations.rb:53:in `save!'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activerecord-6.0.2/lib/active_record/transactions.rb:319:in `block in save!'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activerecord-6.0.2/lib/active_record/transactions.rb:375:in `block in with_transaction_returning_status'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activerecord-6.0.2/lib/active_record/connection_adapters/abstract/database_statements.rb:279:in `transaction'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activerecord-6.0.2/lib/active_record/transactions.rb:212:in `transaction'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activerecord-6.0.2/lib/active_record/transactions.rb:366:in `with_transaction_returning_status'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activerecord-6.0.2/lib/active_record/transactions.rb:319:in `save!'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activerecord-6.0.2/lib/active_record/suppressor.rb:48:in `save!'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activerecord-6.0.2/lib/active_record/persistence.rb:635:in `block in update!'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activerecord-6.0.2/lib/active_record/transactions.rb:375:in `block in with_transaction_returning_status'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activerecord-6.0.2/lib/active_record/connection_adapters/abstract/database_statements.rb:279:in `transaction'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activerecord-6.0.2/lib/active_record/transactions.rb:212:in `transaction'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activerecord-6.0.2/lib/active_record/transactions.rb:366:in `with_transaction_returning_status'
+/Users/nate/.rbenv/versions/2.6.5/lib/ruby/gems/2.6.0/gems/activerecord-6.0.2/lib/active_record/persistence.rb:633:in `update!'
+```
+</details>
+
+### Gut feeling:
+I don't have a good grasp of what the gem is trying to accomplish in that method but, it seems like I'm only getting in that method because:
+- my first update (for `id: 12459`) must set `row_order` to be before element `id: 12470` (which has row_order `-2147483646`), so it must end up being `-2147483647` or `-2147483648`.
+- But now my second update (for `id: 12462`) must do the same thing, and would probably need row_order `-2147483648` or **below** which is the `MIN_RANK_VALUE`, which probably triggers the call to `rebalance_ranks`
+- `current_order` does not have the current `instance` so `origin` is `nil`, and we get the crash at the comparison
+
+=> I feel like the fix might be something along the lines of:
+- pre-adding the current instance to `current_order` when the scope is changing at the same time.
+- adding a check on `origin.nil?`
+- casting `origin.to_i` to get `nil => 0`, or maybe it should take a higher value than destination then? Not quite sure.
+
+Anyways I hope this is clear enough and helpful, let me know if you'd like more information or clarification.
+
+Thank you 🙏 
+I took a shot at moving the CI pipeline to Github Actions to see if it adds value to the project. Seeing two benefits right now:
+
+1. Faster builds. Taking less than 30 minutes ([example](https://github.com/janklimo/ranked-model/commit/27a68fb838e593ed6b98551caf6f0e1c2aef3530/checks?check_suite_id=395429930)), so faster than Travis despite running more jobs.
+1. More flexibility defining services. E.g. testing on MySQL 8 which isn't available on Travis afaik.
+
+**Notable changes:**
+
+1. Updated lockfiles and moved them back into version control. This is to enable caching in CI based on checksums of these files.
+1. Added Ruby 2.7 to the matrix.
+
+**Future work:**
+
+1. Couldn't make MySQL work with JRuby. Since I don't use either of those, it would be nice to get help from contributors who do.
+1. Testing on MySQL 8 breaks due to invalid SQL. Again, I'd like to get eyes on it from some MySQL users.
+
+![Screen Shot 2020-01-11 at 5 51 58 PM](https://user-images.githubusercontent.com/7811733/72203170-20051280-349b-11ea-95b7-7d7ba52ef5d7.png)
+
+Interested in migrating or sticking to Travis?
+
+Adding an option for preferred gap size between ranked models which is being used when adding items first and last. It's also used when `rebalancing_ranks` is triggered. 
+
+Doing it because we're using the gem together with Ember and some drag n drop. Users tend to drag a lot of items to the top (`:first`). We want to avoid collisions as much as possible, cause when we're touching other models than the one being updated, the data is no longer synced between front and backend.
+
+Do whatever you want with this PR, just throwing it out there.
+Hello,
+
+when using mobility (json backend) in combination with ranked model, we see that when we update the position ranked model also tries to save the translations columns as null (instead of an empty hash which is the default behaviour)
+
+Following test case shows the issue, funny enough if I remove the `with_same` option it all works fine and `placeholder` does not get updated. You need a database called `scratches` with postgres to run the file.
+
+```ruby
+require "bundler/inline"
+
+gemfile(true) do
+  source "https://rubygems.org"
+
+  git_source(:github) { |repo| "https://github.com/#{repo}.git" }
+
+  # Activate the gem you are reporting the issue against.
+  gem "activerecord", "~> 5.2.0"
+  gem "pg"
+  gem 'ranked-model'
+  gem 'mobility'
+  gem 'enumerize'
+end
+
+require "active_record"
+require "minitest/autorun"
+require "logger"
+
+Mobility.configure do |config|
+  config.default_backend = :jsonb
+  config.accessor_method = :translates
+  config.query_method = :i18n
+  config.default_options[:locale_accessors] = true
+  config.default_options[:fallbacks] = true
+  config.default_options[:dirty] = true
+end
+
+
+# This connection will do for database-independent bug reports.
+ActiveRecord::Base.establish_connection(adapter: "postgresql", database: "scratches")
+ActiveRecord::Base.logger = Logger.new(STDOUT)
+
+ActiveRecord::Schema.define do
+  drop_table :registration_form_fields, if_exists: true
+  drop_table :registration_forms, if_exists: true
+
+  create_table :registration_forms, force: true do |t|
+    t.string :name, null: false
+  end
+
+  create_table :registration_form_fields, force: true do |t|
+    t.string :name, null: false
+    t.jsonb :label, default: {}, null: false
+    t.jsonb :placeholder, default: {}, null: false
+    t.integer :row_order
+    t.belongs_to :registration_form, foreign_key: true, index: true, null: false
+  end
+end
+
+class RegistrationForm < ActiveRecord::Base
+  has_many :fields, class_name: 'RegistrationFormField', dependent: :destroy, inverse_of: :registration_form
+end
+
+class RegistrationFormField < ActiveRecord::Base
+  include RankedModel
+  extend Mobility
+
+  belongs_to :registration_form
+
+  ranks :row_order, with_same: :registration_form_id
+
+  translates :label, type: :string
+  translates :placeholder, type: :string
+end
+
+class BugTest < Minitest::Test
+  def test_association_stuff
+    registration_from = RegistrationForm.create!(name: 'jefke')
+    puts registration_from.fields.create!(name: 'email', label: 'email')
+
+    registration_from.fields.first.reload
+
+    registration_from.fields.first.update!(row_order_position: 1)
+  end
+end
+```
+
+
+I'm evaluating implementing this gem on a project with lots of existing records.
+
+I couldn't find any info in the docs about how to correctly migrate data.
+
+Here's my model:
+
+```ruby
+module Properties
+  class Image < ApplicationRecord
+    include RankedModel
+    ranks :sort_order, with_same: :property_id
+  end
+end
+```
+
+there is a unique index on these columns (I'm using Postgres):
+
+```ruby
+add_column :properties_images, :sort_order, :integer
+add_index :properties_images, [:property_id, :sort_order], unique: true
+```
+
+Here's the migration script that keeps failing due to a violated uniqueness constraint:
+
+```ruby
+ActiveRecord::Base.transaction do
+  Property.all.find_each do |property|
+    Properties::Image.where(property: property).order(created_at: :desc).each_with_index do |image, index|
+      image.update(sort_order_position: index)
+    end
+  end
+end
+```
+
+What's the recommended way to populate the new column once this gem is installed?
+- Adds a general 'cannot rearrange' functionality
+- leverages it to abort save when cannot re-arrange
+
+Alternate strategy to #148
+Extracted from #148
+
+- Remove trailing whitespace
+- Make --only-failures possible
+- Always call super from included
+- Have less activerecord::base envy
+None
+A take on 'first do no harm' when seeing the occasional
+
+```
+NoMethodError: undefined method `rank' for nil:NilClass (Most recent call first)
+
+
+File /app/vendor/bundle/ruby/2.6.0/gems/ranked-model-0.4.4/lib/ranked-model/ranker.rb line 188 in rearrange_ranks
+```
+
+There are various possible strategies for handling a missing 'current_x'
+- reset cache and retry
+- make a best effort with what we know
+- calculate 'freshness' of the current instance and do something when not fresh
+  - have a pluggable strategy when no longer fresh
+- try to lock the re-reranking
+
+Related
+- https://github.com/mixonic/ranked-model/issues/124
+- https://github.com/mixonic/ranked-model/pull/117
+
+Work done:
+- just the failing test #149
+- two commits: 1. failing test, 2. make it pass
+  - strategy 1: skip cannot rearrange (this PR).
+  - strategy 2: abort save #151
+- unrelated misc  #150
+Introduced in #30

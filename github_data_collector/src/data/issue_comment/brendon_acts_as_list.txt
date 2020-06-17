@@ -1,0 +1,84 @@
+In rails 6 we get the following deprecation warning:
+
+    DEPRECATION WARNING: Class level methods will no longer inherit
+    scoping from `create` in Rails 6.1. To continue using the scoped
+    relation, pass it into the block directly. To instead access the full
+    set of models, as Rails 6.1 will, use `<model name>.unscoped`.
+    (called from acts_as_list_list at /path/to/acts_as_list/lib/acts_as_list/active_record/acts/list.rb:229)
+
+when we call `find_or_create_by` on a model with `acts_as_list`.  To get
+rid of this deprecation warning, we need to use the full `unscoped` method
+instead of the restricted `unscope(:select, :where)`.
+
+No other tests seem to break with this change, so I assume fully unscoping isn't going to cause any problems elsewhere in how `acts_as_list` works.
+
+In the first commit I've also tweaked the Gemfile and Appraisals files to work out of the box now that rails 6 is available and it doesn't work with sqlite 1.3.
+Given the following index (Postgres):
+
+```ruby
+add_index :properties_images, [:property_id, :position], unique: true
+```
+
+sequential updates will not be used (and reordering always fail) unless explicitly specified:
+
+```ruby
+acts_as_list scope: :property, sequential_updates: true
+```
+
+One way to fix this would be to scan all indexes of the target table in `SequentialUpdatesMethodDefiner` and see if any of them include position. Another way is just to mention this in the docs. Opening a conversation first.
+Make sure to read #325 first.
+I'm using Rails `6.0` with `gem 'acts_as_list', '~> 0.9.19'` (I've also tried lower versions), and can not seem to get `acts_as_list` working. Below is an example trying to grab the last image, to later perform a positional change.
+
+```
+irb(main):009:0> sp = StorageProperty.first
+  StorageProperty Load (0.3ms)  SELECT "storage_properties".* FROM "storage_properties" ORDER BY "storage_properties"."id" ASC LIMIT $1  [["LIMIT", 1]]
+=> #<StorageProperty id: 1, name: "ABC Storage", created_at: "2019-08-12 00:52:19", updated_at: "2019-08-15 21:22:41", stripe_id: "cus_FbuU7fMjwIR2Sj", card_brand: "MasterCard", card_last4: "4444", card_exp_month: "2", card_exp_year: "2023", email: "info@abcstorage.com", onboarding_completed_at: "2019-08-15 04:05:33", status: "active", street_address: nil, secondary_address: nil, city_name: nil, province: nil, postal: nil, country: nil, phone_number: nil, card_token: nil, plan_id: nil>
+irb(main):010:0> sp.images.last
+Traceback (most recent call last):
+        3: from (irb):10
+        2: from app/models/image.rb:1:in `<main>'
+        1: from app/models/image.rb:5:in `<class:Image>'
+NoMethodError (undefined method `acts_as_list' for #<Class:0x00007ff0935b8ea8>)
+```
+
+Models
+
+```
+class StorageProperty < ApplicationRecord
+    has_many :images, -> { order(position: :asc) }, dependent: :destroy
+    accepts_nested_attributes_for :images
+end
+
+class Image < ApplicationRecord
+
+  belongs_to :storage_property
+
+  acts_as_list scope: :storage_property
+
+  has_one_attached :file
+  delegate_missing_to :file
+  validates :file, presence: true
+
+  scope :positioned, -> { order(position: :asc) }
+end
+
+```
+As title describe, old implement cased bugs in STI use case;
+I have a client which has many addresses and each address I use acts_as_list scoped by the client. My client_id in the addresses table has an index attached to it which broke my tests.
+
+`acts_as_list scope: :client`
+
+Now when I add the first address it gets position 1, and the second gets position 1. If I remove the index on client_id, then it works as expected. The first address gets position 1, and the second address I add to the client gets position 2. The only thing I changed was removing the index on client_id.
+closes #333 
+Resolves #287 .
+
+I have noticed that under some peculiar situations it is possible to end up with a list that contains duplicate positions in acts_at_list. The duplicate positions cause unexpected behaviors to acts_as_list and sometimes leads to errors. 
+
+Would it be OK if I created a PR with a function that fixes lists that contain duplicate positions? 
+
+It could be done by arbitrarily choosing an order for the items with duplicated positions (there is no way of knowing which should come first with respect to one another) and moving other items out of the way. 
+
+Related to #76 #317 
+The description says that <code>add_new_at: nil</code> "_will result in new items not being added to the list on create, i.e, position will be kept nil after create_", but it not says that subsequent scope changes will not change it's position. What should be the correct behavior?
+
+Some context: I have a scope <code>acts_as_list scope: [:distribution_center, state: :preparation_queue]</code>, and I'm having trouble adding elements to this list. I noticed that when a record satisfy this scope but already have a position value lower then the bottom element it duplicates the correspondent value on the list before sending the element to bottom. So I just put all positions to null when it's not on the list, and the one case that is missing is when a new element is created.

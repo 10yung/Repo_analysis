@@ -1,0 +1,142 @@
+Attempt to improve RTSP parsing, especially when dealing with non-standard-compliant RTSP endpoints that only use `/n` instead of `/r/n`. Replaces #1922.
+
+I don't have a way to test it with such a broken RTSP server, so please let me know if this does indeed work as expected. I tested this with a couple of public RTSP servers successfully, so there should be no regression, but again, please make sure you don't see any issue with your RTSP usage.
+'Session:' point was newer reached after 'Transport:' processing because of changed \n to 0 character in 'Transport:' line
+This PR tries to address a feature we've been missing so far, that is the configuration of a list of folders we shouldn't write to, at least when it comes to files that may be written as a consequence of an API call. To make a simple example, you might ask for a .mjr recording or a .pcap capture, and saved to, e.g., `/usr/bin/`, at the risk of causing problems to the instance. This patch adds a new property you can add to `janus.jcfg`, an array called `protected_folders`, which contains the base folders you don't want Janus to write to, e.g.:
+
+	protected_folders = [
+		"/bin",
+		"/boot",
+		"/dev",
+		"/etc",
+		"/initrd",
+		"/lib",
+		"/lib32",
+		"/lib64",
+		"/proc",
+		"/root",
+		"/sbin",
+		"/sys",
+		"/usr",
+		"/var",
+		"/opt/janus/bin",
+		"/opt/janus/etc",
+		"/opt/janus/include",
+		"/opt/janus/lib",
+		"/opt/janus/lib32",
+		"/opt/janus/lib64",
+		"/opt/janus/sbin",
+	]
+
+With such a list in effect, trying to save an .mjr file in `/usr/bin` would fail since the `/usr` exception would be triggered. At the moment, this is only enforced on attempts to start a new recorder and new pcap/text2pcap captures, that is what you can usually ask for via API: as such, it does NOT include, for instance, configuration files, or files that plugins open themselves using folders specified in their configuration files (although plugins may of course be modified to use that check too). This is because configuration files are supposed to be only accessible to who manages the Janus instance, and so if you write a wrong folder there, you're basically shooting your own foot, while API calls are outside of your control.
+
+By default, no folder is protected, Janus only relies on what is written in `janus.jcfg`: since by default, even after updates, the existing `janus.jcfg` is not touched, existing deployments would need an update to their configuration file to start taking advantage of this. New instances instead should be able to use it right away, as the value of `protected_folders` is uncommented in the sample configuration file. Not sure whether we should have a hardcoded list to fallback to when such a value is missing in the code itself: on one side it would start protecting deployments, but on the other end it might break existing applications that for one reason or another are using those folders.
+
+The underlying implementation uses [realpath](https://pubs.opengroup.org/onlinepubs/000095399/functions/realpath.html) under the curtains, meaning it's supposed to be smart enough to take into account relative paths and symbolic links. That said, it might not be perfect, so any improvement here would be welcome, as well as generic feedback on whether you think this is useful/effective or not as it is.
+
+Real-time text is specified in [RFC4103](https://tools.ietf.org/html/rfc4103), and is basically a way to have live text conversations on RTP: the core difference with regular instant messaging is that you see the text as it's being typed, rather than when the other person sends the completed message. While it's been around for a while, it will be even more important in the future since it will be part of the so called "Next-Generation Emergency Services".
+
+I'm writing a blog post on the whole effort, so I won't spend too many words on it here (you can refer to that once I share the link). The main thing you need to be aware of, from a Janus perspective, is that if you negotiate data channels in the SIP plugin, now, you'll attempt to establish a real-time text session (the data channel part of the SDP will be transformed to an `m=text` portion instead). Data will then be exchanged as an ArrayBuffer containing the T.140 blocks with the real-time text: I made a quick (and very ugly) update to the SIP demo to show this in action.
+
+I only tested this for incoming calls from an old client called TIPcon1, and negotiating text only (no audio/video along text): the plan is to test this with other media and for outgoing calls as well (which should simply require us to offer data channels from the web application, nothing more), and possibly with other endpoints as well. Since I don't have access to other endpoints, though, I'm looking forward to feedback from people who do instead.
+This is an extension to the work started in #1884, where we did a bit of refactoring to give us more control on RTP extensions. That effort payed off here, as it allowed us to inject our own transport-wide RTP extension, which is the first step to implementing some form of bandwidth estimation in Janus.
+
+More specifically, this patch implements the following changes:
+
+1. It allows plugins to negotiate transport-wide CC when offering themselves, which was prevented before.
+2. When negotiated, and when video is used, we add a global sequence number to the transport-wide CC extension (`http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01`). Before we only parsed the extension set by clients, in order to craft our RTCP feedback to send back: this now allows clients (e.g., browsers) to send us feedback via RTCP instead.
+3. There is code in place to parse the transport-cc RTCP feedback sent by clients: we parse the whole message and build a list, which is currently ignored.
+
+This whole effort will be the starting point to implement some actual BWE, which will happen in a separate PR. As it is, even ignoring the feedback we get back as we do now, it still improves some use cases that were partially broken before, e.g., sender-side BWE from both caller and callee in the VideoCall plugin (see #1473 and #1861). In fact, ensuring we negotiate the extension also when we offer ourselves, means browsers will add the extension in those sessions as well, and use the feedback we send back to adapt their bitrate: before, this was only possible when the client was offering (EchoTest, VideoCall caller, VideoRoom publisher, etc.)
+
+Please make sure you test this and provide feedback, as it's an important step forward to make considerable improvements to the bandwitdh management in Janus. Since it's based on #1884, testing this branch you actually test both, and I **do** need feedback on both. Once I have a clearer idea on whether it works as expected and causes no issues, I'll be able to focus on the more complex stuff, like integrating some algorithm to do basic bandwidth estimation, and provide plugins (and applications) with more precise information, and possibly even automated behaviours.
+This is a new logger that extends the functionality we added in #1814. Specifically, it allows you to send the Janus logs in real-time to a remote [HOMER](https://github.com/sipcapture/) instance. It can be compiled with a `--enable-homer-logger` passed to the configure script, and supports two different ways to push logs to HOMER:
+
+1. Using native HEP, over either UDP or TCP;
+2. Using HTTP, which actually "piggybacks" the existing HTTP event handler syntax by leveraging a currently unused event type.
+
+You choose the protocol and backend in the `janus.logger.homerlog.jcfg` configuration file. The HTTP support actually depends on whether libcurl is available or not: if it isn't, the logger will be built with only HEP support. I plan to add gzip support as well (since log lines can be large, and HOMER seems to support it, at least on UDP/TCP), but I haven't come to that yet.
+
+This was originally part of #1814 itself, but eventually, to keep things simple, I only merged the reference JSON-based logger implementation. One more reason is that, to be honest I haven't properly tested the logger either: I did test HEP/UDP against a barebone nodejs application using the `hep-js` stack, and it seems to work, but I did not test TCP, and neither did I test if this works with an actual HOMER instance due to lack of time. Besides, HTTP support actually needs some change in HEpop, since it introduces a new event type they're not aware of, and that should now be mapped to logs somehow. Pinging the awesome @lmangani to bring him up to speed.
+
+Looking forward to feedback, especially with respect to testing this with the real thing!
+This is an important change you should be aware of, if you're writing your own plugin, as it changes the signatures of all methods that deal with sending/receivng RTP, RTCP and data messages.
+
+The main motivation comes from our so far poor management of RTP extensions. In fact, at the moment RTP extensions are relayed across RTP packets, when core and plugin exchange them, which is a problem for many reasons:
+
+1. The receiver of the media (e.g., a VideoRoom subscriber) may have negotiated different IDs for its RTP extensions than the one the source (e.g., a VideoRoom publisher) did. This means that the info, for instance, on audio-level may be lost, or even worse info related to an extension may be read as a different extension entirely due to a conflict in IDs. In normal circumstances this doesn't happen (in the example of the VideoRoom, the extensions negotiated by the publisher are used for the SDP offer for the subscriber), but since we support features like source switching, where the source of the media we send to a receiver may dynamically change through the course of a session, this is a real problem.
+2. We can't add our own extensions, and a very good example of that is `mid`, which uniquely identifies a stream in a session. Since we can't add our own extension, or replace an existing one (with media traversing plugins we don't know the original IDs for the two, see above), we have to keep the extension as it is: if the `mid` values for the two PeerConnections are different, though (e.g., VideoCall caller uses `0` and `1`, VideoCall callee uses `audio` and `video`), and we negotiate the `mid` extension, the received might drop all packets containing a `mid` it doesn't know (all of the in the VideoCall example above). So far this has forced us to forcibly prevent the negotiation of IDs like `mid`, which is bad for several reasons.
+3. The "adding our own extension" is important for another reason as well, namely the potential ability, in the future, to implement BWE (bandwidth estimation) in Janus itself, which will require us to be able to add a custom extension ourselves, and ignore what the sender sent originally.
+
+In order to cover all those requirements and potentially solve the issues, the idea we came up with was to refactor the way we exchange media between core and plugins. Until now we blindly passed the buffer of the data (whatever the content) and its length, which wasn't of course enough if we needed to add something else, e.g., to preserve/relay/originate properties the core should be aware of. For this reason, this patch introduces three new structures: `janus_plugin_rtp`, `janus_plugin_rtcp` and `janus_plugin_data`. As the names suggest, these structures abstract an RTP, RTCP and data packet that core and plugins might exchange: they contain, of course, the data and its length as before, but also some more info that acts as metadata. This as another advantage: it makes the data core and plugins exchange more "extensible", meaning that if we'll need more info there, all we need to do is modify the struct, and we can keep the signature as it is.
+
+As a result, the callbacks now change like this:
+
+_Old:_
+
+```
+	void (* const incoming_rtp)(janus_plugin_session *handle, int video, char *buf, int len);
+	void (* const incoming_rtcp)(janus_plugin_session *handle, int video, char *buf, int len);
+	void (* const incoming_data)(janus_plugin_session *handle, char *label, char *buf, int len);
+
+	void (* const relay_rtp)(janus_plugin_session *handle, int video, char *buf, int len);
+	void (* const relay_rtcp)(janus_plugin_session *handle, int video, char *buf, int len);
+	void (* const relay_data)(janus_plugin_session *handle, char *label, char *buf, int len);
+
+```
+
+_New:_
+
+```
+	void (* const incoming_rtp)(janus_plugin_session *handle, janus_plugin_rtp *packet);
+	void (* const incoming_rtcp)(janus_plugin_session *handle, janus_plugin_rtcp *packet);
+	void (* const incoming_data)(janus_plugin_session *handle, janus_plugin_data *packet);
+
+	void (* const relay_rtp)(janus_plugin_session *handle, janus_plugin_rtp *packet);
+	void (* const relay_rtcp)(janus_plugin_session *handle, janus_plugin_rtcp *packet);
+	void (* const relay_data)(janus_plugin_session *handle, janus_plugin_data *packet);
+```
+
+As you can see, nothing complex, and if you look at the stock plugins, the change we needed to make there to make this work was minimal. For RTCP and data, the metadata is basic: only a boolean for audio/video in the former (as the original callback needed it), the datachannel label for the latter.
+
+For RTP, instead, the structure contains some more info besides the audio/video boolean: specifically the values of some of the extensions. This is very important, because on incoming packets, the core will parse the extensions before passing the RTP packet to the plugin, and put the values there; this should make life easier to plugins, as they won't need to inspect the RTP packet themselves, but will just need to read a value from a struct. On outgoing packets, instead, **the core will get rid of all extensions**, and **write them from scratch**. This is the only way, in fact, we can inject our own extensions, and with values we'll know will not cause conflicts: at the moment, the core will add the `mid` extension if it was negotiated, and look at the values in the extensions part of `janus_plugin_rtp` to see if it needs to add some more.
+
+As you may have guessed, this means we're now less trasparent when it comes to extensions: more importantly, that while you'll still receive all extensions from browsers/devices (we don't strip them on the way in, as they may be important for recordings), you'll only be able to send an RTP extension if the core knows about it. At the moment, the list is limited to two: audio-levels, and video-orientation. Anything else that is not supported in `janus_plugin_rtp` will be discarded. While this may be seen as a limitation, I don't think it is: first of all, there wasn't any other way to address those issues, and besides, if you really care about an extension, just contribute support to the core. Besides, it makes _sending_ extensions easy as well: if you want to send an audio-level extension, just set the value in the struct, and the core will place it for you.
+
+As a side note, I took advantage of this small refactoring to also add a couple of helper methods in the core callbacks, namely `send_pli` and `send_remb`: since PLI and REMB are most of the times the only RTCP packets plugins originate themselves, rather than crafting the RTCP message manually it made sense to expose a method that would allow the core to do that on behalf of plugins, in order to, again, simplify their lives.
+
+I guess this is all. I'm really looking for feedback, as I believe this is an important and helpful change. As I anticipated, the plan is to base upcoming work (e.g., BWE) on top of this, so make sure you're not caught unprepared when I'll merge.
+All plugins use numeric identifiers for their resources: this is especially true for plugins that support the concept of rooms and participants, so AudioBridge, VideoRoom and TextRoom. This dates back to the very beginnings of Janus, where using numeric identifiers seemed to make more sense from a management and performance perspective, especially considering they'd be used as keys in hashtables, and compared often. That said, I've often seen requests in the past to support strings too, as many people rely on other unique identifiers, e.g., UUIDs, for their resources: having a different space in plugin forces people to implement their own mappings and keep them aligned, which can be cumbersome.
+
+This patch is a first attempt to try and solve that. Specifically, it aims at adding support for string-based identifiers to AudioBridge, VideoRoom and TextRoom: it will NOT change how the core works (sessions and handles will still be numeric), nor will it touch other plugins (don't be greedy :wink: ). It does that by introducing a new static configuration properties to these plugins, called `string_ids`: this means that, when you start Janus, it's up to you to tell plugins if you'll use numeric identifiers as before (`string_ids=false`, the default), or strings (`string_ids=true`). You cannot mix the two, e.g., use strings in one room and numbers in another: it's one or another, decided at startup.
+
+For the time being, I've only updated the AudioBridge, in order to figure out if/how this works and if it's worth it. As you can see from the amount of changes, it was a lot of work, so I won't start with the other plugins until I know that:
+
+1. this is something people would be interested in (the lack of feedback on other PRs has been annoying);
+2. the existing patch doesn't introduce regressions for numeric IDs (the plugin must still work exactly as expected if you change nothing);
+3. it works exactly the same way if you use strings in all cases (feature parity);
+4. we have no leaks or crashes due to the usage of strings.
+
+Thanks, feedback welcome.
+The MQTT v5 has got support of request/response message pattern. For that reason, message properties such as: "response_topic" and "correlation_date" were introduced. Any client that supports MQTT v5 standard now is able to utilize request/response message pattern out the box. At the same time, the choice fully on client side and client applications can continue using their own ways to correlate requests and responses on top of async pub/sub messages.
+
+The proposal is to add a support for the new clear way of communication over MQTT, that's now available by modern clients with the support of MQTT v5 standard.
+
+What we can do:
+1. We may store incoming message properties within an **internal state** of the MQTT transport plugin, where a state record consists of the key: "transaction" and the value: "message properties".
+2. For any message sent with `push_event` a "transaction" is known, so we may find a record in the **internal state**.
+3. Then, we may:
+    - use "response_topic" from incoming message properties as a destination topic of an outgoing message
+    - pass "correlation_data" from incoming message properties to outgoing message as is
+        - a bit more flexible way may be to specify a list of properties to pass within the plugin configuration
+
+
+That's may be important to mention that:
+- These changes aren't affect in any way (source code, API, the way how clients interact with plugins) application plugins or the other transport plugins. The changes make sense only for MQTT transport plugin and are encapsulated within it.
+- They are not breaking changes, so current users may proceed without any changes to their code. At the same time, those who want to utilize new features of MQTT v5 standard will be able to do that.
+
+Specs:
+- Correlation Data  
+    https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901115
+- Response Topic  
+    https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901114

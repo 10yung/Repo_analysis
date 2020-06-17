@@ -1,0 +1,255 @@
+https://github.com/pelotom/runtypes/pull/80 implements `.asReadonly()` which is awesome! Would be great to have it mentioned in the README so the next dev doesn't miss it.
+
+cc @googol
+
+Cheers!
+
+
+I have the following Runtype which I use as part of an ElasticSearch query:
+
+```typescript
+import { Dictionary, Lazy, Literal, Number, Partial, Record as RtRecord, Runtype, String, Union } from "runtypes";
+
+export interface ElasticSearchFieldMapping {
+  type: "boolean" | "date" | "double" | "integer" | "keyword" | "text";
+  analyzer?: string;
+  fields?: Record<string, ElasticSearchFieldMapping>;
+  ignore_above?: number;
+}
+
+export const ElasticSearchFieldMapping: Runtype<ElasticSearchFieldMapping> = Lazy(() =>
+  RtRecord({
+    type: Union(
+      Literal("boolean"),
+      Literal("date"),
+      Literal("double"),
+      Literal("integer"),
+      Literal("keyword"),
+      Literal("text"),
+    ),
+  }).And(Partial({
+    analyzer: String,
+    fields: Dictionary(ElasticSearchFieldMapping, "string"),
+    ignore_above: Number,
+  })),
+);
+```
+
+When I use `.check(input)` to throw an exception, the code that tries to describe the expected input ends up in a stack overflow:
+
+```
+RangeError: Maximum call stack size exceeded
+    at Array.map (<anonymous>)
+    at /opt/nodejs/node_modules/runtypes/lib/show.js:29:22
+    at Array.map (<anonymous>)
+    at /opt/nodejs/node_modules/runtypes/lib/show.js:44:56
+    at /opt/nodejs/node_modules/runtypes/lib/show.js:24:61
+    at /opt/nodejs/node_modules/runtypes/lib/show.js:36:80
+    at Array.map (<anonymous>)
+    at /opt/nodejs/node_modules/runtypes/lib/show.js:36:31
+    at Array.map (<anonymous>)
+    at /opt/nodejs/node_modules/runtypes/lib/show.js:44:56
+```
+How can I describe the result of an async function?
+
+For example:
+
+```ts
+const fetchSignIn = t
+  .Contract(
+    Login,
+    Password,
+    // best place for type declaration
+    // here we need possibility to describe runtype `SignInResponse`
+    t.InstanceOf(Promise)
+  )
+  .enforce(async (login, password) => {
+    const response = await request('/sign-in', {login, password})
+    // inline `check` unreliably if we has a few result branches 
+    return SignInResponse.check(response)
+  });
+```
+The better way, then `Record({}).And(Partail({}))`
+I has an error, but don't know why:
+
+![error](https://user-images.githubusercontent.com/27290320/66707990-3d1e2e00-ed52-11e9-8309-2820902cf8a8.png)
+
+I wanted to get your thoughts on a potential feature, if its something that you are open to, I would be more than happy to work on it!
+
+## Overview
+Add `stringify`/`parse` methods to Runtype. These methods would work somewhat similar to `JSON.stringify` using the [`replacer` parameter](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON/stringify) and `JSON.parse` using the [`reviver` parameter](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON/parse) to whitelist. However, the runtypes version of `stringify`/`parse` would recurse through the given Runtype and use that to whitelist which properties get serialized/deserialized. 
+
+## Use Case
+
+Currently runtypes supports enforcing object structure aligns with type expectations. This is incredibly useful when sending/receiving data over the wire. It would make runtypes more powerful if it could also be used to enforce that serialization/deserialization works as expected. When using `JSON.stringify` its very easy to accidentally include fields that should not be returned or were not even defined on the runtype. 
+
+If implementing an endpoint that sends an `User` object:
+
+```typescript
+import { Record, String } from 'runtypes';
+
+const User = Record({
+  userName: String,
+  displayName: String,
+});
+
+async function getUser(req, res, next): Promise<void> {
+  ...
+  const rawUser:  = await getUserFromDataBase();
+  const typedUser = User.check(rawUser);
+
+  res.body(JSON.stringify(myUser)); // DANGER DANGER could include property 'socialSecurityNumber'
+}
+``` 
+
+This could be very dangerous if the object returned by `getUserFromDataBase` looked like this:
+
+```typescript
+{
+  userName: "maclockard",
+  displayName: "Mac",
+  socialSecurityNumber: 555555, // DANGER DANGER
+}
+```
+
+since `JSON.stringify` would include the entire object, and I would have thought I was safe given I checked it was a `User` using runtypes. There are multiple different ways to solve this, such as using the [`replacer` parameter](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON/stringify) or explicitly constructing a new object everytime, however, these become increasingly unwieldy and error prone for complex, large, or deeply nested objects. It also doesn't make sense to change `check` to throwing on unexpected fields since the object is still a valid `User`.
+
+So instead I propose adding a `stringify` method to the Runtype itself, that would handle this whitelisting automatically based on how it was defined.
+
+## Example
+
+```typescript
+import { Record, String } from 'runtypes';
+
+const User = Record({
+  userName: String,
+  displayName: String,
+});
+
+const rawUser = {
+  userName: "maclockard",
+  displayName: "Mac",
+  socialSecurityNumber: 555555, // DANGER DANGER
+}
+
+// still preserves extraneous properties check as `socialSecurityNumber`
+const typedUser = User.check(rawUser);
+
+// creates a json string payload
+const stringUser = User.stringify(typedUser); // {userName: "maclockard", displayName: "Mac"}
+```
+
+This allows one to confidently send the user over the wire without needing to worry about extraneous properties. An inverse `parse` method could also be made
+
+#### Comparison Cases 
+
+
+```typescript
+import { Record, String, Number } from 'runtypes';
+
+const User = Record({
+  userName: String,
+  displayName: String,
+  dog: Record({
+    name: String;
+    age: Number;
+  }),
+});
+
+const rawUser = {
+  userName: "maclockard",
+  displayName: "Mac",
+  socialSecurityNumber: 555555, // DANGER DANGER
+  age: 26 // DANGER might be sensitive
+  dog: {
+    name: "pluto",
+    age: 5,
+  },
+}
+
+// JSON.stringify
+
+const dangerUser1 = JSON.stringify(rawUser);
+/*
+{
+  userName: "maclockard",
+  displayName: "Mac",
+  socialSecurityNumber: 555555, // DANGER DANGER
+  age: 26 // DANGER might be sensitive
+  dog: {
+    name: "pluto",
+    age: 5,
+  },
+}
+*/
+
+const incorrectUser2 = JSON.stringify(rawUser, ["userName", "displayName"]);
+/*
+{
+  userName: "maclockard",
+  displayName: "Mac",
+  dog: {}, // missing everything :(
+}
+*/
+
+const dangerUser3 = JSON.stringify(rawUser, ["userName", "displayName", "name", "age"]);
+/*
+{
+  userName: "maclockard",
+  displayName: "Mac",
+  age: 26 // DANGER might be sensitive
+  dog: {
+    name: "pluto",
+    age: 5,
+  },
+}
+*/
+
+// runtypes stringify
+
+const safeUser4 = User.stringify(rawUser);
+/*
+{
+  userName: "maclockard",
+  displayName: "Mac",
+  dog: {
+    name: "pluto",
+    age: 5,
+  },
+}
+*/
+```
+
+
+
+Should Runtypes leverage TypeScript 3.7's new assertions feature ( https://github.com/microsoft/TypeScript/pull/32695)?  The TL;DR for this feature is that you can mark a function as an "assertion" meaning that it always throws unless a particular condition is true.  It's like an imperative type guard function.
+
+Should we add an `assert()` method to `Runtype` that's an alias for `check()` but with an assertion (`void` or `throw`) signature as opposed to the `check`'s "return the static type" signature?
+
+For example: 
+
+```ts
+// current
+check(x: any): A;
+
+// possible in TS 3.7
+check(x: any): A;
+assert(x: any): asserts x is A;
+
+// current usage
+function foo(x: unknown) {
+  const y = String.check(x);
+  return y.toUpperCase();
+}
+
+// possible in TS 3.7
+function foo(x: unknown) {
+  String.assert(x);
+  return x.toUpperCase();
+}
+```
+
+Looks like `Tuples` match for arrays with a length >= to the component length?  Shouldn't tuples need to match the length exactly?  See https://github.com/pelotom/runtypes/blob/master/src/types/tuple.ts#L235 .
+
+Also, any reason not to have a Tuples of length 0 and 1?  Since arrays don't have a constraint on length it seems like a Tuples is better for these cases.
+https://github.com/pelotom/runtypes/blob/18d8a1d7a0467d40fef98c727159ed997ace8ea1/src/types/constraint.ts#L10

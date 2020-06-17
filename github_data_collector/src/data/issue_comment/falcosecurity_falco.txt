@@ -1,0 +1,484 @@
+**Motivation**
+
+After #968 will be merged in we need to ensure that all the built packages list/require the dynamic deps they need.
+
+**Feature**
+
+A little followup to PR 968 in order to list the packages deps (CPack).
+
+
+
+**Motivation**
+
+PR #968 already introduced a CircleCI workflow for build and test purposes.
+It proved to be way faster and stable than Travis.
+Furthermore there is no need to have 2 CI systems.
+
+**Feature**
+
+Remove TravisCI configuration.
+
+**Alternatives**
+
+NONE
+
+**Additional context**
+
+CircleCI is a better option for integrating our CI with the CNCF CI system.
+
+**What to document**
+
+I am asking wheter we should remove (or not) the CONTRIBUTING and CODE_OF_CONDUCT from the repo in order to fallback to the organization ones ([here](https://github.com/falcosecurity/.github)).
+
+They are the same files and the .github repo works pretty well as a default mechanism.
+
+kube-apiserver configuration
+```
+  --audit-policy-file=/etc/kubernetes/audit-policy.yaml \
+  --audit-webhook-config-file=/etc/kubernetes/audit-webhook-kubeconfig \
+[root@kube-master01 k8s-using-daemonset]# cat /etc/kubernetes/audit-webhook-kubeconfig 
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: http://10.254.138.138:8765/k8s_audit
+  name: falco
+contexts:
+- context:
+    cluster: falco
+    user: ""
+  name: default-context
+current-context: default-context
+preferences: {}
+users: []
+[root@kube-master01 k8s-using-daemonset]# 
+
+```
+k8s_audit_rules.yaml 
+```
+- macro: create
+  condition: ka.verb=create
+
+- macro: contains_private_credentials
+  condition: >
+    (ka.req.configmap.obj contains "aws_access_key_id" or
+     ka.req.configmap.obj contains "aws-access-key-id" or
+     ka.req.configmap.obj contains "aws_s3_access_key_id" or
+     ka.req.configmap.obj contains "aws-s3-access-key-id" or
+     ka.req.configmap.obj contains "password" or
+     ka.req.configmap.obj contains "passphrase")
+
+- rule: Create/Modify Configmap With Private Credentials
+  desc: >
+     Detect creating/modifying a configmap containing a private credential (aws key, password, etc.)
+  condition: kevt and configmap and kmodify and contains_private_credentials
+  output: K8s configmap with private credential (user=%ka.user.name verb=%ka.verb configmap=%ka.req.configmap.name config=%ka.req.configmap.obj)
+  priority: WARNING
+  source: k8s_audit
+  tags: [k8s]
+
+```
+demo
+```
+apiVersion: v1
+data:
+  ui.properties: |
+    color.good=purple
+    color.bad=yellow
+    allow.textmode=true
+  access.properties: |
+    aws_access_key_id = MY-ID
+    aws_secret_access_key = MY-KEY
+kind: ConfigMap
+metadata:
+  creationTimestamp: 2016-02-18T18:52:05Z
+  name: my-config
+  namespace: default
+  resourceVersion: "516"
+  selfLink: /api/v1/namespaces/default/configmaps/my-config
+  uid: b4952dc3-d670-11e5-8cd0-68f728db1985
+```
+audit events
+```
+[root@kube-master01 k8s-using-daemonset]# grep aws_access_key_id /var/log/kubernetes/kube-apiserver-audit.log  | jq .
+{
+  "kind": "Event",
+  "apiVersion": "audit.k8s.io/v1",
+  "level": "Request",
+  "auditID": "ad2a436d-bcd3-4ec3-8645-24fbffc228a5",
+  "stage": "ResponseComplete",
+  "requestURI": "/api/v1/namespaces/default/configmaps",
+  "verb": "create",
+  "user": {
+    "username": "admin",
+    "groups": [
+      "system:masters",
+      "system:authenticated"
+    ]
+  },
+  "sourceIPs": [
+    "172.16.16.13"
+  ],
+  "userAgent": "kubectl/v1.17.0 (linux/amd64) kubernetes/70132b0",
+  "objectRef": {
+    "resource": "configmaps",
+    "namespace": "default",
+    "name": "my-config",
+    "uid": "b4952dc3-d670-11e5-8cd0-68f728db1985",
+    "apiVersion": "v1"
+  },
+  "responseStatus": {
+    "metadata": {},
+    "code": 201
+  },
+  "requestObject": {
+    "kind": "ConfigMap",
+    "apiVersion": "v1",
+    "metadata": {
+      "name": "my-config",
+      "namespace": "default",
+      "selfLink": "/api/v1/namespaces/default/configmaps/my-config",
+      "uid": "b4952dc3-d670-11e5-8cd0-68f728db1985",
+      "creationTimestamp": "2016-02-18T18:52:05Z"
+    },
+    "data": {
+      "access.properties": "aws_access_key_id = MY-ID\naws_secret_access_key = MY-KEY\n",
+      "ui.properties": "color.good=purple\ncolor.bad=yellow\nallow.textmode=true\n"
+    }
+  },
+  "requestReceivedTimestamp": "2020-01-16T08:02:23.097547Z",
+  "stageTimestamp": "2020-01-16T08:02:23.115769Z",
+  "annotations": {
+    "authorization.k8s.io/decision": "allow",
+    "authorization.k8s.io/reason": ""
+  }
+}
+```
+But, falco did not receive it!
+```
+[root@kube-master01 ~]# kubectl logs -f falco-daemonset-bzlds 
+* Setting up /usr/src links from host
+* Unloading falco-probe, if present
+* Running dkms install for falco
+
+Kernel preparation unnecessary for this kernel.  Skipping...
+
+Building module:
+cleaning build area...
+make -j1 KERNELRELEASE=4.19.88 -C /lib/modules/4.19.88/build M=/var/lib/dkms/falco/0.18.0/build.....
+cleaning build area...
+
+DKMS: build completed.
+
+falco-probe.ko:
+Running module version sanity check.
+ - Original module
+   - Found /lib/modules/4.19.88/kernel/extra/falco-probe.ko
+   - Storing in /var/lib/dkms/falco/original_module/4.19.88/x86_64/
+   - Archiving for uninstallation purposes
+ - Installation
+   - Installing to /lib/modules/4.19.88/kernel/extra/
+
+depmod.........................
+
+DKMS: install completed.
+* Trying to load a dkms falco-probe, if present
+falco-probe found and loaded in dkms
+Thu Jan 16 08:01:19 2020: Falco initialized with configuration file /etc/falco/falco.yaml
+Thu Jan 16 08:01:19 2020: Loading rules from file /etc/falco/falco_rules.yaml:
+Thu Jan 16 08:01:19 2020: Loading rules from file /etc/falco/falco_rules.local.yaml:
+Thu Jan 16 08:01:19 2020: Loading rules from file /etc/falco/k8s_audit_rules.yaml:
+Thu Jan 16 08:01:20 2020: Starting internal webserver, listening on port 8765
+08:02:35.711726499: Notice a tracked program opened a file (user=root command=mv -i auditlogging.yaml k8sauditlogging.yaml file=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:02:35.711734167: Notice a tracked program opened a file (user=root command=mv -i auditlogging.yaml k8sauditlogging.yaml file=/etc/ld.so.cache) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:02:35.711747808: Notice a tracked program opened a file (user=root command=mv -i auditlogging.yaml k8sauditlogging.yaml file=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:02:35.711751006: Notice a tracked program opened a file (user=root command=mv -i auditlogging.yaml k8sauditlogging.yaml file=/lib64/libselinux.so.1) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:02:35.711796531: Notice a tracked program opened a file (user=root command=mv -i auditlogging.yaml k8sauditlogging.yaml file=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:02:35.711799896: Notice a tracked program opened a file (user=root command=mv -i auditlogging.yaml k8sauditlogging.yaml file=/lib64/libacl.so.1) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:02:35.711842327: Notice a tracked program opened a file (user=root command=mv -i auditlogging.yaml k8sauditlogging.yaml file=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:02:35.711845883: Notice a tracked program opened a file (user=root command=mv -i auditlogging.yaml k8sauditlogging.yaml file=/lib64/libattr.so.1) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:02:35.711879590: Notice a tracked program opened a file (user=root command=mv -i auditlogging.yaml k8sauditlogging.yaml file=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:02:35.711882655: Notice a tracked program opened a file (user=root command=mv -i auditlogging.yaml k8sauditlogging.yaml file=/lib64/libc.so.6) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:02:35.711926600: Notice a tracked program opened a file (user=root command=mv -i auditlogging.yaml k8sauditlogging.yaml file=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:02:35.711930977: Notice a tracked program opened a file (user=root command=mv -i auditlogging.yaml k8sauditlogging.yaml file=/lib64/libpcre.so.1) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:02:35.711971415: Notice a tracked program opened a file (user=root command=mv -i auditlogging.yaml k8sauditlogging.yaml file=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:02:35.711975044: Notice a tracked program opened a file (user=root command=mv -i auditlogging.yaml k8sauditlogging.yaml file=/lib64/libdl.so.2) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:02:35.712018604: Notice a tracked program opened a file (user=root command=mv -i auditlogging.yaml k8sauditlogging.yaml file=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:02:35.712023135: Notice a tracked program opened a file (user=root command=mv -i auditlogging.yaml k8sauditlogging.yaml file=/lib64/libpthread.so.0) k8s.ns=<NA> k8s.pod=<NA> container=Thu Jan 16 08:11:05 2020: Falco internal: syscall event drop. 1 system calls dropped in last second.host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:02:35.712376540: Notice a tracked program opened a file (user=root command=mv -i auditlogging.yaml k8sauditlogging.yaml file=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:02:35.712384066: Notice a tracked program opened a file (user=root command=mv -i auditlogging.yaml k8sauditlogging.yaml file=/proc/filesystems) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:02:35.712453401: Notice a tracked program opened a file (user=root command=mv -i auditlogging.yaml k8sauditlogging.yaml file=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:02:35.712457383: Notice a tracked program opened a file (user=root command=mv -i auditlogging.yaml k8sauditlogging.yaml file=/usr/lib/locale/locale-archive) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:09:01.384251337: Error File below / or /root opened for writing (user=root command=vi ../../rules/k8s_audit_rules.yaml parent=bash file=/root/falco/rules/.k8s_audit_rules.yaml.swp program=vi container_id=host image=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:09:01.384306248: Error File below / or /root opened for writing (user=root command=vi ../../rules/k8s_audit_rules.yaml parent=bash file=/root/falco/rules/.k8s_audit_rules.yaml.swx program=vi container_id=host image=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:09:01.384403273: Error File below / or /root opened for writing (user=root command=vi ../../rules/k8s_audit_rules.yaml parent=bash file=/root/falco/rules/.k8s_audit_rules.yaml.swp program=vi container_id=host image=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:11:05.021528207: Critical Falco internal: syscall event drop. 1 system calls dropped in last second. (ebpf_enabled=0 n_drops=1 n_drops_buffer=1 n_drops_bug=0 n_drops_pf=0 n_evts=15534)
+08:11:15.393771000: Error File below / or /root opened for writing (user=root command=vi ../../rules/k8s_audit_rules.yaml parent=bash file=/root/falco/rules/.k8s_audit_rules.yaml.swp program=vi container_id=host image=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:11:15.393806782: Error File below / or /root opened for writing (user=root command=vi ../../rules/k8s_audit_rules.yaml parent=bash file=/root/falco/rules/.k8s_audit_rules.yaml.swx program=vi container_id=host image=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:11:15.393899488: Error File below / or /root opened for writing (user=root command=vi ../../rules/k8s_audit_rules.yaml parent=bash file=/root/falco/rules/.k8s_audit_rules.yaml.swp program=vi container_id=host image=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:20:51.514697217: Notice a tracked program opened a file (user=root command=cat /usr/lib/systemd/system/kube-apiserver.service file=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:20:51.514701439: Notice a tracked program opened a file (user=root command=cat /usr/lib/systemd/system/kube-apiserver.service file=/etc/ld.so.cache) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:20:51.514713347: Notice a tracked program opened a file (user=root command=cat /usr/lib/systemd/system/kube-apiserver.service file=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:20:51.514715938: Notice a tracked program opened a file (user=root command=cat /usr/lib/systemd/system/kube-apiserver.service file=/lib64/libc.so.6) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:20:51.514958368: Notice a tracked program opened a file (user=root command=cat /usr/lib/systemd/system/kube-apiserver.service file=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:20:51.514962169: Notice a tracked program opened a file (user=root command=cat /usr/lib/systemd/system/kube-apiserver.service file=/usr/lib/locale/locale-archive) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:20:51.515008539: Notice a tracked program opened a file (user=root command=cat /usr/lib/systemd/system/kube-apiserver.service file=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:20:51.515011421: Notice a tracked program opened a file (user=root command=cat /usr/lib/systemd/system/kube-apiserver.service file=/usr/lib/systemd/system/kube-apiserver.service) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:21:53.230534097: Notice a tracked program opened a file (user=root command=cat /etc/kubernetes/audit-webhook-kubeconfig file=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:21:53.230538044: Notice a tracked program opened a file (user=root command=cat /etc/kubernetes/audit-webhook-kubeconfig file=/etc/ld.so.cache) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:21:53.230550771: Notice a tracked program opened a file (user=root command=cat /etc/kubernetes/audit-webhook-kubeconfig file=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:21:53.230553608: Notice a tracked program opened a file (user=root command=cat /etc/kubernetes/audit-webhook-kubeconfig file=/lib64/libc.so.6) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:21:53.230774318: Notice a tracked program opened a file (user=root command=cat /etc/kubernetes/audit-webhook-kubeconfig file=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:21:53.230778652: Notice a tracked program opened a file (user=root command=cat /etc/kubernetes/audit-webhook-kubeconfig file=/usr/lib/locale/locale-archive) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:21:53.230820097: Notice a tracked program opened a file (user=root command=cat /etc/kubernetes/audit-webhook-kubeconfig file=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:21:53.230822427: Notice a tracked program opened a file (user=root command=cat /etc/kubernetes/audit-webhook-kubeconfig file=/etc/kubernetes/audit-webhook-kubeconfig) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:22:50.186569075: Error File below / or /root opened for writing (user=root command=vi ../../rules/k8s_audit_rules.yaml parent=bash file=/root/falco/rules/.k8s_audit_rules.yaml.swp program=vi container_id=host image=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:22:50.186586054: Error File below / or /root opened for writing (user=root command=vi ../../rules/k8s_audit_rules.yaml parent=bash file=/root/falco/rules/.k8s_audit_rules.yaml.swx program=vi container_id=host image=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:22:50.186659868: Error File below / or /root opened for writing (user=root command=vi ../../rules/k8s_audit_rules.yaml parent=bash file=/root/falco/rules/.k8s_audit_rules.yaml.swp program=vi container_id=host image=<NA>) k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host k8s.ns=<NA> k8s.pod=<NA> container=host
+08:24:07.680958057: Critical Falco internal: syscall event drop. 1 system calls dropped in last second. (ebpf_enabled=0 n_drops=1 n_drops_buffer=1 n_drops_bug=0 n_drops_pf=0 n_evts=13165)
+Thu Jan 16 08:24:07 2020: Falco internal: syscall event drop. 1 system calls dropped in last second.08:26:38.656632960: Critical Falco internal: syscall event drop. 1 system calls dropped in last second. (ebpf_enabled=0 n_drops=1 n_drops_buffer=1 n_drops_bug=0 n_drops_pf=0 n_evts=6263)
+Thu Jan 16 08:26:38 2020: Falco internal: syscall event drop. 1 system calls dropped in last second.08:29:08.919139460: Critical Falco internal: syscall event drop. 1 system calls dropped in last second. (ebpf_enabled=0 n_drops=1 n_drops_buffer=1 n_drops_bug=0 n_drops_pf=0 n_evts=14143)
+```
+
+**Describe the bug**
+
+All builds started failing after https://github.com/draios/sysdig/pull/1568 introduced an `ASSERT` macrot hat was already defined in [`sysdig.h`](https://github.com/draios/sysdig/blob/dev/userspace/sysdig/sysdig.h#L31).
+
+**How to reproduce it**
+
+Open any PR and it will fail.
+
+**Expected behavior**
+PRs go green unless they introduce something broken
+
+
+**Environment**
+
+NO need
+
+**Additional context**
+
+
+
+<!-- Please use this template while reporting a bug and provide as much info as possible. Not doing so may result in your bug not being addressed in a timely manner. Thanks! -->
+
+**Describe the bug**
+https://github.com/kubernetes/kubernetes/blob/master/CHANGELOG-1.16.md#deprecations-and-removals
+we have to use apps/v1 places like here 
+https://github.com/falcosecurity/falco/blob/dev/integrations/k8s-using-daemonset/k8s-with-rbac/falco-daemonset-configmap.yaml#L1
+
+<!-- A clear and concise description of what the bug is. -->
+
+**How to reproduce it**
+1. use latest k8s 
+2. apply the yaml files 
+
+You will get below error 
+ kubectl apply -f k8s-with-rbac/falco-daemonset-configmap.yaml
+error: unable to recognize "k8s-with-rbac/falco-daemonset-configmap.yaml": no matches for kind "DaemonSet" in version "extensions/v1beta1"
+
+<!-- Minimal and precise steps to reproduce the bug. -->
+
+**Expected behaviour**
+
+<!-- A clear and concise description of what you expected to happen. -->
+
+**Screenshots**
+
+
+<!-- If applicable, add screenshots to help explain your problem. -->
+
+**Environment**
+
+<!-- Please complete the following info. -->
+
+- Falco version:
+<!-- Use "falco --version". -->
+- System info:
+<!-- Falco has a built-in support command you can use  "falco --support | jq .system_info" -->
+- Cloud provider or hardware configuration:
+- OS:
+<!-- Eg., output of "cat /etc/os-release". -->
+- Kernel:
+<!-- Eg., output of "uname -a". -->
+- Installation method:
+<!-- Eg., Kubernetes, RPM, DEB, from source? -->
+
+**Additional context**
+
+<!-- Add any other context about the problem here. -->
+
+Signed-off-by: Rajib Mitra <rajib.jolite@gmail.com>
+<!--  Thanks for sending a pull request!  Here are some tips for you:
+
+1. If this is your first time, please read our contributor guidelines in the [CONTRIBUTING.md](CONTRIBUTING.md) file and learn how to compile Falco from source [here](https://falco.org/docs/source).
+2. Please label this pull request according to what type of issue you are addressing.
+3. . Please add a release note!
+4. If the PR is unfinished while opening it specify a wip in the title before the actual title, for example, "wip: my awesome feature"
+-->
+
+**What type of PR is this?**
+
+> Uncomment one (or more) `/kind <>` lines:
+
+> /kind bug
+
+> /kind cleanup
+
+> /kind design
+
+> /kind documentation
+
+> /kind failing-test
+
+ /kind feature
+
+> If contributing rules or changes to rules, please make sure to also uncomment one of the following line:
+
+> /kind rule-update
+
+> /kind rule-create
+
+<!--
+Please remove the leading whitespace before the `/kind <>` you uncommented.
+-->
+
+**Any specific area of the project related to this PR?**
+
+> Uncomment one (or more) `/area <>` lines:
+
+> /area build
+
+> /area engine
+
+> /area examples
+
+> /area rules
+
+> /area integrations
+
+> /area tests
+
+> /area proposals
+
+<!--
+Please remove the leading whitespace before the `/area <>` you uncommented.
+-->
+
+**What this PR does / why we need it**:
+
+**Which issue(s) this PR fixes**:
+
+<!--
+Automatically closes linked issue when PR is merged.
+Usage: `Fixes #<issue number>`, or `Fixes (paste link of issue)`.
+If PR is `kind/failing-tests` or `kind/flaky-test`, please post the related issues/tests in a comment and do not use `Fixes`.
+-->
+
+Fixes #
+
+**Special notes for your reviewer**:
+
+**Does this PR introduce a user-facing change?**:
+
+<!--
+If no, just write "NONE" in the release-note block below.
+If yes, a release note is required:
+Enter your extended release note in the block below.
+If the PR requires additional action from users switching to the new release, prepend the string "action required:".
+For example, `action required: change the API interface of the rule engine`.
+-->
+
+```release-note
+
+```
+
+**Motivation**
+Long back in the community call we discussed to standerize python code, so that it remains or follows same pattern of code. In python this can be done by checking flake and pep8 rules in ci pipeline. 
+<!--
+Is your feature request related to a problem?
+Please describe what the problem is clearly and concisely.
+Eg., I'm always frustrated when ...
+-->
+
+**Feature**
+1. Flake8 
+2. pylint
+<!--
+Describe the solution you would like.
+A clear and concise description of what you want to happen.
+-->
+
+**Alternatives**
+
+<!--
+Describe alternatives you have considered, if any.
+A clear and concise description of any alternative solutions or features you have considered.
+-->
+
+**Additional context**
+
+<!-- Add any other context or screenshots about the feature request here. -->
+
+**Describe the bug**
+
+We have the Kubernetes audit endpoint enabled, which is receiving all the JSON audit events. When Falco receives a Pod created event with the following piece of JSON Pod spec:
+
+```JSON
+"spec": {
+  "volumes": [ {
+    "name": "etc",
+    "hostPath": {
+      "path": "/etc",
+      "type": ""
+    }
+  }],
+```
+
+It crashes with this error:
+
+```
+terminate called after throwing an instance of 'nlohmann::detail::type_error'
+what():  [json.exception.type_error.302] type must be string, but is object
+```
+
+It seems that Falco is not expecting an object for the hostPath field?
+
+**How to reproduce it**
+
+Create a pod with a hostpath volume.
+
+**Expected behaviour**
+
+The event should be scanned and processed successfully.
+
+**Environment**
+
+- Falco version: 0.18.0 (Docker image built from minimal Dockerfile)
+- System info:
+"system_info": {
+        "machine": "x86_64",
+        "nodename": "",
+        "release": "4.14.152-127.182.amzn2.x86_64",
+        "sysname": "Linux",
+        "version": "#1 SMP Thu Nov 14 17:32:43 UTC 2019"
+    },
+- Cloud provider or hardware configuration: AWS
+- OS: Amazon Linux 2
+- Installation method: Kubernetes / Docker
+**What type of PR is this?**
+
+/kind feature
+
+**Any specific area of the project related to this PR?**
+
+NONE
+
+**What this PR does / why we need it**:
+
+#484
+
+```release-note
+* switch to systemd if available in debian package
+* hardened systemd settings
+```

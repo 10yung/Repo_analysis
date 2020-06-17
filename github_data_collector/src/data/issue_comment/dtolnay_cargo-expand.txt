@@ -1,0 +1,117 @@
+Original idea: https://github.com/dtolnay/trybuild/issues/35
+Suggested approach: https://github.com/dtolnay/trybuild/issues/35#issuecomment-539253118
+
+## Solution Summary
+
+`cargo expand` should be able to expand the code of a test file `somename.rs` in the `tests` directory of a given crate via `--test somename` even though `somename.rs` exists but `"somename"` is not part of the test targets listed for the given crate by `cargo-metadata`.
+
+## Technical Details
+
+The expansion should be done in a similar way as the `trybuild` crate handles building and testing of its tests:
+
+- pull out the code under test (e.g. our `somename.rs`) into a temp. directory
+- run `rustc` against that
+   - just like `trybuild` would
+   - using `--pretty=expanded` instead of building or testing anything
+
+Would be good to be able to only expand specific macros and leave other source as is. 
+
+i.e.: `cargo expand --crate="my-crate-derive"`
+
+or `cargo expand --derive=MyTraitA,MyTraitB`
+
+at the very least would be good to not expand macros that come from std.
+Would it be possible to present a better error message to user when trying to export wasm-bindgen project?
+
+```bash
+cargo expand --target wasm32-unknown-unknown
+   Compiling proc-macro2 v0.4.30
+   Compiling unicode-xid v0.1.0
+   Compiling syn v0.15.39
+   Compiling wasm-bindgen-shared v0.2.47
+   Compiling cfg-if v0.1.9
+   Compiling lazy_static v1.3.0
+   Compiling bumpalo v2.4.3
+   Compiling wasm-bindgen v0.2.47
+   Compiling log v0.4.6
+   Compiling quote v0.6.12
+   Compiling wasm-bindgen-backend v0.2.47
+   Compiling wasm-bindgen-macro-support v0.2.47
+   Compiling wasm-bindgen-macro v0.2.47
+error[E0463]: can’t find crate for `core`
+error: aborting due to previous error
+For more information about this error, try `rustc --explain E0463`.
+error: Could not compile `wasm-bindgen`.
+To learn more, run the command again with --verbose.
+```
+This was solved by installing the Nightly toolchain:
+```bash
+rustup target add wasm32-unknown-unknown --toolchain nightly
+```
+
+Would it be possible to give a warning, or better error message in this case?
+Currently the Cargo subprocess spawned by cargo-expand does not display Cargo's usual progress bar. I believe this is because we pipe the child's stderr to perform filtering here:
+
+https://github.com/dtolnay/cargo-expand/blob/3ae4ca126a4bd557ef7f7954911d65db56525b37/src/main.rs#L358
+
+and that means Cargo does not get a winsize from this ioctl:
+
+https://github.com/rust-lang/cargo/blob/6be12653dcefb46ee7b605f063ee75b5e6cba513/src/cargo/core/shell.rs#L377
+
+I tried a naive fix in #61 but it didn't work, the second ioctl fails with:
+
+```console
+Inappropriate ioctl for device (os error 25)
+```
+
+Will need to figure out what's the correct way to provide a winsize to the child process.
+Currently macro_rules definitions are not visible in the expanded code. Sometimes it can be useful to see them, such as when you have a procedural macro whose job is to emit a macro_rules macro.
+Rustfmt can hit cases where code takes exponentially long to format, particularly in macro-generated code. https://github.com/rust-lang/rustfmt/issues/3465
+
+We may want to consider limiting rustfmt execution time to some small number of seconds, after which we kill the rustfmt process and fall back to unformatted code.
+I know this is probably very impossible unless rustc adds support for it, but:
+
+I think it would be useful to be able to expand code even when it doesn't compile, especially when debugging procedural macros.
+
+(For now, the easiest way I've found is just to wrap your entire output into `compile_error` to see it.)
+When expanding a crate with hundreds of thousands of lines post expansion, the progress can seem to pause for many seconds after printing:
+
+```console
+Finished dev [unoptimized + debuginfo] target(s) in 10.64s
+```
+
+and before the expanded output appears. It is reasonable for users to expect that no further work needs to take place after something is "Finished". Let's print messages in the same style as Cargo to show that formatting and colorizing are taking place.
+If the user has a crate like:
+
+```rust
+fn main() {
+    println!("{:?}", S);
+}
+```
+
+We can inject the following code before compiling, I guess similarly to how `cargo clippy` works (but I haven't looked at how that is).
+
+```rust
+#![feature(trace_macros)]
+trace_macros!(true);
+```
+
+The output looks like:
+
+```
+note: trace_macro
+ --> src/main.rs:8:5
+  |
+8 |     println!("{:?}", S);
+  |     ^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: expanding `println! { "{:?}" , S }`
+  = note: to `print ! ( concat ! ( "{:?}" , "\n" ) , S )`
+  = note: expanding `print! { concat ! ( "{:?}" , "\n" ) , S }`
+  = note: to `$crate :: io :: _print ( format_args ! ( concat ! ( "{:?}" , "\n" ) , S ) )`
+```
+
+It shows the intermediate expansion steps, not just the final expanded result.
+For example, avoid expanding `try!` and other macros inside the output of proc macros.
+
+cc @djc

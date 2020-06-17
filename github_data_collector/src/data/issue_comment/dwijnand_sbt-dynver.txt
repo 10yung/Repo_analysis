@@ -1,0 +1,179 @@
+Which of the ways would you recommend to write the version string to a resource such as `conf/dynver.txt` or some such?
+Sometimes when you're developing a library or sbt plugin, the most convenient way to test it is in another project, and so you have a dev cycle like this:
+
+1. Run `sbt publishLocal`
+2. Rerun command in the dependent project to test the changes
+
+When using sbt-dynvar, this dev cycle becomes far more tedious:
+
+1. Run `sbt publishLocal`
+2. Copy the timestamp that was built
+3. Open `plugins.sbt`/`build.sbt` in dependent project
+4. Update dependency to have the new timestamp
+5. Rerun command in other project to test the changes
+
+It'd be nice if out of the box, sbt dynver had a system property that could be set to turn off outputting the timestamp, perhaps replacing it with `dev`. Of course, I can do this in my own project, but often the project is not my own project, and I don't want to go updating the `build.sbt` of that project to override the sbt config, and then need to back it out each time I commit, etc.
+A long-standing issue with sbt-dynver and publishing on Travis CI is that when you create a commit (e.g. bump the version number in the README) and a tag, and push _both_, then Travis CI will kick-off two builds and one will fail (race condition to Bintray, for example).
+
+Found this code to avoid it:
+
+```bash
+	if [ -z "$TRAVIS_TAG" ]; then
+		TRAVIS_TAG=$( git -C "$TRAVIS_BUILD_DIR" tag --points-at )
+		if [ -n "$TRAVIS_TAG" ]; then
+			echo "Found future tag \"${TRAVIS_TAG}\", skipping."
+			exit 0
+		fi
+	fi
+```
+`sbt-dynver` [uses `git describe --abbrev=8`](https://github.com/dwijnand/sbt-dynver/blob/master/src/main/scala/sbtdynver/DynVerPlugin.scala#L207) and the pattern matches on [_exactly_  `8` characters](https://github.com/dwijnand/sbt-dynver/blob/master/src/main/scala/sbtdynver/DynVerPlugin.scala#L133) for the abbreviated SHA-1. 
+
+`git describe --abbrev=<n>` produces a shortened representation of the SHA-1 of [_at least_ `n`](https://git-scm.com/docs/git-describe?origin_team=T02A7C6DG#Documentation/git-describe.txt---abbrevltngt).
+
+`sbt-dynver` causes a `MatchError` whenever the abbreviated SHA-1 is longer than `8`:
+
+```
+[info] Loading settings for project root from build.sbt ...
+[info] Resolving key references (69692 settings) ...
+[error] scala.MatchError: 1.6.0-M4+51-8dc64459f+20190718-1826
+[error]  (of class java.lang.String)
+[error]         at scala.PartialFunction$$anon$1.apply(PartialFunction.scala:255)
+[error]         at scala.PartialFunction$$anon$1.apply(PartialFunction.scala:253)
+[error]         at sbtdynver.GitDescribeOutput$Parser$$anonfun$parse$1.applyOrElse(DynVerPlugin.scala:145)
+[error]         at sbtdynver.GitDescribeOutput$Parser$$anonfun$parse$1.applyOrElse(DynVerPlugin.scala:145)
+[error]         at scala.runtime.AbstractPartialFunction.apply(AbstractPartialFunction.scala:34)
+[error]         at scala.Option.map(Option.scala:146)
+[error]         at sbtdynver.DynVer.getGitDescribeOutput(DynVerPlugin.scala:210)
+[error]         at sbtdynver.DynVerPlugin$.$anonfun$buildSettings$7(DynVerPlugin.scala:50)
+[error]         at scala.Function1.$anonfun$compose$1(Function1.scala:44)
+[error]         at sbt.internal.util.EvaluateSettings$MixedNode.evaluate0(INode.scala:221)
+[error]         at sbt.internal.util.EvaluateSettings$INode.evaluate(INode.scala:164)
+[error]         at sbt.internal.util.EvaluateSettings.$anonfun$submitEvaluate$1(INode.scala:87)
+[error]         at sbt.internal.util.EvaluateSettings.sbt$internal$util$EvaluateSettings$$run0(INode.scala:98)
+[error]         at sbt.internal.util.EvaluateSettings$$anon$3.run(INode.scala:94)
+[error]         at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+[error]         at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+[error]         at java.lang.Thread.run(Thread.java:748)
+[error] scala.MatchError: 1.6.0-M4+51-8dc64459f+20190718-1826
+[error]  (of class java.lang.String)
+[error] Use 'last' for the full log.
+Project loading failed: (r)etry, (q)uit, (l)ast, or (i)gnore? 
+```
+
+which can be reproduced using [this commit](https://github.com/lagom/lagom/pull/2055/commits/8dc64459fb9db91f7c80f7735d00562c18515614) (NOTE: the link is now broken because I rebased but I kept the commit reproducing the error [here](https://github.com/ignasi35/lagom/commit/8dc64459fb9db91f7c80f7735d00562c18515614)).
+
+
+The workaround is to amend the commit to get a different SHA-1 so the hash collision resolves.
+DynVer doesn't respect tags with build metadata in them. SemVer tags with a `+` in them completely break DynVer.
+
+**Metadata SemVer tags**
+
+**Input:**
+v1.2.3+foo
+**Expected Result:**
+Ignore tag or Valid SemVer version (maybe use `v1.2.3-13dcda87+foo.0` instead?)
+**Actual Result:**
+Invalid SemVer version `v1.2.3+foo+0-13dcda87` 
+sbt crash/stacktrace
+
+```
+[error] scala.MatchError: v1.2.3+foo+0-13dcda87 (of class java.lang.String)
+[error]         at sbtdynver.GitDescribeOutput$.parse(DynVerPlugin.scala:116)
+[error]         at sbtdynver.DynVer.$anonfun$getGitDescribeOutput$3(DynVerPlugin.scala:167)
+[error]         at scala.Option.map(Option.scala:146)
+[error]         at sbtdynver.DynVer.getGitDescribeOutput(DynVerPlugin.scala:167)
+[error]         at sbtdynver.DynVerPlugin$.$anonfun$buildSettings$7(DynVerPlugin.scala:44)
+[error]         at scala.Function1.$anonfun$compose$1(Function1.scala:44)
+[error]         at sbt.internal.util.EvaluateSettings$MixedNode.evaluate0(INode.scala:221)
+[error]         at sbt.internal.util.EvaluateSettings$INode.evaluate(INode.scala:164)
+[error]         at sbt.internal.util.EvaluateSettings.$anonfun$submitEvaluate$1(INode.scala:87)
+[error]         at sbt.internal.util.EvaluateSettings.sbt$internal$util$EvaluateSettings$$run0(INode.scala:98)
+[error]         at sbt.internal.util.EvaluateSettings$$anon$3.run(INode.scala:94)
+[error]         at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1135)
+[error]         at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:635)
+[error]         at java.base/java.lang.Thread.run(Thread.java:844)
+[error] scala.MatchError: v1.2.3+foo+0-13dcda87 (of class java.lang.String)
+[error] Use 'last' for the full log.
+```
+It seems like dynver is trying to produce a valid SemVer version as its version, but at the moment, the tag parser is a bit too flexible in what it allows:
+
+**Non SemVer tags**
+
+**Input:**
+v123456
+**Expected Result:**
+Error or ignore tag
+**Actual Result:**
+version = 123456
+
+**Input:**
+v1.2.3.4
+**Expected Result:**
+Error or ignore tag
+**Actual Result:**
+version = 1.2.3.4
+
+**Input:**
+v1_this_really_shouldn't_be_a_valid_dynver_tag_@&%
+**Expected Result:**
+Error or ignore tag
+**Actual Result:**
+version = 1_this_really_shouldn't_be_a_valid_dynver_tag_@&%
+
+
+
+Hi,
+I like your plug in very much.
+My normal workflow is to open sbt and leave it open even for days (unless changing something related to the build, there is no need to reload the project)
+The version setting isn't changed unless I reload the project.
+It is technically understood (version is a setting not a task) but in case of a dirty files I will have to reload the project each minute and it takes more than 30 seconds (or use an outdated version).
+
+I ended up doing:
+```sbt
+def refreshVersion = Command.command("refreshVersion") { state =>
+  val extracted = Project extract state
+  import extracted._
+  /* - At first I thought to manually set the version. It seems unimportant - just refresh the session
+    val result: Option[(State, Result[String])] = Project.runTask(dynver, state)
+    result match {
+      case None => state.fail // Key wasn't defined.
+      case Some((newState, Inc(inc))) => state.fail // error detail, inc is of type Incomplete, use Incomplete.show(inc.tpe) to get an error message
+      case Some((newState, Value(v))) =>
+        println(s"Setting the version to $v")
+        appendWithoutSession(Seq(version := v), state) // do something with v: inc.Analysis
+    }
+  */
+  state.log.info("refreshing version")
+  appendWithoutSession(Seq(), state) // do something with v: inc.Analysis
+}
+
+ThisBuild / commands += refreshVersion
+
+val dirtyEnd = """.*(-\d\d\d\d)$""".r
+def stripTime(version: String) = version match {
+  case dirtyEnd(time) => version.stripSuffix(time)
+  case _ => version
+}
+ThisBuild / version ~= stripTime
+ThisBuild / dynver ~= stripTime
+```
+
+and make compile depend on:
+```
+versionCheck := {
+  val dynamicVersion = dynver.value
+  val staticVersion = version.value
+  if (dynamicVersion != staticVersion)
+    sys.error(s"The version setting ($staticVersion) is different from the dynamic (dynver) one ($dynamicVersion). Please use the refreshVersion command to refresh the setting.")
+}
+```
+
+This way the dynamic version only contains the day - refresh is needed only once a day.
+Also, reload in our project takes more than 30 seconds. The refresh command works 2 in seconds.
+But, still, the refresh should be done manually.
+
+Do you have a better idea?
+
+Thanks!
+Would require per sub-project configuration and being able to match the different version tags for each subproject (e.g. `foo-v1.0.0`, `bar-0.5.0`) and pass the right glob to `git describe --match`.
+Any chance of a simple option to enable including branch names other than master in the version string?

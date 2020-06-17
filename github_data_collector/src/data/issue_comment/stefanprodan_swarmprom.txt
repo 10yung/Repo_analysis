@@ -1,0 +1,307 @@
+I want to be able to use swarmprom behind reverse proxy.
+First problem is grafana, when i query https://supervision.infra.domain.fr/grafana
+I get 
+```
+If you're seeing this Grafana has failed to load its application files
+1. This could be caused by your reverse proxy settings.
+2. If you host grafana under subpath make sure your grafana.ini root_path setting includes subpath
+3. If you have a local dev build make sure you build frontend using: npm run dev, npm run watch, or npm run build
+4. Sometimes restarting grafana-server can help
+```
+I found solution here https://grafana.com/docs/grafana/latest/installation/behind_proxy/
+I need to be able to change ``root_url`` var
+
+```
+docker exec -it d13a4a534e36 /bin/cat conf/defaults.ini | grep root_url
+root_url = %(protocol)s://%(domain)s:%(http_port)s/
+```
+Is there a way to do this ?
+I created a config file ``defaults.ini`` bind on ``/usr/share/grafana/conf/defaults.ini``
+And changed value as 
+```
+root_url = %(protocol)s://%(domain)s:%(http_port)s/grafana/
+```
+But i still get the same msg
+
+Here my complete docker-stack file
+```
+version: "3.3"
+
+networks:
+  net:
+    driver: overlay
+    attachable: true
+  traefik-public:
+    external: true
+
+volumes:
+    prometheus: {}
+    grafana: {}
+    alertmanager: {}
+
+configs:
+  dockerd_config:
+    file: ./dockerd-exporter/Caddyfile
+  node_rules:
+    file: ./prometheus/rules/swarm_node.rules.yml
+  task_rules:
+    file: ./prometheus/rules/swarm_task.rules.yml
+  grafana_config:
+    file: ./grafana/defaults.ini
+
+services:
+  dockerd-exporter:
+    image: stefanprodan/caddy
+    networks:
+      - net
+    environment:
+      - DOCKER_GWBRIDGE_IP=172.18.0.1
+    configs:
+      - source: dockerd_config
+        target: /etc/caddy/Caddyfile
+    deploy:
+      mode: global
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 64M
+
+  cadvisor:
+    image: google/cadvisor
+    networks:
+      - net
+    command: -logtostderr -docker_only
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /:/rootfs:ro
+      - /var/run:/var/run
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    deploy:
+      mode: global
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 64M
+
+  grafana:
+    image: stefanprodan/swarmprom-grafana:5.3.4
+    networks:
+      - default
+      - net
+      - traefik-public
+    environment:
+      - GF_SECURITY_ADMIN_USER=${ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${ADMIN_PASSWORD:-password}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      #- GF_SERVER_ROOT_URL=${GF_SERVER_ROOT_URL:-localhost}
+      #- GF_SMTP_ENABLED=${GF_SMTP_ENABLED:-false}
+      #- GF_SMTP_FROM_ADDRESS=${GF_SMTP_FROM_ADDRESS:-grafana@test.com}
+      #- GF_SMTP_FROM_NAME=${GF_SMTP_FROM_NAME:-Grafana}
+      #- GF_SMTP_HOST=${GF_SMTP_HOST:-smtp:25}
+      #- GF_SMTP_USER=${GF_SMTP_USER}
+      #- GF_SMTP_PASSWORD=${GF_SMTP_PASSWORD}
+    configs:
+      - source: grafana_config
+        target: /usr/share/grafana/conf/defaults.ini
+    volumes:
+      - grafana:/var/lib/grafana
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 64M
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.grafana.entrypoints=https"
+        - "traefik.http.routers.grafana.tls=true"
+        - "traefik.http.routers.grafana.rule=Host(`tspeda-swarm-supervision.infra.domain.fr`) && PathPrefix(`/grafana`)"
+        - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+
+  alertmanager:
+    image: stefanprodan/swarmprom-alertmanager:v0.14.0
+    networks:
+      - default
+      - net
+      - traefik-public
+    environment:
+      - SLACK_URL=${SLACK_URL:-https://hooks.slack.com/services/TOKEN}
+      - SLACK_CHANNEL=${SLACK_CHANNEL:-general}
+      - SLACK_USER=${SLACK_USER:-alertmanager}
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+    volumes:
+      - alertmanager:/alertmanager
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 64M
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.alertmanager.entrypoints=https"
+        - "traefik.http.routers.alertmanager.tls=true"
+        - "traefik.http.routers.alertmanager.rule=Host(`tspeda-swarm-supervision.infra.domain.fr`) && PathPrefix(`/alertmanager`)"
+        - "traefik.http.services.alertmanager.loadbalancer.server.port=9093"
+
+  unsee:
+    image: cloudflare/unsee:v0.8.0
+    networks:
+      - default
+      - net
+      - traefik-public
+    environment:
+      - "ALERTMANAGER_URIS=default:http://alertmanager:9093"
+    deploy:
+      mode: replicated
+      replicas: 1
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.unsee.entrypoints=https"
+        - "traefik.http.routers.unsee.tls=true"
+        - "traefik.http.routers.unsee.rule=Host(`tspeda-swarm-supervision.infra.domain.fr`) && PathPrefix(`/unsee`)"
+        - "traefik.http.services.unsee.loadbalancer.server.port=8080"
+
+  node-exporter:
+    image: stefanprodan/swarmprom-node-exporter:v0.16.0
+    networks:
+      - net
+    environment:
+      - NODE_ID={{.Node.ID}}
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+      - /etc/hostname:/etc/nodename
+    command:
+      - '--path.sysfs=/host/sys'
+      - '--path.procfs=/host/proc'
+      - '--collector.textfile.directory=/etc/node-exporter/'
+      - '--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc)($$|/)'
+      - '--no-collector.ipvs'
+    deploy:
+      mode: global
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 64M
+
+  prometheus:
+    image: stefanprodan/swarmprom-prometheus:v2.5.0
+    networks:
+      - default
+      - net
+      - traefik-public
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention=${PROMETHEUS_RETENTION:-24h}'
+    volumes:
+      - prometheus:/prometheus
+    configs:
+      - source: node_rules
+        target: /etc/prometheus/swarm_node.rules.yml
+      - source: task_rules
+        target: /etc/prometheus/swarm_task.rules.yml
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          memory: 2048M
+        reservations:
+          memory: 128M
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.prometheus.entrypoints=https"
+        - "traefik.http.routers.prometheus.tls=true"
+        - "traefik.http.routers.prometheus.rule=Host(`tspeda-swarm-supervision.infra.domain.fr`) && PathPrefix(`/prometheus`)"
+        - "traefik.http.services.prometheus.loadbalancer.server.port=9090"
+```
+Hi. Have you considered adding [Grafana Loki](https://grafana.com/oss/loki/) to the stack? It would allow to monitor logs too, and even mix current metrics with log-related ones for better insights. It would be pretty easy to set up with it's new [Docker Logging Driver Plugin](https://grafana.com/blog/2019/07/15/lokis-path-to-ga-docker-logging-driver-plugin-support-for-systemd/).
+Hi,
+
+Would be great if we could update packages! Prometheus/Grafana/Node-exporter all to latest versions.
+
+Best,
+Samir.
+If `DOMAIN` variable is not set, the stack will be deployed with meaningless labels like following:
+
+```yaml
+- traefik.frontend.rule=Host:grafana.
+```
+
+This PR make `DOMAIN` variable to be required, which means deployment will fail if the variable is not set.
+I have simple 3 nodes swarm cluster where each node is master and worker:
+```       "ID                            HOSTNAME            STATUS              AVAILABILITY        MANAGER STATUS      ENGINE VERSION",
+        "oxmqs5lze5dk5m6ni0me4msnu *   dock1               Ready               Active              Leader              19.03.1",
+        "cwyprb7cxtepai541h58no4as     dock2               Ready               Active              Reachable           19.03.1",
+        "o3b2ttd0wxbyfh1e1yovj8rxw     dock3               Ready               Active              Reachable           19.03.1"
+```
+
+So because in current docker-compose.yml file placement for Grafana, Prometheus, Caddy and AlertManager is setup to be deployed on master, I changed it to be deployed only to dock1 using placement
+```
+placement:
+  constraints:
+    - node.hostname == dock1
+```
+Unfortunately it didn't work and most of these services went to dock3.
+Next try I applied label "Monitoring=true"  to dock1 and used placement :
+```
+placement:
+  constraints:
+    - node.labels.Monitoring == true 
+```
+but this same situation :(
+
+When I did this same on Swarm node with 1 master only, all placement constraints works correctly.
+Does anyone have this same situation like I have ?
+
+
+After setting up alerts within Grafana, I found that if the Prometheus instance was temporarily unavailable, this would cause the alert to fail permanently with: 
+
+```
+description = Error: Could not find datasource Data source not found
+```
+
+This would re-trigger until I went into Grafana, and manually re-tested the rule and saved the alert (with no actual changes to the alert, or data sources).
+
+[This issue](https://github.com/grafana/grafana/issues/13004) suggests the cause is specifying `deleteDatasources` which has the same name as datasource defined after it. I tried this in my deployment, then killed prometheus: I witnessed the alerts re-enter pending and then clear automatically with no other side-effects (e.g. duplication of the data source within Grafana).
+
+I'm not aware of why this entry exists, so I have created this quick PR to remove it. If it's needed, please let me know and I'll look at other workarounds.
+The README.md currently mentions how to do this using DNS, but could this process not be improved on by using Consul instead?
+
+As already mentioned in the readme, [DockerSwarm.rocks](https://dockerswarm.rocks/) recommends Traefik and HTTPS.  This install uses Consul as a key-value store for the SSL certificates, which means many/most of the Docker Swarm installs following that recipe will have Consul installed as well.
+
+---
+
+Relevant Prometheus docs:
+https://prometheus.io/docs/prometheus/latest/configuration/configuration/#consul_sd_config
+Could "Memory Usage by Node" have the total available memory per node too?
+That would be quite useful
+Hi,
+
+could we have the Caddy dockerfile as well? It seems that is missing from the corresponding directory.
+
+Thanks,
+Ioan
+Not an issue but more of a question.....How do we monitor Windows workers in a hybrid swarm cluster?  Node-exporter, Cadvisor, and Dockerd-exporter will not run on my Windows worker nodes.  Has anyone come up with a solution to handle a hybrid environment?  Thank you!

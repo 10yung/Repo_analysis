@@ -1,0 +1,247 @@
+The code that does the alignment is wrong:
+```
+if (align == 1 && (free_mem_addr & 0xFFFFF000)) {
+        free_mem_addr &= 0xFFFFF000;
+        free_mem_addr += 0x1000;
+ }
+```
+It should be (masking with 0x00000FFF instead of 0xFFFFF000) :
+```
+if (align == 1 && (free_mem_addr & 0x00000FFF)) {
+        free_mem_addr &= 0xFFFFF000;
+        free_mem_addr += 0x1000;
+}
+```
+`<Heads up>`*Sorry for the block of text and pictures. This has just been bugging me for a bit and I wanted to provide as much context as I could.*`</Heads up>`
+
+When playing around with `15-video-ports` I noticed that the default kernel code would actually print 'X' in the middle of the screen and not the top left corner as I would expect. I thought this was weird and started playing around with that code and discovered more weird things regarding printing.
+
+I couldn't print multiple characters sequentially nor change their colors. For example, if I remove `offset_from_vga` in the subscript and just had int literals, I could always print a character at the top left corner of the screen on QEMU (address 0xb8000), but I could never change the color nor print a character immediately after.
+
+For reference, here's me attempting to print a blue 'B', and green 'C' in the top left corner with:
+
+```c
+char *vga = 0xb8000;
+vga[0] = 'B';
+vga[1] = 0x0D;  // light magenta on black
+vga[2] = 'C';
+vga[3] = 0x0a;  // light green on black
+```
+
+![Error Screenshot 2019-12-28 at 15 52 21](https://user-images.githubusercontent.com/6019989/71549368-45b5f600-298a-11ea-8ae0-c82dc4a71ed7.png)
+
+BUT I can get my intended results if I instead explicitly assign those values to the video memory addresses:
+
+```c
+*(char *)(0xb8000) = 'B';
+*(char *)(0xb8001) = 0x09;
+*(char *)(0xb8002) = 'C';
+*(char *)(0xb8003) = 0x0a;
+```
+
+![Expected Screenshot 2019-12-28 at 15 53 14](https://user-images.githubusercontent.com/6019989/71549373-536b7b80-298a-11ea-9ea4-10f432f6511e.png)
+
+I dug deeper into this and looked at the assembly to see if perhaps `gcc` somehow emitted some bad instructions, but as far as I can tell, the assembly looks clean.
+
+Broken example:
+
+```
+    char *vga = 0xb8000;
+  52:   48 c7 45 f0 00 80 0b    movq   $0xb8000,-0x10(%rbp)
+  59:   00  
+os-tutorial/15-video-ports/kernel/kernel.c:31
+    // This doesn't work as intended
+    vga[0] = 'B';
+  5a:   48 8b 45 f0             mov    -0x10(%rbp),%rax
+  5e:   c6 00 42                movb   $0x42,(%rax)          # B is successfully printed
+os-tutorial/15-video-ports/kernel/kernel.c:32
+    vga[1] = 0x0D;  // light magenta on black
+  61:   48 8b 45 f0             mov    -0x10(%rbp),%rax
+  65:   48 83 c0 01             add    $0x1,%rax             # This should be 0xb8001
+  69:   c6 00 0d                movb   $0xd,(%rax)
+os-tutorial/15-video-ports/kernel/kernel.c:33
+    vga[2] = 'C';
+  6c:   48 8b 45 f0             mov    -0x10(%rbp),%rax
+  70:   48 83 c0 02             add    $0x2,%rax             # This should be 0xb8002
+  74:   c6 00 43                movb   $0x43,(%rax)
+os-tutorial/15-video-ports/kernel/kernel.c:34
+    vga[3] = 0x0a;  // light green on black
+  77:   48 8b 45 f0             mov    -0x10(%rbp),%rax
+  7b:   48 83 c0 03             add    $0x3,%rax             # This should be 0xb8003
+  7f:   c6 00 0a                movb   $0xa,(%rax)
+```
+
+Working example for reference:
+
+```
+    *(char *)(0xb8000) = 'B';
+  59:   b8 00 80 0b 00          mov    $0xb8000,%eax
+  5e:   c6 00 42                movb   $0x42,(%rax)
+os-tutorial/15-video-ports/kernel/kernel.c:40
+    *(char *)(0xb8001) = 0x09;
+  61:   b8 01 80 0b 00          mov    $0xb8001,%eax
+  66:   c6 00 09                movb   $0x9,(%rax)
+os-tutorial/15-video-ports/kernel/kernel.c:41
+    *(char *)(0xb8002) = 'C';
+  69:   b8 02 80 0b 00          mov    $0xb8002,%eax
+  6e:   c6 00 43                movb   $0x43,(%rax)
+os-tutorial/15-video-ports/kernel/kernel.c:42
+    *(char *)(0xb8003) = 0x0a;
+  71:   b8 03 80 0b 00          mov    $0xb8003,%eax
+  76:   c6 00 0a                movb   $0xa,(%rax)
+```
+
+Even more confused, I looked further with gdb (`make gdb`).
+
+![Screenshot 2019-12-28 at 16 17 06](https://user-images.githubusercontent.com/6019989/71549586-e5c14e80-298d-11ea-90de-d1bc408a9e36.png)
+
+**And this is the strange part**:
+
+![Screenshot 2019-12-28 at 16 18 42](https://user-images.githubusercontent.com/6019989/71549593-fbcf0f00-298d-11ea-86d7-c0a7cd100d52.png)
+
+
+**SOMEHOW on the set of instructions when I attempt to access `vga[1]`, `rax` decrements from `0xb8000` to `0xb7fff` and I don't know why**. The corresponding assembly for this is:
+
+```
+  61:   48 8b 45 f0             mov    -0x10(%rbp),%rax
+  65:   48 83 c0 01             add    $0x1,%rax             # This should be 0xb8001
+  69:   c6 00 0d                movb   $0xd,(%rax)
+```
+
+So, to actually ask my question now, have I been doing something wrong this whole time, or is this a bug in QEMU, or am I misunderstanding something and this is just "working as intended"?
+
+# Stuff about my environment/other stuff I tried
+
+- This may or may not be a big deal, but instead of cross compiling to `i386`, I'm instead targeting `x86_64` so I didn't have to make an i386 gcc from scratch in an earlier step. I was able to get all other examples working with this setup until now. I also haven't tried making the i386 cross-compiler and rerunning this example, but even if that's the "intended way" of running this example, it would still be nice if someone could offer insight on why I'm running into this issue for my 64bit case.
+- I'm using GCC v8.3.0 for compiling.
+- QEMU version 4.1.0 which seems to be one of the newer versions, but I'm also able to reproduce this with QEMU 2.12.1.
+
+# Diff for reproducing
+
+People who want to reproduce this should be able to just `git apply` this diff to the repo:
+
+```
+diff --git a/15-video-ports/Makefile b/15-video-ports/Makefile
+index b611257..64be05d 100644
+--- a/15-video-ports/Makefile
++++ b/15-video-ports/Makefile
+@@ -4,11 +4,16 @@ HEADERS = $(wildcard kernel/*.h drivers/*.h)
+ OBJ = ${C_SOURCES:.c=.o}
+ 
+ # Change this if your cross-compiler is somewhere else
+-CC = /usr/local/i386elfgcc/bin/i386-elf-gcc
+-GDB = /usr/local/i386elfgcc/bin/i386-elf-gdb
++CC = gcc -march=x86-64
++GDB = gdb
++LD = ld -A x86-64
++QEMU = qemu-system-x86_64
++ELF = elf64
+ # -g: Use debugging symbols in gcc
+ CFLAGS = -g
+ 
++all: os-image.bin
++
+ # First rule is run by default
+ os-image.bin: boot/bootsect.bin kernel.bin
+ 	cat $^ > os-image.bin
+@@ -16,18 +21,18 @@ os-image.bin: boot/bootsect.bin kernel.bin
+ # '--oformat binary' deletes all symbols as a collateral, so we don't need
+ # to 'strip' them manually on this case
+ kernel.bin: boot/kernel_entry.o ${OBJ}
+-	i386-elf-ld -o $@ -Ttext 0x1000 $^ --oformat binary
++	${LD} -o $@ -Ttext 0x1000 $^ --oformat binary
+ 
+ # Used for debugging purposes
+ kernel.elf: boot/kernel_entry.o ${OBJ}
+-	i386-elf-ld -o $@ -Ttext 0x1000 $^ 
++	${LD} -o $@ -Ttext 0x1000 $^
+ 
+ run: os-image.bin
+-	qemu-system-i386 -fda os-image.bin
++	${QEMU} -fda os-image.bin
+ 
+ # Open the connection to qemu and load our kernel-object file with symbols
+ debug: os-image.bin kernel.elf
+-	qemu-system-i386 -s -fda os-image.bin &
++	${QEMU} -s -fda os-image.bin &
+ 	${GDB} -ex "target remote localhost:1234" -ex "symbol-file kernel.elf"
+ 
+ # Generic rules for wildcards
+@@ -36,7 +41,7 @@ debug: os-image.bin kernel.elf
+ 	${CC} ${CFLAGS} -ffreestanding -c $< -o $@
+ 
+ %.o: %.asm
+-	nasm $< -f elf -o $@
++	nasm $< -f ${ELF} -o $@
+ 
+ %.bin: %.asm
+ 	nasm $< -f bin -o $@
+diff --git a/15-video-ports/kernel/kernel.c b/15-video-ports/kernel/kernel.c
+index dcc2d9f..589285d 100644
+--- a/15-video-ports/kernel/kernel.c
++++ b/15-video-ports/kernel/kernel.c
+@@ -27,6 +27,15 @@ void main() {
+     /* Let's write on the current cursor position, we already know how
+      * to do that */
+     char *vga = 0xb8000;
+-    vga[offset_from_vga] = 'X'; 
+-    vga[offset_from_vga+1] = 0x0f; /* White text on black background */
++    // This doesn't work as intended
++    vga[0] = 'B';
++    vga[1] = 0x0D;  // light magenta on black
++    vga[2] = 'C';
++    vga[3] = 0x0a;  // light green on black
++
++    // But this does
++    //*(char *)(0xb8000) = 'B';
++    //*(char *)(0xb8001) = 0x09;
++    //*(char *)(0xb8002) = 'C';
++    //*(char *)(0xb8003) = 0x0a;
+ }
+```
+I appreciate a lot from this repo, but this repo did not finish a memory management or a simple file system.
+I alone am not able to finish it, but I have great passion in creating it. Is there anyone who excels in C want to finish it with me?
+In all of the lessons(specifically in lesson 16), you use 80x25 as the default screen size. Why? How can I get the real screen size?
+I have installed binutils like said and it appears that it does not work because this happens:
+```
+i386-elf-gcc: command not found
+```
+Any fixes?
+While running the code from Lesson 2 in an online compiler, I get this:
+
+ld: warning: cannot find entry symbol _start; defaulting to 0000000008049000
+Command terminated by signal 11
+
+Can someone fix this?
+
+
+
+I’ve had this problem for some time now but it has spread to my testing environment. The keyboard stopped working with qemu on macos, then stopped working on linux, and yesterday it stopped working on windows. Earlier, I could use the keyboard with qemu on windows but not on linux or macos, and then windows went down too. There was a time when all three worked, and then stopped without any direct changes on my part. 
+
+I have no idea what’s going on
+
+https://github.com/penetratingshot/flame
+There are a few things incorrect in the 04-stack section:
+
+1. Not just the stack top can be accessed, everywhere in the stack can be accessed.
+2. The stack top is not 0x7ffe, it's 0x7ffa (where 'C' is stored)
+3. 0x8000 is the base address of the stack which doesn't contain anything, so it's garbage even before popping anything out of the stack
+I've been following along with your tutorials, and I noticed that your int_to_ascii function still needs to reverse the contents of the string it populates. I implemented some code that reverses the string in place and tested it. Hopefully this is helpful, thank you so much for your awesome tutorials!
+when I define 1M bytes in stack,kernel has something wrong.
+like this:
+void main() {
+    char str[1024*1024];
+    ....
+}
+
+so I change the code in boot/switch_pm.asm
+
+[bits 32]
+init_pm: ; we are now using 32-bit instructions
+    ....
+    mov ebp, 0x900000 ; <----------change 0x90000 to 0x900000
+    mov esp, ebp
+    ...
+
+then kernel run successed.
+this is a bug? 

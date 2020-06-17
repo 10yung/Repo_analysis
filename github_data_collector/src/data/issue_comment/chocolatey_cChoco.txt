@@ -1,0 +1,121 @@
+Fixes `cChocoPackageInstaller` `Test-TargetResource` setting optional `pSource` parameter when calling `Test-LatestVersionInstalled`
+There was a change in `Test-TargetResource` when passing a custom source to `Test-LatestVersionInstalled`
+
+Previously, the code was:
+```
+        if ($AutoUpgrade -and $isInstalled) {
+            $result = Test-LatestVersionInstalled -pName $Name -pSource $Source
+        } else {
+            $result = $isInstalled
+        }
+```
+
+Current code it (line `167` in `cChocoPackageInstall.psm1`):
+```
+        if ($AutoUpgrade -and $isInstalled) {
+            if ($Source){
+                [string]$pSource = "-pSource `"$Source`""
+            }
+            $result = Test-LatestVersionInstalled -pName $Name $pSource
+        } else {
+            $result = $isInstalled
+        }
+```
+which results in `choco` being executed as:
+```
+choco upgrade <package> --noop --source="-pSource "<custom_source>""
+```
+
+
+This is related to #95 and adds a new resource parameter called `UpgradeLowerVersions` that causes the cChocoPackageInstall resource to call `choco update` instead of executing an uninstall/install when the package is already installed and on a lower version.
+This is in answer to #20 and partly related to #124. 
+
+This resource allows control over config settings via "choco config set/unset. It also has an option for querying the xml settings file directly. This is for performance reasons as discussed in #124. It is optional and not recommended for ongoing management but makes the resource much quicker, 2.82 seconds vs 0.68 seconds (see sample output below).
+
+Sample output:
+```powershell
+# normal mode
+VERBOSE [SURFACE]: LCM:[ Start  Set]
+VERBOSE [SURFACE]:[DSCEngine] Importing the module C:\Program Files\WindowsPowerShell\Modules\cChoco\DscResources\cChocoConfig\cChocoConfig.psm1 in force mode.
+VERBOSE [SURFACE]: LCM:  [ Start  Resource ]  [[cChocoConfig]webRequestTimeoutSeconds]
+VERBOSE [SURFACE]: LCM:  [ Start  Test]  [[cChocoConfig]webRequestTimeoutSeconds]
+VERBOSE [SURFACE]:[[cChocoConfig]webRequestTimeoutSeconds] Importing the module cChocoConfig in force mode.
+VERBOSE [SURFACE]:[[cChocoConfig]webRequestTimeoutSeconds] Querying choco config via CLI
+VERBOSE [SURFACE]:[[cChocoConfig]webRequestTimeoutSeconds] webRequestTimeoutSeconds is in desired state
+VERBOSE [SURFACE]: LCM:  [ End    Test]  [[cChocoConfig]webRequestTimeoutSeconds]  in 1.9260 seconds.
+VERBOSE [SURFACE]: LCM:  [ Skip   Set]  [[cChocoConfig]webRequestTimeoutSeconds]
+VERBOSE [SURFACE]: LCM:  [ End    Resource ]  [[cChocoConfig]webRequestTimeoutSeconds]
+VERBOSE [SURFACE]: LCM:  [ End    Set]
+VERBOSE [SURFACE]: LCM:  [ End    Set]    in  2.8210 seconds.   
+
+# querying xml directly
+VERBOSE: [SURFACE]: LCM:  [ Start  Set]
+VERBOSE: [SURFACE]:[DSCEngine] Importing the module C:\Program Files\WindowsPowerShell\Modules\cChoco\DscResources\cChocoConfig\cChocoConfig.psm1 in force mode.
+VERBOSE: [SURFACE]: LCM:  [ Start  Resource ]  [[cChocoConfig]webRequestTimeoutSeconds]
+VERBOSE: [SURFACE]: LCM:  [ Start  Test]  [[cChocoConfig]webRequestTimeoutSeconds]
+VERBOSE: [SURFACE]:[[cChocoConfig]webRequestTimeoutSeconds] Importing the module cChocoConfig in force mode.
+VERBOSE: [SURFACE]:[[cChocoConfig]webRequestTimeoutSeconds] Querying chco config via chocolatey.config xml...
+VERBOSE: [SURFACE]:[[cChocoConfig]webRequestTimeoutSeconds] webRequestTimeoutSeconds is in desired state
+VERBOSE: [SURFACE]: LCM:  [ End    Test]  [[cChocoConfig]webRequestTimeoutSeconds]  in 0.4470 seconds.
+VERBOSE: [SURFACE]: LCM:  [ Skip   Set]  [[cChocoConfig]webRequestTimeoutSeconds]
+VERBOSE: [SURFACE]: LCM:  [ End    Resource ]  [[cChocoConfig]webRequestTimeoutSeconds]
+VERBOSE: [SURFACE]: LCM:  [ End    Set]
+VERBOSE: [SURFACE]: LCM:  [ End    Set]    in  0.6830 seconds.  
+```
+
+feedback welcome.
+As discussed in #117 here is support for specifying a minimum allowed version. Test-TargetResource returns true if the installed package version is greater or equal to that specified. This helps when user are given permission to update to the latest version of apps not yet specified in DSC. 
+
+Originally I had intended to include a MaxmimumVersion also but on reflection I don't have a use case for this so its probably better to not include it for no reason. 
+
+One caveat that i welcome feedback on is that when using MinimumVersion the test is carried out on [System.Version] objects as opposed to strings for the Version parameter. This could be confusing but I didn't want to alter the behaviors of Version as it is an existing feature. Let me know if you have any concerns about this. 
+There is an unexpected behaviour that's getting the $env:ChocolateyInstall as null value.
+I'm facing an issue to use the cChoco install package DSC because for some reason the $env:ChocolateyInstall variable is empty. Therefore, I added a line to dynamically get the choco.exe sourcedue the $env:ChocolateyInstall is empty.
+
+#130 
+When large packages are being downloaded WinRM can report there is an issue with envelope size.
+
+![image](https://user-images.githubusercontent.com/12760779/60005808-2353c080-9667-11e9-8ed5-854c84e18a01.png)
+
+The [issue has been documented](https://github.com/chocolatey/cChoco#ws-management---exceeds-the-maximum-envelope-size-allowed) but needs investigation if we can resolve / work around it without any changes on the end system.
+
+See [Slack chat](https://chocolatey.slack.com/archives/C80D80QUU/p1561365326001800) for info.
+THere is cChocoFeature but not cChocoConfig to manage config of Chocolatey directly. For completeness a new resource should be added.
+Internally we have moved away from cChocoFeature and instead use a custom resource. Our custom resource reads from Chocolatey.config xml to determine if any given feature is enabled rather than running ```powershell choco feature```
+
+This gives us a pretty reasonable boost in speed for the routine consistency checks. Would you consider us merging our changes upstream to this repo? I can appreciate the idea of reading the config file might not be desired and possible considered anti-pattern
+
+As an idea of speed increase and thus the reason we went this way:
+
+```powershell
+PS D:\Code> measure-command {([xml](Get-content C:\ProgramData\chocolatey\config\chocolatey.config)).Select
+SingleNode("/chocolatey/config/add[@key='cacheLocation']").value}
+Days              : 0
+Hours             : 0
+Minutes           : 0
+Seconds           : 0
+Milliseconds      : 3
+Ticks             : 38312
+TotalDays         : 4.43425925925926E-08
+TotalHours        : 1.06422222222222E-06
+TotalMinutes      : 6.38533333333333E-05
+TotalSeconds      : 0.0038312
+TotalMilliseconds : 3.8312
+
+PS D:\Code> Measure-Command { choco config get --name "cachelocation"}
+Days              : 0
+Hours             : 0
+Minutes           : 0
+Seconds           : 1
+Milliseconds      : 528
+Ticks             : 15283585
+TotalDays         : 1.76893344907407E-05
+TotalHours        : 0.000424544027777778
+TotalMinutes      : 0.0254726416666667
+TotalSeconds      : 1.5283585
+TotalMilliseconds : 1528.3585
+```
+
+worth noting also 1 seconds isn't exactly bad but we have massively varying number on this which was the other reason we made a custom resource. For instance on my workstation the latter command takes 19 seconds. Something else entirely to look into but nonetheless the xml method is blindingly quick. 
+
+Thoughts and feedback welcome

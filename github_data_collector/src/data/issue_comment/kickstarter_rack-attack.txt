@@ -1,0 +1,234 @@
+after upgrading the gem to latest, started seeing unexpected behaviour on throttlers, rolling back to 5.4.2 fixes the issue but that version is far behind. Could not find time to look deep on where it happens. Redis is used locally and production.
+
+at 5.4.2 the gem throttles properly, example send 200 req/s and set limit at 1 req/s, only one req/s gets allowed, same test on 6.x.x allows sometimes 3 req/s. Setting the limit to 50 req/s, and sending 500 req/s on > 6  releases, allows sometimes 120 req/s which can bring bad expectations.
+Hi,
+
+When upgrading the gem from `6.0.0` to `6.2.2` we've seen a huge increase in calls to redis (our cache store).
+
+This has also increased latency.
+
+Was this change intentional? why does this happen?
+
+Request count from NewRelic attached:
+![image](https://user-images.githubusercontent.com/1576396/71672235-15050080-2d7e-11ea-8da1-9bec8217db47.png)
+_The grey line represents the release of the version with the upgraded gem_
+`incrby`, `ttl` and `get` are the ones that went way up.
+I've bumped by ruby recently to 2.6.5, and now my rails is not starting up at all. Removing `class Rack::Attack` makes the server run as expected, without issues.
+
+I am using Rails `5.1.7` and rack-attack version `6.1.0`. Here is how my configuration looks like:
+
+```
+class Rack::Attack
+  # Ignore in development and test environments
+  return unless Rails.env.production?
+
+  # Blacklist
+  # This IP was by extremely aggressive scraper
+  Rack::Attack.blocklist_ip("107.151.148.74")
+
+  ### Configure Cache ###
+
+  # If you don't want to use Rails.cache (Rack::Attack's default), then
+  # configure it here.
+  #
+  # Note: The store is only used for throttling (not blacklisting and
+  # whitelisting). It must implement .increment and .write like
+  # ActiveSupport::Cache::Store
+
+  # Rack::Attack.cache.store = ActiveSupport::Cache::MemoryStore.new
+
+  ### Throttle Spammy Clients ###
+
+  # If any single client IP is making tons of requests, then they're
+  # probably malicious or a poorly-configured scraper. Either way, they
+  # don't deserve to hog all of the app server's CPU. Cut them off!
+  #
+  # Note: If you're serving assets through rack, those requests may be
+  # counted by rack-attack and this throttle may be activated too
+  # quickly. If so, enable the condition to exclude them from tracking.
+
+  # Throttle all requests by IP (60rpm)
+  #
+  # Key: "rack::attack:#{Time.now.to_i/:period}:req/ip:#{req.ip}"
+  throttle('req/ip', limit: 300, period: 5.minutes) do |req|
+    req.ip # unless req.path.start_with?('/assets')
+  end
+
+  ### Prevent Brute-Force Login Attacks ###
+
+  # The most common brute-force login attack is a brute-force password
+  # attack where an attacker simply tries a large number of emails and
+  # passwords to see if any credentials match.
+  #
+  # Another common method of attack is to use a swarm of computers with
+  # different IPs to try brute-forcing a password for a specific account.
+
+  # Throttle POST requests to /users/sign_in by IP address
+  #
+  # Key: "rack::attack:#{Time.now.to_i/:period}:logins/ip:#{req.ip}"
+  throttle('logins/ip', limit: 5, period: 20.seconds) do |req|
+    if req.path == '/users/sign_in' && req.post?
+      req.ip
+    end
+  end
+
+  # Throttle POST requests to /users/sign_in by email param
+  #
+  # Key: "rack::attack:#{Time.now.to_i/:period}:logins/email:#{req.email}"
+  #
+  # Note: This creates a problem where a malicious user could intentionally
+  # throttle logins for another user and force their login requests to be
+  # denied, but that's not very common and shouldn't happen to you. (Knock
+  # on wood!)
+  throttle("logins/email", limit: 5, period: 20.seconds) do |req|
+    if req.path == '/users/sign_in' && req.post?
+      # return the email if present, nil otherwise
+      req.params['email'].presence
+    end
+  end
+
+  ### Custom Throttle Response ###
+
+  # By default, Rack::Attack returns an HTTP 429 for throttled responses,
+  # which is just fine.
+  #
+  # If you want to return 503 so that the attacker might be fooled into
+  # believing that they've successfully broken your app (or you just want to
+  # customize the response), then uncomment these lines.
+  # self.throttled_response = lambda do |env|
+  #  [ 503,  # status
+  #    {},   # headers
+  #    ['']] # body
+  # end
+end
+```
+
+What happens, is that I get these errors, depending on what's not commented out:
+`undefined method 'blocklist_ip' for Rack::Attack:Class (NoMethodError)`
+`undefined method 'throttle' for Rack::Attack:Class (NoMethodError)`
+
+I'm experiencing some odd behavior while attempting to pass a proc as an argument to a throttle `period`.
+
+I tried following the suggestion to use a proc by @ktheory in https://github.com/kickstarter/rack-attack/pull/81#issuecomment-53975700, as my use case is very similar.
+
+The following code appears to work fine for me:
+```ruby
+period_proc =  proc { (Time.now.end_of_month - Time.now).to_i }
+Rack::Attack.throttle('daily per-user throttle', limit: 100_000, period: period_proc) do |request|
+  # business logic
+end
+```
+
+However, when I changed the `period_proc` above to use `#end_of_day` instead, the value is calculated properly, but each request seems to result in a new throttle being created, and the `count` value never surpasses 1:
+```ruby
+period_proc = proc { (Time.now.end_of_day - Time.now).to_i }
+Rack::Attack.throttle('daily per-user throttle', limit: 100_000, period: period_proc) do |request|
+  # business logic
+end
+```
+
+My understanding is that the ID showing up in the logs corresponds to a current throttle period, and a new one is created after a current throttle period expires. This ID was being incremented on each new request, even though the period had not ended
+```
+Cache increment: rack::attack:58997
+Cache increment: rack::attack:59008
+```
+The ID using the `#end_of_month` code remained consistent, as far as I saw.
+
+Out of curiosity, I tried using `#end_of_week`, and the count would reset seemingly sporadically, creating showing an incremented ID when the count went back to 1 (without hitting the limit).
+
+It seems that the problem is actually occurring in each scenario, but when the proc yields lower values, it happens more reliably. My guess is that something is busting the cache, but I'm not sure why, or how to explain the discrepancy in behavior.
+
+I'm using v5.4.2 of the gem on Ruby 2.2 with `ActiveSupport::Cache::DalliStore`.
+
+Any guidance is very much appreciated!
+Upon upgrading to 6.2.1 (from 6.1.0), we end up with Rack::Attack twice in our middleware stack. 
+
+Actual behavior:
+```
+$ rails middleware
+...
+use Rack::Head
+use Rack::ConditionalGet
+use Authenticator::PartOne
+use Rack::Attack     # <--- our intended Rack::Attack instance
+use Authenticator::PartTwo
+use Rack::Attack     # <--- the duplicate now added in 6.2 that we don't want
+run OurApp::Application.routes
+```
+
+Expected behavior:
+```
+$ rails middleware
+...
+use Authenticator::PartOne
+use Rack::Attack     # <--- our intended Rack::Attack instance
+use Authenticator::PartTwo
+run OurApp::Application.routes
+```
+
+As you can see, our specific case involves a two-phase authentication middleware stack that is specifically designed to surround Rack::Attack, so we cannot move Rack::Attack to the end of the stack, where it installs itself by default.
+
+I see that 6.2.1 was intended to turn the second instance into a no-op, but we'd much prefer avoiding the double load to begin with.
+
+Given the need to configure Rack::Attack anyway, one could argue against auto-loading the middleware. However, I'd like to instead propose a couple of ways to allow disabling the auto-load for advanced configurations like ours, while preserving it as the new default behavior.
+
+1. Add a config option `Rack::Attack.auto_load = true`. Defaults to true. When false, the initializer would skip the auto-load.
+
+2. Rework the gem's default require by moving most of lib/rack/attack.rb into a new file. Replace the original file with nothing but:
+```ruby
+require 'rack/attack/<newfile>'
+require 'rack/attack/railtie' if defined?(::Rails)
+```
+This would allow advanced configurations to set the Gemfile as
+```ruby
+gem 'rack-attack', require: 'rack/attack/<newfile>'
+```
+which would implicitly disable the auto-load railtie.
+
+Either way preserves your new default while adding a path for more specific configuration for those of us with apps with advanced middleware configurations.
+
+Are you open to either of the above solutions? If at least one is acceptable, I'm happy to prepare a PR accordingly if that'd be helpful.
+
+FWIW, either of the above would also allow the removal of the already-called condition (`return ... if ... env["rack.attack.called"]`) added in #457, which I think may break/prevent PR #442.
+
+Using thread locals is the simplest implementation in this case I can think of.
+
+Closes #200 
+This can be used as:
+```ruby
+use Rack::Attack do
+  ...
+  throttle("requests by ip", limit: 5, period: 2) do |request|
+    request.ip
+  end
+
+  blocklist("block all access to admin") do |request|
+    request.path.start_with?("/admin")
+  end
+
+  self.blocklisted_response = lambda do |env|
+    [503, {}, ['Blocked']]
+  end
+  ...
+end
+```
+
+The code is a little bit more complicated than it should be as I'm not broke old style of reopening `Rack::Attack`. I would prefer to remain only new style of configuring, but then this will force all gem users to update their `Rack::Attack` settings and recently added feature of using middleware automatically would not make sense. Maybe this makes more sense for 7.0 release?
+
+New tests and documentation are missing - would add them after agreeing on implementation. 
+
+Closes #178 
+This is a work in progress (failing tests, missing new tests and documentation), but basically is ready for review to verify basic ideas.
+
+To add new adapters, all is needed is inheriting from base class and implementing required methods:
+```ruby
+module Rack
+  class Attack
+    class MyStoreAdapter < StoreAdapter
+      ...
+```
+
+Closes #380 
+Hello there, today while exploring GitHub looking for interesting projects found yours and I would love to contribute by designing a logo for it. I'm a designer in development and an open source enthusiast. We would be working together to create the design that fits best. Of course it's totally free and you can quit whenever you want. In case you agree, please let me know any preferences you may have about colors, shapes, etc.
+
+Kind regards.

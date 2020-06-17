@@ -1,0 +1,203 @@
+Just hit #198 which is strangely closed while the issue itself is still active. Took me some time to figure it out.
+...while we wait for 0.3. Mostly mechanical changes so I probably missed something.  
+
+Thoughts @lnicola @carllerche?
+Currently, tower-web fits the niche of being the only Rust web framework that is:
+
+- async
+- macro based
+- compiles on stable
+
+There is a space for it to evolve. I have also mentioned in the past the plan to merge with Warp. At a high level, the goal for that would be to update the macros to generate warp filters.
+
+However, reality is that I don't have time to focus on this right now. My time is going to be entirely consumed on updating Tokio, Tower, mio, bytes, etc... to `std::future` and release the next major version of those libraries. So, until that is done, I can't spend any dev time on tower-web.
+
+Given that, I see two options.
+
+a) deprecate tower-web and suggest to use [warp](https://github.com/seanmonstar/warp/) (and revisit come the end of 2019 / 2020 if time becomes available).
+b) pull in additional contributors who would be able to do the development (significant) and I can focus on mentoring that group.
+
+I would like to see b) happen, but that would require people to step up as it would be significant work. The default option would be a), to deprecate tower-web.
+
+If any are interested in taking on development, please comment in here and we can see if something can get going.
+Missing value don't always assume "404 Bad Request" status code. For instance in case of authorization it would be more appropriate to return "403 Forbidden" if access token is required by the application. At the same time, some applications may want to process requests from anonymous users along with authorized ones.
+
+```rust
+impl_web! {
+    impl Resource {
+        #[get("/foo")]
+        fn foo(&self, t: Token) -> Result<String, ()> {
+            Ok(String::from("user"))
+        }
+
+        fn bar(&self, t: Option<Token>) -> Result<String, ()> {
+            match t {
+                Some(_) => Ok(String::from("user")),
+                None => Ok(String::from("anonymous")),
+            }
+        }
+    }
+}
+```
+
+Currently, that is impossible to specify status code or any additional details of the `extract::error::Error`
+
+```rust
+struct Token;
+
+impl<B: BufStream> Extract<B> for Token {
+    type Future = Immediate<Token>;
+
+    fn extract(context: &Context) -> Self::Future {
+        match context.request().headers().get(http::header::AUTHORIZATION) {
+            Some(_) => Immediate::ok(Token{}),
+            None => Immediate::err(Error::missing_argument()),
+        }
+    }
+}
+```
+
+The proposal is to change the `extract::error::Error` to make such error customization possible:
+
+```rust
+impl<B: BufStream> Extract<B> for Token {
+    type Future = Immediate<Token>;
+
+    fn extract(context: &Context) -> Self::Future {
+        match context.request().headers().get(http::header::AUTHORIZATION) {
+            Some(_) => Immediate::ok(Token{}),
+            None => Immediate::err(Error::missing(forbidden())),
+        }
+    }
+}
+
+fn forbidden() -> tower_web::Error {
+    tower_web::Error::from(StatusCode::FORBIDDEN)
+}
+```
+This commit updates the async-await-preview feature to use the compatibility layer provided in `futures-preview`. This was necessary since tokio stopped tracking nightly.
+
+Please forgive me if I ended up doing something silly. I'm still piecing together the state of the futures ecosystem.
+
+Thanks!
+... with the message "attempted to run an executor while another executor is already running"
+
+It seems like `tower-web` should run synchronous handlers without a running executor, possibly using `threadpool::blocking` and `executor::exit`?
+
+The following code fails to compile:
+
+```
+#[derive(Debug, Serialize, Deserialize)] 
+#[derive(Extract)]
+#[derive(Response)]       // LINE 3
+pub struct Example {
+    #[prost(string,  tag="1")]  // LINE 5
+    pub data: String
+}
+```
+with this error message:
+
+> error[E0658]: The attribute `prost` is currently unknown to the compiler and may have meaning added to it in the future (see issue #29642)                                                                                                                                                                                  
+>   --> src/logic.rs:89:5                                                                                                                                                                                                                                                                                                     
+>    |                                                                                                                                                                                                                                                                                                                        
+> 89 |     #[prost(string, tag="1")]                                                                                                                                                                                                                                                                                
+>    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                                                                                                                                                                                                                                                                                
+>                                                                                                                                                                                                                                                                                                                             
+> error: aborting due to previous error 
+
+And 
+
+- If we comment `LINE 3`, it compiles fine. 
+- If we comment `LINE 5`, it compiles fine.
+
+That implies `Response` doesn't work when `prost` is present.
+I'll try my best to summarize this, because apparently it's not as obvious as I thought, to see where the use case and problem lies.
+
+**Problem:** It's hard to write something that returns multiple types of Responses (structs) + different status codes without manually defining a multitude of `#[web(either)]` or turning everything into Strings. Moreover the `#[web(either)]` approach doesn't work with setting the status code.
+
+**Use case:**
+You have multiple REST apis that return something, depending on the outcome.
+One might have for example something like this in pseudo-code:
+```rust
+#[post("/foo/baz")]
+#[content_type("application/json")]
+fn playback_start(&self, body: MyStruct) -> Failure<Foo> {
+    match do_something(&self.state, &body.id) {
+        Some(v) => {v.xy()?;
+             SuccessStruct {
+                http_status_code: 200, // or leave it out because 200 should be default
+                body: ...
+            }
+         },
+        None => ErrorStruct {
+                 http_status_code: 409,
+                 body: ..
+       }
+    }
+}
+```
+So depending on the outcome of the operation we return a different Struct, that has to be serialized and send back, and, we want to set the http status code differently.
+
+**Problem Details:**
+Setting the http-status code can be done directly with one Struct as documented in the [docs](https://docs.rs/tower-web/0.3.4/tower_web/#deriveresponse).
+But setting it from multiple Structs in one return gives headaches.
+For this one example one might come up with an enum like so:
+```rust
+#[derive(Response)]
+#[web(either)]
+enum MyResponse {
+    Success(A),
+    Fail(B),
+}
+
+#[derive(Response)]
+struct SuccessStruct {
+    #[web(status)]
+    custom_status: u16,
+    body: String,
+}
+
+#[derive(Response)]
+struct ErrorStruct {
+    #[web(status)]
+    custom_status: u16,
+    body: String,
+}
+```
+But it doesn't work for three reasons:
+A) We can't define Response more than once, so `MyResponse` would have to handle the status already.
+B) We can't make this generic due to #190. So we can't make this enum generic to allow multiple success and for example one error type. => We end up with having to do an enum for every possible state.
+C) Even if A would work, this doesn't scale for more different types due to B.
+
+We also can't just return a `http::response::Response<T>` due to `T` not being allowed as generic and the enums serialization striking back again, so we can't use an enum approach. Also we still would have to create a `Response` via the builder.
+
+Things to keep in mind:
+We don't want to get the enum itself serialized ( `Succes { .. }` is not a desired json return).
+We probably still want to allow `Failure<MyResult>` because there is a difference in specifically designed returns and blatantly internal server errors. (When doing a try over a result that's supposed to work.)
+
+**Current workaround:**
+One can currently work around by returning `Failure<Response<String>>` and adding some helpers to build a response and serialize their structs. [Example of actual code in use](https://gist.github.com/0xpr03/0b82d7705ce38d1b4899890a856ffa50)
+I'm not sure if the stable macros are flexible enough to be able to dispense with `impl_web!`, but it should probably be tracked somewhere.
+The `Response` derive isn't handing down debug derives.
+
+For example the following won't work:
+```rust
+#[derive(Debug, Response)]
+pub struct ApiResponse<T>
+where
+    T: Serialize + Debug,
+{
+    pub value: Option<T>,
+    pub msg: Option<String>,
+}
+```
+Will throw
+```log
+error[E0277]: `T` doesn't implement `std::fmt::Debug`
+   --> src/models.rs:122:17
+    |
+122 | #[derive(Debug, Response)]
+    |                 ^^^^^^^^ `T` cannot be formatted using `{:?}` because it doesn't implement `std::fmt::Debug`
+```
+
+I was told that serde is handling this via [attributes](https://serde.rs/field-attrs.html#bound) which tower-web probably also would have to implement.

@@ -1,0 +1,117 @@
+This introduces a UUID typecasting option, which effectively functions as a string, but coerced to nil unless the string exactly matches the UUID pattern.
+
+This fixes issue #174
+Hi there. 
+
+I'm using Neo4J, which uses this gem for attribute declaration.
+
+I'm also building a Rails app that uses UUIDs as primary keys in my Postgres database. I would like to be able to reference these primary keys, e.g. `user_id`, and have them be of the UUID type.
+
+This could look something like:
+
+```
+class Node
+  include ActiveAttr::TypecastedAttributes
+  attribute :user_id, type: UUID
+end
+```
+
+Currently, I'm using `type: String`, but that doesn't ensure that the given value is actually a UUID, and I have to write Active Model validators to ensure this, which is a bit of a pain.
+
+Any pointers on where to start working on a PR is much appreciated. Thanks.
+
+We recently ran into a memory issue that I successfully traced back to the creation of an anonymous class (`Class.new`) based on a type that includes `AttriveAttr::BasicModel`. 
+
+Below is the simplest form of the scenario demonstrating the Class objects eating up memory. It looks like the Class objects are somehow being held on to - which might be ok in general, but not ideal in case of an anonymous class instance created each time.
+
+Running this test for any class that does not involve `AttriveAttr::BasicModel` clears up the memory as expected. 
+
+I am not proposing that creating anonymous classes like this is a best practice. We removed this pattern from our code base - but ideally, this shouldn't have happened.
+
+```ruby
+require 'active_attr'
+
+class MyClass
+  include ActiveAttr::BasicModel
+end
+
+def class_object_count
+  ObjectSpace.count_objects[:T_CLASS].to_s
+end
+
+puts "#{class_object_count} <- # Classes Before"
+
+100000.times {Class.new(MyClass)}
+puts "#{class_object_count} <- # Classes After"
+
+GC.start
+puts "#{class_object_count} <- # Classes After GC"
+
+```
+```ruby
+class MyItemObject
+  include ActiveAttr::Model
+  attribute :one
+  attribute :two
+end
+
+Class MyObject
+  include ActiveAttr::Model
+  attribute :my_objects, type: [MyArrayObject], typecaster: -> { |values| values.map { |value| MyItemObject.new(value) }
+end
+
+object = MyObject.from_json(json_dump)
+puts object.my_objects.object_id
+puts object.my_objects.object_id
+```
+
+This will produce a different object_id at each run.  Can't say I expected this.  If typecasting results are temporary perhaps they should be returned as frozen?
+Documents known options for `.attribute` and `.attribute!` .. There may be others that I'm not aware of?
+
+All of the default typecasters are stateless, so allocating a new instance for each field becomes extremely costly, especially for larger models. To reduce this, we can memoize the `TYPECASTER_MAP`.
+
+This should be a backwards compatible change with a speed boost. The only people who might have trouble are those who modified the typecaster map. This is a frozen constant, though, so nobody should be touching this.
+
+This is currently about 10% quicker on a model with 93 fields. The benchmark creates a model and then calls `to_json`. I also ran the benchmark on a smaller model with only 12 String fields and saw a 1-2% improvement.
+
+Currently, typecasting works on attribute reading. There are two defects:
+– every reading is every typecasting.
+– if typecasted class has attributes they can't be changed, because typecasting creates a new instance every time.
+
+I suggest typecasting on writing. It avoids from both defects
+
+This conversion is done by Transpec 3.1.1 with the following command:
+    transpec -f
+- 350 conversions
+  from: obj.should
+    to: expect(obj).to
+- 179 conversions
+  from: == expected
+    to: eq(expected)
+- 22 conversions
+  from: it { should ... }
+    to: it { is_expected.to ... }
+- 10 conversions
+  from: obj.should_receive(:message)
+    to: expect(obj).to receive(:message)
+- 6 conversions
+  from: obj.should_not
+    to: expect(obj).not_to
+- 3 conversions
+  from: it { should_not ... }
+    to: it { is_expected.not_to ... }
+- 1 conversion
+  from: <= expected
+    to: be <= expected
+- 1 conversion
+  from: =~ [1, 2]
+    to: match_array([1, 2])
+- 1 conversion
+  from: >= expected
+    to: be >= expected
+- 1 conversion
+  from: obj.stub(:message)
+    to: allow(obj).to receive(:message)
+
+For more details: https://github.com/yujinakayama/transpec#supported-conversions
+

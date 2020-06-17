@@ -1,0 +1,111 @@
+### Description
+Some query result may have very big columns,  but I just want a slice of the columns. Of course I can do it by hand, but it is not memory efficient , because the result takes a lot of memory. Can pilosa support limit / offset just like sql, return just the exact slice that i want. In other words, what  I want is paging? 
+
+### Success criteria (What criteria will consider this ticket closeable?)
+ limit / offset just like sql.
+
+I have 200T csv file. It is impossible to generate bitmap file in pilosa.Could I generate bitmap file outside pilosa by other engine such as spark/tez and load bitmap file into pilosa? 
+
+## Overview
+
+There was an edge case where setting cacheType to none
+wouldn't zero out its cacheSize. This fixes that edge case.
+
+## Pull request checklist
+
+- [x] I have read the [contributing guide](https://github.com/pilosa/pilosa/blob/master/CONTRIBUTING.md).
+- [x] I have agreed to the [Contributor License Agreement](https://cla-assistant.io/pilosa/pilosa).
+- [ ] I have updated the [documentation](https://github.com/pilosa/pilosa/tree/master/docs).
+- [x] I have resolved any merge conflicts.
+- [x] I have included tests that cover my changes.
+- [x] All new and existing tests pass.
+- [x] Make sure PR title conforms to convention in CHANGELOG.md.
+- [x] Add appropriate changelog label to PR (if applicable).
+
+## Code review checklist
+This is the checklist that the reviewer will follow while reviewing your pull request. You do not need to do anything with this checklist, but be aware of what the reviewer will be looking for.
+
+- [ ] Ensure that any changes to external docs have been included in this pull request.
+- [ ] If the changes require that minor/major versions need to be updated, tag the PR appropriately.
+- [ ] Ensure the new code is [properly commented](https://github.com/golang/go/wiki/CodeReviewComments#doc-comments) and follows [Idiomatic Go](https://dmitri.shuralyov.com/idiomatic-go).
+- [ ] Check that tests have been written and that they cover the new functionality.
+- [ ] Run tests and ensure they pass.
+- [ ] Build and run the code, performing any applicable integration testing.
+- [ ] Make sure PR title conforms to convention in CHANGELOG.md.
+- [ ] Make sure PR is tagged with appropriate changelog label.
+
+It should be possible to clear integer values via PQL, e.g.
+
+`Clear(<col>, intfield=x)`
+
+If we follow our import logic, this would actually set the intfield at <col> equal to `x` and then clear the existence bit. Alternatively, it might be more intuitive if it only cleared the value if it were equal to x, if it just ignored x, if it didn't take an x parameter at all and was just `Clear(<col>, intfield)`. I think I'd be in favor of mirroring our import logic, but also supporting that last syntax which would behave equivalently to `Clear(<col>, intfield=0)`
+
+If we have a field called `size` which is an int, and we query it like `Count(Row(size=10))` we get `0` back.
+
+If we query it like `Count(Row(size==10))` (the correct way), we get the expected result based on the data in the field.
+
+`Row(size=10)` should either (a) return an error, or (b) return the actual row 10 on the size field which would represent which records have their 9th binary digit as 1 for size. (because row 0 and 1 are used for existence and sign).  I would actually lean toward the latter.
+What if you could ?profile=true on a query and get some
+numbers back? That'd be really cool.
+
+We already have tracing/spans, but right now, those only generate
+any data if you have something set up for them to trace to. Add a
+fancy wrapper that lets us generate our own tracing data, and dump
+it into the request response, if ?profile=true.
+
+We track wall-clock execution time, possible arbitrary KV pairs,
+and before/after heap amounts, plus maximum heap size (according
+to runtime) and number of GC runs.
+
+I did this in another branch, but that isn't ready for merging yet, and I wanted it for other things, so here's a separate PR. I also added heap estimations to it in this branch. This would be helpful for things like `dx` and especially for interacting with the RowCache stuff (though there's no actual way for us to check real physical memory usage, because of mmap).
+For feature requests, please provide the following:
+
+### Description
+
+As we we've started to try out some of the more complex binary algebra queries on Pilosa, found a need to be able to have things like Row with all 0's or all 1's. 
+E.g. `Xor(Row(<all 1's>),Row(field1=1))`
+
+Any way to simulate it now? Noticed that if Pilosa gets ID that it never seen before - it would treat it as row with all 0's, any better way?
+
+### Success criteria (What criteria will consider this ticket closeable?)
+
+Can use row with all 0's and all 1's in more complex binary algebra queries
+# Description
+
+There are many situations where records in a data set do not have natural sequential integer ids and we want to simply assign them at ingest time (rather than using column translation). In these cases, a single client importing into an empty Pilosa can fairly easily generate sequential ids and import the data performantly.
+
+But what if there are multiple clients? What if there is already data in Pilosa? Clients need some way of coordinating which IDs each one will allocate, and understanding what data is already in Pilosa so it doesn't get overwritten. One could imagine any variety of where clients communicate with each other (or through another service) to synchronize, or are configured ahead of time not to produce overlapping ids, and can interrogate Pilosa about what data it already has, but these all seem messy and like kind of a lot of work.
+
+What if the import endpoints which take a shard parameter simply allowed you to leave that parameter off? If you do not specify what shard the data should go into, Pilosa knows that it should use a new empty shard to ingest the data. This will allow any number of concurrent clients to throw shardfulls of data at Pilosa without having to do any synchronization or pre-communication!
+
+Pilosa will have to take care such that concurrent requests don't end up in the same shard, but this is purely internal to Pilosa, and seems a lot easier than trying to coordinate with clients. The node receiving the request can look at its availableShards data and select from among the first few empty ones. It would then send out a request to all the owners of that shard to let them know it is reserving it. If the owners respond that they have no data for that shard, then the node can continue with the import. The owners will have to reject any other modifications to that shard until the import is finished.
+
+
+...we have some that do, and some that don't, this is bad.
+
+Pilosa is the only entity which actually knows at any given point which nodes own a shard, if the client is relying on old info about this, some of it's requests might fail, and some succeed... then it has to re-fetch the shard/node info and try again.
+
+If the client is responsible for sending imports to all replicas, Pilosa can't elegantly manage forwarding a request which came to an incorrect node. It doesn't know if the client is already sending requests to a subset of the replicas for that node.
+
+If Pilosa is being contacted through a proxy, then Pilosa *has* to do the forwarding, unless the proxy can intelligently forward them or something, but this sounds like a nightmare.
+
+So overall it seems that life would be a lot simpler if Pilosa handled all replication internally. I know that the import-values endpoint needs to change, but that may be it.
+
+
+### What's going wrong?
+
+If someone's filesystem creates 0-byte `.available.shards` files, pilosa can fail to start up because it can't read them.
+
+### What was expected?
+
+Well, probably a working filesystem, but I think that's out of scope. I think we should handle that case gracefully.
+
+So far as I can tell, the `.available.shards` files are functionally a cache -- they can be recreated at runtime by querying other nodes. If we can't read them, we should ignore them rather than failing.
+
+### Steps to reproduce the behavior
+
+Zero out the files while pilosa is down, start it up.
+
+### Information about your environment (OS/architecture, CPU, RAM, cluster/solo, configuration, etc.)
+
+Affected systems were Centos using XFS, but it's irrelevant.

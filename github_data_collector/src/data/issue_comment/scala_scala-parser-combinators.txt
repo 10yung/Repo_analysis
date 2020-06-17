@@ -1,0 +1,169 @@
+I've isolated a 3-rule pattern, where I'd expect the parser to succeed for a given input, but it fails instead. The sample grammar:
+```
+RuleA ::= RuleB.
+RuleB ::= IDENTIFIER
+        | RuleC '.' IDENTIFIER
+        .
+RuleC ::= RuleB
+        | RuleA
+        .
+```
+The implementation:
+```scala
+import scala.util.parsing.combinator._
+import scala.util.parsing.combinator.syntactical.StandardTokenParsers
+
+object SimpleParser extends StandardTokenParsers with PackratParsers {
+  lexical.delimiters ++= List(".", "$")
+
+  lazy val ruleA: PackratParser[String] = ruleB <~ "$"
+  lazy val ruleB: PackratParser[String] = (ident
+                                       ||| ruleC ~> "." ~> ident)
+  lazy val ruleC: PackratParser[String] = (ruleB
+                                       ||| ruleA)
+
+  def main(args: Array[String]) = {
+    println(ruleA(new PackratReader(new lexical.Scanner("x.x$"))))
+  }
+}
+```
+It fails for input `x.x$`, telling me that it expects a `$` instead of the `.`.
+
+For me, this seems to be a problem with how indirect left-recursion is handled. I'm not sure if the [original algorithm](http://www.vpri.org/pdf/tr2007002_packrat.pdf) is incapable of handling this pattern, or this is an implementation bug.
+
+Edit:
+I've accidentally used `|` (first matching alt.) instead of `|||` (longest matching alt.), I've fixed that in the code, but doesn't change the outcome.
+ParseResult and its subtype are members of scala.util.parsing.combinator.Parsers. Why? This limits the ability to write code using ParseResult without any added benefit as far as I can see.
+
+E.g. I would like to define a scalatest Matcher. I have to wrap it now into a scope, parameterized by a Parsers instance or I have to redefine the Matcher in every test case.
+This change means revival of lastNoSuccessVar(deleted by #108).
+However, in this time, a new variable(`lastFailure` in `Success` class) is
+immutable(i.e. this variable does not means revival of side effects).
+That is why, probably, this change does not break referentially transparent
+
+Edit: I signed CLA. Sorry for not following the procedure.
+This issue may be expected operation, but I feel failure msg is inappropriate.
+
+execute below parser in version 1.1.1 and 1.1.2.
+
+```
+import scala.util.parsing.combinator._
+
+object Parser extends JavaTokenParsers {
+  def apply(str: String): ParseResult[List[Node]] = parseAll(top, str)
+
+  private def top: Parser[List[Node]] = repsep(node, '\n')
+
+  private def node: Parser[Node] = positioned(ident ~ ":" ~ ident ^^ {
+    case v0 ~ _ ~ v1 => Node(v0, v1)
+  })
+}
+```
+
+parsed text (This text causes failure. An appropriate text is, for example, `A : B`.) is 
+
+```
+A
+A : B : C
+```
+
+In version 1.1.1, I got `':' expected but 'A' found`. This failure message is expected message. 
+
+However, in version 1.1.2, I got `end of input expected`. This message loses information where is wrong point. 
+
+As a result that I checked difference of code between 1.1.1 and 1.1.2 lightly, I suspect that #108's change causes this. In addition, as far as I know, this problem occurs when using `repsep` (e.g. if `parseAll` uses `node` method directly, parser does not cause this problem)
+
+**Environment**
+scala version : 2.12.8
+sbt version : 1.2.8
+As mentioned in https://github.com/scala/scala-parser-combinators/issues/221#issue-458575331, it would be neat to add cross-compilation to Dotty to this library.
+To figure out how to do this, it might help to look at https://github.com/scala/scala-xml/pull/312, where this is done for the `scala-xml` library.
+It would be nice to add the bits of code from chapter 33 of "Programming in Scala" as tests to be sure we don't break compatibility (too much) with the book.
+This overrides `err` in RegexParser to make it consume whitespace just
+like regex and literal. The original motivation was:
+
+```
+object parser extends RegexParsers {
+  def num = "\\d+".r
+
+  def twoNums =  num ~ (num | err("error!"))
+}
+
+// succeeds
+parser.parseAll(twoNums, "42    721")
+
+// fails with a parsing Failure instead of an Error
+// because err doesn't consume the whitespace but the regex does.
+parser.parseAll(twoNums, "42    foo")
+```
+
+This may change the output of some parsers that failed to parse input
+(from a Failure to an Error).
+
+fixes #29, reintroduction of #30 
+Hi all, 
+
+I've created a fork which adds completion support to the library, which allows providing as-you-type autocomplete or TAB-completion experiences: https://github.com/jchapuis/scala-parser-combinators.git
+
+In a nutshell, additions are:
+
+- ` def completions(in: Input): Completions` method which allows querying the list of possible completions for a certain input. This returns a structured type which can contain tagged and ranked completions.
+- implementations of this method for all the combinators 
+- a new set of operators which allows tagging and ranking elements of the grammar
+
+I have also implemented fuzzy matching completion parsers which are not present in the fork right now but that I could potentially integrate.
+
+Would you consider this as a possible PR? It's of course extending the "traditional" functionality of parser combinators, so it add extra complexity and testing requirements that are maybe not desirable for the core library. At any rate I'm creating this issue also to to point out that building completion experiences using parser-combinators is feasible and actually works well with the functional nature of these grammars.
+Hi,
+
+The parser combinators works wonderfully, except for a minor tweak I'd like to add: I would like to constrain the type of position data structure in my parser pipeline.
+
+At the moment, parsers.scala will use the base type Position, and leave the specific position type to Readers. The downstream operation will need to perform pattern matching to cast the position data into specific type, e.g. OffsetPosition. This gets tedious if I already know that my parser will only use one specific Position type
+
+I propose to make position a type member in a similar fashion to Elem and Input. Existing code base can be kept in-tact by adding
+
+```scala
+type Pos = Position. 
+```
+If needed, a user can constrain the position type to be more specific by overriding the type member;
+e.g.
+
+```scala
+override type Pos = OffsetPosition
+```
+
+I will send out a pull request on the proposed change. Please take a look.
+ParseResult.toString results in java.util.NoSuchElementException: head of empty list
+Relevant code:
+
+``` scala
+val ast = progParser(new TokenReader(in))
+println(ast.toString) // <-------------- Here is where things go wrong
+                               //println(ast.get.toString) works fine
+
+
+class TokenReader(in:List[Token]) extends Reader[Elem]
+  {
+    def atEnd:Boolean = in.isEmpty
+    def first:Elem = in.head
+    def pos:Position = in.head.pos;
+    def rest = new TokenReader(in.tail)
+  }
+
+def progParser: Parser[List[Definition]] = (paddedDefParser.+) <~ eofParser
+
+class Expression()
+case class Definition(val leftside:DefLhs, val rightside:DefRhs) extends Expression
+```
+
+Error + top of stacktrace:
+
+```
+[error] (run-main-8) java.util.NoSuchElementException: head of empty list
+java.util.NoSuchElementException: head of empty list
+    at scala.collection.immutable.Nil$.head(List.scala:420)
+    at scala.collection.immutable.Nil$.head(List.scala:417)
+    at fumurtCompiler.FumurtParser$TokenReader.pos(Parser.scala:88)
+    at scala.util.parsing.combinator.Parsers$Success.toString(Parsers.scala:154)
+
+```

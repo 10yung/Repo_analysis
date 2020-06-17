@@ -1,0 +1,247 @@
+Just an idea.  Might be nice to have a function called rx_raw which allows user to explicitly specify a part of the rx.  For example:
+
+rx_alpha() %>% rx_raw("{8}")
+"[A-z]{8}"
+
+Yes, I know about rx_multiple.  This is just an example when I know what the rx should look like, but I can't get the rx functions to bend to my will.  Other possible names could be rx_expert, rx_as_is.
+
+I have been thinking how to organize package documentation. We basically have a few "groups" of functions that may make sense to be introduced together (at least in pkgdown):
+
+### Single-character functions
+These are functions that return one character and do not require any "wrappers"
+- `rx_alpha_num`
+- `rx_br` and `rx_line_break`
+- `rx_digit`
+- `rx_something`
+- `rx_space`
+- `rx_tab`
+- `rx_whitespace`
+- `rx_word_char` and `rx_word` (with default `rep="some"`) argument.
+
+### Character "sets"
+These function output ranges or "sets" of characters, wrapped into `[`, for which we don't have a way to express them with single character. This is important when "nesting" them into supersets below, when "outer" set of `[` need to be "peeled off". From the user stand point they may not be any different from **Single-character functions**
+- `rx_alphanum`
+- `rx_alpha`
+- `rx_lower` and  `rx_upper`
+- `rx_punctuation`
+- `rx_range`
+
+### "Appenders"
+These functions take `.data` argument and simply append something to it, thus modifying the behavior of previously appended function(s).
+- `rx_capture_groups`
+- `rx_count` 
+- `rx_end_of_line` and `rx_start_of_line`
+- `rx_one_or_more` and `rx_none_or_more`
+- `rx_with_any_case`
+
+### "Expression-wrappers"
+These functions allow user to specify the sequence of characters out of which **all** should be matched to the string.
+- `rx_avoid` and `rx_seek`
+- `rx_find` (and `rx_literal`, which I now dropped)
+- `rx_maybe` (which is `rx_find` with `rep` argument set to "maybe")
+- `rx_or` (which might need a bit of extra work, see #16  and thus will be out of this category) 
+
+### "Superset functions"
+These functions specify a list of *mutually exclusive* symbols/expressions, only **one** of which should be matched to the string.
+- `rx_one_of`
+- `rx_anything_but` and `rx_something_but`
+(eventually `rx_either_of`) will be moved here as well, if we decide to keep it.
+
+I find this grouping helpful when reasoning about the functionality our package covers.
+
+There are a few functions I dropped:
+`rx_any_of` (duplicate of `rx_one_of`)
+`rx_digits` (too little advantage compared to `rx_digit(rep=n)`
+`rx_literal` (duplicate of `rx_find`)
+`rx_not` (duplicate of `rx_avoid_suffix`)
+`rx_new` has been moved to `utils.R` 
+Right now we have `rx_or` implementation which compares `.data` and `value`
+
+```r
+##### Do not run
+rx() %>% 
+  rx_find("a") %>%
+  rx_or("b") # or at best rx_or(rx_find("b"))
+```
+In the comments you mentioned:
+```r
+##### Do not run
+  # Not sure if I like this. I would prefer:
+  # find(value = "foo") %>%
+  #   or() %>%
+  #   find("bar")
+  # Rather than having to nest a rule inside of or(), maybe use glue?
+```
+Might the solution be similar to how now (in dev branch) we organized `rx_one_of()`:
+
+```r
+###### Do not run
+rx() %>%
+  rx_find("gr") %>%
+  either_of(rx_find("a"), rx_find("e")) %>%
+  rx_find("y")
+```
+In a sense, this is `rx_one_of` with `(?:a|b)` instead of `[ab]` and limited to two arguments only. I actually believe nothing prevents us from allowing more arguments, if we go down this route. I think going this route will add consistency to the package.
+
+
+
+We need more end-to-end examples. Emails, urls, SSNs, license plates, etc. Lets collect links to those here and later implement.
+Basically boils down to detecting that `.data` is not of `rx_string` class and acting as though first argument is the `value` argument.
+Reference: http://adv-r.had.co.nz/S3.html
+> UPDATED: sanitize now has method dispatch, so we can simply write
+```r
+## unexported function for sanitizing arguments
+sanitize_args <- function(...){
+   if (missing(...)) return(NULL) 
+  res <- sapply(list(...), sanitize) 
+  Reduce(paste0, res)
+}
+
+is.rx_string <- function(x){
+  inherits(x, "rx_string")
+}
+
+# class constructor - also unexported function. 
+rx <- function(x){
+  if(is.rx_string(x)) return(x)
+  class(x) <- c("rx_string", class(x)) 
+  x
+}
+
+rx_literal <- function(.data, ...) {
+  UseMethod("rx_literal", .data)
+}
+
+rx_literal.character <- function(.data, ...){
+  res <- paste0(sanitize(.data), sanitize_args(...))
+  rx(res)
+}
+
+rx_literal.rx_string <- function(.data, ...) {
+  res <- paste0(.data, sanitize_args(...))
+  rx(res)
+}
+```
+Now you dont need a constructor. Function works both in chain and stand alone
+```r
+rx_literal("?@")
+#> [1] "\\?@"
+#> attr(,"class")
+#> [1] "rx_string" "character"
+
+rx_literal("?") %>% rx_literal("@")
+#> [1] "\\?@"
+#> attr(,"class")
+#> [1] "rx_string" "character"
+```
+Hadley [says ](http://adv-r.had.co.nz/S3.html)we should also implement a few essential methods. We should rethink all of our functions with vectorization in mind.
+>When implementing a vector class, you should implement these methods: `length, [, [<-, [[, [[<-, c`. (If `[` is implemented `rev, head, and tail` should all work).
+### Problem
+I think the package will be incomplete until we find a way to express groups of characters. Here's a challenge to express email pattern matching in `rx`:
+
+![regex-example](https://user-images.githubusercontent.com/13419011/54075789-9e08f380-42a3-11e9-9374-45dd126d8977.png)
+
+### Challenges
+First of all, I dont know of the way to express single "word" character (`alnum` + `_`). We used `rx_word` to denote `\\w+` and perhaps it should have been `rx_word_char() %>% rx_one_or_more()`.
+```r
+rx_char <- function(.data = NULL, value=NULL) {
+  if(missing(value))
+    return(paste0(.data, "\\w"))
+  paste0(.data, sanitize(value))
+}
+```
+I also extended `rx_count` to cases of ranges of input
+
+```r
+rx_count <- function(.data = NULL, n = 1) {
+  if(length(n)>1){
+    n[is.na(n)]<-""
+    return(paste0(.data, "{", n[1], "," , n[length(n)], "}"))
+  }
+  paste0(.data, "{", n,"}")
+}
+```
+Finally, we dont have a way to express word boundaries (`\\b`) and it might be useful to denote them. We shall call this function `rx_word_edge`
+```r
+rx_word_start <- function(.data = NULL){
+  paste0(.data, "\\b")
+}
+
+rx_word_end <- rx_word_start
+``` 
+Finally, our biggest problem is that there's no way to express groups of characters, other than through `rx_any_of()`, but if we pass other `rx` expressions, values will be sanitized twice, meaning that we will get four backslashes before each symbol instead of two.
+
+```r
+# this function is exactly like rx_any_of() but without sanitization
+rx_group <- function(.data = NULL, value) {
+  paste0(.data, "[", value, "]")
+}
+```
+### Solution
+Here's what it looks like when we put all pieces together:
+```r
+x <- rx_word_start() %>% 
+  rx_group(
+    rx() %>% 
+      rx_char() %>% 
+      rx_char(".%+-")
+  ) %>%
+  rx_one_or_more() %>% 
+  rx_char("@") %>% 
+  rx_group(
+    rx() %>% 
+      rx_char() %>% 
+      rx_char(".-")
+  ) %>% 
+  rx_one_or_more() %>% 
+  rx_char(".") %>% 
+  rx_alpha() %>% 
+  rx_count(2:6) %>% 
+  rx_word_end()
+x
+#> [1] "\\b[\\w\\.%\\+-]+@[\\w\\.-]+\\.[[:alpha:]]{2,6}\\b"
+
+txt <- "This text contains email first.last@gmail.com and noname@post.io. The latter is no longer valid."
+regmatches(txt, gregexpr(x, txt, perl = TRUE))
+#> [[1]]
+#> [1] "first.last@gmail.com" "noname@post.io"  
+stringr::str_extract_all(txt, x)
+#> [[1]]
+#> [1] "first.last@gmail.com" "noname@post.io"  
+```
+The code works but I don't like it.
+1. Constructor `rx` look redundant (I believe, there's a way to get rid of it entirely using specialized class, see below).
+1. It is not very clear what `rx_one_or_more()` is referring to. I wonder if all functions should have `rep` argument with default option `one` and options `some`/`any` in addition to what `rx_count` does today.
+1. Should `rx_char()` without arguments be called `rx_wordchar`? 
+1. Should `rx_char()` with arguments be called `rx_literal()` or `rx_plain`? 
+1. We should be very explicit about sanitization of arguments. To the extent that we should just mention: "input will be sanitized".
+1. `rx_group` is artificial construct, a duplicate of `rx_any_of`, but without sanitization. Here I see couple of solutions.
+  a. Allow "nested pipes" (as I have done above). Create S3 class and this way detect when type of `value` argument is not character, but `rx_string`. Input of this class do not need to be sanitized, because it has been sanitized at creation.
+  b. Do not allow "nested pipes". Instead define `rx_any_of()` to have `...` and allow multiple arguments mixing functions and characters. Then hypotherical pipe would look like this:
+```r
+rx_word_edge() %>% 
+  rx_any_of(rx_wordchar(), ".%+-", rep="some") %>%
+  rx_literal("@") %>% 
+  rx_any_of(rx_wordchar(), ".-", rep="some") %>% 
+  rx_literal(".") %>% 
+  rx_alpha(rep=2:6) %>% 
+  rx_word_edge()
+```
+It's a lot to digest, but somehow everything related to one particular problem. Happy to split the issue once we identify the issues worth tackling.
+Awesome short name and a hex with blue and red pill. Tagline: "Rx is a painkiller for regex"
+```r
+available::available("rx")
+#> -- rx --------------------------------------------------------------------------
+#> Name valid: ✔
+#> Available on CRAN: ✔ 
+#> Available on Bioconductor: ✔
+#> Available on GitHub:  ✔ 
+#> Abbreviations: http://www.abbreviations.com/rx
+#> Wikipedia: https://en.wikipedia.org/wiki/rx
+#> Wiktionary: https://en.wiktionary.org/wiki/rx
+#> Urban Dictionary:
+#>   (noun)from the symbol meaning "[prescription]" this [seeks] to label  someone very annoying that can only be taken in [small doses] at set  periods of time.
+#>   http://rx.urbanup.com/915152
+#> Sentiment:???
+```
+Btw, `vx` is also available name, if you decide to go for that one. But I really like the "painkiller" message

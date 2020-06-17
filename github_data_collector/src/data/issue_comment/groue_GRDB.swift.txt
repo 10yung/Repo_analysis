@@ -1,0 +1,449 @@
+### What did you do?
+
+Attempting to perform FTS search to filter results for a NSTableView. 
+
+```
+Fatal error: Unexpectedly found nil while implicitly unwrapping an Optional value: file …ViewController.swift, line 92
+```
+
+### Environment
+
+**GRDB flavor(s): GRDB
+**GRDB version: 4.8.1
+**Installation method: CocoaPods
+**Xcode version: 11.3.1
+**Swift version: 5.x (newest?, whatever is default from a new project)
+**Platform(s) running GRDB: macOS
+**macOS version running Xcode: 10.5.3 public beta 2
+
+### Demo Project
+
+Hello, I am a fairly novice programmer and am running into an issue with `FetchedRecordsController`. I am aware it is a deprecated API. Being the 2nd time I'm using GRDB – a wonderful library –, I was trying to use code from a previous project that continues to work, though after this message, I will possibly try to migrate to `ValueObservation` since it is a new app and is the preferred method. I have an `NSTableView` that filters from the value of a `NSSearchField`. I get a crash when trying to `setRequest` from a SQL query:
+
+`try! itemController.setRequest(sql: sql, arguments: [queryString])`
+
+It is a media app, much like those apps that catalog books, music, film, etc. It is mostly for personal use for now and as it grows, I'm not sure what the table structure will look like. For the moment, I am merely trying to get a basic app to work, and will refine it as it is built. As it stands, the code is as such:
+
+```
+class ViewController: NSViewController {
+	…
+    var selectedRowIndexes: IndexSet = []
+
+    var sortString = "uuid" // for later filtering and sorting by columns and order
+    var sortOrder = "DESC"
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+
+        try! self.setupDatabase()
+        lib.dbCreateTables()
+
+        itemController = try! FetchedRecordsController(
+                dbPool,
+                sql: "SELECT item.id, item.uuid, item.title, item.series, item.creator, item.publisher, item.year, item.size, item.date_created, item.date_updated, item.favorite FROM item ORDER BY uuid DESC")
+        try! itemController.performFetch()
+
+        // track changes
+        itemController.trackChanges(
+                // animated table changes maybe are not needed at the moment, so could remove this and re-add later using ValueObservation
+                willChange: { [unowned self] _ in
+                    self.selectedRowIndexes = self.tableView.selectedRowIndexes
+                    self.tableView.beginUpdates()
+                },
+
+                // controller's records have changed:
+                didChange: { [unowned self] _ in
+                    self.tableView.reloadData()
+                    self.tableView.selectRowIndexes(self.selectedRowIndexes, byExtendingSelection: false)
+                }
+        )
+        …
+        self.filterTable() // on startup show all results, later used for filtering
+    }
+	…
+    public func filterTable() {
+        if searchString == "" {
+            try! itemController.setRequest(RestrictedItem.order(Column("uuid").desc))
+        } else {
+            let queryString = lib.formatQuery(searchString) // appends * to each search term for FTS
+
+            var sql = """
+                      SELECT item.id, item.uuid, item.title, item.series, item.creator, item.publisher, item.year,  item.subjects, item.size, item.date_created, item.date_updated, item.favorite
+                      FROM item
+                      JOIN item_search ON item_search.rowid = item.id
+                      WHERE item_search MATCH ?
+                      ORDER BY
+                      """
+            sql = sql + " " + self.sortString + " " + self.sortOrder
+            try! itemController.setRequest(sql: sql, arguments: [queryString]) // * crash here
+        }
+		…
+    }
+}
+```
+
+Query is ok as run within the SQLite console.
+
+`RestrictedItem` with a subset of fields for the `NSTableView`:
+
+```
+struct RestrictedItem {
+    // Prefer Int64 for auto-incremented database ids
+    var id: Int64?
+    var uuid: Int64
+    var title: String
+    var series: String?
+    var creator: String
+    var publisher: String?
+    var year: Int
+    var subjects: String?
+    var size: Int?
+    var date_created: Date
+    var date_updated: Date
+    var favorite: Bool
+}
+
+// Hashable conformance supports tableView diffing
+extension RestrictedItem: Hashable {
+}
+
+extension RestrictedItem: Codable, FetchableRecord, TableRecord, MutablePersistableRecord {
+    // TableRecord
+    static let databaseTableName = "item"
+
+    // Define database columns from CodingKeys
+    private enum Columns {
+        static let id = Column(CodingKeys.id)
+        static let uuid = Column(CodingKeys.uuid)
+        static let title = Column(CodingKeys.title)
+        static let series = Column(CodingKeys.series)
+        static let creator = Column(CodingKeys.creator)
+        static let publisher = Column(CodingKeys.publisher)
+        static let year = Column(CodingKeys.year)
+        static let subjects = Column(CodingKeys.subjects)
+        static let size = Column(CodingKeys.size)
+        static let date_created = Column(CodingKeys.date_created)
+        static let date_updated = Column(CodingKeys.date_updated)
+        static let favorite = Column(CodingKeys.favorite)
+    }
+
+    // Update id after it has been inserted in the database.
+    mutating func didInsert(with rowID: Int64, for column: String?) {
+        id = rowID
+    }
+}
+```
+
+```
+final class MediaLibrary: NSObject {
+
+    func dbCreateTables() {
+        let exists = try! dbPool.read { db in
+            // Bool, true if the table exists
+            try db.tableExists("item")
+        }
+        if exists == true {
+            return
+        }
+
+        try! dbPool.write { db in
+            // Create table
+            try db.create(table: "item", ifNotExists: true) { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("uuid", .integer).unique().notNull().indexed()
+                t.column("title", .text).notNull()
+                t.column("series", .text)
+                t.column("creator", .text).notNull()
+                t.column("publisher", .text)
+                t.column("year", .integer).notNull()
+                t.column("isbn", .text)
+                t.column("description", .text)
+                t.column("subjects", .text)
+                t.column("size", .integer).indexed()
+                t.column("date_created", .datetime).notNull()
+                t.column("date_updated", .datetime).notNull()
+                t.column("favorite", .boolean).notNull().defaults(to: false)
+         …
+            }
+
+            // Create full-text table, perhaps later will be contentless
+            try db.create(virtualTable: "item_search", ifNotExists: true, using: FTS5()) { t in
+                t.tokenizer = .porter(wrapping: .unicode61()) // unsure how to use remove_diacritics=2, .remove I recall didn't show up as an available option 
+                t.prefixes = [2, 3]
+                t.column("title")
+                t.column("series")
+                t.column("creator")
+                t.column("publisher")
+                t.column("description")
+                t.column("subjects")
+            }
+
+            // full-text search triggers
+            try db.execute(sql: """
+                                CREATE TRIGGER IF NOT EXISTS item_delete
+                                AFTER DELETE ON item
+                                BEGIN DELETE FROM item_search where rowid=old.id;
+                                END;
+                                CREATE TRIGGER IF NOT EXISTS item_insert
+                                AFTER INSERT ON item
+                                BEGIN INSERT INTO item_search(rowid, title, series, creator, publisher, description, subjects)
+                                VALUES (new.id, new.title, new.series, new.creator, new.publisher, new.description, new.subjects
+                                ); END;
+                                CREATE TRIGGER IF NOT EXISTS update_title
+                                AFTER UPDATE OF title ON item
+                                BEGIN DELETE FROM item_search where rowid=old.id;
+                                INSERT INTO item_search(rowid, title, series, creator, publisher, description, subjects)
+                                VALUES (
+                                new.id, new.title, new.series, new.creator, new.publisher, new.description, new.subjects
+                                ); END;
+                                CREATE TRIGGER IF NOT EXISTS update_series
+                                AFTER UPDATE OF series ON item
+                                BEGIN DELETE FROM item_search where rowid=old.id;
+                                INSERT INTO item_search(rowid, title, series, creator, publisher, description, subjects)
+                                VALUES (
+                                new.id, new.title, new.series, new.creator, new.publisher, new.description, new.subjects
+                                ); END;
+                                CREATE TRIGGER IF NOT EXISTS update_creator
+                                AFTER UPDATE OF creator ON item
+                                BEGIN DELETE FROM item_search where rowid=old.id;
+                                INSERT INTO item_search(rowid, title, series, creator, publisher, description, subjects)
+                                VALUES (
+                                new.id, new.title, new.series, new.creator, new.publisher, new.description, new.subjects
+                                ); END;
+                                CREATE TRIGGER IF NOT EXISTS update_publisher
+                                AFTER UPDATE OF subjects ON item
+                                BEGIN DELETE FROM item_search where rowid=old.id;
+                                INSERT INTO item_search(rowid, title, series, creator, publisher, description, subjects)
+                                VALUES (
+                                new.id, new.title, new.series, new.creator, new.publisher, new.description, new.subjects
+                                ); END;
+                                CREATE TRIGGER IF NOT EXISTS update_description
+                                AFTER UPDATE OF publisher ON item
+                                BEGIN DELETE FROM item_search where rowid=old.id;
+                                INSERT INTO item_search(
+                                rowid, title, series, creator, publisher, description, subjects)
+                                VALUES (
+                                new.id, new.title, new.series, new.creator, new.publisher, new.description, new.subjects
+                                ); END;
+                                CREATE TRIGGER IF NOT EXISTS update_subjects
+                                AFTER UPDATE OF subjects ON item
+                                BEGIN DELETE FROM item_search where rowid=old.id;
+                                INSERT INTO item_search(
+                                rowid, title, series, creator, publisher, description, subjects)
+                                VALUES (
+                                new.id, new.title, new.series, new.creator, new.publisher, new.description, new.subjects
+                                ); END;
+                                """)
+        }
+    }
+…
+}
+```
+
+As I'm not too experienced at programming, I'm trying to decrypt the the debug output. What I think is relevant:
+
+ ```
+0x7fff67e62218 <+40>:  jne    0x7fff67e62262            ; <+114>
+    0x7fff67e6221a <+42>:  testq  %r15, %r15
+    0x7fff67e6221d <+45>:  jne    0x7fff67e62320            ; <+304>
+    0x7fff67e62223 <+51>:  leaq   0x12f9b6(%rip), %rax      ; "laceableCollection.swift"
+    0x7fff67e6222a <+58>:  movabsq $-0x8000000000000000, %r8 ; imm = 0x8000000000000000 
+    0x7fff67e62234 <+68>:  orq    %rax, %r8
+    0x7fff67e62237 <+71>:  leaq   0x12f167(%rip), %rdi      ; "Fatal error"
+    0x7fff67e6223e <+78>:  leaq   0x12fe4b(%rip), %r9       ; "/BuildRoot/Library/Caches/com.apple.xbs/Sources/swiftlang/swiftlang-1100.8.280/swift/stdlib/public/core/StaticString.swift"
+…
+0x7fff67e6232d <+317>: leaq   0x12f071(%rip), %rdi      ; "Fatal error"
+    0x7fff67e62334 <+324>: leaq   0x12f185(%rip), %rcx      ; "UnsafeBufferPointer with negative count"
+    0x7fff67e6233b <+331>: movl   $0xb, %esi
+    0x7fff67e62340 <+336>: movl   $0x27, %r8d
+    0x7fff67e62346 <+342>: jmp    0x7fff67e62365            ; <+373>
+    0x7fff67e62348 <+344>: subq   $0x8, %rsp
+    0x7fff67e6234c <+348>: leaq   0x12f052(%rip), %rdi      ; "Fatal error"
+    0x7fff67e62353 <+355>: leaq   0x12f0c6(%rip), %rcx      ; "Not enough bits to represent the passed value"
+    0x7fff67e6235a <+362>: movl   $0xb, %esi
+    0x7fff67e6235f <+367>: movl   $0x2d, %r8d
+    0x7fff67e62365 <+373>: movl   $0x2, %edx
+    0x7fff67e6236a <+378>: movl   $0x2, %r9d
+    0x7fff67e62370 <+384>: pushq  $0x1
+    0x7fff67e62372 <+386>: callq  0x7fff67e629c0            ; function signature specialization <Arg[0] = Exploded, Arg[1] = Exploded, Arg[2] = Dead, Arg[3] = Dead> of Swift._fatalErrorMessage(_: Swift.StaticString, _: Swift.StaticString, file: Swift.StaticString, line: Swift.UInt, flags: Swift.UInt32) -> Swift.Never
+```
+
+Please let me know if you need more information. 
+
+btw, it is terrific that the documentation is as extensive as it is. Though as a novice programmer, I sometimes find it difficult to refer to, needing to reread sections multiple times to figure something out. Being so long, perhaps you might someday consider moving it to the wiki, and having each section being a separate page, with some side bar for navigation so it is easier to see the whole API at a glance, and quickly navigate to relevant sections. I'm not sure what else might make the docs easier to use. Perhaps, as books might sometimes title their sections based on what to do, rather than API names, maybe that would be a good section to add. Sometimes too, for each topic such as `ValueObservation` and record/struct types, maybe a bit of rewording so I can go to the section and at the beginning see what parts are relevant rather than so far needing to read the whole thing and then figuring out which part of the API to use. I'll continue to think about how the docs could be easier to use.
+DatabasePoolSchemaCacheTests.testCachedStatementsAreNotShared
+
+[crash.log](https://github.com/groue/GRDB.swift/files/4060737/crash.log)
+
+(Description of this PR to be written)
+Sometimes a Travis test fails. I was lucky to catch it in Xcode today:
+
+<details>
+<summary>stack trace</summary>
+
+```
+Test Case '-[GRDBOSXTests.DatabasePoolReleaseMemoryTests testDatabasePoolReleaseMemoryClosesReaderConnections]' started.
+xctest(92280,0x7000084a3000) malloc: tiny_free_list_remove_ptr: Internal invariant broken (prev ptr of next): ptr=0x100f91970, next_prev=0x0
+xctest(92280,0x7000084a3000) malloc: *** set a breakpoint in malloc_error_break to debug
+(lldb) bt all
+  thread #1, queue = 'com.apple.root.user-interactive-qos'
+    frame #0: 0x00007fff5d1aa94e libsystem_kernel.dylib`__ulock_wait + 10
+    frame #1: 0x00007fff5d0215ac libdispatch.dylib`_dispatch_ulock_wait + 47
+    frame #2: 0x00007fff5d02168b libdispatch.dylib`_dispatch_thread_event_wait_slow + 33
+    frame #3: 0x00007fff5d03147a libdispatch.dylib`_dispatch_apply_invoke_and_wait + 265
+    frame #4: 0x00007fff5d030f5a libdispatch.dylib`dispatch_apply_f + 768
+    frame #5: 0x0000000103bc41a3 libswiftDispatch.dylib`static (extension in Dispatch):__C.OS_dispatch_queue.concurrentPerform(iterations: Swift.Int, execute: (Swift.Int) -> ()) -> () + 227
+    frame #6: 0x00000001090d6672 GRDBOSXTests`DatabasePoolReleaseMemoryTests.testDatabasePoolReleaseMemoryClosesReaderConnections(self=0x0000000100a4a630) at DatabasePoolReleaseMemoryTests.swift:116
+    frame #7: 0x00000001090d9405 GRDBOSXTests`@objc DatabasePoolReleaseMemoryTests.testDatabasePoolReleaseMemoryClosesReaderConnections() at <compiler-generated>:0
+    frame #8: 0x00007fff2fe2cf1c CoreFoundation`__invoking___ + 140
+    frame #9: 0x00007fff2fe2cde7 CoreFoundation`-[NSInvocation invoke] + 311
+    frame #10: 0x000000010036cf15 XCTest`__24-[XCTestCase invokeTest]_block_invoke_2.199 + 65
+    frame #11: 0x00000001003e237b XCTest`-[XCTMemoryChecker _assertInvalidObjectsDeallocatedAfterScope:] + 51
+    frame #12: 0x0000000100375fa3 XCTest`-[XCTestCase assertInvalidObjectsDeallocatedAfterScope:] + 116
+    frame #13: 0x000000010036cea4 XCTest`__24-[XCTestCase invokeTest]_block_invoke.193 + 207
+    frame #14: 0x00000001003ceee6 XCTest`-[XCTestCase(Failures) performFailableBlock:testCaseRun:shouldInterruptTest:] + 57
+    frame #15: 0x00000001003cee02 XCTest`-[XCTestCase(Failures) _performTurningExceptionsIntoFailuresInterruptAfterHandling:block:] + 96
+    frame #16: 0x000000010036cae2 XCTest`__24-[XCTestCase invokeTest]_block_invoke + 855
+    frame #17: 0x00000001003d4d8d XCTest`-[XCUITestContext performInScope:] + 237
+    frame #18: 0x000000010036c6d2 XCTest`-[XCTestCase testContextPerformInScope:] + 87
+    frame #19: 0x000000010036c77e XCTest`-[XCTestCase invokeTest] + 137
+    frame #20: 0x000000010036e417 XCTest`__26-[XCTestCase performTest:]_block_invoke_2 + 43
+    frame #21: 0x00000001003ceee6 XCTest`-[XCTestCase(Failures) performFailableBlock:testCaseRun:shouldInterruptTest:] + 57
+    frame #22: 0x00000001003cee02 XCTest`-[XCTestCase(Failures) _performTurningExceptionsIntoFailuresInterruptAfterHandling:block:] + 96
+    frame #23: 0x000000010036e32e XCTest`__26-[XCTestCase performTest:]_block_invoke.338 + 88
+    frame #24: 0x00000001003dcc60 XCTest`+[XCTContext runInContextForTestCase:block:] + 225
+    frame #25: 0x000000010036da61 XCTest`-[XCTestCase performTest:] + 675
+    frame #26: 0x00000001003b4168 XCTest`-[XCTest runTest] + 57
+    frame #27: 0x0000000100368a45 XCTest`__27-[XCTestSuite performTest:]_block_invoke + 365
+    frame #28: 0x000000010036821d XCTest`-[XCTestSuite _performProtectedSectionForTest:testSection:] + 55
+    frame #29: 0x00000001003684e0 XCTest`-[XCTestSuite performTest:] + 296
+    frame #30: 0x00000001003b4168 XCTest`-[XCTest runTest] + 57
+    frame #31: 0x0000000100368a45 XCTest`__27-[XCTestSuite performTest:]_block_invoke + 365
+    frame #32: 0x000000010036821d XCTest`-[XCTestSuite _performProtectedSectionForTest:testSection:] + 55
+    frame #33: 0x00000001003684e0 XCTest`-[XCTestSuite performTest:] + 296
+    frame #34: 0x00000001003b4168 XCTest`-[XCTest runTest] + 57
+    frame #35: 0x0000000100368a45 XCTest`__27-[XCTestSuite performTest:]_block_invoke + 365
+    frame #36: 0x000000010036821d XCTest`-[XCTestSuite _performProtectedSectionForTest:testSection:] + 55
+    frame #37: 0x00000001003684e0 XCTest`-[XCTestSuite performTest:] + 296
+    frame #38: 0x00000001003b4168 XCTest`-[XCTest runTest] + 57
+    frame #39: 0x00000001003f3a4a XCTest`__44-[XCTTestRunSession runTestsAndReturnError:]_block_invoke + 171
+    frame #40: 0x00000001003f3b6b XCTest`__44-[XCTTestRunSession runTestsAndReturnError:]_block_invoke.80 + 68
+    frame #41: 0x000000010038c2f3 XCTest`-[XCTestObservationCenter _observeTestExecutionForBlock:] + 603
+    frame #42: 0x00000001003f37bd XCTest`-[XCTTestRunSession runTestsAndReturnError:] + 639
+    frame #43: 0x000000010034cbcf XCTest`-[XCTestDriver runTestsAndReturnError:] + 424
+    frame #44: 0x00000001003d9567 XCTest`_XCTestMain + 1491
+    frame #45: 0x00000001000023c4 xctest`main + 264
+    frame #46: 0x00007fff5d06eed9 libdyld.dylib`start + 1
+  thread #2
+    frame #0: 0x00007fff5d1a9b6a libsystem_kernel.dylib`__workq_kernreturn + 10
+    frame #1: 0x00007fff5d261630 libsystem_pthread.dylib`_pthread_wqthread + 446
+    frame #2: 0x00007fff5d261405 libsystem_pthread.dylib`start_wqthread + 13
+    frame #3: 0x0000000100000006 xctest`_mh_execute_header + 6
+  thread #3, queue = 'shared memory transport listener queue'
+    frame #0: 0x00007fff5d1abeae libsystem_kernel.dylib`__semwait_signal + 10
+    frame #1: 0x00007fff5d136830 libsystem_c.dylib`nanosleep + 199
+    frame #2: 0x00007fff5d136724 libsystem_c.dylib`usleep + 53
+    frame #3: 0x000000010052289c DTXConnectionServices`__52-[DTXSharedMemoryTransport _setupWithShm:asCreator:]_block_invoke + 764
+    frame #4: 0x00007fff5d01fd53 libdispatch.dylib`_dispatch_call_block_and_release + 12
+    frame #5: 0x00007fff5d020dcf libdispatch.dylib`_dispatch_client_callout + 8
+    frame #6: 0x00007fff5d027124 libdispatch.dylib`_dispatch_lane_serial_drain + 618
+    frame #7: 0x00007fff5d027bdc libdispatch.dylib`_dispatch_lane_invoke + 388
+    frame #8: 0x00007fff5d030090 libdispatch.dylib`_dispatch_workloop_worker_thread + 603
+    frame #9: 0x00007fff5d26160b libsystem_pthread.dylib`_pthread_wqthread + 409
+    frame #10: 0x00007fff5d261405 libsystem_pthread.dylib`start_wqthread + 13
+  thread #4
+    frame #0: 0x00007fff5d2613f8 libsystem_pthread.dylib`start_wqthread
+  thread #5
+    frame #0: 0x00007fff5d2613f8 libsystem_pthread.dylib`start_wqthread
+* thread #6, queue = 'GRDB.DatabasePool.reader.1', stop reason = breakpoint 1.1
+  * frame #0: 0x00007fff5d2330de libsystem_malloc.dylib`malloc_error_break
+    frame #1: 0x00007fff5d226676 libsystem_malloc.dylib`malloc_vreport + 437
+    frame #2: 0x00007fff5d23a86c libsystem_malloc.dylib`malloc_zone_error + 184
+    frame #3: 0x00007fff5d223130 libsystem_malloc.dylib`tiny_free_list_remove_ptr + 589
+    frame #4: 0x00007fff5d2208c1 libsystem_malloc.dylib`tiny_free_no_lock + 376
+    frame #5: 0x00007fff5d220631 libsystem_malloc.dylib`free_tiny + 483
+    frame #6: 0x00007fff5d0319c3 libdispatch.dylib`_dispatch_source_dispose + 82
+    frame #7: 0x00007fff5d0202c1 libdispatch.dylib`_dispatch_dispose + 94
+    frame #8: 0x00007fff5d020ac2 libdispatch.dylib`-[OS_dispatch_source _xref_dispose] + 55
+    frame #9: 0x00007fff5c99dc5f libsqlite3.dylib`unixFileControl + 1503
+    frame #10: 0x00007fff5c98645f libsqlite3.dylib`sqlite3WalClose + 63
+    frame #11: 0x00007fff5c98622d libsqlite3.dylib`sqlite3PagerClose + 285
+    frame #12: 0x00007fff5c985c49 libsqlite3.dylib`sqlite3BtreeClose + 345
+    frame #13: 0x00007fff5c9b522e libsqlite3.dylib`sqlite3LeaveMutexAndCloseZombie + 462
+    frame #14: 0x00007fff5c9be9f1 libsqlite3.dylib`sqlite3Close + 1121
+    frame #15: 0x000000010c142efa GRDB`static Database.closeConnection_v2(sqliteConnection=0x000000010db2ba80, sqlite3_close_v2=0x00007fff5c9becb0 libsqlite3.dylib`sqlite3_close_v2, self=GRDB.Database) at Database.swift:469
+    frame #16: 0x000000010c140b6d GRDB`static Database.closeConnection(sqliteConnection=0x000000010db2ba80, self=GRDB.Database) at Database.swift:428
+    frame #17: 0x000000010c142ded GRDB`Database.close(self=0x000000010db34510) at Database.swift:416
+    frame #18: 0x000000010c06629c GRDB`closure #1 in SerializedDatabase.deinit(db=0x000000010db34510) at SerializedDatabase.swift:52
+    frame #19: 0x000000010bfdce76 GRDB`thunk for @callee_guaranteed (@guaranteed Database) -> (@error @owned Error) at <compiler-generated>:0
+    frame #20: 0x000000010c0662eb GRDB`partial apply for thunk for @callee_guaranteed (@guaranteed Database) -> (@error @owned Error) at <compiler-generated>:0
+    frame #21: 0x000000010c0672e9 GRDB`closure #1 in SerializedDatabase.reentrantSync<A>(self=0x000000010db343d0, block=0x000000010c0662d0 GRDB`partial apply forwarder for reabstraction thunk helper from @callee_guaranteed (@guaranteed GRDB.Database) -> (@error @owned Swift.Error) to @escaping @callee_guaranteed (@guaranteed GRDB.Database) -> (@out (), @error @owned Swift.Error) at <compiler-generated>) at SerializedDatabase.swift:137
+    frame #22: 0x000000010c067408 GRDB`partial apply for closure #1 in SerializedDatabase.reentrantSync<A>(_:) at <compiler-generated>:0
+    frame #23: 0x0000000103bcc531 libswiftDispatch.dylib`partial apply forwarder for reabstraction thunk helper <A> from @callee_guaranteed () -> (@out A, @error @owned Swift.Error) to @escaping @callee_guaranteed () -> (@out A, @error @owned Swift.Error) + 17
+    frame #24: 0x0000000103bc49b2 libswiftDispatch.dylib`closure #1 () -> () in closure #1 (() throws -> A) -> () in (extension in Dispatch):__C.OS_dispatch_queue.(_syncHelper in _F417D752D2C4E9330E1C700411CE0C6A)<A>(fn: (() -> ()) -> (), execute: () throws -> A, rescue: (Swift.Error) throws -> A) throws -> A + 82
+    frame #25: 0x0000000103bcc59d libswiftDispatch.dylib`merged partial apply forwarder for closure #1 () -> () in (extension in Dispatch):__C.OS_dispatch_queue.(_syncHelper in _F417D752D2C4E9330E1C700411CE0C6A)<A>(fn: (Dispatch.DispatchWorkItem) -> (), flags: Dispatch.DispatchWorkItemFlags, execute: () throws -> A, rescue: (Swift.Error) throws -> A) throws -> A + 29
+    frame #26: 0x0000000103bcc570 libswiftDispatch.dylib`partial apply forwarder for closure #1 () -> () in closure #1 (() throws -> A) -> () in (extension in Dispatch):__C.OS_dispatch_queue.(_syncHelper in _F417D752D2C4E9330E1C700411CE0C6A)<A>(fn: (() -> ()) -> (), execute: () throws -> A, rescue: (Swift.Error) throws -> A) throws -> A + 16
+    frame #27: 0x0000000103bcc331 libswiftDispatch.dylib`partial apply forwarder for reabstraction thunk helper from @callee_guaranteed () -> () to @escaping @callee_guaranteed () -> () + 17
+    frame #28: 0x0000000103bcd859 libswiftDispatch.dylib`reabstraction thunk helper from @callee_guaranteed () -> () to @escaping @callee_guaranteed () -> ()partial apply forwarder with unmangled suffix ".203" + 9
+    frame #29: 0x0000000103bbd03e libswiftDispatch.dylib`reabstraction thunk helper from @escaping @callee_guaranteed () -> () to @callee_unowned @convention(block) () -> () + 14
+    frame #30: 0x00007fff5d020dcf libdispatch.dylib`_dispatch_client_callout + 8
+    frame #31: 0x00007fff5d02ca2c libdispatch.dylib`_dispatch_lane_barrier_sync_invoke_and_complete + 60
+    frame #32: 0x0000000103bc4f5a libswiftDispatch.dylib`@nonobjc __C.OS_dispatch_queue.sync(execute: () -> ()) -> () + 154
+    frame #33: 0x0000000103bc93b0 libswiftDispatch.dylib`partial apply forwarder for @nonobjc  + 16
+    frame #34: 0x0000000103bc485b libswiftDispatch.dylib`(extension in Dispatch):__C.OS_dispatch_queue.(_syncHelper in _F417D752D2C4E9330E1C700411CE0C6A)<A>(fn: (() -> ()) -> (), execute: () throws -> A, rescue: (Swift.Error) throws -> A) throws -> A + 267
+    frame #35: 0x0000000103bc4e8f libswiftDispatch.dylib`(extension in Dispatch):__C.OS_dispatch_queue.sync<A>(execute: () throws -> A) throws -> A + 159
+    frame #36: 0x000000010c066694 GRDB`SerializedDatabase.reentrantSync<A>(block=0x000000010c0662d0 GRDB`partial apply forwarder for reabstraction thunk helper from @callee_guaranteed (@guaranteed GRDB.Database) -> (@error @owned Swift.Error) to @escaping @callee_guaranteed (@guaranteed GRDB.Database) -> (@out (), @error @owned Swift.Error) at <compiler-generated>, self=0x000000010db343d0) at SerializedDatabase.swift:130
+    frame #37: 0x000000010c066215 GRDB`SerializedDatabase.deinit(self=0x000000010db343d0) at SerializedDatabase.swift:51
+    frame #38: 0x000000010c066819 GRDB`SerializedDatabase.__deallocating_deinit(self=0x000000010db343d0) at SerializedDatabase.swift:0
+    frame #39: 0x000000010caa7a00 libswiftCore.dylib`_swift_release_dealloc + 16
+    frame #40: 0x000000010c03fd62 GRDB`Pool.Item.deinit(self=(element = 0x0000010488660800, available = false)) at Pool.swift:0
+    frame #41: 0x000000010c03fd97 GRDB`Pool.Item.__deallocating_deinit(self=(element = 0x0000010488660800, available = false)) at Pool.swift:0
+    frame #42: 0x000000010caa7a00 libswiftCore.dylib`_swift_release_dealloc + 16
+    frame #43: 0x000000010ca9becb libswiftCore.dylib`swift_arrayDestroy + 59
+    frame #44: 0x000000010c837db6 libswiftCore.dylib`Swift._ContiguousArrayStorage.__deallocating_deinit + 54
+    frame #45: 0x000000010caa7a00 libswiftCore.dylib`_swift_release_dealloc + 16
+    frame #46: 0x000000010c041caa GRDB`closure #1 in Pool.clear(items=0 values, block=0x000000010c0419b0 GRDB`closure #1 () -> () in GRDB.Pool.clear() -> () at Pool.swift:110) at Pool.swift:117
+    frame #47: 0x000000010c041d56 GRDB`partial apply for closure #1 in Pool.clear(andThen:) at <compiler-generated>:0
+    frame #48: 0x000000010c04103a GRDB`thunk for @callee_guaranteed (@inout [Pool<A>.Item]) -> (@error @owned Error) at <compiler-generated>:0
+    frame #49: 0x000000010c041dc4 GRDB`thunk for @callee_guaranteed (@inout [Pool<A>.Item]) -> (@error @owned Error)partial apply at <compiler-generated>:0
+    frame #50: 0x000000010bfdade0 GRDB`closure #1 in ReadWriteBox.write<A>(block=0x000000010c041d90 GRDB`reabstraction thunk helper <A> from @callee_guaranteed (@inout Swift.Array<GRDB.Pool<A>.(Item in _B5841CED021678AE4EAAED27CE233841)>) -> (@error @owned Swift.Error) to @escaping @callee_guaranteed (@inout Swift.Array<GRDB.Pool<A>.(Item in _B5841CED021678AE4EAAED27CE233841)>) -> (@out (), @error @owned Swift.Error)partial apply forwarder with unmangled suffix ".26" at <compiler-generated>, self=0x000000010db2ab40) at ReadWriteBox.swift:23
+    frame #51: 0x000000010bfdaed8 GRDB`partial apply for closure #1 in ReadWriteBox.write<A>(_:) at <compiler-generated>:0
+    frame #52: 0x0000000103bcc531 libswiftDispatch.dylib`partial apply forwarder for reabstraction thunk helper <A> from @callee_guaranteed () -> (@out A, @error @owned Swift.Error) to @escaping @callee_guaranteed () -> (@out A, @error @owned Swift.Error) + 17
+    frame #53: 0x0000000103bc49b2 libswiftDispatch.dylib`closure #1 () -> () in closure #1 (() throws -> A) -> () in (extension in Dispatch):__C.OS_dispatch_queue.(_syncHelper in _F417D752D2C4E9330E1C700411CE0C6A)<A>(fn: (() -> ()) -> (), execute: () throws -> A, rescue: (Swift.Error) throws -> A) throws -> A + 82
+    frame #54: 0x0000000103bcc59d libswiftDispatch.dylib`merged partial apply forwarder for closure #1 () -> () in (extension in Dispatch):__C.OS_dispatch_queue.(_syncHelper in _F417D752D2C4E9330E1C700411CE0C6A)<A>(fn: (Dispatch.DispatchWorkItem) -> (), flags: Dispatch.DispatchWorkItemFlags, execute: () throws -> A, rescue: (Swift.Error) throws -> A) throws -> A + 29
+    frame #55: 0x0000000103bcc570 libswiftDispatch.dylib`partial apply forwarder for closure #1 () -> () in closure #1 (() throws -> A) -> () in (extension in Dispatch):__C.OS_dispatch_queue.(_syncHelper in _F417D752D2C4E9330E1C700411CE0C6A)<A>(fn: (() -> ()) -> (), execute: () throws -> A, rescue: (Swift.Error) throws -> A) throws -> A + 16
+    frame #56: 0x0000000103bcc331 libswiftDispatch.dylib`partial apply forwarder for reabstraction thunk helper from @callee_guaranteed () -> () to @escaping @callee_guaranteed () -> () + 17
+    frame #57: 0x0000000103bbd03e libswiftDispatch.dylib`reabstraction thunk helper from @escaping @callee_guaranteed () -> () to @callee_unowned @convention(block) () -> () + 14
+    frame #58: 0x00007fff5d020dcf libdispatch.dylib`_dispatch_client_callout + 8
+    frame #59: 0x00007fff5d02cd81 libdispatch.dylib`_dispatch_sync_invoke_and_complete_recurse + 65
+    frame #60: 0x00007fff5d02c8e7 libdispatch.dylib`_dispatch_sync_f_slow + 195
+    frame #61: 0x0000000103bc94e8 libswiftDispatch.dylib`partial apply forwarder for (extension in Dispatch):__C.OS_dispatch_queue.(_syncBarrier in _F417D752D2C4E9330E1C700411CE0C6A)(block: () -> ()) -> () + 168
+    frame #62: 0x0000000103bc485b libswiftDispatch.dylib`(extension in Dispatch):__C.OS_dispatch_queue.(_syncHelper in _F417D752D2C4E9330E1C700411CE0C6A)<A>(fn: (() -> ()) -> (), execute: () throws -> A, rescue: (Swift.Error) throws -> A) throws -> A + 267
+    frame #63: 0x0000000103bc5189 libswiftDispatch.dylib`(extension in Dispatch):__C.OS_dispatch_queue.sync<A>(flags: Dispatch.DispatchWorkItemFlags, execute: () throws -> A) throws -> A + 473
+    frame #64: 0x000000010bfda536 GRDB`ReadWriteBox.write<A>(block=0x000000010c041d90 GRDB`reabstraction thunk helper <A> from @callee_guaranteed (@inout Swift.Array<GRDB.Pool<A>.(Item in _B5841CED021678AE4EAAED27CE233841)>) -> (@error @owned Swift.Error) to @escaping @callee_guaranteed (@inout Swift.Array<GRDB.Pool<A>.(Item in _B5841CED021678AE4EAAED27CE233841)>) -> (@out (), @error @owned Swift.Error)partial apply forwarder with unmangled suffix ".26" at <compiler-generated>, self=0x000000010db2ab40) at ReadWriteBox.swift:22
+    frame #65: 0x000000010c041b5d GRDB`Pool.clear(block=0x000000010c0419b0 GRDB`closure #1 () -> () in GRDB.Pool.clear() -> () at Pool.swift:110, self=0x000000010db35060) at Pool.swift:116
+    frame #66: 0x000000010c04198d GRDB`Pool.clear(self=0x000000010db35060) at Pool.swift:110
+    frame #67: 0x000000010c0bba6a GRDB`DatabasePool.releaseMemory(self=0x000000010d14b7a0) at DatabasePool.swift:165
+    frame #68: 0x00000001090d8a98 GRDBOSXTests`closure #6 in DatabasePoolReleaseMemoryTests.testDatabasePoolReleaseMemoryClosesReaderConnections(s3=0x000000010db30070, dbPool=0x000000010d14b7a0) at DatabasePoolReleaseMemoryTests.swift:113
+    frame #69: 0x00000001090d8af1 GRDBOSXTests`partial apply for closure #6 in DatabasePoolReleaseMemoryTests.testDatabasePoolReleaseMemoryClosesReaderConnections() at <compiler-generated>:0
+    frame #70: 0x00000001082f32dc GRDBOSXTests`thunk for @escaping @callee_guaranteed () -> () at <compiler-generated>:0
+    frame #71: 0x00000001090d8c11 GRDBOSXTests`thunk for @escaping @callee_guaranteed () -> ()partial apply at <compiler-generated>:0
+    frame #72: 0x00000001090d8ca6 GRDBOSXTests`closure #7 in DatabasePoolReleaseMemoryTests.testDatabasePoolReleaseMemoryClosesReaderConnections(index=2, blocks=3 values) at DatabasePoolReleaseMemoryTests.swift:117
+    frame #73: 0x00000001090d8d0d GRDBOSXTests`partial apply for closure #7 in DatabasePoolReleaseMemoryTests.testDatabasePoolReleaseMemoryClosesReaderConnections() at <compiler-generated>:0
+    frame #74: 0x0000000103bc8111 libswiftDispatch.dylib`partial apply forwarder for reabstraction thunk helper from @callee_guaranteed (@unowned Swift.Int) -> () to @escaping @callee_guaranteed (@unowned Swift.Int) -> () + 17
+    frame #75: 0x0000000103bc4214 libswiftDispatch.dylib`reabstraction thunk helper from @escaping @callee_guaranteed (@unowned Swift.Int) -> () to @callee_unowned @convention(block) (@unowned Swift.Int) -> () + 20
+    frame #76: 0x00007fff5d020e04 libdispatch.dylib`_dispatch_client_callout2 + 8
+    frame #77: 0x00007fff5d030957 libdispatch.dylib`_dispatch_apply_invoke + 159
+    frame #78: 0x00007fff5d020dcf libdispatch.dylib`_dispatch_client_callout + 8
+    frame #79: 0x00007fff5d02ee80 libdispatch.dylib`_dispatch_root_queue_drain + 671
+    frame #80: 0x00007fff5d02f4bd libdispatch.dylib`_dispatch_worker_thread2 + 90
+    frame #81: 0x00007fff5d2616dd libsystem_pthread.dylib`_pthread_wqthread + 619
+    frame #82: 0x00007fff5d261405 libsystem_pthread.dylib`start_wqthread + 13
+  thread #7
+    frame #0: 0x00007fff5d1a9b6a libsystem_kernel.dylib`__workq_kernreturn + 10
+    frame #1: 0x00007fff5d261630 libsystem_pthread.dylib`_pthread_wqthread + 446
+    frame #2: 0x00007fff5d261405 libsystem_pthread.dylib`start_wqthread + 13
+    frame #3: 0x0000000100000002 xctest`_mh_execute_header + 2
+```
+
+</details>

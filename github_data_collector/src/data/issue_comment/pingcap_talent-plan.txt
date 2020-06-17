@@ -1,0 +1,159 @@
+When doing this homework, I found `make test_example` drained my disk space, and then panicked due to `no space left on device`.
+
+After understanding the test code, I found the test code never cleanup the data generated after each testcase.
+
+In my opinion, since the size of the data each test case generated is not ignorable, the test should remove them after each case.
+
+Something like that:
+```go
+// tidb/mapreduce/urltop10_test.go
+func testURLTop(t *testing.T, rounds RoundsArgs) {
+	// ......
+	for k := range dataSize {
+		for i, gen := range gens {
+			// generate data
+			prefix := dataPrefix(i, dataSize[k], nMapFiles[k])
+			// ......
+                        // added code here: clean up, or cleanup only when the case has passed
+			os.RemoveAll(prefix)
+		}
+	}
+}
+```
+
+Is there any good reason not doing this?
+
+Or is the cleanup part of the homework?
+
+------
+在做这个作业的时候，我在运行 `make test_example` 发现生成的`mr_homework`占了大量磁盘空间，并且测试由于`no space left on device` panic了。
+在理解了测试代码后，我发现测试代码并不在每个testcase之后清理生成的文件。（也许是希望随后由用户手动`make cleanup`？但这样就容易出现我上面的问题。）
+在我看来，每个testcase生成的文件的大小并不小到可以忽略，是否考虑在每个testcase执行完（或者执行完且为pass）后立即清理掉这部分文件？（还是说在某处手动清理是作业的一部分？）
+像这样：
+```go
+// tidb/mapreduce/urltop10_test.go
+func testURLTop(t *testing.T, rounds RoundsArgs) {
+	// ......
+	for k := range dataSize {
+		for i, gen := range gens {
+			// generate data
+			prefix := dataPrefix(i, dataSize[k], nMapFiles[k])
+			// ......
+                        // 新增代码: clean up, 或者也可以放在测试pass的分支中
+			os.RemoveAll(prefix)
+		}
+	}
+}
+```
+Now that we have mentioned the map-based implementation in [part4](https://github.com/pingcap/talent-plan/blob/master/rust/projects/project-1/project.md#part-4-store-values-in-memory), why is our requirement in the [project spec](https://github.com/pingcap/talent-plan/blob/master/rust/projects/project-1/project.md#project-spec) to return `unimplemented`?
+I am confused. I think it is better to return map-based results.
+OS: Windows10 64-bit, version 1903, build 18362.535
+
+Rust: 1.39.0  
+
+
+
+I didn’t implement compaction feature for my own KvStore at all, however, after I ran all tests, it showed that my own KvStore passed the compaction test. 
+
+
+
+Then I found the way of detecting the size of a directory seemed to be the problem. Actually, it is risky to find out the size of an opened file by inspecting its metadata.  When we dump data into an opened database log file, it is possible that the metadata won’t be updated immediately. 
+
+
+
+The related code is shown as follows:
+
+```rust
+let dir_size = || {
+    let entries = WalkDir::new(temp_dir.path()).into_iter();
+    let len: walkdir::Result<u64> = entries
+    .map(|res| {
+        res.and_then(|entry| entry.metadata())
+        .map(|metadata| metadata.len())
+    })
+    .sum();
+    len.expect("fail to get directory size")
+};
+let mut current_size = dir_size(); // current_size = 0
+for iter in 0..1000 {
+    for key_id in 0..1000 {
+        let key = format!("key{}", key_id);
+        let value = format!("{}", iter);
+        store.set(key, value)?;
+    }
+
+    let new_size = dir_size(); // new_size = 0 as metadata is not updated
+    if new_size > current_size { // false --> 'compaction triggered' (not!)
+        current_size = new_size;
+        continue;
+    }
+    // Compaction triggered
+
+    drop(store);
+    ...
+}
+```
+
+let’s say, the first call of `dir_size`  returns 0, which is assigned to `current_size`. And then 1000 key-value pairs are put into `store`. Unfortunately, the second call of `dir_size` will still return 0 because there is only one log file and its metadata is not updated. Therefore，the statement `new_size > current_size` is false because they are equal actually, finally, the test function claims “compaction triggered”, which is not true.
+
+
+
+If we do system call like `fsync` or something as we write to file, metadata will be updated of course, but it is too heavy. Here we just want to know file size, so why not just open the file, seek the file pointer to the end, and record its position? Like this:
+
+```rust
+let dir_size = || -> u64 {
+    let size: io::Result<u64> = WalkDir::new(temp_dir.path())
+    .into_iter()
+    .filter_map(|e| e.ok())
+    .filter(|e| e.path().is_file())
+    .filter_map(|e| File::open(&e.path()).ok())
+    .map(|mut f| f.seek(SeekFrom::End(0)))
+    .sum();
+    size.expect("fail to get total size of logs")
+};
+```
+
+
+
+By this way, the compaction test fails if KvStore doesn’t deal with file compaction.
+
+Any ideas? 
+Signed-off-by: Muhammad Falak R Wani <falakreyaz@gmail.com>
+There were some [redundant_clone](https://rust-lang.github.io/rust-clippy/master/#redundant_clone) I guess this rule is added to clippy recently ...
+Firstly, very thanks to your great jobs!  I'm reaching to project-4, and trying to preview bb-5, but it says coming soon :)
+
+Are there any plans for it? (The previous build-blocks have tought me many backgrounds, and they are awesome!)
+BB3's exercise points to Custom Serialization. The exercise consists of
+using serde to serialize and deserialize redis protocol messages. For this
+purpose it's necessary writing a new serde's data format, making it able to
+serialize and deserialize redis protocol's messages.
+
+This commit updates BB3's exercise mentioned above and points the
+helping link for serde's documentation about writing a data format.
+
+Discussed on tikv-wg slack on:
+- https://tikv-wg.slack.com/archives/CKD9363A8/p1573310455016400
+- https://tikv-wg.slack.com/archives/CKD9363A8/p1574274353032000
+
+I always get the output like this:
+~~~
+error[E0432]: unresolved import `kvs::KvStore`
+ --> tests/tests.rs:2:5
+  |
+2 | use kvs::KvStore;
+  |     ^^^^^^^^^^^^ no `KvStore` in the root
+
+error: aborting due to previous error
+
+For more information about this error, try `rustc --explain E0432`.
+error: Could not compile `kvs`.
+
+To learn more, run the command again with --verbose.
+~~~
+so i can't run the test correctly, when i write nothing in my file.
+On slack QuRyu reported some problems completing the project 4 benchmarks: https://tikv-wg.slack.com/archives/CKD9363A8/p1568990445005500
+
+The two main problems:
+
+- They ran into ulimits for open socks. I believe this benchmark describes opening many sockets at once. For simplicity it _might_ be best to pick a number that is lower than the default ulimits. This could be an opportunity to discuss ulimits, which are something that plague networked programs and their test suits, but also this section is already super complicated - adding a ulimit digression would just make it more so.
+- They needed to search for an unbound port for the server. This seems to indicate that criterion is running benchmarks in parallel, which is surprising.

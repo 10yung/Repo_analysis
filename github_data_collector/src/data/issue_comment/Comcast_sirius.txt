@@ -1,0 +1,81 @@
+Sirius relies on Akka remoting in order for nodes to catchup with each other.  This has a few drawbacks:
+
+1. Akka remoting protocol is not stable between versions of Akka
+1. Akka remoting requires bidirectional communication between nodes
+
+I propose adding support into Sirius for HTTP-based following where Sirius can be configured to listen on a given port and accept HTTP requests for log ranges.  Following nodes would be configured with the URI through which to request those log ranges, which could be behind a load balancer.
+
+I've already implemented this behavior in my Spring application by disabling Akka-based catchup and tapping into the Akka actor system directly to read log subranges and to replay them and it works quite well.  The Spring controllers support streaming which allows the followers to request the entire log from a given sequence.
+Adds `RequestWithMetadataHandler` which Sirius will pass the sequence and timestamp of all `OrderedEvent`s.
+This is a much simpler approach.  I've updated the `AkkaFutureAdapter` class to instead convert the Akka `Future[T]` to a Java 8 `CompletableFuture[T]`.
+
+I've kept the `Sirius` interface the same as in that it continues to return `Future[T]` which would eliminate the potential for breaking a consumer which implements that interface directly, but that does put additional onus on the consumer to determine if the returned `Future[T]` is a `CompletableFuture[T]` or not. 
+We sometimes see `akka.pattern.AskTimeoutException` during startup, and generally a restart fixes the problem or the timeouts will occur several times and then cease.
+The timeouts occur while executing:
+
+`sirius.enqueuePut(event.getKey().fullKey(), data).get();`
+
+As you can see, we enqueuePut, and then immediately block until the future returns. Here is a [thread dump](https://github.com/Comcast/sirius/files/1162716/blah3.txt) I took while waiting for the future.
+
+The main thread is waiting for the future, but there don't seem to be any other threads doing anything sirius related. I had expected to see our main thread waiting on a sirius implementation thread to finish its work, but I don't see any threads like that.
+
+This node's sirius cluster config only contained `/user/sirius`.
+
+This is happening at startup, but after `com.comcast.xfinity.sirius.api.Sirius.isOnline()` returns true. Sometime around then, we see this in the logs:
+
+> 2017-07-14 19:46:24,297 WARN  s=localListingInfoWebService-root_out env="ape" [sirius-system-akka.actor.default-dispatcher-12] Sirius(akka://sirius-system): SiriusSupervisor Actor received unrecognized message IsInitializedResponse(true)
+
+Perhaps this warning is relevant to the issue.
+We recently detected a situation where several follower nodes were found to be missing data that could be found in the uberstore of one of the Paxos-participating nodes. The affected nodes were all in the same data center, but not all nodes in that data center were affected (7 out of 28 in that data center). Further, there seemed to be two sets of affected nodes, similar in the degree to which they were affected (e.g. nodes A, C, F, G were missing 540 of a particular type of event while B, D, E, were only missing 167 of that event). However, all of the missing events took place around the same time.
+
+Our cluster topology involves three data centers and has three parts to it:
+
+The first part is composed of three Paxos-participating nodes, only one of which generates events that go out to the cluster. The other two nodes are for failover. All three nodes are in the same datacenter.
+
+The second part is composed of what we call repeater nodes. Their responsibility is to distribute updates from the Paxos-participating nodes (in a different datacenter) to the client-facing nodes they share a datacenter with. That is to say, the sirius cluster config for repeater nodes lists only the Paxos-participating nodes, and the sirius cluster config for client facing nodes lists only the repeater nodes. There are three repeater nodes in each datacenter.
+
+The third part is composed of the nodes serving customer traffic.
+
+I was able to obtain a copy of the uberstore directory from one of the Paxos-participating nodes (145) and one of the affected nodes (141). Using the waltool, I determined a sequence range that encompassed the missing events and extracted that same range from each uberstore:
+
+- [range-54693000-54695000-141.txt](https://github.com/Comcast/sirius/files/590239/range-54693000-54695000-141.txt)
+- [range-54693000-54695000-145.txt](https://github.com/Comcast/sirius/files/590240/range-54693000-54695000-145.txt)
+
+As you can see, there are some individual events missing as well as a large chunk that's missing (546935891-546943916)
+
+Some more information about our setup:
+- Sirius 1.2.6
+- [Sirius Config](https://github.com/Comcast/sirius/files/590291/sirius-config.txt)
+- Our ingest patterns tend to be bursty.
+- We rebuild the WAL once a month on average (with each release).
+
+Please let me know if there is anything else you would like to know.
+When using nodetool, if I pass in an "akka://..." nodeId, I get the following error message:
+
+> akka.remote.RemoteTransportException: No transport is loaded for protocol: [akka], available protocols: [akka.tcp]
+
+However, [SiriusShortNameParser expects nodeIds to start with "akka://"](https://github.com/Comcast/sirius/blob/master/src/main/scala/com/comcast/xfinity/sirius/util/SiriusShortNameParser.scala#L90):
+
+> java.lang.IllegalArgumentException: akka.tcp://.../user/sirius does not appear to be a vaild Akka address or Sirius node short name
+Before 'live' compaction, DELETE events older than 7 days (by default) were compacted out during WalTool compaction.
+
+When Sirius switched to using live compaction, that bit of logic was left out.  So if a DELETE event is not followed by a subsequent PUT then it lives in the Uberstore forever.
+
+For our usage, this has led to more than 165,000,000 stale DELETE events in the Uberstore.  That represents almost 3x the live PUTs and 15gb out of the 40gb Uberstore.
+
+Sirius needs to re-add the ability to purge DELETE events that are older than a specified age while doing compaction.
+
+ActorRef eviction is designed in the following way:
+- keep track of when latest received Pong messages and actor resolutions have occurred
+- removing references who haven't been updated beyond a certain threshold from the map
+- fire off an attempt to re-resolve these actor refs
+
+The first piece currently isn't functioning as desired. The map is keyed on an Actor's path, and the Pong message is received from the membership actor `/user/sirius/membership`, while the resolution path and the map in the MembershipAgent are keyed on the supervisor's path `/user/sirius`. In short, Pong messages aren't resetting the timeout threshold, and all Refs in the MembershipAgent are recreated (by default) every 40 seconds or so.
+
+This is safe, but it should be fixed in order to work as intended.
+
+Election in the Leader actor is actually quite a simple FSM. This could be modeled very easily with `context.become()` (or with a real FSM, though that might be overkill). It would reduce the amount of variable state in the Leader somewhat. This change would also make it significantly clearer what the leader does with incoming messages in each case.
+
+Similar to #98 , dump ActorRef resolution for ActorSelection, but this time in the context of the elected leader in the Leader actor. At first, using a resolved reference seems like a good idea in the Leader -- we care whether there is an actor alive at the other end. However, we're also doing our own liveness testing for the elected leader, and doubling up on that just leads to confusion. 
+
+Also, while we care whether there is a live remote leader, we _don't_ care which instantiation it is -- and stale ActorRefs with old ids can be problematic.

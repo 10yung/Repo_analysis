@@ -1,0 +1,94 @@
+I am no longer happy about depending on the `rand` crates. There is too much churn, too many crates, and IMO, worst of all, there is no desire to [add a minimal version check to their CI](https://github.com/rust-random/rand/issues/741). Which means _anything_ that depends on `quickcheck` in turn cannot reliably have its own minimal version check.
+
+Because I am tired of depending on `rand`, I have started removing it completely where possible. For example, in `walkdir`, I've [removed quickcheck as a dependency](https://github.com/BurntSushi/walkdir/commit/5d16163ce67245d07df0f913847b5f7a4c4c02b6). In ripgrep, I've [removed `tempfile` as a dependency](https://github.com/BurntSushi/ripgrep/commit/31807f805a793c254587105ca8ee0d41dfe3004b), because it in turn was the only thing bringing `rand` into ripgrep's dependency tree.
+
+I don't see any other path forward here. I can either continue to grin and bear `rand`, drop everything that depends on randomness, or figure out how to generate randomness without `rand`. Specifically, I'd very much like to add a minimal version check back to the `regex` crate, which catches bugs that happen in practice. (See [here](https://github.com/rust-lang/regex/issues/570) and [here](https://github.com/rust-lang/regex/issues/593).) My sense is that there is some design space in the ecosystem for a simple source of randomness that doesn't need to be cryptographically secure, and an API that does not experience significant churn. Certainly, quickcheck does not need a cryptographic random number generator.
+
+With that said, there is some infrastructure in the `rand` API that is incredibly useful. For example, quickcheck makes heavy use of the [`Rng::gen`](https://docs.rs/rand/0.7.0/rand/trait.Rng.html#method.gen) method for generating values based on type.
+
+So it seems like if we have something like the `Rng` trait with with a non-cryptographic RNG, then we'd be probably good to go.
+
+Are there other avenues here? What have I missed? My experience in building infrastructure for randomness is pretty limited, so am I underestimating the difficulty involved here?
+
+Another side to this question is whether any users of quickcheck are leveraging parts of the `rand` ecosystem that would be difficult or impossible to do if we broke ties with `rand`.
+Aims to fix #119, #190 and #233. Changes the implementation of `Arbitrary` for numbers to ignore the `size` of `gen`, and instead pick uniformly from the entire range of the type.
+
+Todo:
+* [x] change behavior
+  * [X] integer types
+  * [x] floating-point types
+* [X] add tests
+* [x] explain new meaning of `Gen`'s `size()` in documentation
+Hello,
+
+It appears this test will always pass even setting `QUICKCHECK_TESTS` and `QUICKCHECK_MAX_TESTS` to a large value (e.g., `10000000`) and `QUICKCHECK_GENERATOR_SIZE` to `300`,
+
+```rust
+fn prop_gt(x: i8) -> bool {
+    x != i8::min_value()
+}
+
+fn main() {
+    quickcheck(prop_gt as fn(i8) -> bool);
+    println!("Hello, world!");
+}
+```
+
+It appears these lines of code attribute to this issue,
+https://docs.rs/quickcheck/0.8.2/src/quickcheck/arbitrary.rs.html#756-771
+If `upper = min(g.size(), $ty::max_value() as usize)`, then `if upper > $ty::max_value()` always evaluates to the else branch.
+I have a test with signature:
+```rust
+fn a_test(n: usize) -> bool
+```
+but all the selected values of n are in (0, 100) which seems counter-intuitive. Is this what I should expect?
+Obviously we can't do full generic N until const generics are implemented. I only wanted it for 3 `[f32; 2]`s anyway (and settled for six `f32`s in my function's parameters) and I'd be happy to send a pull request for just `[T: Arbitrary; k]` for a few small `k`s if that's good with you.
+Would be nice to have. `String`'s impl isn't quite the same.
+I have a type which wraps an `i32`, and wrote an `Arbitrary` impl like so:
+
+``` rust
+trait Arbitrary<PgDate> {
+    fn arbitrary<G: Gen>() -> Self {
+          PgDate(i32::arbitrary())
+    }
+}
+```
+
+When I actually output what it's running with, the values are only ranging from `100` to `-100`, instead of 100 completely random numbers as I'd expect. Additionally, `shrink` appears to be flawed on these types. My understanding was that quickcheck would test for known problematic values for a given type. For `i32` I'd expect that to at minimum be `1`, `0`, `-1`, `i32::MAX` and `i32::MIN`, but when I add the `shrink` like so:
+
+``` rust
+fn shrink(&self) -> Box<Iterator<Item=Self>> {
+    Box::new(self.0.shrink().map(PgDate))
+```
+
+I just see the same range of -100 to 100. This caused a critical bug that occurs for any values less than `-2451545` to go unnoticed.
+
+Using rustc 1.0.0-nightly (3d0d9bb6f 2015-01-12 22:56:20 +0000):
+
+```
+fn reverse<T: Clone>(xs: &[T]) -> Vec<T> {
+    let mut rev = vec!();
+    for x in xs.iter() {
+        rev.insert(0, x.clone())
+    }
+    rev
+}
+
+#[test]
+fn reverse_identity() {
+  fn prop(xs: Vec<i32>) -> bool {
+    xs == reverse(reverse(xs.as_slice()).as_slice())
+  }
+  quickcheck(prop);
+}
+```
+
+produces
+
+```
+error: the trait `quickcheck::tester::Testable` is not implemented for the type `fn(collections::vec::Vec<i32>) -> bool {tests::reverse_identity::prop}`
+```
+
+`quickcheck(false)` compiles; this appears to be specific to the fn impls, including the zero-arg fn.
+
+Currently `INFINITY`, `NEG_INFINITY`, `NAN` and possibly `-0.0` are never generated by quickcheck. These values are valid floats, and should be tested for.

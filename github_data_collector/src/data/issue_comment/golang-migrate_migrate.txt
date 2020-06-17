@@ -1,0 +1,192 @@
+This PR aims to solve DB inconsistency mentioned in https://github.com/golang-migrate/migrate/issues/325 by letting transactional DB drivers handle setting the version and dirty flag when running a migration.
+
+- Adds a method `Transactional() bool` to the `Driver` interface
+- Skips calling `SetVersion` in `migrate.go` for transactional drivers
+- Adds a `version` argument to `Run` so that transactional drivers know which version to set upon success
+- Updates the Postgres driver to make use of a transaction
+
+Try it out by following the "alternative" instructions in https://github.com/chrismwendt/golang-migrate-consistency
+
+TODO
+
+- Implement transactional migrations for transactional drivers
+  - [ ] SQLite
+  - [ ] MySQL
+  - [ ] ...others
+- [ ] Clean up the string munging in `postgres.go`
+**Describe the Bug**
+
+When the `migrate` command is killed while a migration is running and the migration succeeds asynchronously inside Postgres, the DB is left marked dirty when in reality it's clean. This is inconsistent, and causes confusion.
+
+This situation realistically occurs when a migration takes longer to run than the app is given to initialize by the supervisor (e.g. Kubernetes) and the supervisor restarts the app.
+
+**Steps to Reproduce**
+
+Full repro at https://github.com/chrismwendt/golang-migrate-consistency
+
+**Expected Behavior**
+
+For databases that support transactions/rollback (specifically Postgres), the DB should not be eagerly marked dirty until the migration has failed.
+
+The DB should never be in a state where the migration succeeded but the DB has been marked dirty.
+
+**Migrate Version** 4.8.0
+
+**Loaded Source Drivers** file
+
+**Loaded Database Drivers** postgres, postgresql, stub
+
+**Go Version** go version go1.13.3 darwin/amd64
+
+**Stacktrace** N/A
+
+**Discussion**
+
+Are there any existing issues related to this?
+
+Does anyone have other ideas on how to enforce the consistency? This won't work for databases that don't support transactions, but perhaps it could be an optional feature that transactional database drivers support.
+
+**Is your feature request related to a problem? Please describe.**
+This has been a long standing todo from the original migrate implementation
+
+**Describe the solution you'd like**
+Support for the Neo4j graph database
+
+**Describe alternatives you've considered**
+I have implemented this solution
+
+**Additional context**
+My accompanying pull request is here: #320 
+
+**Describe the Bug**
+I am trying to implement the driver for Neo4J. The generic driver implementation instructions say that if you can't provide Lock/Unlock functionality, those functions should return `nil`. However if the Lock function returns `nil`, it fails dt.Test()
+
+**Steps to Reproduce**
+Steps to reproduce the behavior:
+1. Implement a driver with a noop Lock function.
+2. Run dt.Test() with that driver, observe failure
+
+**Expected Behavior**
+The new driver implementation guide shouldn't result in explicit test failure
+
+**Migrate Version**
+Latest
+
+**Loaded Source Drivers**
+
+
+**Loaded Database Drivers**
+Custom, Neo4J, potentially and non-locking driver
+
+**Go Version**
+Latest, though not applicable
+
+**Stacktrace**
+testing.go:97: lock: expected err not to be nil
+
+**Additional context**
+None
+
+**Is your feature request related to a problem? Please describe.**
+We recently ran into an issue where there was no statement timeout in a migration. This caused a down time.
+
+We would like to specify a timeout and say that no migration statement should run for more than ~30 seconds say.
+
+**Describe the solution you'd like**
+Add postgres statement timeout to the connection session.
+
+**Describe alternatives you've considered**
+Adding statement timeout to each migration. (hard since we need every engineer to remember this during reviews and writing migrations)
+
+**Additional context**
+
+
+This PR adds validation to migration versions when creating migrations and improves/refactors creation in general. As a "side-effect", it fixes #238.
+
+## Rationale
+
+`migrate create` doesn't validate migration versions when creating files. This causes issues when creating files that results in same-version migrations. It's easy to replicate this behavior:
+
+```
+# created sequentially too fast (unix format)
+
+$ for name in same_second_one same_second_two; do
+$   migrate create -dir migs -ext sql -format "unix" "$name"
+$ done
+$ ls -1 migs
+1575445236_same_second_one.down.sql
+1575445236_same_second_one.up.sql
+1575445236_same_second_two.down.sql
+1575445236_same_second_two.up.sql
+
+# low precision time format (stupid, but valid format)
+
+$ migrate create -dir migs -ext sql -format "20060102" same_day_one
+$ migrate create -dir migs -ext sql -format "20060102" same_day_two
+$ ls -1 migs
+20191204_same_day_one.down.sql
+20191204_same_day_one.up.sql
+20191204_same_day_two.down.sql
+20191204_same_day_two.up.sql
+```
+
+I accidentally hit the first case when converting an already existing database schema into migrations, using a very similar loop, iterating over table names, creating migrations and redirecting the output of `pg_dump -st $table` into each "up" migration. It didn't occur to me that versions would be colliding. When I tried to run `migrate up`, a very obscure ["unable to parse file"](https://github.com/golang-migrate/migrate/blob/41b578a45e9ee45589dd72599113d6253c409d1a/source/file/file.go#L74) error popped up. Reading the source code explained it.
+
+Since it's much harder to refactor the whole `source` package to show useful error messages ([Migrations.Append()](https://github.com/golang-migrate/migrate/blob/41b578a45e9ee45589dd72599113d6253c409d1a/source/migration.go#L48) isn't supposed to return `error` with useful messages instead of `bool`?), I went for the simpler "warn the kids that the stove is hot" solution.
+
+## Solution & Improvements
+
+* Validate migration version on creation, to avoid creation of duplicated versions
+
+A refactoring of the migration creation code first generates the `version` component and then checks if any files with that version already exists on disk.
+
+Here's the corresponding outputs to the commands above, using the fixed version:
+
+```
+$ go build -o /tmp/migrate ./cmd/migrate
+$ cd "$(mktemp -d)"
+
+$ /tmp/migrate create -dir migs -ext sql -format "20060102" same_day_one
+migs/20191204_same_day_one.up.sql
+migs/20191204_same_day_one.down.sql
+
+$ /tmp/migrate create -dir migs -ext sql -format "20060102" same_day_two
+error: duplicate migration version: 20191204
+
+$ ls -1 migs
+20191204_same_day_one.down.sql
+20191204_same_day_one.up.sql
+```
+
+* Use `os.OpenFile` with `O_CREATE|O_EXCL` to create files to avoid file collisions
+
+This would be very difficult to cause, but I can imagine some bogus uses of `parallel` + `migrate` that would case this to happen (in cases someone want to generate hundreds of migrations faster, but the script contains bugs, for example).
+
+* Use `filepath` functions to manipulate paths, making `cleanPath()` not necessary
+
+I see that in the discussion of #238 and the proposed fix for it in 9f6c7e5fc9ec3c682bb84701f344bb9a51e58aa2 and #250, there's a lot of string manipulation gymnastics to handle cross-platform path manipulation. `filepath` is the cross-platform solution for this and all its functions should be used when doing real, on disk, OS specific, path manipulation.
+
+So this PR properly fixes #238 and supersedes #250.
+
+* Prints generated filenames
+
+This can be debatable, but popular migration generators (active record, django, etc) print the filenames out, so the developer knows which file was created. It's also convenient to simply copy-paste the name of the file to open it for editing.
+
+## Tests
+
+The PR updates the migration creation tests, but I'm not able to run the whole suite because I'm on Fedora 31 which ships the kernel with cgroupsv2 enabled and docker doesn't work with it (as of now).
+
+`go test ./internal/cli/...` does work though.
+
+And I quickly tested the built CLI on a Windows VM: https://gist.github.com/13k/1483f0c377991252b486fd604fd5acee
+I see a commit from Nov 2018 to make a copy and move to cmd/migrate, does it make sense to remove the cli folder at this point since has been been a year? If so I can open a PR.
+Is this possibly a feature which others want to see in here as well?
+The idea is to keep the migration file count small when there will be
+frequent changes to views, functions or bulk data inserts.
+
+Tracking and undoing migrations in this case would be handled by version control only.
+
+Here is an example of this concept: [https://flywaydb.org/getstarted/repeatable](https://flywaydb.org/getstarted/repeatable)
+Hi, is there a way to define a Postgres `-database`connection using `ident` authentication?
+
+I looked at https://github.com/lib/pq/issues/645 which suggests using  `dbname=postgres host=/tmp`, but this doesn't seem to work with the URL syntax.

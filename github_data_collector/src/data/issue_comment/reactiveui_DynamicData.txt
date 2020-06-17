@@ -1,0 +1,642 @@
+**Is your feature request related to a problem? Please describe.**
+Well not exactly a problem but it could benefit everyone that's using the DD on mobile (and other platforms too): Shuffling on the lists and unnecessary update of  whole item in the UI due to the replacement of items even when their `TKey` is the same as the previous cached version. That means the items are equal (not the same reference) but only a property has changed.
+
+The issue I'm talking about is mentioned in this issue:
+#240 
+
+The real life case:
+In my most recent projects I've been using `Akavache` as fetcher of data and caching mechanism, and `DynamicData` to provide the data through my services connecting them through the viewmodels. That's a nice duo, but I'm constantly being hit by the combination of `GetAndFetchLatest` (gets from the cache and from the remote) + `AddOrUpdate`/`EditDiff` because the replacement of items is making my lists to shuffle when a property of the object gets changed on the remote.
+
+**Describe the solution you'd like**
+As already discussed in the issue #240 above there are two proposed solutions:
+- one is to provide a `Transform` that receives an update action as argument, so that could be implemented for each specific case before presenting the data at the viewmodel level (for my case at least).
+- the second one is to provide something closer to the cache itself, like the `EditDiff` and `AddOrUpdate`, making use of the `Edit` to perform the update action as passed in.
+
+I think both of these mechanisms would be great additions to the framework. For my case the **second one** would be the perfect addition, to not have to rely on it as an extension snippet that I copy and paste into my project. 
+With them in place I imagine it would cover most of the cases people are using, having this optimization out of the box to be used. With that we could fine grain how the items would get updated and when.
+
+**Describe alternatives you've considered**
+No others for now.
+
+**Describe suggestions on how to achieve the feature**
+They are already proposed on the issue #240
+
+**Additional context**
+Unlike `ExpireAfter` the `LimitSizeTo` does not notify the subscribers on deletion, only on completion.
+
+I listen on a `Observable` and to keep track of it (like history) I put it into a ObservableChangeSet and persist it. Basically a persistable history of an `Observable`. The `Observable` I listen runs forever. But the `LimitSizeTo` never notify the subscriber when deletion occurs only when the `ISourceCache` completes. So I cannot delete the oldest objects from the database to keep the memory/disk size constant.
+
+The code where it fails for me:
+```
+public IObservable<IChangeSet<TObject, TKey>> CreatePersistenceObservableChangeSet<TObject, TKey>(
+            IObservable<TObject> fromObservable,
+            Func<TObject, TKey> keySelector,
+            int sizeLimit = 0)
+        {
+            return ObservableChangeSet.Create(cache =>
+            {
+                var collection = GetCollection<TObject>();
+                var compositeDisposable = new CompositeDisposable();
+
+                // initial load from database after restart
+                cache.AddOrUpdate(collection.FindAll());
+
+                if (sizeLimit > 0)
+                {
+                    cache.LimitSizeTo(sizeLimit)
+                        .Subscribe(items =>
+                        {
+                            foreach (var keyValuePair in items)
+                            {
+                                collection.Delete(keyValuePair.Key);
+                            }
+                        })
+                        .DisposeWith(compositeDisposable);
+                }
+
+                fromObservable.Subscribe(item =>
+                    {
+                        collection.Upsert(keySelector(item), item);
+                        cache.AddOrUpdate(item);
+                    })
+                    .DisposeWith(compositeDisposable);
+
+                return compositeDisposable;
+            }, keySelector);
+        }
+```
+Hi there! I noticed the following odd behaviour, which I think is a bug in `ObservableCache`.
+
+**Describe the bug**
+If I subscribe to the observable returned by `ObservableCache.Connect()` as items are being added to the cache on a separate thread, these additions are not reliably reflected in the changes received on the subscription.
+
+**Steps To Reproduce**
+The following code reproduces the issue fairly reliably on my PC.
+```c#
+            var source = Enumerable.Range(1, 10000)
+                .ToObservable()
+                .SubscribeOn(NewThreadScheduler.Default)
+                //.Delay(TimeSpan.FromSeconds(1))
+                .Publish();
+
+            var cache = source
+                .ToObservableChangeSet(x => x)
+                .AsObservableCache();
+
+            source.Connect();
+            //await source.LastAsync();
+            var allChanges = await cache.Connect().Flatten().Select(chg => chg.Current).ToList();
+
+            Assert.That(allChanges, Is.EquivalentTo(Enumerable.Range(1, 10000)));
+```
+
+If I wait until the source has fully populated the cache (by uncommenting the `await` above), or if I delay populating the cache until after subscribing (by uncommenting the `Delay` above) then the result is as expected, which suggests this is a concurrent subscribe/update issue.
+
+**Expected behavior**
+`allChanges` should contain all 10000 items produced by `source`.
+
+
+**Screenshots**
+<!-- If applicable, add screenshots to help explain your problem. -->
+n/a
+
+
+**Environment**
+<!-- Please complete the following information. -->
+- OS:       Windows 10 Pro
+- Device:   PC
+- Version:   6.13.21
+- Working Version: n/a
+
+**Additional context**
+My best guess as to what's going on is that some updates are sneaking in between the lock being released in `ObservableCache.Connect()`, in which the `initial` snapshot is created, and the returned observable being subscribed to.
+
+Best wishes & thanks for creating this library.
+Chris.
+
+This is just an example of one-to-many, where the a ```subrecord``` could be referenced/shared by many parent ```records```.
+
+Inner join might make sense not to return duplicates, but cardinality of right join should be that of the set on the right.
+
+```
+    public class SubRecord
+    {
+        public Guid id { get; set; }
+        public string Desc { get; set; }
+    }
+
+    public class Record
+    {
+        public int id { get; set; }
+        public Guid SubId { get; set; }
+        public string Desc { get; set; }
+    }
+
+    class Program
+    {
+        static void Main(string[] args)
+        {
+            var recordsCache = new SourceCache<Record, int>(i => i.id);
+            var subRecordsCache = new SourceCache<SubRecord, Guid>(i => i.id);
+
+            subRecordsCache.Edit(cache =>
+            {
+                cache.AddOrUpdate(new SubRecord() { id = Guid.Parse("f6cebdba-9261-4730-87dc-3ec5c9c7a060"), Desc="sub one"});
+                cache.AddOrUpdate(new SubRecord() { id = Guid.Parse("3d8e329d-dbab-4346-8ceb-a0112097469c"), Desc="sub two"});
+                cache.AddOrUpdate(new SubRecord() { id = Guid.Parse("4c1f245f-a06f-4bb9-bcae-2d1589a99b21"), Desc="sub three"});
+            });
+
+            recordsCache.Edit(cache =>
+            {
+                cache.AddOrUpdate(new Record() { id = 1, SubId = Guid.Parse("f6cebdba-9261-4730-87dc-3ec5c9c7a060"), Desc = "parent 1 of sub one" });
+                cache.AddOrUpdate(new Record() { id = 2, SubId = Guid.Parse("f6cebdba-9261-4730-87dc-3ec5c9c7a060"), Desc = "parent 2 of sub one" });
+                cache.AddOrUpdate(new Record() { id = 3, SubId = Guid.Parse("4c1f245f-a06f-4bb9-bcae-2d1589a99b21"), Desc = "parent 3 of sub three" });
+            });
+
+            var innerJoinResultSubscription = subRecordsCache.Connect()
+                                    .InnerJoin(recordsCache.Connect(), records => records.SubId, (SubRecord subrecord, Record record) => (r: record, s: subrecord))
+                                    .Bind(out var innerJoinResult)
+                                    .Subscribe();
+
+            Console.WriteLine($"innerJoinResultList count {innerJoinResult.Count}:");
+            innerJoinResult.ToObservable()
+                .Subscribe(item =>
+                {
+                    Console.WriteLine($"---> {item.Item1.Desc}, {item.Item2.Desc} ");
+                });
+
+            //right join of subrecord to parents - expected result cardinality of n parent records
+            var rightJointResultSubscription = subRecordsCache.Connect()
+                                    .RightJoin(recordsCache.Connect(), records => records.SubId,
+                                        (key, subrecord, record) =>
+                                        {
+                                            if(subrecord.HasValue)
+                                            {
+                                                return (record: record, subrecord: subrecord.Value);
+                                            }
+                                            else
+                                            {
+                                                return (record: record, subrecord: default(SubRecord));
+                                            }
+                                        })
+                                    .Bind(out var rightJoinResult)
+                                    .Subscribe();
+
+            Console.WriteLine($"rightJoinResultList count {rightJoinResult.Count}:");
+            rightJoinResult.ToObservable()
+                .Subscribe(item =>
+                {
+                    Console.WriteLine($"---> {item.Item1.Desc}, {item.Item2.Desc} ");
+                });
+        }
+    }
+
+```
+
+The result is invalid:
+
+```
+innerJoinResultList count 2:
+---> parent 2 of sub one, sub one
+---> parent 3 of sub three, sub three
+rightJoinResultList count 2:
+---> parent 2 of sub one, sub one
+---> parent 3 of sub three, sub three
+```
+
+**Expected result is rightJoinResult count of 3** or
+
+```
+innerJoinResultList count 3:
+---> parent 1 of sub one, sub one
+---> parent 2 of sub one, sub one
+---> parent 3 of sub three, sub three
+rightJoinResultList count 3:
+---> parent 1 of sub one, sub one
+---> parent 2 of sub one, sub one
+---> parent 3 of sub three, sub three
+```
+
+Here is the corresponding SQL:
+```
+use tempdb;
+
+CREATE TABLE #SubRecord
+(
+    id INT PRIMARY KEY,
+    Name VARCHAR(50) NOT NULL,
+);
+
+CREATE TABLE #Record
+(
+    id INT PRIMARY KEY,
+	SubId INT NOT NULL,
+    Name VARCHAR(50) NOT NULL,
+);
+
+insert into #SubRecord values
+	(1, 'sub one'),
+	(2, 'sub two'),
+	(3, 'sub three');
+
+insert into #Record values
+	(1, 1, 'parent 1 ref to sub 1'),
+	(2, 1, 'parent 2 ref to sub 1'),
+	(3, 3, 'parent 3 ref to sub 3');
+
+select parent.Name Name, sub.Name SubName from #SubRecord sub inner join #Record parent on sub.id = parent.SubId; 
+select count(*) from
+	(select sub.id from #SubRecord sub inner join #Record parent on sub.id = parent.SubId) as innerjoinresult; 
+
+select parent.Name Name, sub.Name SubName from #SubRecord sub right join #Record parent on sub.id = parent.SubId;
+select count(*) from
+	(select sub.id from #SubRecord sub right join #Record parent on sub.id = parent.SubId) as rightjoinresult;
+```
+and the result:
+```
+Inner Join: count 3
+parent 1 ref to sub 1	sub one
+parent 2 ref to sub 1	sub one
+parent 3 ref to sub 3	sub three
+
+Right Join: count 3
+parent 1 ref to sub 1	sub one
+parent 2 ref to sub 1	sub one
+parent 3 ref to sub 3	sub three
+```
+
+PS: It looks like 
+```var rightCache = right.Synchronize(locker).ChangeKey(_rightKeySelector).AsObservableCache(false);``` 
+assumes that subrecords could not be shared by parent records ?? as ChangeKey eliminates all but one parents that share subrecords (unique key constraint???).
+
+replacing RightJoin with this Transform produces expected result but I am unsure about concurrency issues
+```
+            var rightJoinResultSubscription = recordsCache.Connect()
+                                                .Transform(record =>
+                                                {
+                                                    var subrecord = subRecordsCache.Lookup(record.SubId);
+                                                    if (subrecord.HasValue)
+                                                    {
+                                                        return (record: record, subrecord: subrecord.Value);
+                                                    }
+                                                    else
+                                                    {
+                                                        return (record: record, subrecord: default(SubRecord));
+                                                    }
+                                                })
+                                                .Bind(out var rightJoinResult)
+                                                .Subscribe();
+```
+
+PS2: This is a follow-up to a closed question/issue about many-many relationships implementation #239 
+The correct solution there is to use a ```RightJoin``` instead of recommended InnerJoin
+
+
+
+
+
+Bumps [FluentAssertions](https://github.com/fluentassertions/fluentassertions) from 4.19.4 to 5.10.0.
+<details>
+<summary>Release notes</summary>
+<p><em>Sourced from <a href="https://github.com/fluentassertions/fluentassertions/releases">FluentAssertions's releases</a>.</em></p>
+<blockquote>
+<h2>5.10.0</h2>
+<p><a href="https://fluentassertions.com/releases/%5B#5100%5D(https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/5100)">fluentassertions/fluentassertions#5100</a></p>
+<h2>5.9.0</h2>
+<p><a href="https://fluentassertions.com/releases/%5B#590%5D(https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/590)">fluentassertions/fluentassertions#590</a></p>
+<h2>5.8.0</h2>
+<p><a href="https://fluentassertions.com/releases/%5B#580%5D(https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/580)">Release Notes</a></p>
+<h2>5.7.0</h2>
+<p><a href="https://fluentassertions.com/releases/%5B#570%5D(https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/570)">Release Notes</a></p>
+<h2>5.6.0</h2>
+<ul>
+<li>{New} Provide opt-out to <code>AssertionOptions(o =&gt; o.WithStrictOrdering())</code> - <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/974">#974</a></li>
+<li>{New} Add collection assertion <code>ContainEquivalentOf</code> - <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/950">#950</a></li>
+<li>{New} Add <code>Should().NotThrowAfter</code> assertion for actions - <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/942">#942</a></li>
+</ul>
+<p>Kudos to <a href="https://github.com/BrunoJuchli">@BrunoJuchli</a>, <a href="https://github.com/matthiaslischka">@matthiaslischka</a> and <a href="https://github.com/frederik-h">@frederik-h</a> for these amazing additions.</p>
+<h2>5.5.3</h2>
+<ul>
+<li>{Fix} Performance fixes in <code>BeEquivalenTo</code> - <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/935">#935</a></li>
+<li>{Fix} Reverted 5.5.0 changes to <code>AssertionScope</code> to ensure binary compatibility - <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/977">#977</a></li>
+</ul>
+<h2>5.5.2</h2>
+<ul>
+<li>{Fix} Allows <code>BeEquivalentTo</code> to handle a non-generic collection as the SUT - <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/975">#975</a>, <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/973">#973</a></li>
+<li>{Fix} Optimized performance of <code>IncludeMemberByPathSelectionRule</code> - <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/969">#969</a></li>
+</ul>
+<h2>5.5.1</h2>
+<ul>
+<li>{New} Now provides a hint when strings differ in length and contain differences - <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/915">#915</a>, <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/907">#907</a></li>
+<li>{New} Added <code>ThrowAsync</code>, <code>ThrowExactlyAsync</code> and <code>NotThrowAsync</code> - <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/931">#931</a></li>
+<li>{New} Added support for <code>Should().Throw</code> and <code>Should().NotThrow</code> for <code>Func&lt;T&gt;</code> - <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/951">#951</a></li>
+<li>{New} Added support for <code>private protected</code> access modifier - <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/932">#932</a></li>
+<li>{New} Updated <code>BeApproximately</code> to support nullable types for both the subject and the expectation nullable - <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/934">#934</a></li>
+<li>{New} Added <code>async</code> version of <code>ExecutionTime</code> to - <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/938">#938</a></li>
+<li>{New} Updated <code>NotBeApproximately</code> to accepting nullable subject and expectation - <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/939">#939</a></li>
+<li>{New} <code>type.Should().Be(type)</code> now support open generics - <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/954">#954</a>, <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/955">#955</a></li>
+<li>{Fix} Minor performance improvements to prevent rendering messages if a test did not fail - <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/921">#921</a>, <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/915">#915</a></li>
+<li>{Fix} Improve performance of <code>Should().AllBeEquivalentTo()</code> - <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/920">#920</a>, <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/914">#914</a></li>
+<li>{Fix} Improve the presentation of enums to include the value and the number - <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/923">#923</a>, <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/897">#897</a></li>
+<li>{Fix} <code>BeEquivalentTo</code> with <code>WithStrictOrdering</code> produced messy failure message - <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/918">#918</a></li>
+<li>{Fix} Fixes detecting checking equivalency of a <code>null</code> subject to a dictionary - <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/933">#933</a></li>
+<li>{Fix} Fixes duplicate conversions being mentioned in the output of the equivalency API - <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/941">#941</a></li>
+<li>{Fix} Comparing an object graph against <code>IEnumerable</code> now works now as expected - <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/911">#911</a></li>
+<li>{Fix} Selecting members during object graph assertions now better handles <code>new</code> overrides -<a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/960">#960</a>, <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/956">#956</a></li>
+</ul>
+<p><strong>Note</strong> In versions prior to 5.5, FA may have skipped certain properties in the equivalency comparison. <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/960">#960</a> fixes this, so this may cause some breaking changes.</p>
+<p>Lots of kudos <a href="https://github.com/jnyrup">@jnyrup</a> and <a href="https://github.com/krajek">@krajek</a> for a majority for the work in this release.</p>
+<h2>5.5.0</h2>
+</tr></table> ... (truncated)
+</blockquote>
+</details>
+<details>
+<summary>Commits</summary>
+<ul>
+<li><a href="https://github.com/fluentassertions/fluentassertions/commit/b69ca0750631ca6933fe6c4902bf32c382518f09"><code>b69ca07</code></a> Added release notes for 5.10 (<a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/1214">#1214</a>)</li>
+<li><a href="https://github.com/fluentassertions/fluentassertions/commit/7b01b240c1806c8f08791b6546736a494037061d"><code>7b01b24</code></a> Merge pull request <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/1208">#1208</a> from jnyrup/enum_equality</li>
+<li><a href="https://github.com/fluentassertions/fluentassertions/commit/787e61643a4863185c589b05a111977ebabee346"><code>787e616</code></a> Reintroduced the dependency on System.Xml.Linq for .NET 4.5/4.7</li>
+<li><a href="https://github.com/fluentassertions/fluentassertions/commit/503a4533fcee1211e6d91348093660e068fce26c"><code>503a453</code></a> Increase mutation score (<a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/1211">#1211</a>)</li>
+<li><a href="https://github.com/fluentassertions/fluentassertions/commit/c194c75bff79ca1bfdc0b9ce1912b7024ca0b4b4"><code>c194c75</code></a> Increase mutation score</li>
+<li><a href="https://github.com/fluentassertions/fluentassertions/commit/4607f791c945896d1eb3c7dc5c207aff0ede0728"><code>4607f79</code></a> Merge pull request <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/1210">#1210</a> from jnyrup/configurationStoreInterceptor</li>
+<li><a href="https://github.com/fluentassertions/fluentassertions/commit/eaa952f5115955c527dbaf03fa0f8f3df2e427ba"><code>eaa952f</code></a> Intercept Reflection exceptions from <code>AppSettingsConfigurationStore</code></li>
+<li><a href="https://github.com/fluentassertions/fluentassertions/commit/57dd7eeac91ad0340291b998e716febd2a95e8de"><code>57dd7ee</code></a> Merge pull request <a href="https://github-redirect.dependabot.com/fluentassertions/fluentassertions/issues/1209">#1209</a> from jnyrup/xmlSummaries</li>
+<li><a href="https://github.com/fluentassertions/fluentassertions/commit/b6fa364be5a7203ecdcee1f9e7feb62cb0815fbb"><code>b6fa364</code></a> Cleanup parameter xml summaries</li>
+<li><a href="https://github.com/fluentassertions/fluentassertions/commit/734e3e7b1ef1eab957a4b33d6da3da49850fee15"><code>734e3e7</code></a> Fix comparing enums and integers for equality</li>
+<li>Additional commits viewable in <a href="https://github.com/fluentassertions/fluentassertions/compare/4.19.4...5.10.0">compare view</a></li>
+</ul>
+</details>
+<br />
+
+
+[![Dependabot compatibility score](https://api.dependabot.com/badges/compatibility_score?dependency-name=FluentAssertions&package-manager=nuget&previous-version=4.19.4&new-version=5.10.0)](https://dependabot.com/compatibility-score.html?dependency-name=FluentAssertions&package-manager=nuget&previous-version=4.19.4&new-version=5.10.0)
+
+Dependabot will resolve any conflicts with this PR as long as you don't alter it yourself. You can also trigger a rebase manually by commenting `@dependabot rebase`.
+
+[//]: # (dependabot-automerge-start)
+[//]: # (dependabot-automerge-end)
+
+---
+
+<details>
+<summary>Dependabot commands and options</summary>
+<br />
+
+You can trigger Dependabot actions by commenting on this PR:
+- `@dependabot rebase` will rebase this PR
+- `@dependabot recreate` will recreate this PR, overwriting any edits that have been made to it
+- `@dependabot merge` will merge this PR after your CI passes on it
+- `@dependabot squash and merge` will squash and merge this PR after your CI passes on it
+- `@dependabot cancel merge` will cancel a previously requested merge and block automerging
+- `@dependabot reopen` will reopen this PR if it is closed
+- `@dependabot close` will close this PR and stop Dependabot recreating it. You can achieve the same result by closing it manually
+- `@dependabot ignore this major version` will close this PR and stop Dependabot creating any more for this major version (unless you reopen the PR or upgrade to it yourself)
+- `@dependabot ignore this minor version` will close this PR and stop Dependabot creating any more for this minor version (unless you reopen the PR or upgrade to it yourself)
+- `@dependabot ignore this dependency` will close this PR and stop Dependabot creating any more for this dependency (unless you reopen the PR or upgrade to it yourself)
+- `@dependabot use these labels` will set the current labels as the default for future PRs for this repo and language
+- `@dependabot use these reviewers` will set the current reviewers as the default for future PRs for this repo and language
+- `@dependabot use these assignees` will set the current assignees as the default for future PRs for this repo and language
+- `@dependabot use this milestone` will set the current milestone as the default for future PRs for this repo and language
+- `@dependabot badge me` will comment on this PR with code to add a "Dependabot enabled" badge to your readme
+
+Additionally, you can set the following in your Dependabot [dashboard](https://app.dependabot.com):
+- Update frequency (including time of day and day of week)
+- Pull request limits (per update run and/or open at any time)
+- Automerge options (never/patch/minor, and dev/runtime dependencies)
+- Out-of-range updates (receive only lockfile updates, if desired)
+- Security updates (receive only security updates, if desired)
+
+
+
+</details>
+In trying to set up paging of a SourceList according to the examples in Dynamic.Trader I noticed that there seems to be an inconsistency in what type of IChangeSets are returned for operators for ObservableCache and ObservableList.
+
+The example in Dynamic.Trader uses an IObservableCache and Sort returns ISortedChangeSet and Page returns IPagedChangeSet:
+
+```csharp
+            _cleanUp = tradeService.All.Connect()
+                .Filter(filter) // apply user filter
+                .Transform(trade => new TradeProxy(trade), new ParallelisationOptions(ParallelType.Ordered, 5))
+                .Sort(sort, SortOptimisations.ComparesImmutableValuesOnly) // Returns ISortedChangeSet
+                .Page(pager) // Returns IPagedChangeSet
+                .ObserveOn(schedulerProvider.MainThread)
+                .Do(changes => PageParameters.Update(changes.Response)) // changes.Response available because of IPagedChangeSet
+                .Bind(out _data)        // update observable collection bindings
+                .DisposeMany()          // dispose when no longer required
+                .Subscribe();
+```
+
+If you try to do the same with a IObservableList instead everything returns IChangeSet:
+
+```csharp
+            var listTradeService = new SourceList<Trade>();
+
+            _cleanUp = listTradeService.Connect()
+                .Filter(filter) // apply user filter
+                .Transform(trade => new TradeProxy(trade))
+                .Sort(sort) // Returns IChangeSet
+                .Page(pager) // Returns IChangeSet
+                .ObserveOn(schedulerProvider.MainThread)
+                .Do(changes => PageParameters.Update(changes.Response)) // changes.Response NOT available because of IChangeSet
+                .Bind(out _data)        // update observable collection bindings
+                .DisposeMany()          // dispose when no longer required
+                .Subscribe();
+```
+
+No matter which way is supposed to be the "correct" way of doing things it can get really confusing when trying to use the operators.
+**Description**
+
+When filling a cache from an observable using "ToObservableChangeSet" with "expireAfter" and "AsObservableCache" memory keeps groving.
+
+See example code below and description how to see issue...
+
+`ExpiringCache = itemSource
+                .ToObservableChangeSet(vt => vt.Guid, i => TimeSpan.FromSeconds(5), 5)
+                    .AsObservableCache();`
+
+**Steps To Reproduce**
+
+1. Start attached program to reproduce issue
+2. When program running with Visual Studio (i use 2019 Pro) go to "Diagnostic Tools" => "Memory Usage" and click on "Take Snapshot"
+3. After some time (e.g. 15-20 seconds) take a second snapshot
+4. Compare the snapshots by clicking on the "Object (diff)" cell of the second snapshot
+
+In comparison loads of "ExpirableItems" inside dictionaries can be seen (see screenshot below).
+
+It seems like when expired objects are removed from cache some helper objects are still kept alive.
+
+Long term memory profiling of similar setup with larger objects show increasing memory.
+
+**Expected behavior**
+
+Memory should not keep growing after expire-threshold
+**Screenshots**
+
+![image](https://user-images.githubusercontent.com/15092942/69736673-482af300-1133-11ea-8c29-bb87789e8198.png)
+
+**Environment**
+- OS:       Windows 10
+- Device:   PC
+- Version:   DynamicData 6.13.21
+- Working Version: n/a
+
+**Additional context**
+<!-- Add any other context about the problem here. -->
+[ExpireTest.zip](https://github.com/reactiveui/DynamicData/files/3897528/ExpireTest.zip)
+
+Hi Guys,
+
+I'm interested in using my existing c# viewmodels within Blazor. Does anyone know if DynamicData works within Blazor.  I know you get ReactiveUI.Blazor that is supported but what about DD ?
+
+Blazor is obviously single threaded.  Can DD work on a single thread and was "StateHasChanged" used in the implementation ?
+
+
+**Describe the bug**
+When you use the OnItemAdded() method to react to ChangeSets of a SourceList and add new items to a SourceList, the order of the generated "Add" ChangeSets might be wrong depending on the order of using Subscribe() or OnItemAdded() on the ChangeSet observable returned by Connect(). This will result in a follow up exception in any classes which consume the ChangeSets (like binding onto a ReadOnlyObservableCollection).
+
+**Steps To Reproduce**
+
+        [TestMethod]
+        public void DynamicDataReaddTest()
+        {
+            SourceList<int> source = new SourceList<int>();
+            
+            IList<int> indices = new List<int>();
+
+            /*  Block A begin */
+            source.Connect().OnItemAdded(it =>
+                {
+                    if (it == 5)
+                    {
+                        source.Add(10);
+                    }
+                })
+                .Subscribe(_ => { }, ex => Assert.Fail());
+            /*  Block A end */
+
+            /*  Block B begin */
+            source.Connect().Subscribe(it =>
+            {
+                System.Diagnostics.Debug.WriteLine(it);
+                foreach (Change<int> change in it)
+                {
+                    Debug.WriteLine($"## Change: {change}");
+                    ItemChange<int> item = change.Item;
+                    Debug.WriteLine($"## Item: {item}");
+                    Debug.WriteLine($"## Item.CurrentIndex: {item.CurrentIndex}, Item.Current: {item.Current}");
+                    indices.Add(item.CurrentIndex);
+                }
+            }, ex => Assert.Fail());
+            /*  Block B end */
+            
+            source.Add(5);
+
+            CollectionAssert.AreEqual(new List<int> {0, 1}, indices.ToCollection());
+        }
+
+When you run this unit test it will fail and will generate the following debug output:
+```
+ChangeSet<Int32>. Count=1
+## Change: Add. Current: 10, Previous: <None>
+## Item: Current: 10, Previous: <None>
+## Item.CurrentIndex: 1, Item.Current: 10
+ChangeSet<Int32>. Count=1
+## Change: Add. Current: 5, Previous: <None>
+## Item: Current: 5, Previous: <None>
+## Item.CurrentIndex: 0, Item.Current: 5
+```
+
+As you see, the "Add" ChangeSet for the second number added comes first (CurrentIndex=1), then the "Add" ChangeSet for the first number added comes second (CurrentIndex=0). This results in an ArgumentOutOfRangeException in the ReadOnlyObservableCollection because the CurrentIndex=1 is not valid (yet).
+
+If you swap the blocks "A" and "B" to change the order when a subscription is build you will get the correct order:
+
+        [TestMethod]
+        public void DynamicDataReaddTest()
+        {
+            SourceList<int> source = new SourceList<int>();
+            
+            IList<int> indices = new List<int>();
+
+            /*  Block B begin */
+            source.Connect().Subscribe(it =>
+            {
+                System.Diagnostics.Debug.WriteLine(it);
+                foreach (Change<int> change in it)
+                {
+                    Debug.WriteLine($"## Change: {change}");
+                    ItemChange<int> item = change.Item;
+                    Debug.WriteLine($"## Item: {item}");
+                    Debug.WriteLine($"## Item.CurrentIndex: {item.CurrentIndex}, Item.Current: {item.Current}");
+                    indices.Add(item.CurrentIndex);
+                }
+            }, ex => Assert.Fail());
+            /*  Block B end */
+            
+            /*  Block A begin */
+            source.Connect().OnItemAdded(it =>
+                {
+                    if (it == 5)
+                    {
+                        source.Add(10);
+                    }
+                })
+                .Subscribe(_ => { }, ex => Assert.Fail());
+            /*  Block A end */
+            
+            source.Add(5);
+
+            CollectionAssert.AreEqual(new List<int> {0, 1}, indices.ToCollection());
+        }
+
+This will pass the unit test and create the following debug output:
+
+```
+ChangeSet<Int32>. Count=1
+## Change: Add. Current: 5, Previous: <None>
+## Item: Current: 5, Previous: <None>
+## Item.CurrentIndex: 0, Item.Current: 5
+ChangeSet<Int32>. Count=1
+## Change: Add. Current: 10, Previous: <None>
+## Item: Current: 10, Previous: <None>
+## Item.CurrentIndex: 1, Item.Current: 10
+```
+
+**Expected behavior**
+
+The order of the ChangeSet items/events should be the same regardless of the order of subscriptions build on the observable returned by Connect().
+
+**Environment**
+- Version:  DynamicData 6.13.20
+Given this code:
+
+```
+...
+            var source = new SourceCache<AppExtension, string>(a => a.Id);
+            source
+                .Connect()
+                .ObserveOnDispatcher()
+                .TransformAsync(async ext => new ExtensionViewModel(ext, await ext.GetExtensionPropertiesAsync(), await GetLogo(ext)))
+                .Bind(out extensions)
+                .DisposeMany()
+                .Subscribe()
+                .DisposeWith(disposables);
+
+...
+
+        private async Task<BitmapImage> GetLogo(AppExtension ext)
+        {
+            var filestream = await ext.AppInfo.DisplayInfo.GetLogo(new Windows.Foundation.Size(1, 1)).OpenReadAsync();
+            BitmapImage logo = new BitmapImage();
+            logo.SetSource(filestream);
+
+            return logo;
+        }
+```
+
+When the `GetLogo` method is called, the following error is shown:
+
+> "The application called an interface that was marshalled for a different thread."
+
+If the fluent chain is incorrect, how could I asynchronously transform the input items?
+
+Thanks!

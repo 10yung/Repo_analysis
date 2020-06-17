@@ -1,0 +1,213 @@
+I apply casual impact with the following code
+`impact <- CausalImpact(SynthTS, pre.period, post.period, model.args = list(niter = 5000, nseasons = 7, season.duration = 1, dynamic.regression=FALSE)) `
+
+but I hit the following error:
+```
+Error in parse(text = x, keep.source = FALSE) : 
+  <text>:1:9: unexpected symbol
+1: My Column
+                    ^
+```
+
+For debugging my SynthTS is a zoo object:
+```
+> str(SynthTS)
+‘zoo’ series from 2016-07-01 to 2019-10-30
+  Data: num [1:1217, 1:7] 0 66.4 49.7 10 76.9 ...
+ - attr(*, "dimnames")=List of 2
+  ..$ : NULL
+  ..$ : chr [1:7] "My Column" "My Column2" "My Column3" "My Column4" ...
+  Index:  Date[1:1217], format: "2016-07-01" "2016-07-02" "2016-07-03" "2016-07-04" "2016-07-05" "2016-07-06" "2016-07-07" "2016-07-08" "2016-07-09" "2016-07-10" "2016-07-11" ...
+```
+
+Can it be an issue that my column names have a space inside?
+Hi I used a customized BSTS model for CausalImpact by using `zoo` object for response variable. however the plot function didn't show the pre-intervention error bar shown as below. Any ideas about how to fix it? Thanks! 
+
+![image](https://user-images.githubusercontent.com/6514708/66695969-4c32ac80-ec7c-11e9-9c32-8e1362d5c739.png)
+
+I am trying to exclude a single date in my post period, and model the impact with the rest of the dates. If I don't filter out the single date (see `grey_date` below) the code runs fine and returns results. If I do filter out the `grey_date` then it causes R to crash.
+
+```
+pre_start = '2019-02-17'
+pre_end = '2019-04-13'
+post_start = '2019-04-28'
+post_end = '2019-05-25'
+
+pre.period <- as.Date(c(pre_start, pre_end))
+post.period <- as.Date(c(post_start, post_end))
+
+grey_date = '2019-05-17'
+metric = 'xyz'
+
+data_comp <- dat %>%
+  filter(ds >= as.Date(pre_start) & ds <= as.Date(post_end)) %>%
+  filter(ds != as.Date(grey_date)) %>% # this line causes crash, works fine without it
+  select(ds, country, metric) %>%
+  spread(country, metric)
+
+timeseries <- zoo(data_comp %>% select(NO, NL), data_comp$ds)
+
+# CausalImpact
+impact <- CausalImpact(
+  timeseries, 
+  pre.period, 
+  post.period,
+  model.args = list(prior.level.sd = 0.01, niter = 5000, nseasons = 7, season.duration = 1)
+)
+```
+See impact_inference.R, line 248:
+```R
+  summary <- dplyr::mutate(summary,
+                           RelEffect = AbsEffect / Pred,
+                           RelEffect.lower = AbsEffect.lower / Pred,
+                           RelEffect.upper = AbsEffect.upper / Pred,
+                           RelEffect.sd = AbsEffect.sd / Pred)
+```
+I noticed negative RelEffect.sd in my `CausalImpactObject$summary` which is clearly the product of not using ```abs(Pred)``` as the denominator, as I believe it should be in each of these cases.  In particular the upper and lower bounds are out of order, too, when ```Pred < 0 ```.
+Hi, from looking at the code I can see that `CausalImpact` generates the posterior predictive samples by getting the state value draws and sampling noise with variance equal to the `sigma.obs` draws from the bsts model object.
+
+When I try to replicate the inference step using `predict.bsts`, I get different results. In particular, the credible intervals produced by generating the posterior predictive with `bsts.predict` are larger than `CausalImpact` suggests. The bounds of the relative difference credible interval can differ by 2-3%. Is there inherently a difference between how `CausalImpact` prediction and `predict.bsts` works? I've attached example code below.
+
+```
+library(magrittr)
+library(CausalImpact)
+
+# Dummy data
+set.seed(1)
+x1 <- 8000 + arima.sim(model = list(ar = 0.99), n = 100)
+y <- 1.2 * x1 + rnorm(100, 0, 1)
+y[71:100] <- y[71:100] + 10
+data <- cbind(y, x1)
+
+pre.period <- c(1, 70)
+post.period <- c(71, 100)
+
+# Run CausalImpact
+impact <- CausalImpact(data, pre.period, post.period, model.args = list(niter = 10000, standardize.data = F))
+
+# Predictions from bsts
+bsts_model <- impact$model$bsts.model
+bsts_predict <-
+  predict.bsts(bsts_model,
+               newdata = data[post.period[1]:post.period[2], "x1"])
+
+# Actuals as a matrix
+observed_post <-
+  data[post.period[1]:post.period[2], "y"] %>% 
+  rep(nrow(bsts_predict$distribution)) %>% 
+  matrix(nrow = nrow(bsts_predict$distribution), byrow = T)
+
+# Calculate differences
+ppd_diff <- observed_post - bsts_predict$distribution
+# Cumulative to last day of post period
+diff_cum <- rowSums(ppd_diff)
+reldiff_cum <- rowSums(ppd_diff)/rowSums(observed_post)
+
+# Calculated stats
+cat("Absolute difference:\n")
+c(quantile(diff_cum, 0.025), mn = mean(diff_cum), quantile(diff_cum, 0.975)) %>% 
+  print()
+# Returns 75.6, 204.3, 342.3
+
+cat("Relative difference:\n")
+c(quantile(reldiff_cum, 0.025), mn = mean(reldiff_cum), quantile(reldiff_cum, 0.975)) %>% 
+  print()
+# Returns 0.026%, 0.071%, 0.12%
+
+# Compare to CausalImpact CIs
+summary(impact)
+# Returns 123.2, 203.7, 288.0
+#         0.043%, 0.071%, 0.1%
+```
+thanks for releasing this amazing library! Are there any documented use cases of how Google uses this CausalImpact library on real world data?
+
+ It'd also be helpful if someone could point me to any documentation of this library being used for practical real use cases, and not just sample data. I'm trying to understand the limitations in the interpretation of the output before I use this library to reach any conclusions for an actual use case. Thanks,
+Hi!
+
+I've been working with bsts to model time-series and make forecasts, but have run into some problems with the predict function and holidays. 
+
+When I train the model with regressor holidays these regressors do not appear to be used in the predict function. For instance in a simple local level model the holiday regressor causes the response variable to go down, but the predictor of the response over the same period does not capture this behaviour. 
+
+I attach below a minimum working example based on the regression.holiday code from the documentation: 
+
+```
+library(bsts)
+library(ggplot2)
+set.seed(12345)
+
+trend <- cumsum(rnorm(1095, 0, .1))
+  dates <- seq.Date(from = as.Date("2014-01-01"), length = length(trend), by = "day")
+  y <- zoo(trend + rnorm(length(trend), 0, .2), dates)
+
+AddHolidayEffect <- function(y, dates, effect) {
+  ## Adds a holiday effect to simulated data.
+  ## Args:
+  ##   y: A zoo time series, with Dates for indices.
+  ##   dates: The dates of the holidays.
+  ##   effect: A vector of holiday effects of odd length.  The central effect is
+  ##     the main holiday, with a symmetric influence window on either side.
+  ## Returns:
+  ##   y, with the holiday effects added.
+  time <- dates - (length(effect) - 1) / 2
+  for (i in 1:length(effect)) {
+    y[time] <- y[time] + effect[i]
+    time <- time + 1
+  }
+  return(y)
+}
+
+## Define some holidays.
+memorial.day <- NamedHoliday("MemorialDay")
+memorial.day.effect <- c(-.75, -2, -2)
+memorial.day.dates <- as.Date(c("2014-05-26", "2015-05-25", "2016-05-25"))
+y <- AddHolidayEffect(y, memorial.day.dates, memorial.day.effect)
+
+## The holidays can be in any order.
+holiday.list <- list(memorial.day)
+
+## Let's train the model to just before MemorialDay
+cut_date = as.Date("2016-05-20")
+train_data <- y[time(y) < cut_date]
+test_data <- y[time(y) >= cut_date]
+ss <- AddLocalLevel(list(), train_data)
+ss <- AddRegressionHoliday(ss, train_data, holiday.list = holiday.list)
+model <- bsts(train_data, state.specification = ss, niter = 500, ping = 0)
+## Now let's make a prediction covering MemorialDay
+my_horizon = 15
+## Note adding the time stamps here doesn't help either
+pred <- predict(object = model, horizon = my_horizon)
+## Make a data frame for plotting
+plot_info <- data.frame(Date = time(y), 
+                        value = y, 
+                        predict_mean = NA,
+                        predict_upper = NA,
+                        predict_lower = NA
+                       )
+plot_info[plot_info$Date %in% time(test_data)[1:my_horizon],]$predict_mean = pred$mean
+plot_info[plot_info$Date %in% time(test_data)[1:my_horizon],]$predict_lower = pred$interval[1,]
+plot_info[plot_info$Date %in% time(test_data)[1:my_horizon],]$predict_upper = pred$interval[2,]
+## Let's make a pretty plot to demonstrate the problem
+filter(plot_info, Date > time(test_data)[1] - 25 & Date < time(test_data)[my_horizon] + 10)  %>% 
+    ggplot(aes(x = Date, y = value)) +
+    geom_line() +
+    geom_line(aes(y = predict_mean), col = "Forest Green") + # The prediction
+    geom_line(aes(y = predict_lower), col = "Forest Green", lty = 2) + # lower bound
+    geom_line(aes(y = predict_upper), col = "Forest Green", lty = 2)  # upper bound
+```
+
+Using the same dataset, multiple runs of CausalImpact produce different p-values and confidence intervals using bsts.  They are within a small range of each other when using large niter values, but I want to produce the same values each time.  How can these be controlled so that the results are consistent with every run?
+
+Thanks
+Hi! what is the best way to handle past known interventions effects in the time series?
+thx!
+Hi, 
+
+While using my dataset for this model I've run into this error:
+
+"bsts.model$original.series must end on a stretch of NA at least as long as y.cf"
+
+I've tried to read the github code to better understand this error but I'm still stuck. 
+
+Is there any advice that I can use in diagnosing this?
+
+Thanks!

@@ -1,0 +1,199 @@
+As proposed in https://github.com/withoutboats/romio/pull/106#issuecomment-548947560
+
+cc @Ralith I am not a native English speaker, so any help with grammar will be appreciated.
+There is no way to convert stream objects to their underlying type, but in some cases it's useful to be able to perform blocking I/O, such as when wrapped in stream that handles WouldBlock error in some way.
+
+The specific use case for this is https://github.com/dbcfd/tls-async which works around the issue using `Compat<S>` where `S: AsyncRead + AsyncWrite`, which implements 0.1 Futures `Stream`. However this [won't work](https://github.com/rust-lang-nursery/futures-rs/issues/1463) outside of 0.1 executor (e.g. Tokio), which makes the usage with Romio awkward. I'm not sure what's the best solution here, but I would assume reexporting mio interfaces is acceptable. This would allow the depending library to use `Read + Write` directly.
+
+This allows setting various socket options (e.g. SO_REUSEPORT) before
+binding to the socket, and also socket passing from the service supervisor (e.g. systemd).
+Hi there,
+
+I read through some of the other issues on timers in `romio`, but it seemed slightly different than changing the underlying `mio/net2` settings. I want to open a large number of TCP connections to different hosts, which may or may not respond. In order to prevent an excessive number of open files on the client I want to configure aggressive connection timeouts to prune connections that don't respond quickly. 
+
+I'd be happy to try to submit a PR to add a `Builder` object or something to make `TcpStream` more configurable, but I'm not sure if there is somewhere I should be looking for an example of this. (I'm digging into the Rust async/await story, and I'm not experienced in it yet.) 
+
+Here's a brief snippet that shows the code I'm using -- I appear to be hanging onto connections that fail for some time, and if there is an alternate path to fix I'd be happy to try that out instead. 
+
+```rust
+fn main() -> io::Result<()> {
+    let delay = 1e9 as u64 / REQUESTS_PER_SECOND;
+
+    executor::block_on(async {
+
+        for _ in 0..TOTAL_REQUESTS {
+            juliex::spawn(async move {
+                let addr = random_addr(80);
+                match TcpStream::connect(addr).await {
+                    Ok(mut stream) => {
+                        stream.write_all(&REQUEST)
+                            .await
+                            .expect("Failed to write to socket")
+
+                        stream.close()
+                            .await
+                            .expect("Failed to close socket");
+
+                        println!("Success: {:?}", &addr);
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to connect: '{}'", e);
+                    }
+                }
+
+            });
+        }
+    });
+
+    Ok(())
+}
+```
+
+Thanks!
+Ryan
+This library  doesn't look  active, Can it be move to [Rustasync organization](https://github.com/rustasync). It may will be better for it
+First access of `CURRENT_REACTOR` would run a reactor in a background thread?
+Does it mean for threadpoll executor, each thread local reactor would be running in a paired 
+ background thread? Why not run the reactor via `unpark()` just like tokio (the runtime setup would init the reactor directly).
+
+Why exists so-called `fallback` way? Please help to clarify it.
+https://github.com/withoutboats/romio/pull/87 removed the `vectored` implementations because `mio` doesn't support std's `ioslice` yet, which is used in the current `AsyncRead` and `AsyncWrite` traits. We should restore these implementations once `mio` supports it.
+
+## Refs
+- https://docs.rs/mio/0.6.16/mio/net/struct.TcpStream.html#method.read_bufs
+- https://github.com/withoutboats/romio/pull/87
+This is very similar to https://github.com/tokio-rs/tokio/issues/852.
+
+Running the following test program hangs and doesn't notice that the client has closed the write side of the `TcpStream`:
+
+```rust
+#![feature(futures_api, async_await, await_macro)]
+
+use std::{io, net::IpAddr};
+
+use futures::{StreamExt, io::{AsyncReadExt, AsyncWriteExt}};
+use romio::TcpListener;
+use romio::TcpStream;
+
+fn main() {
+    futures::executor::block_on(async {
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let mut listener = TcpListener::bind(&(ip, 0).into()).unwrap();
+
+        let port = listener.local_addr().unwrap().port();
+
+        let mut incoming = listener.incoming();
+        let (_rx, mut tx) = await!(TcpStream::connect(&(ip, port).into())).unwrap().split();
+        let (mut rx, _tx) = await!(incoming.next()).unwrap().unwrap().split();
+
+        println!("Connection established");
+
+        println!("Closing tx");
+        await!(tx.close()).unwrap();
+
+        println!("Wait for server to notice connection was closed...");
+        let mut byte = [0];
+        let res = await!(rx.read_exact(&mut byte));
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    })
+}
+```
+
+By adding in a wrapper around the clients `TcpStream` that implements `poll_close` to call `shutdown(Shutdown::Write)` the server notices that the client has closed the TCP connection
+
+```rust
+struct Fix(TcpStream);
+
+impl AsyncRead for Fix {
+    fn poll_read(&mut self, waker: &Waker, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+        self.0.poll_read(waker, buf)
+    }
+}
+
+impl AsyncWrite for Fix {
+    fn poll_write(&mut self, waker: &Waker, buf: &[u8]) -> Poll<io::Result<usize>> {
+        self.0.poll_write(waker, buf)
+    }
+
+    fn poll_flush(&mut self, waker: &Waker) -> Poll<io::Result<()>> {
+        self.0.poll_flush(waker)
+    }
+
+    fn poll_close(&mut self, waker: &Waker) -> Poll<io::Result<()>> {
+        ready!(self.poll_flush(waker)?);
+        Poll::Ready(self.0.shutdown(std::net::Shutdown::Write))
+    }
+}
+```
+
+For some reason in the linked Tokio issue they don't want to apply this change to `TcpStream` itself, I can't see any reason not to just change it though.
+From talking with @withoutboats: it would make sense to create a timer implementation on top of OS timers. I'm not quite sure yet how this should work, but a cursory search shows that there's multiple options available on unix through `timer_create(2)` and `epoll(2)` with a timeout parameter. I'm not sure yet about Windows.
+
+## References
+- https://stackoverflow.com/questions/7845817/asynchronous-timer-in-linux
+I was trying to make a supervisor app with async/await and failed.
+I can express my thoughts in Python as following code, but i don't know how to do it in Rust.
+
+```python
+import asyncio
+
+
+class App:
+    def __init__(self):
+        self.api = ControlService(self)
+        self.business = MyBussinessService()
+
+    async def serve(self):
+        await asyncio.wait([
+            self.api.serve(),
+            self.business.serve()
+        ])
+
+
+class ControlService:
+    def __init__(self, app):
+        self.app = app
+
+    async def serve(self):
+        while True:
+            print('[ControlService   ] Waiting for user cmd...')
+            cmd = await simulate_user_request()
+            print("[ControlService   ] Received user cmd: {}".format(cmd))
+            if cmd == "reset":
+                # here we need to mutate the business and get the result
+                ok = self.app.business.reset()
+                if ok:
+                    pass
+                else:
+                    pass
+            else:
+                pass
+
+
+class MyBussinessService:
+    def __init__(self):
+        self._value = 0
+
+    def reset(self):
+        self._value = 0
+        return True
+
+    async def serve(self):
+        while True:
+            print('[BussinessService ] Business value: {}'.format(self._value))
+            self._value += 1
+            await asyncio.sleep(1)
+
+
+async def simulate_user_request():
+    await asyncio.sleep(5)
+    return "reset"
+
+
+if __name__ == '__main__':
+    app = App()
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(app.serve())
+    loop.close()
+```

@@ -1,0 +1,213 @@
+I don't know if this is the correct place to ask this, but I'm clueless on how to achieve this.
+
+I've got the following code
+```go
+package app
+type FooService interface {
+		Foo(id uint) *Foo
+		UpdateFoo(id uint, *Foo) error
+		BusinessOperation(fooID uint, barID uint) error // -> this will have to call BarService.UpdateBar() somewhere in the implementation
+}
+
+type BarService interface {
+		Bar(id uint) *Bar
+		UpdateBar(id uint, *Bar) error
+}
+```
+
+As you can see, I basically have 2 structs that contain db / business logic and one of them has to use the other one. The problem occurs in the actual implementation, as the structs would have to share the same database (not an issue for regular use, but for transactions it becomes an issue).
+
+```go
+package mysql
+
+type fooService struct {
+		db *sqlbuilder.Database
+		bs app.BarService // important
+}
+
+type barService struct {
+		db *sqlbuilder.Database
+}
+
+func (fs *fooService) BusinessOperation(fooID uint, barID uint) error {
+		tx, err := fs.db.NewTx(nil)
+		...
+		foo := fs.Foo(fooId) // can't use this as it uses the db field (not a part of the transaction)
+		foo := &Foo{}
+		tx.Collection("foo").Find("id", id).One(foo) // instead i have to copy paste code in order the use the transaction
+		...
+		fs.bs.Bar(barID) // can't use this as it uses the db field (not a part of the transaction)
+		bar := &Bar{}
+		tx.Collection("bar").Find("id", id).One(bar) // instead i have to copy paste code in order the use the transaction		
+}
+```
+
+The `BusinessOperation` method interally creates a Transaction to be used across all the database operations, but I've yet to find a way to actually share that transaction.
+Suggested solutions I've seen were to create an interface that wraps both `sql.DB` and `sql.Tx` like that:
+
+```go
+type executor interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+	Prepare(query string) (*sql.Stmt, error)
+	Query(query string, args ...interface{}) (*sql.Rows, error)
+	QueryRow(query string, args ...interface{}) *sql.Row
+}
+```
+
+... and have different structs implement it so then you can pass it around as an argument to the aforementioned methods:
+
+```go
+func (fs *fooService) BusinessOperation(db executor, fooID uint, barID uint) error {
+		...
+		fs.bs.Bar(db, barID) // this would work
+}
+```
+
+The problem with this approach is that those methods on the interface wouldn't work for `upper` as the methods are quite a bunch more to implement.
+What I came up with was to try and compose `sqlbuilder.Database` or `sqlbuilder.Tx` and add noop methods for my db or tx implemenation. 
+```go
+type DB interface {
+		sqlbulider.Database
+		Commit() error
+		Rollback() error
+}
+
+type db struct {
+		sqlbuilder.Database
+}
+
+// noop
+func (d *db) Commit() error   { return nil }
+func (d *db) Rollback() error { return nil }
+
+type tx struct {
+	sqlbuilder.Tx	
+}
+```
+... and the issue occurs right here. Tx has to implement all methods of `sqlbuilder.Database`, some of which I have no idea how to:
+
+```go
+	NewTx(ctx context.Context) (Tx, error)
+	Tx(ctx context.Context, fn func(sess Tx) error) error 
+	Context() context.Context
+	WithContext(context.Context) Database
+	SetTxOptions(sql.TxOptions)
+	TxOptions() *sql.TxOptions
+```
+I have no idea how should those be implemented.
+I tried doing the opposite and simply wrap `sqlbulider.Tx`, but the same issue occurs, except for the `db` struct:
+```go
+	Context() context.Context
+	WithContext(context.Context) Tx
+	SetTxOptions(sql.TxOptions)
+	TxOptions() *sql.TxOptions
+```
+
+I'd be very glad if I could get some help regarding this issue.
+I am trying to do a join query and have it map correctly to my struct:
+
+```go
+type ExerciseCms struct {
+	Uuid          string  `db:"uuid" json:"uuid"`
+	Timestamp     int64   `db:"timestamp" json:"timestamp"`
+	Object        string  `db:"object" json:"object"`
+	Audio         *Asset  `db:"-" json:"audio"`
+	Image         *Asset  `db:"-" json:"image"`
+	Video         *Asset  `db:"-" json:"video"`
+	Assets        []*Asset `db:"-" json:"assets,omitempty"`
+}
+
+res = db.Select("exercises.*", "assets").From("exercises").LeftJoin("assets").On("exercises.uuid = assets.exercise_uuid")
+err = res.All(&exercises)
+// Log is done in a loop
+log.Println("DEBUG: ", e.Assets)
+```
+
+Produces:
+
+```go
+DEBUG:  []
+```
+I want to suggest moving the License to a separate LISENCE file in the repo. This allows it to be more easily auto-discovered, e.g. by the relatively new [go.dev](https://pkg.go.dev/upper.io/db.v3?tab=doc) site. Currently the side is not showing db.v3 docs due to not being able to detect the license.
+
+![image](https://user-images.githubusercontent.com/75205/72066032-e4721900-32df-11ea-9612-8ba121cbb912.png)
+
+I've the following code:
+
+https://github.com/argoproj/argo/blob/850669f7a04d2f5ba07ea9ef93012b10dd3bca89/persist/sqldb/workflow_archive.go#L46
+
+This is very slow (taking 7 seconds to return). My hypothesizes that column `workflow` is very large (up to 1MB) and that the cost of transmitting 40 that from the database is just very costly.
+
+Assuming my hypothesis is correct - is there a way to make sure that upper.db does not transfer data it does not need please? 
+The `db.Collection` interface does not include a `Database()` function, even though it is implemented by most every adapter's `collection` implementation.
+
+If interacting with a collection through the standard `db.Collection` interface type, there does not seem to be a way to reference the underlying database.  (Perhaps I am mistaken?) `sqladapter.Collection` would be ideal for use, but it's `internal` and off-limits 😕 
+
+Specifically, I'd like to see [this method](https://github.com/upper/db/blob/636336184928271b83f43dd9f8c003fa586d5cc0/internal/sqladapter/collection.go#L26) added as part of [this interface](https://github.com/upper/db/blob/636336184928271b83f43dd9f8c003fa586d5cc0/collection.go#L25).
+Is the mongo driver you guys are using maintained? It seems not https://github.com/go-mgo/mgo/blob/v2-unstable/README.md
+
+Also, what is the recommended way to do a join? Should I use the driver itself? Right now I am making multiple queries instead of aggregating the results. I understand the SQLBuilder isn't supported but there must be some workaround
+.Select(db.Raw("o.id ,oc.project_daily_report_send_time ")).From("o1 as o").
+		Join("o2 as oc").On("oc.org_id = o.id").Where(db.Cond{
+		"oc.is_delete": consts.AppIsNoDelete,
+		"oc.status":    consts.AppStatusEnable,
+		"o.is_delete":  consts.AppIsNoDelete,
+		"o.status":     consts.AppStatusEnable,
+	}).Paginate(uint(size)).Page(uint(page))
+
+count, err := paginator.TotalEntries()
+
+paginator.All(po)
+
+can't mapping result  into po but count has value
+Given two structs User and Profile linked with a foreign key:
+
+```go
+type User struct {
+	ID        uuid.UUID
+	Name      string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+type Profile struct {
+	ID        uuid.UUID
+	UserID    uuid.UUID
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+```
+
+It would be good to be able to query as follows:
+
+```go
+type UserWithProfile struct {
+	User    User    `db:",inline"`
+	Profile Profile `db:",inline"`
+}
+
+res := []*UserWithProfile{}
+err := db.
+        SelectFrom("users").
+        Join("profiles AS p").On("users.id = p.user_id").
+        All(res)
+```
+
+Right now, this is impossible due to *conflicting field names with multiple inline structs*.  The user's `ID`, `CreatedAt` and `UpdatedAt` columns are all unset, while only the joined Profile's fields are set.
+
+This could be solvable via:
+
+1. When iterating through column names, record the number of times that you've seen each column name (https://github.com/upper/db/blob/fad80cdab4f761cb26416675df120f5d8c3f0db7/lib/sqlbuilder/fetch.go#L162)
+2. If we've seen a column name > 1 time, iterate through the embedded structs in order and set the N'th struct's field with the given value.
+
+This assumes that the struct field's ordering is the same as the order in the database query.
+
+We could also dynamically rename fields on the fly so that we can match regardless of order, though this is much more work.
+Hi,
+
+I'm using de PostgreSQL and I'm trying to find a way to make my inserts idempotent using `ON CONFLICT DO NOTHING` ( see https://www.postgresql.org/docs/9.5/sql-insert.html).
+
+Any tips on how to do this without writing all the insert SQL code by hand?
+
+Thanks!
+I looked at the documentation but I don't know if it supports nested transactions.

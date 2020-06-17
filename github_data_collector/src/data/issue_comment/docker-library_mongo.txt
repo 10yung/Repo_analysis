@@ -1,0 +1,190 @@
+https://www.mongodb.com/support-policy
+
+The MongoDB 3.4 release signing key was expired yesterday (https://github.com/docker-library/mongo/issues/379#issuecomment-571389809), but has been updated since. Maybe we need to wait for an Ubuntu rebuild to get the latest key update before removing? (Last Ubuntu was 21 day ago https://github.com/docker-library/official-images/pull/7147)
+
+```console
+$ docker run -it --rm buildpack-deps
+root@11b95ef3f0fb:/# export GNUPGHOME="$(mktemp -d)"
+root@11b95ef3f0fb:/# gpg --batch --keyserver ha.pool.sks-keyservers.net --recv-keys 0C49F3730359A14518585931BC711F9BA15703C6
+gpg: keybox '/tmp/tmp.DZIlj5J8fs/pubring.kbx' created
+gpg: /tmp/tmp.DZIlj5J8fs/trustdb.gpg: trustdb created
+gpg: key BC711F9BA15703C6: public key "MongoDB 3.4 Release Signing Key <packaging@mongodb.com>" imported
+gpg: Total number processed: 1
+gpg:               imported: 1
+root@11b95ef3f0fb:/# gpg --fingerprint
+/tmp/tmp.DZIlj5J8fs/pubring.kbx
+-------------------------------
+pub   rsa4096 2016-01-11 [SC] [expires: 2024-12-03]
+      0C49 F373 0359 A145 1858  5931 BC71 1F9B A157 03C6
+uid           [ unknown] MongoDB 3.4 Release Signing Key <packaging@mongodb.com>
+
+root@11b95ef3f0fb:/# 
+```
+
+Closes #379.
+Running in the container (I used `docker run -it mongo:3.4.21-xenial /bin/bash`). Using `apt-get update` fails. Error log
+
+```
+W: GPG error: http://repo.mongodb.org/apt/ubuntu xenial/mongodb-org/3.4 Release: The following signatures were invalid: KEYEXPIRED 1578250443
+W: The repository 'http://repo.mongodb.org/apt/ubuntu xenial/mongodb-org/3.4 Release' is not signed.
+N: Data from such a repository can't be authenticated and is therefore potentially dangerous to use.
+N: See apt-secure(8) manpage for repository creation and user configuration details.
+E: Failed to fetch store:/var/lib/apt/lists/partial/repo.mongodb.org_apt_ubuntu_dists_xenial_mongodb-org_3.4_multiverse_binary-amd64_Packages.gz  Hash Sum mismatch
+E: Some index files failed to download. They have been ignored, or old ones used instead.
+```
+Running `apt-key list | grep -A 1 expired` shows the expired key
+```
+pub   4096R/A15703C6 2016-01-11 [expired: 2020-01-05]
+uid                  MongoDB 3.4 Release Signing Key <packaging@mongodb.com>
+```
+Added MONGO_USERNAME & MONGO_PASSWORD
+
+> Credit goes to: https://www.shapeblock.com/docker-mongodb/
+Basically, I'm trying to configure shards when running `mongos`:
+
+```js
+sh.addShard("rs1/db")
+```
+But the scripts in `docker-entrypoint-initdb.d` only run for `mongod`:
+
+https://github.com/docker-library/mongo/blob/59fba668ae47e3ec7f7917a56db4f94d6d774765/3.6/docker-entrypoint.sh#L192-L318
+
+Does it make sense to run for `mongos` too?
+
+…password using environment variables
+This issue (I would call it a bug but perhaps it is a feature request) is that users would like to a la `docker-compose.yml` and/or environment variables be able to set a database with a username and password they specify upon launch of the image.
+
+### Background:
+
+This issue was filed https://github.com/docker-library/mongo/issues/174 and closed because the behavior of a PR https://github.com/docker-library/mongo/pull/145 was mentioned as the solution. What https://github.com/docker-library/mongo/pull/145 *actually* does and what users *expect* are entirely different.  What PR https://github.com/docker-library/mongo/pull/145 does is set a user with elevated permissions (i.e. "root" user) that has superuser access to the entire MongoDB instance (as mentioned in https://github.com/docker-library/mongo/issues/174#issuecomment-460448991.  However what most users *expect* from these environment variables is that a database they specify is initialized with the username and password they have set. It is confusing that these environment variables (`MONGO_INITDB_DATABASE`, `MONGO_INITDB_ROOT_PASSWORD` and `MONGO_INITDB_ROOT_USERNAME`) pertain to only setting a user with the role `root` on the database `admin` and initializing an user specified database for `.js` and `.sh` scripts in `/docker-entrypoint-initdb.d/` to be run against.
+
+### Proposal:
+
+We should make the environment variables very explicitly named in what they do in addition to adding others for the behavior I think most users come to expect when reading the variable names. Since it is the case most users would like their instance initialized with a database of their specification we should add this feature to meet that expectation.
+
+* We keep `MONGO_INITDB_ROOT_USERNAME` and `MONGO_INITDB_ROOT_PASSWORD`
+* We remove `MONGO_INITDB_DATABASE` as it is misleading
+* We add `MONGO_INITDB_ROOT_DATABASE` and allow it to override the hardcoded `admin` database
+* We add `MONGO_USERDB_ADMIN_USERNAME`, `MONGO_USERDB_ADMIN_PASSWORD`, and `MONGO_USERDB_ADMIN_DATABASE`
+ * We update the documentation to state:
+   * `MONGO_INITDB_ROOT_USERNAME`, `MONGO_INITDB_ROOT_PASSWORD`, and `MONGO_INITDB_ROOT_DATABASE` will be used for the `root` role to Mongo
+  * `MONGO_USERDB_ADMIN_USERNAME`, `MONGO_USERDB_ADMIN_PASSWORD`, and `MONGO_USERDB_ADMIN_DATABASE` will be used to initialize a user specified database
+  * That all of the `.js` and `.sh` scripts a user supplies in `/docker-entrypoint-initdb.d/` will be executed against `MONGO_USERDB_ADMIN_DATABASE`
+
+### Reasons for change:
+
+ * The variables `MONGO_INITDB_ROOT_PASSWORD` and `MONGO_INITDB_ROOT_USERNAME` are **only** used for the `admin` database
+  * Currently all `MONGO_INITDB_DATABASE` does is have operations used against it whenever a user has dropped in `.js` or `.sh` scripts into `/docker-entrypoint-initdb.d/`. This unclear unless you look at `docker-entrypoint.sh` in this repository and no where clearly stated in the documentation as such
+  * The documentation is unclear and the only way to hack in a user initialized database with a username and password on image launch is to also create a script in `/docker-entrypoint-initdb.d/` which then places burden on the user to maintain the `root` role credentials in environment variables which live separately from a custom `.js` or `.sh` script which they have to volume into the image
+
+### References:
+
+* Issue: https://github.com/docker-library/mongo/issues/174
+* PR: https://github.com/docker-library/mongo/pull/145
+
+### Involved Persons:
+@mmi-rperez
+@tianon 
+@vutran1710
+@yosifkit
+@lonix1
+@johnwyles
+Dockerfile
+```shell
+FROM mongo
+ADD ./mongo-init.sh /docker-entrypoint-initdb.d/
+```
+
+```shell
+mongodb_1  | about to fork child process, waiting until server is ready for connections.
+mongodb_1  | forked process: 29
+mongodb_1  | 2019-01-15T21:20:47.367+0000 I CONTROL  [main] ***** SERVER RESTARTED *****
+mongodb_1  | 2019-01-15T21:20:47.370+0000 I CONTROL  [main] Automatically disabling TLS 1.0, to force-enable TLS 1.0 specify --sslDisabledProtocols 'none'
+mongodb_1  | 2019-01-15T21:20:47.374+0000 I CONTROL  [initandlisten] MongoDB starting : pid=29 port=27017 dbpath=/data/db 64-bit host=343629fa23cd
+mongodb_1  | 2019-01-15T21:20:47.374+0000 I CONTROL  [initandlisten] db version v4.0.5
+mongodb_1  | 2019-01-15T21:20:47.374+0000 I CONTROL  [initandlisten] git version: 3739429dd92b92d1b0ab120911a23d50bf03c412
+mongodb_1  | 2019-01-15T21:20:47.374+0000 I CONTROL  [initandlisten] OpenSSL version: OpenSSL 1.0.2g  1 Mar 2016
+mongodb_1  | 2019-01-15T21:20:47.374+0000 I CONTROL  [initandlisten] allocator: tcmalloc
+mongodb_1  | 2019-01-15T21:20:47.374+0000 I CONTROL  [initandlisten] modules: none
+mongodb_1  | 2019-01-15T21:20:47.374+0000 I CONTROL  [initandlisten] build environment:
+mongodb_1  | 2019-01-15T21:20:47.374+0000 I CONTROL  [initandlisten]     distmod: ubuntu1604
+mongodb_1  | 2019-01-15T21:20:47.374+0000 I CONTROL  [initandlisten]     distarch: x86_64
+mongodb_1  | 2019-01-15T21:20:47.374+0000 I CONTROL  [initandlisten]     target_arch: x86_64
+mongodb_1  | 2019-01-15T21:20:47.374+0000 I CONTROL  [initandlisten] options: { net: { bindIp: "127.0.0.1", port: 27017, ssl: { mode: "disabled" } }, processManagement: { fork: true, pidFilePath: "/tmp/docker-entrypoint-temp-mongod.pid" }, systemLog: { destination: "file", logAppend: true, path: "/proc/1/fd/1" } }
+mongodb_1  | 2019-01-15T21:20:47.374+0000 I STORAGE  [initandlisten]
+mongodb_1  | 2019-01-15T21:20:47.374+0000 I STORAGE  [initandlisten] ** WARNING: Using the XFS filesystem is strongly recommended with the WiredTiger storage engine
+mongodb_1  | 2019-01-15T21:20:47.374+0000 I STORAGE  [initandlisten] **          See http://dochub.mongodb.org/core/prodnotes-filesystem
+mongodb_1  | 2019-01-15T21:20:47.375+0000 I STORAGE  [initandlisten] wiredtiger_open config: create,cache_size=487M,session_max=20000,eviction=(threads_min=4,threads_max=4),config_base=false,statistics=(fast),log=(enabled=true,archive=true,path=journal,compressor=snappy),file_manager=(close_idle_time=100000),statistics_log=(wait=0),verbose=(recovery_progress),
+mongodb_1  | 2019-01-15T21:20:47.866+0000 I STORAGE  [initandlisten] WiredTiger message [1547587247:866155][29:0x7eff7bb21a40], txn-recover: Set global recovery timestamp: 0
+mongodb_1  | 2019-01-15T21:20:47.873+0000 I RECOVERY [initandlisten] WiredTiger recoveryTimestamp. Ts: Timestamp(0, 0)
+mongodb_1  | 2019-01-15T21:20:47.883+0000 I CONTROL  [initandlisten]
+mongodb_1  | 2019-01-15T21:20:47.883+0000 I CONTROL  [initandlisten] ** WARNING: Access control is not enabled for the database.
+mongodb_1  | 2019-01-15T21:20:47.883+0000 I CONTROL  [initandlisten] **          Read and write access to data and configuration is unrestricted.
+mongodb_1  | 2019-01-15T21:20:47.883+0000 I CONTROL  [initandlisten]
+mongodb_1  | 2019-01-15T21:20:47.883+0000 I STORAGE  [initandlisten] createCollection: admin.system.version with provided UUID: 6019a1c5-fc8c-45ed-9355-5677a9ed6c47
+mongodb_1  | 2019-01-15T21:20:47.892+0000 I COMMAND  [initandlisten] setting featureCompatibilityVersion to 4.0
+mongodb_1  | 2019-01-15T21:20:47.897+0000 I STORAGE  [initandlisten] createCollection: local.startup_log with generated UUID: bc5c6df0-c572-4cbe-815c-daebc8c7f596
+mongodb_1  | 2019-01-15T21:20:47.909+0000 I FTDC     [initandlisten] Initializing full-time diagnostic data capture with directory '/data/db/diagnostic.data'
+mongodb_1  | 2019-01-15T21:20:47.911+0000 I NETWORK  [initandlisten] waiting for connections on port 27017
+mongodb_1  | 2019-01-15T21:20:47.911+0000 I STORAGE  [LogicalSessionCacheRefresh] createCollection: config.system.sessions with generated UUID: b7cba875-b5b1-4633-9d4e-944a52b3c84a
+mongodb_1  | child process started successfully, parent exiting
+mongodb_1  | 2019-01-15T21:20:47.925+0000 I INDEX    [LogicalSessionCacheRefresh] build index on: config.system.sessions properties: { v: 2, key: { lastUse: 1 }, name: "lsidTTLIndex", ns: "config.system.sessions", expireAfterSeconds: 1800 }
+mongodb_1  | 2019-01-15T21:20:47.925+0000 I INDEX    [LogicalSessionCacheRefresh] 	 building index using bulk method; build may temporarily use up to 500 megabytes of RAM
+mongodb_1  | 2019-01-15T21:20:47.926+0000 I INDEX    [LogicalSessionCacheRefresh] build index done.  scanned 0 total records. 0 secs
+mongodb_1  | 2019-01-15T21:20:47.969+0000 I NETWORK  [listener] connection accepted from 127.0.0.1:36626 #1 (1 connection now open)
+mongodb_1  | 2019-01-15T21:20:47.969+0000 I NETWORK  [conn1] received client metadata from 127.0.0.1:36626 conn1: { application: { name: "MongoDB Shell" }, driver: { name: "MongoDB Internal Client", version: "4.0.5" }, os: { type: "Linux", name: "Ubuntu", architecture: "x86_64", version: "16.04" } }
+mongodb_1  | 2019-01-15T21:20:47.972+0000 I NETWORK  [conn1] end connection 127.0.0.1:36626 (0 connections now open)
+mongodb_1  | 2019-01-15T21:20:48.032+0000 I NETWORK  [listener] connection accepted from 127.0.0.1:36628 #2 (1 connection now open)
+mongodb_1  | 2019-01-15T21:20:48.032+0000 I NETWORK  [conn2] received client metadata from 127.0.0.1:36628 conn2: { application: { name: "MongoDB Shell" }, driver: { name: "MongoDB Internal Client", version: "4.0.5" }, os: { type: "Linux", name: "Ubuntu", architecture: "x86_64", version: "16.04" } }
+mongodb_1  | 2019-01-15T21:20:48.065+0000 I STORAGE  [conn2] createCollection: admin.system.users with generated UUID: 0ec16545-de93-480f-ad22-184f838e30b6
+mongodb_1  | Successfully added user: {
+mongodb_1  | 	"user" : "root",
+mongodb_1  | 	"roles" : [
+mongodb_1  | 		{
+mongodb_1  | 			"role" : "root",
+mongodb_1  | 			"db" : "admin"
+mongodb_1  | 		}
+mongodb_1  | 	]
+mongodb_1  | }
+mongodb_1  | 2019-01-15T21:20:48.084+0000 E -        [main] Error saving history file: FileOpenFailed: Unable to open() file /home/mongodb/.dbshell: Unknown error
+```
+Currently, Dockerfile declares VOLUME for /data/db, /data/configdb:
+https://github.com/docker-library/mongo/blob/32e5645325ae5dff2ae6f934049cbd6b4635aec0/4.1/Dockerfile#L87
+
+This is sub-optimal, because some workflows in inherited images become excessively complicated.
+For example, seeding a database from a dump now requires
+````Dockerfile
+RUN mkdir /data/local-db
+
+COPY mongo-dump /var/mongo-dump
+RUN mongod --fork --dbpath /data/local-db --logpath /var/log/mongodb.log && \
+    mongorestore --db mydb /var/mongo-dump/mydb && \
+    mongod --shutdown  --dbpath /data/local-db
+RUN chown -R mongodb:mongodb /data/local-db
+
+CMD ["mongod", "--dbpath", "/data/local-db"]
+````
+instead of just
+````Dockerfile
+RUN mongod --fork --logpath /var/log/mongodb.log && \
+    mongorestore --db mydb /var/mongo-dump/mydb && \
+    mongod --shutdown
+````
+because /data/db [doesn't persist](https://docs.docker.com/engine/reference/builder/#notes-about-specifying-volumes) between `docker build` and `docker run` invocations.
+
+It is proposed to remove VOLUME directive, and leave volumes configuration up to end user.
+After a longer investigation in https://jira.mongodb.org/browse/SERVER-27182 Mark Benvenuto found out that MongoDB 3.4 is working in NanoServer.
+
+[My approach](https://github.com/StefanScherer/dockerfiles-windows/tree/master/mongo/3.4) uses a simple COPY deployment as the MSI package can't be installed in NanoServer.
+
+How should an official Dockerfile look like?
+
+Hi,
+
+I'm running the mongo image on a NUMA-enabled machine, and I get following warning from logs when MongoDB is starting:
+
+> WARNING: You are running on a NUMA machine.
+>           We suggest launching mongod like this to avoid performance problems:
+>               numactl --interleave=all mongod [other options]
+
+How can I resolve this? Any help is appreciated, thanks.

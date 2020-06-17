@@ -1,0 +1,157 @@
+Is it possible to convert assembly code into binary code?
+There are many changes since the last time.
+I noticed that Travis CI triggered, but is doesn't appear in "Checks" for pull requests. You need to add this setting in your repository.
+Since we migrated our CI, and Capstone used our CI, setting GitHub Action would help automate sending builds without our help.
+
+You only need to add the token (you can see it at https://scan.coverity.com/projects/capstone-next/builds/new page) in the Github repo Settings -> Secrets -> Add
+
+There you should add a token with a name `COVERITY_SCAN_TOKEN`
+
+Feel free to reach me if you have questions.
+
+
+After playing around with [test_86.c](https://github.com/aquynh/capstone/blob/next/tests/test_x86.c) I cannot seem to get anything show a "PRIOR_XX" state. What is the difference between this and being unlisted? If it's supposed to indicate the flag was unaffected by the instruction then wouldn't it appear for all the flags for say `mov eax, 0x0`?
+`next` branch:
+```
+$ ./cstool x32 "df e9"
+ 0  df e9                                            fucompi	st(1)
+```
+`v4` branch (which is correct):
+```
+$ ./cstool x32 "df e9"
+ 0  df e9                                            fucomip	st(1)
+```
+see also #692.
+There seems to be an issue with `update_flags` on some ARM instruction (at least for `ADC` and `SBC`). More precisely, Capstone reports `update_flags` as `true` when it should be `false` (according to ARM reference manual).
+
+The following code snippet shows the issue:
+
+```python
+from capstone import *
+from capstone.arm import *
+
+CODE = [
+    b"\x03\x00\xa1\xe0", # adcal r0, r1, r3
+    b"\x03\x00\xb1\xe0", # adcsal r0, r1, r3
+    b"\x03\x00\xc1\xe0", # sbcal r0, r1, r3
+    b"\x03\x00\xd1\xe0", # sbcsal r0, r1, r3
+    b"\x03\x00\x81\xe0", # addal r0, r1, r3
+    b"\x03\x00\x91\xe0", # addsal r0, r1, r3
+    b"\x03\x00\x41\xe0", # subal r0, r1, r3
+    b"\x03\x00\x51\xe0", # subsal r0, r1, r3
+]
+
+md = Cs(CS_ARCH_ARM, CS_MODE_ARM)
+md.detail = True
+
+for code in CODE:
+    for i in md.disasm(code, 0x1000):
+        print("{} {} ; update_flags: {}".format(i.mnemonic, i.op_str, i.update_flags))
+```
+
+Output:
+
+```shell
+adc r0, r1, r3 ; update_flags: True
+adcs r0, r1, r3 ; update_flags: True
+sbc r0, r1, r3 ; update_flags: True
+sbcs r0, r1, r3 ; update_flags: True
+add r0, r1, r3 ; update_flags: False
+adds r0, r1, r3 ; update_flags: True
+sub r0, r1, r3 ; update_flags: False
+subs r0, r1, r3 ; update_flags: True
+```
+
+Here `update_flags` is `true` for `ADC` and `SBC` when it should be `false` (generally, it should only report `true` for those instructions with the `s` suffix). Notice that this does not happen with neither `ADD` nor `SUB`.
+Hi,
+I found some issues when using the RISC-V backend (tested with latest code on `next` branch)
+
+1.
+
+Change the `RISCV_CODE32` example code to
+`#define RISCV_CODE32 "\x33\x03\xf0\x41"`
+
+```
+Platform: riscv32
+Code:0x33 0x03 0xf0 0x41 
+Disasm:
+0x1000:	neg	t1, $ $t6
+	op_count: 2
+		operands[0].type: REG = t1
+		operands[1].type: REG = t6
+```
+
+notice the bad `op_str` above
+
+2.
+
+```
+	uint16_t regs_read[16]; ///< list of implicit registers read by this insn
+	uint8_t regs_read_count; ///< number of implicit registers read by this insn
+
+	uint16_t regs_write[20]; ///< list of implicit registers modified by this insn
+	uint8_t regs_write_count; ///< number of implicit registers modified by this insn
+```
+
+Is not updated correctly by the backend (all values are zero) but using the details directly
+
+```
+	cs_riscv* riscv;
+	cs_detail* detail;
+
+	// detail can be NULL on "data" instruction if SKIPDATA option is turned ON
+	if (ins->detail == NULL)
+		return;
+
+	riscv = &(ins->detail->riscv);
+	detail = ins->detail;
+	if (riscv->op_count)
+		printf("\top_count: %u\n", riscv->op_count);
+
+	for (i = 0; i < riscv->op_count; i++) {
+           ...
+```
+Works as expected
+I'm on the 'next' branch using python bindings. I find that the LEA instruction reports that it reads from memory via i.operands->access
+
+```
+operand_data = [[],[],[],[]]
+for operand in i.operands:
+	if operand.type == X86_OP_MEM:
+		data = operand.size
+		if operand.access & capstone.CS_AC_READ:
+			operand_data[2].append(data)
+			
+		if operand.access & capstone.CS_AC_WRITE:
+			operand_data[3].append(data)
+```
+
+One of the failing cases byte code: b'448d4258'
+
+Related to issue #301 (linking not showing up, so: ) https://github.com/aquynh/capstone/issues/301#issue-65073528
+
+It looks like it was fixed at one point, but those changes do not still seem to be present. Am I missing something?
+
+Bytes `0x85, 0x15, 0xba, 0x1e, 0x36, 0x00` are correctly decoded as `test %edx,0x361eba(%rip)`. However, the both operands are not marked as read. 
+
+It looks like the problem is that the entry for `X86_TEST32mr, X86_INS_TEST` in X86MappingInsnOp.inc is empty. Fill in the entry as follows solves the problem:
+
+```
+diff --git a/arch/X86/X86MappingInsnOp.inc b/arch/X86/X86MappingInsnOp.inc
+index 909a98dd..3eb192ea 100644
+--- a/arch/X86/X86MappingInsnOp.inc
++++ b/arch/X86/X86MappingInsnOp.inc
+@@ -13399,8 +13399,8 @@
+ },
+ 
+ {      /* X86_TEST32mr, X86_INS_TEST: test */
+-       0,
+-       { 0 }
++       X86_EFLAGS_RESET_OF | X86_EFLAGS_MODIFY_SF | X86_EFLAGS_MODIFY_ZF | X86_EFLAGS_UNDEFINED_AF | X86_EFLAGS_MODIFY_PF | X86_EFLAGS_RESET_CF,
++       { CS_AC_READ, CS_AC_READ, 0 }
+ },
+ 
+ {      /* X86_TEST32ri, X86_INS_TEST: test */
+```
+
+Is there any particular reason that this entry is empty? If not, I can create PR to fix the problem.

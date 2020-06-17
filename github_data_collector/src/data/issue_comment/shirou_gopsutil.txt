@@ -1,0 +1,177 @@
+This fix is to address issue mentioned in https://github.com/shirou/gopsutil/pull/713, originally comes from https://github.com/influxdata/telegraf/issues/6813
+To fix this issue:
+https://github.com/shirou/gopsutil/issues/816
+The commented block has 2 problems, so should be disabled:
+1. Will not work, in case we track disk info on the host from container, as /dev will be mapped into other mount point
+2. Useful info about vg name removed if we follow symlink, here the example:
+```
+~# ls -la /dev/mapper/dm--01--vg-root
+lrwxrwxrwx 1 root root 7 Oct  3 10:47 /dev/mapper/dm--01--vg-root -> ../dm-0
+```
+Issue is opened:
+https://github.com/shirou/gopsutil/issues/817
+**Is your feature request related to a problem? Please describe.**
+
+While trying to all of the information of all my processes in my Windows 10 PC using gopsutil.process, I observed about %40 CPU usage and ~38s runtime. After introducing go's concurrency and removing Cmdline() and IOCounters() calls which used most of the runtime, I was able to reduce it to about ~1.5s. However %40 CPU usage stayed. I did CPU profiling with pprof and found getFromSnapProcess was using the most resources. Right now it discards 2 of the 3 values (ppid, name and num threads) returned by a  windows.ProcessEntry32 object in each call, which is found by iterating through all of the processess in the PC. This causes a O(3 * N * N) complexity while it is possible to iterate for once and keep the data for further calls with just a O(N) complexity with only a slight increase in memory usage. 
+
+**Describe the solution you'd like**
+
+ I wrote an external replacement function for getFromSnapProcess which keeps its data as a map with referencing: 
+ 
+https://golang.hotexamples.com/examples/syscall/-/Process32First/golang-process32first-function-examples.html
+
+I observed a drop in CPU from %40 to %2 while increasing total memory usage by about 20MB. Runtime also dropped from 1.4s to about 0.3s. However I don't have the time to prepare this for gopsutil at the moment. Therefore I wanted to add this as a feature request.  
+
+**Describe the bug**
+This line is trying to evaluate link not respecting the case when running in container.
+https://github.com/shirou/gopsutil/blob/master/disk/disk_linux.go#L304
+
+**Expected behavior**
+Disk statistics can be gathered when running in container and host fs is mounted inside container.
+
+**To Reproduce**
+https://github.com/influxdata/telegraf/issues/6898
+
+**Environment (please complete the following information):**
+ - [X] Linux: [paste contents of `/etc/os-release` and the result of `uname -a`]
+```
+Linux <HOSTNAME> 4.4.0-154-generic #181-Ubuntu SMP Tue Jun 25 05:29:03 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux
+```
+
+```
+root@logs-02:~# cat /etc/os-release 
+NAME="Ubuntu"
+VERSION="16.04.6 LTS (Xenial Xerus)"
+ID=ubuntu
+ID_LIKE=debian
+PRETTY_NAME="Ubuntu 16.04.6 LTS"
+VERSION_ID="16.04"
+HOME_URL="http://www.ubuntu.com/"
+SUPPORT_URL="http://help.ubuntu.com/"
+BUG_REPORT_URL="http://bugs.launchpad.net/ubuntu/"
+VERSION_CODENAME=xenial
+UBUNTU_CODENAME=xenial
+```
+
+**Possible solution:**
+ Either to remove the entire block https://github.com/shirou/gopsutil/blob/master/disk/disk_linux.go#L303-L308 (this is preferable as symlink contains the name of LVM and it is not making sense to eval it to the name of device) or to change the above-mentioned line line to:
+```go
+devpath, err := filepath.EvalSymlinks(common.GetEnv("HOST_MOUNT_PREFIX","/",d.Device))
+```
+
+**Describe the bug**
+In linux, process executable is detected by evaluating `/proc/<PID>/exe`
+https://github.com/shirou/gopsutil/blob/bcf28f0c372c3cdfcfda49420468d1584dfe8f2c/process/process_linux.go#L812
+In some cases, this symbolic link is not in a proper state, that leads to error when resolving it, while process is still running
+
+**To Reproduce**
+```go
+import "github.com/shirou/gopsutil/process"
+proc,err := process.NewProcess(5)
+name, err := proc.Exe()
+```
+```
+root@logs-02:~# ls /proc/5
+ls: cannot read symbolic link '/proc/5/exe': No such file or directory
+attr       clear_refs       cpuset   fd       limits     mem         net        oom_score      projid_map  sessionid  stat     task
+autogroup  cmdline          cwd      fdinfo   loginuid   mountinfo   ns         oom_score_adj  root        setgroups  statm    timers
+auxv       comm             environ  gid_map  map_files  mounts      numa_maps  pagemap        sched       smaps      status   uid_map
+cgroup     coredump_filter  exe      io       maps       mountstats  oom_adj    personality    schedstat   stack      syscall  wchan
+
+root@logs-02:~# ls -la /proc/5/exe
+ls: cannot read symbolic link '/proc/5/exe': No such file or directory
+lrwxrwxrwx 1 root root 0 Jan 14 13:05 /proc/5/exe
+```
+
+**Expected behavior**
+Get valid executable name
+
+**Environment (please complete the following information):**
+ - [X] Linux: [paste contents of `/etc/os-release` and the result of `uname -a`]
+
+```
+Linux <HOSTNAME> 4.4.0-154-generic #181-Ubuntu SMP Tue Jun 25 05:29:03 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux
+```
+
+```
+root@logs-02:~# cat /etc/os-release 
+NAME="Ubuntu"
+VERSION="16.04.6 LTS (Xenial Xerus)"
+ID=ubuntu
+ID_LIKE=debian
+PRETTY_NAME="Ubuntu 16.04.6 LTS"
+VERSION_ID="16.04"
+HOME_URL="http://www.ubuntu.com/"
+SUPPORT_URL="http://help.ubuntu.com/"
+BUG_REPORT_URL="http://bugs.launchpad.net/ubuntu/"
+VERSION_CODENAME=xenial
+UBUNTU_CODENAME=xenial
+```
+
+**Possible solution:**
+To use `/proc/<PID>/stat` instead, that provides executable name:
+```
+root@logs-02:~# cat /proc/5/stat
+5 (kworker/0:0H) S 2 0 0 0 -1 69238880 0 0 0 0 0 0 0 0 0 -20 1 0 14 0 0 18446744073709551615 0 0 0 0 0 0 0 2147483647 0 1 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+r
+```
+
+The code can be found here:
+https://github.com/mitchellh/go-ps/blob/master/process_linux.go
+```go
+        statPath := fmt.Sprintf("/proc/%d/stat", p.pid)
+	dataBytes, err := ioutil.ReadFile(statPath)
+	if err != nil {
+		return err
+	}
+
+	// First, parse out the image name
+	data := string(dataBytes)
+	binStart := strings.IndexRune(data, '(') + 1
+	binEnd := strings.IndexRune(data[binStart:], ')')
+	p.binary = data[binStart : binStart+binEnd]
+```
+**Describe the bug**
+../vendor/github.com/shirou/gopsutil/process/process_linux.go:312:21: undefined: Data
+../vendor/github.com/shirou/gopsutil/process/process_linux.go:314:21: undefined: Stack
+../vendor/github.com/shirou/gopsutil/process/process_linux.go:316:21: undefined: RSS
+../vendor/github.com/shirou/gopsutil/process/process_linux.go:324:21: undefined: Locked
+../vendor/github.com/shirou/gopsutil/process/process_linux.go:326:21: undefined: VMS
+../vendor/github.com/shirou/gopsutil/process/process_linux.go:330:14: undefined: PendingProcess
+../vendor/github.com/shirou/gopsutil/process/process_linux.go:362:9: undefined: numCtxSwitches
+../vendor/github.com/shirou/gopsutil/process/process_linux.go:367:9: undefined: NumFDsWithContext
+../vendor/github.com/shirou/gopsutil/process/process_linux.go:377:9: undefined: NumThreadsWithContext
+../vendor/github.com/shirou/gopsutil/process/process_linux.go:385:9: undefined: numThreads
+../vendor/github.com/shirou/gopsutil/process/process_linux.go:385:9: too many errors
+
+**Expected behavior**
+Compile failed
+
+**Environment (please complete the following information):**
+Linux TENCENT64.site 3.10.104-1-tlinux2-0041.tl2 #1 SMP Fri Oct 28 20:58:27 CST 2016 x86_64 x86_64 x86_64 GNU/Linux
+
+**Additional context**
+go version go1.13.5 linux/amd64
+
+This PR introduces netlink support for Linux Connections.
+To use netlink, users should add build tag `-tags=netlink` 
+
+Thanks for sample code of @Brian-Williams in #695.
+
+I choose build tag to change implementation. Because current implementation is enough for most of users, I think. Some of users want to use netlink to work with their big system. They must be their environment and they can compile binary by their own. so adding build tag is not so big problem, I think.
+
+This is what only I think. There must be other objection. Comments are welcome as always.
+
+### Limitation for using netlink
+
+- fd is always 0
+  - to get fd becomes slow
+- support Linux 3.3 or later only (inet_diag_req_v2 is required)
+  - until that, inet_diag has not Protocol field
+
+### TODO
+
+- benchmark
+
+
+add GitHub actions (again)

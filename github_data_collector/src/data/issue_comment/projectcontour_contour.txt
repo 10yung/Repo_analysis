@@ -1,0 +1,136 @@
+The check for spelling errors is missing the site/docs directories and aren't being checked for errors. 
+Fixes #2109 by updating docs for the following sections:
+
+- Getting started guides
+- TLS Configuration
+- Deployment Guides
+- AWS NLB Guides
+**What steps did you take and what happened:**
+When converting an HTTPProxy object to an unstructured object and then performing a DeepCopy on that unstructured object, a panic is experienced.
+
+The following code can be used to replicate:
+
+```go
+package main
+
+import (
+	v1 "github.com/projectcontour/contour/apis/projectcontour/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+)
+
+func main() {
+	proxy := &v1.HTTPProxy{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "HTTPProxy",
+			APIVersion: v1.SchemeGroupVersion.String(),
+		},
+		Spec: v1.HTTPProxySpec{
+			Routes: []v1.Route{
+				{
+					Services: []v1.Service{
+						{
+							Weight: uint32(100),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(proxy.DeepCopyObject())
+	if err != nil {
+		panic(err)
+	}
+
+	unstr := &unstructured.Unstructured{Object:u}
+	unstr.DeepCopy()
+}
+```
+
+When run, results in:
+```
+panic: cannot deep copy uint64
+```
+
+**What did you expect to happen:**
+
+For the above code to run without issue.
+
+**Anything else you would like to add:**
+
+I believe this is occurring due to the use of `uint32` for the `weight` (and other fields) in the HTTPProxy struct. I've manually changed the `weight` field in the `Service` struct from `uint32` to a signed integer and the code above runs fine.
+
+Works:
+```go
+	// Weight defines percentage of traffic to balance traffic
+	// +optional
+	Weight int32 `json:"weight,omitempty"`
+```
+
+Looking at the Kubernetes external API codebase, no unsigned integers are used in the public structs - https://github.com/kubernetes/api, most likely for this reason.
+
+**Environment:**
+
+- Contour version: v1.1.0
+- Kubernetes version: (use `kubectl version`): v1.15.7
+- Kubernetes installer & version: N/A
+- Cloud provider or hardware configuration: N/A
+- OS (e.g. from `/etc/os-release`): N/A
+
+"contour certgen" always generates a Contour certificate whose subject is "contour". This means that when the xDS client connects, it needs to expect the "contour" subject, but that won't always happen, depending on how the operator is deploying Contour.
+
+For example, could be useful to deploy multiple Contours with different service names, e.g. "contour-internal" and "contour-external". In this case, we want to generate separate certificates for each Contour and specify the subject names.
+
+```
+root@envoy-external-srbsm:/# curl -v -H "Host: contour-external" --cacert /ca/cacert.pem --cert /certs/tls.crt --key /certs/tls.key https://contour-external:8001/
+*   Trying 10.105.12.123...
+* Connected to contour-external (10.105.12.123) port 8001 (#0)
+* found 1 certificates in /ca/cacert.pem
+* found 592 certificates in /etc/ssl/certs
+* ALPN, offering http/1.1
+* SSL connection using TLS1.2 / ECDHE_RSA_AES_128_GCM_SHA256
+* 	 server certificate verification OK
+* 	 server certificate status verification SKIPPED
+* SSL: certificate subject name (contour) does not match target host name 'contour-external'
+* Closing connection 0
+curl: (51) SSL: certificate subject name (contour) does not match target host name 'contour-external'
+```
+
+So, it would be useful to add a flag to "contour certgen" to specify the subject name of the Contour certificate.
+
+This is a nice-to-have, since AFAICT the envoy xDS client never checks the server certificate's subject name.
+Updates #403
+
+Strawman design for supporting the ingress.status.loadbalancer field.
+
+Signed-off-by: Dave Cheney <dave@cheney.net>
+Updates #2118
+
+Signed-off-by: Nick Young <ynick@vmware.com>
+As part of reviewing how to integrate the [service-api](https://github.com/kubernetes-sigs/service-apis) CRDs into Contour, I noticed that our code for interacting with Kubernetes is very custom, and there are now better options available.
+
+This issue is to cover moving Contour from Informers to using the Kubebuilder [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime) library.
+
+First up, a design proposal for us to discuss whether this is even a good idea and how it might be done.
+
+In the [deployment options](https://projectcontour.io/docs/v1.1.0/deploy-options/) documentation,  we see the following:
+
+>  Envoy will listen directly on port 8080 on each host that it is running. This is best paired with a DaemonSet (perhaps paired with Node affinity) to ensure that a single instance of Contour runs on each Node.
+
+There are 2 issues with this:
+- The default deployment YAML has envoy listening on ports 80 and 443
+- The default deployment YAML places envoy in a daemonset, not contour (which isn't necessary with split deployment)
+As part of the work I'm doing with the service-api subproject of SIG-Network, we're building new CRDs which will serve as the definition of what the next version of Ingress needs.
+
+Contour will need to support these, so this issue is to cover figuring out how to wire up the new types into Contour, and put them behind an experimental flag so that we can get this wiring in and update the types as they are worked on.
+
+That will allow us to have a headstart on implementing them as they get closer to being finalised.
+
+Putting the usage of them behind an experimental feature flag should insulate the rest of the project from these concerns, hopefully.
+
+Comments on the approach welcomed.
+The quick-start and getting started guides need some updating. I'd like to have separate breakouts as to how to deploy contour to EKS, GKE, and AKS as well as Kind. 
+
+Today there's a smattering of AWS and other docs intermingled and I'd like to make them clear depending on the environment folks are deploying Contour into. 

@@ -1,0 +1,153 @@
+Building on #147, this improves the ergonomics of i8 slice methods in two ways:
+
+1. Changes `ReadBytesExt::read_i8_into` to use a more strict unsafe cast. While this does not change safety or optimized build performance at opt-level 2, it does marginally improve debug code size ([godbolt diff](https://godbolt.org/z/QQKDhg)).
+
+2. Adds a `ByteOrder::write_i8_into` method for completeness and parity with other types, which prevents users having to write their own unsafe blocks or loops with `write_i8` for what is just a slice copy. This parity with other types is especially convenient when macro-generating code per-type since one can treat i8 like all other types ([example](https://github.com/aschampion/rust-n5/blob/d3b3479963d08aef769f3fa52f0c3958c5ab010b/src/lib.rs#L321-L384)).
+I write some kind of protocol parser and I use next code to read protocol data:
+```rust
+reader.read_u32_into::<LittleEndian>(&mut buffer);
+```
+
+I would like to use the same logic for writer:
+```rust
+writer.write_u32_from::<LittleEndian>(&buffer);
+```
+
+Is that already possible? Or it needs implementation?
+I have a mini benchmark for a bit packing/compression algorithm which uses `write_u64` from `WriteBytesExt`.  The benchmark results show about a 2x speedup when I replace `write_u64` with an unsafe equivalent.  This issue is to track to understand why this is, and if we can/should do anything abut it.
+
+Repo:  http://github.com/filodb/compressed_vec
+
+Standard write_u64 code:  in branch `2d-delta-safe2`
+To invoke benchmark: `cargo bench -- "nibblepack8"`
+
+```
+nibblepack8 varying # bits/8
+                        time:   [40.261 ns 40.711 ns 41.252 ns]
+                        change: [+76.426% +77.835% +79.411%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 9 outliers among 100 measurements (9.00%)
+  3 (3.00%) high mild
+  6 (6.00%) high severe
+nibblepack8 varying # bits/12
+                        time:   [26.229 ns 26.456 ns 26.746 ns]
+                        change: [+5.7323% +6.5387% +7.3247%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 11 outliers among 100 measurements (11.00%)
+  1 (1.00%) low severe
+  2 (2.00%) low mild
+  5 (5.00%) high mild
+  3 (3.00%) high severe
+nibblepack8 varying # bits/16
+                        time:   [39.930 ns 40.063 ns 40.225 ns]
+                        change: [+76.888% +78.479% +80.410%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 11 outliers among 100 measurements (11.00%)
+```
+
+(*Note: the # bits /8 and /16 are the ones we care about, basically where number of bits are divisible by 8 as that's the path that uses write_u64)
+
+On another branch, the unsafe code:  `2d-delta-hist`
+
+```
+nibblepack8 varying # bits/8
+                        time:   [22.618 ns 22.742 ns 22.892 ns]
+                        change: [-43.323% -42.881% -42.454%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 9 outliers among 100 measurements (9.00%)
+  5 (5.00%) high mild
+  4 (4.00%) high severe
+nibblepack8 varying # bits/12
+                        time:   [24.619 ns 24.681 ns 24.756 ns]
+                        change: [-7.3756% -6.5124% -5.7051%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 18 outliers among 100 measurements (18.00%)
+  1 (1.00%) low severe
+  1 (1.00%) low mild
+  7 (7.00%) high mild
+  9 (9.00%) high severe
+nibblepack8 varying # bits/16
+                        time:   [22.519 ns 22.554 ns 22.593 ns]
+                        change: [-42.832% -42.519% -42.256%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 11 outliers among 100 measurements (11.00%)
+```
+
+The code is in `byteutils.rs::direct_write_uint_le`.
+
+The unsafe version is about 2x faster.
+
+It's a little hard to tell from disassembly where the relevant asm is.  What I do though is that I comment out the `#[inline]` above the direct_write_uint_le func and run `cargo asm compressed_vec::byteutils::direct_write_uint_le`.
+
+
+I believe I'm doing this correctly. I'm trying to create an f64 from 4 u16s.
+```rust
+extern crate byteorder;
+
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+
+// hello
+fn main() {
+    let mut cursor = std::io::Cursor::new(vec![]);
+    cursor.write_u16::<LittleEndian>(0u16).unwrap();
+    cursor.write_u16::<LittleEndian>(1u16).unwrap();
+    cursor.write_u16::<LittleEndian>(2u16).unwrap();
+    cursor.write_u16::<LittleEndian>(3u16).unwrap();
+
+    println!("{:?}", cursor);
+
+    let f = cursor.read_f64::<LittleEndian>().unwrap();
+    println!("{}", f);
+}
+```
+
+My `println` outputs `Cursor { inner: [0, 0, 1, 0, 2, 0, 3, 0], pos: 8 }`, but the `read_f64` line panics with:
+
+```
+thread 'main' panicked at 'called `Result::unwrap()` on an `Err` value: Custom { kind: UnexpectedEof, error: StringError
+("failed to fill whole buffer") }', libcore/result.rs:945:5
+```
+
+
+Am I doing something wrong? 8 x 8 = 64, so I believe the cursor has the correct number of bytes in it. I see no reason why this would be erroring in this way.
+It would be nice to support `__m128`, `__m256`, `__m128d`, `__m128i`, `__m256d`, `__m256i`, etc. the same way the primitive integers are supported.
+
+
+Hi there,
+
+I've been toying around with adding [faster](https://github.com/AdamNiederer/faster) to a few encoding libraries, and I noticed that I could get up to a 6x speed boost by using it in `write_u16_into`, `write_u32_into`, and `write_u64_into`. The compiler does a pretty good job of vectorizing the read functions.
+
+Would there be any interest in adding this behind a feature?
+
+Benchmarks: (Ivy Bridge host; 128-bit integer vectors)
+```
+faster (No difference between target-cpu=native and target-cpu=x86-64)
+test slice_u16::write_big_endian    ... bench:      23,344 ns/iter (+/- 122) = 8567 MB/s
+test slice_u32::write_big_endian    ... bench:      46,681 ns/iter (+/- 160) = 8568 MB/s
+test slice_u64::write_big_endian    ... bench:     105,206 ns/iter (+/- 369) = 7604 MB/s
+master (-C target-cpu=native)
+test slice_u16::write_big_endian    ... bench:     147,829 ns/iter (+/- 269) = 1352 MB/s
+test slice_u32::write_big_endian    ... bench:     112,241 ns/iter (+/- 652) = 3563 MB/s
+test slice_u64::write_big_endian    ... bench:     108,404 ns/iter (+/- 571) = 7379 MB/s
+```
+The 1.1.0 release [introduced](https://github.com/BurntSushi/byteorder/commit/ef7f25767cb199a5738b2bc530d9a2a9a49abd7f) slice methods for the `ReadBytesExt` trait (`read_*_into`). It would be useful to have the corresponding write methods for the `WriteBytesExt` trait.
+From a discussion on `#rust-beginners` there seems to be a need for `ByteOrder` implementation that dispatches to LE/BE based on runtime information.
+
+Essentially something like this:
+
+```rust
+enum Endianess { Little, Big }
+impl ByteOrder for Endianess {
+    // boilerplate methods with `match` that dispatch to LE or BE
+}
+
+let endianess = get_endianess_at_runtime();
+endianess.read_i32(&some_bytes);
+```
+
+The `byteorder` docs don't seem to say that the crate is focused solely on static/type-level checking, so I'm guessing this would be in scope for the library.
+
+Of course this isn't strictly necessary, as you can probably just write reading/writing code generically and simply move the `LE`/`BE` decision to a higher level, but it may simplify some use cases regardless.
+`write_*` methods of `ByteOrder` trait accept a buffer and don't guarantee that they wouldn't read from it. This has a drawback that strictly speaking, the provided buffer shouldn't be uninitialized.
+
+I suggest to provide some way of guaranteeing that the buffer won't be read from, so it's fine to pass uninitialized buffer.

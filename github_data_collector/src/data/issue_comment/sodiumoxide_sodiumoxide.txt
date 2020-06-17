@@ -1,0 +1,108 @@
+`SODIUM_USE_PKG_CONFIG` [secretly uses](https://github.com/sodiumoxide/sodiumoxide/blob/546e8f21faf51931ebc99000210e06125011486d/libsodium-sys/build.rs#L94) `vcpkg` if the MSVC toolchain is selected which is pretty counter intuitive looking at the name of this variable.
+
+cc @sdroege
+* Make sure we use the target when deciding on what to probe, link or build.
+* Make it easy to persistently enable pkg-config and vcpkg via feature flag.
+* Align environment variables with pkg-config and vcpkg bindings.
+
+Closes #377 
+Closes #359 
+
+This is my first try that does _not_ take any precautions w.r.t. backwards compatibility but sticks to the idea that the bundled build is the default while making it easy to persistently enable pkg-config or vcpkg usage. I also separated linking prebuilt libraries and building from source as this simplifies building from source a bit.
+Also exposes that libsodium provides a recommended minimum hash size (currently 256 bits) so that the user can be freed from having to come up with a reasonable hash size in many cases.
+
+The API change of `State::new` is of course breaking which could be avoided in various ways:
+* `State` just requires the user to supply a hash size and `hash` has a different API.
+* A separate `State::rec_out_len` constructor is provided that forwards to an internal generic constructor.
+* Expose the recommended digest length as a constant `DIGEST_REC` that the user must pass instead of `None`.
+
+Personally, I opted against that as the current 0.2.x crate version suggests that the API is still evolving and hence a clean API seems preferable to a compatible one.
+This allows to zero out types like `generichash::{State, Digest}` which are sometimes performance critical, but contain sensitive information in other cases so that always zeroing out on drop could be considered prohibitively expensive.
+
+Another design point here would be to omit the `Copy` bound to make this more flexible (and avoid making the target types `Copy`), but this would allow misuse if e.g. the type only indirectly owns the relevant memory.
+Memzero variants for consuming methods; for cases when blake2b is used for confidential data (key deriving, etc)
+Continuation of https://github.com/sodiumoxide/sodiumoxide/pull/381
+
+Branch rustsec-2019-0026 should not be purged.
+
+https://www.reddit.com/r/rust/comments/dguqt3/vulnerability_in_sodiumoxide_generichashdigesteq/
+unpack libsodium to libsodium-sys/libsodium-1.0.18/ to build it
+It all started when I tried to crosscompile sodiumoxide to wasm32-wasi.
+
+```
+#[cfg(all(target_arch="wasm32", target_os="wasi"))]
+fn build_libsodium() {
+    std::compile_error!("wasm32")
+}
+
+#[cfg(target_arch = "")] // or comment out this function
+fn build_libsodium() {
+```
+
+Did not help at all. I kept receiving error:
+
+```
+error[E0425]: cannot find function `build_libsodium` in this scope
+  --> libsodium-sys/build.rs:64:9
+   |
+64 |         build_libsodium();
+   |         ^^^^^^^^^^^^^^^ not found in this scope
+```
+
+The issue is: build.rs gets compiled on host. So our target_ predicates in build.rs are equal to host target_ predicates.
+In order to make everything work perfectly we have to:
+
+```
+cross_compilation = env:HOST != env:TARGET 
+
+if (!cross_compilation) {
+    if on windows {
+        try find libsodium from vcpkg
+        try find libsodium in env vars
+        or unpack prebuilt library e.g. msvc/x64/Release/v140/ or mingw/win32/
+    }
+    if on unix {
+        try find libsodium from pkgconfig
+        try find libsodium in env vars
+        or build with ./configure && make
+    }
+} else {
+    try find libsodium in env vars
+      or
+
+    if (crosscompiling to windows for msvc) {
+        unpack prebuilt library e.g. msvc/x64/Release/v140/
+    }
+    if (crosscompiling to windows for gnu) {
+        unpack prebuilt library e.g. mingw/win32/
+    }
+    if (crosscompiling to wasm32-wasi) {
+        unpack prebuilt library e.g. wasm32/wasi/libsodium.a
+    }
+
+    if (crosscompiling on windows) {
+        fail "cannot crosscompile on windows"
+    }
+
+
+    if (crosscompiling on unix to ios or mac or ...) {
+        ./configure with CFLAGS && make
+    }
+}
+```
+
+Does it make sense to you?
+
+@jean-airoldie you can fix this algo to provide version.h for windows (https://github.com/sodiumoxide/sodiumoxide/issues/370)
+@stouset you can try to fix this algo to unify environment variables with those used in pkg-config (https://github.com/sodiumoxide/sodiumoxide/issues/359)
+
+@dnaq what do you think?
+
+@jedisct1 this issue would be much easier to resolve if we can somehow list all .cc files and pass them to [cc](https://crates.io/crates/cc) crate.
+
+Closes: https://github.com/sodiumoxide/sodiumoxide/issues/347
+
+Linked issues: https://github.com/jedisct1/libsodium/issues/872
+Added ability to create ed25519 key pair from 32 byte secret key slice. Libsodium's secret key is the 32 byte secret key concatenated with the 32 byte public key. Openssl PEM/DER files contain just the 32 byte secret key.
+
+The new method keypair_from_secret_key_slice() accepts the 32 byte secret key and derives the 32 byte public key using scalarmult_base. It then creates a new SecretKey using the resulting 64 byte concatenation of the secret and public keys. It returns the resulting SecretKey and the PublicKey.

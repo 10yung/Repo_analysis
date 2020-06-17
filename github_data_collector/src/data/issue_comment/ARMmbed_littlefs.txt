@@ -1,0 +1,188 @@
+The characteristics of littlefs are: If lfs_file_seek is called to write data, it will look for a new block to write, copy the data from the old block, and add new data.
+In this way, if an 8K file increases the last 100 bytes each time through lfs_file_seek (LFS_SEEK_END), it needs 80 times, which means that the block needs to be erased 80 times. Compared to fs_open (LFS_O_APPEND), which only required 2 block erases, the number of erases increased by 40 times.
+const struct lfs_config cfg = 
+{
+    // block device operations
+    .read  = _block_read,
+    .prog  = _block_prog,
+    .erase = _block_erase,
+    .sync  = _block_sync,
+
+    // block device configuration
+    .read_size = 256,
+    .prog_size = 256,
+    .block_size = 32768,
+    .block_count = 4,
+    .cache_size = 256,
+    .lookahead_size = 16,
+    .block_cycles = 500,
+};
+i use stm32f767 Internal flash  test litterfs，when lfs_file_open(&lfs, &file, "boot_count", LFS_O_RDWR | LFS_O_CREAT);   happen lfs error:977: Corrupted dir pair at 0 0，why？
+
+I created a user interface that let me make and read directories and make and read files on a PC.  However when reading a sub directory with one file, I got in an infinite loop in the lfs_fs_traverse function when it was called from lfs_fs_size after the lfs_dir_read of the sub directory path.  This was found to be caused by  lfs_t structure element f->next equal to the current f  which caused the for loop in lfs_fs_traverse:
+    // iterate over any open files
+    for (lfs_file_t *f = (lfs_file_t*)lfs->mlist; f; f = f->next) {
+to never exit.
+there seems to be a couple of f = f->next  in for loops that may have the same problem.
+
+My source code:
+              case 'l' :  /* fl [<path>] - Directory listing */
+                    while(*ptr == ' ')
+                    {
+                      ptr++;
+                    }
+
+                    printf("ptr size %d\n", strlen(ptr));
+
+                    res = lfs_dir_open(&LFSfs, &Dir, ptr);
+
+                    if(res)
+                    {
+                      put_rc(res);
+                      break;
+                    }
+
+                    p11 = s1 = s2 = 0;
+
+                    for(;;)
+                    {
+                      res = lfs_dir_read(&LFSfs, &Dir, &Finfo);
+
+                      if((res < LFS_ERR_OK) || !Finfo.name[0])
+                      {
+                        break;
+                      }
+
+                      if(Finfo.type == LFS_TYPE_DIR)
+                      {
+                        s2++;
+                      }
+                      else
+                      {
+                        s1++;
+                        p11 += Finfo.size;
+                      }
+
+                      xprintf("%c %15,llu  %-12s  %s\n",
+                                (Finfo.type & LFS_TYPE_DIR) ? 'D' : '-',
+                                Finfo.size, Finfo.name,
+                                "");
+                    }
+
+                    printf("%4u File(s),%15llu bytes total\n%4u Dir(s)", s1, p11, s2);
+
+                    ss1 = lfs_fs_size(&LFSfs);  // infinite loop when path is subdirectory
+                    if(ss1 >= 0)
+                    {
+                      printf(", %15d blocks used\n", ss1);
+                    }
+                    else
+                    {
+                      put_rc(ss1);
+                    }
+                    break;
+
+When adding littlefs to a project that uses Clang static checking that includes `clang-analyzer-core`, the `littlefs.c.o` object throws several errors during compilation: 
+
+```
+[6/27] Building C object third-party/CMakeFiles/littlefs.dir/littlefs/lfs.c.o
+FAILED: third-party/CMakeFiles/littlefs.dir/littlefs/lfs.c.o
+/usr/bin/cmake -E __run_co_compile --tidy="/usr/bin/clang-tidy-6.0;-format-style=file" --source=../third-party/littlefs/lfs.c -- /usr/bin/gcc -DBUILD_TEST  -O3 -DNDEBUG   -Wall -Werror -g -Wextra -Wshadow -Wundef -Wno-overflow -Wno-implicit-function-declaration -Wno-missing-field-initializers -std=gnu99 -MD -MT third-party/CMakeFiles/littlefs.dir/littlefs/lfs.c.o -MF third-party/CMakeFiles/littlefs.dir/littlefs/lfs.c.o.d -o third-party/CMakeFiles/littlefs.dir/littlefs/lfs.c.o   -c ../third-party/littlefs/lfs.c
+/plantiga/build/../third-party/littlefs/lfs.c:367:18: error: 1st function call argument is an uninitialized value [clang-analyzer-core.CallAndMessage,-warnings-as-errors]
+    a->tag     = lfs_fromle32(a->tag);
+```
+```
+/**/build/../third-party/littlefs/lfs.c:1011:9: error: Call to function 'strcpy' is insecure as it does not provide bounding of the memory buffer. Replace unbounded copy functions with analogous functions that support length arguments such as 'strlcpy'. CWE-119 [clang-analyzer-security.insecureAPI.strcpy,-warnings-as-errors]
+        strcpy(info->name, "/");
+        ^
+/**/build/../third-party/littlefs/lfs.c:1011:9: note: Call to function 'strcpy' is insecure as it does not provide bounding of the memory buffer. Replace unbounded copy functions with analogous functions that support length arguments such as 'strlcpy'. CWE-119
+/**/build/../third-party/littlefs/lfs.c:2018:9: error: Call to function 'strcpy' is insecure as it does not provide bounding of the memory buffer. Replace unbounded copy functions with analogous functions that support length arguments such as 'strlcpy'. CWE-119 [clang-analyzer-security.insecureAPI.strcpy,-warnings-as-errors]
+        strcpy(info->name, ".");
+```
+
+Suppressing clang checking/warnings-as-errors on the library allows littlefs to build just fine, and indeed I can cross compile with arm-gcc with no problem. 
+
+I understand the reasons for using strcpy on such single character literals, but for the purposes of projects which may use clang or other static analysis, would it make sense to change these function calls to be the 'safer' strncpy or strlcpy?
+
+Here are the resulting lines in my CMakeLists.txt that exclude Clang: (other compilation flags are set elsewhere) 
+```
+###############################################################################
+#### littlefs
+
+set(_lfs_target littlefs)
+
+set(_lfs_src
+    littlefs/lfs.c
+    littlefs/lfs_util.c
+    )
+
+add_library(${_lfs_target} ${_lfs_src})
+target_include_directories(${_lfs_target}
+    INTERFACE
+        littlefs
+)
+
+set_property(TARGET ${_lfs_target} PROPERTY C_STANDARD 99)
+# There are issues with our CLANG-TIDY and this library, we're going to suppress them for now
+set_target_properties(${_lfs_target}
+    PROPERTIES
+        C_CLANG_TIDY ""
+)
+```
+    if ((file->flags & LFS_F_INLINE) &&
+            lfs_max(file->pos+nsize, file->ctz.size) >
+            lfs_min(0x3fe, lfs_min(
+                lfs->cfg->cache_size, lfs->cfg->block_size/8))) {
+        // inline file doesn't fit anymore
+        int err = lfs_file_outline(lfs, file);
+    }
+
+during write files, when this conditions is occurred, then next write data, LFS_F_INLINE is cleared, and will erase a new block.,but the LFS_F_INLINE is not set.  after this, per time writing will erase a new block. this will cost a lot of time.
+is there any solutions or the file size is limited?
+How to configure littlefs internal chip flash?
+Chip: STM32F103RCT6 / RET6
+BLOCK SIZE: 0x400 or 0x800
+For example, there are 10 files, each file is 100 bytes:
+/ path1 / file1
+/ path1 / file2
+/ path1 / file3
+/ path1 / file4
+/ path1 / file5
+
+/ path2 / file6
+/ path2 / file7
+/ path2 / file8
+/ path2 / file9
+/ path2 / file10
+It takes about 1K bytes.
+How do I configure read_size, prog_size,block_count, cache_size, block_cycles, block_count, lookahead_size?
+(Especially smallest block_count,)
+
+And why this configuration
+Hi ,
+
+I am using Winbond QSPI Nand flash with W25N01GV 1 G-bit(128 MB) memory with only block erase(128 KB). Is there any size limitation for using higher size/Block-size in LittleFs?.
+
+For my flash memory (with a page read/program and block erase interface) , does it requires a flash translation layer?. In my first look and up on looking the configuration structures I felt like LittleFs is handling these translation.
+
+If it not requires the translation layer, Can I use it straight in my program which runs in FreeRTOS*?. With minimal mapping, i.e. only configuring "lfs_config".
+
+If anybody have experience in porting the same and you have a how to doc. please share, if it is for STM and for FreeRTOS, really wonderful :-)  ....
+
+Regards,
+Visakh SV
+`lfs_npw2` returns a value v such that `2^v >= a` and `2^(v-1) < a`, but
+the previous comment incorrectly describes it as "less than or equal to
+a".
+I had a system that was constantly hitting this assert, after making
+this change it recovered immediately.
+### Summary
+
+It appears that LFS is targeting the `C99` standard as the minimum C standard that is required to compile the library.  However, this is not mentioned in the [README.md](https://github.com/ARMmbed/littlefs/blob/ab56dc5a8b9b06e3cd2b84099c140ade636f3de5/README.md), [DESIGN.md](https://github.com/ARMmbed/littlefs/blob/f7fd7d966a9d8c6e783a95cd289401f42045a73c/DESIGN.md), nor [SPEC.md](https://github.com/ARMmbed/littlefs/blob/bdff4bc59eb69bc403e0f5878e72a96a0a21a190/SPEC.md) documents.
+
+It would be helpful to explicitly list this requirement in at least one of those documents.
+My vote would be to add it as a goal in the top of the README.md (as part of the list including `Power-loss resilience`, `Dynamic wear leveling`, and `Bounded RAM/ROM`)
+
+### Why `c99`?
+
+I realized that, although I could offer suggestions (or perhaps even PRs) for issues in LFS, I could not do so without knowing at least the minimum C version that it would need to work with.  Since none of the docs (listed above) indicated this, I dug in to find the minimum version.   The Travis.yml file, as part of the CI checks, compiles with `-std=c99`.  This leaves only `c90` (aka `c89` or `ansi`), `iso9899:199409` (aka `c94` or `c95`) as the earlier versions.  Neither `c90` nor `c95` support `// C++-style comments`, and therefore the minimum target version must be `c99`. 

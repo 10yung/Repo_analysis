@@ -1,0 +1,140 @@
+Hey, I'm in the process of making an async version of https://github.com/daa84/neovim-lib. One hurdle I'm facing is that msgpack-rust only support synchronous IO. It would be great (well, at least for me) if it would work asynchronously as well.
+
+Are there plans? Would you accept a PR? If so, how should it be implemented? I guess one does not want to throw away the sync versions, so should the API be duplicated, or should it be a feature switch?
+From [this comment](https://github.com/3Hren/msgpack-rust/pull/214#issuecomment-561191415):
+
+> For c-style enums this serializes quite poorly.
+> 
+> ```rust
+> enum Foo {
+>    A,
+>    B,
+>    C
+> }
+> ```
+> 
+> Resulting msgpack is `{"A": None}` where I expected `"A"`. Can this be fixed before release or does this need another option, were I to open a PR?
+> 
+> It generally seems like rmp's output cannot really be consumed from other languages.
+
+serde_json does this optimization, and it seems pretty easy: https://github.com/serde-rs/json/blob/master/src/ser.rs#L883-L890. If I recall correctly, we'll need to modify the deserializer to accept this kind of enum serialization too - but that shouldn't be too bad.
+
+For consistency, I think we should do this both when writing string variant names and when writing integer variant indices.
+
+I'm not sure how breaking this change would be with our policies. On an upgrade, it would cause the serializer to produce different output for the same enum, output which would not be accepted by older versions of this library. We could also just add this as an option, and make it the default in the next major version?
+This [issue in Serde](https://github.com/serde-rs/serde/issues/1587) affects Serde Msgpack.
+
+Serde Msgpack unlike other format implementations has an option to the serializer to tell whether to serialize structs as a map with named fields or as a sequence without field names. The deserializer doesn't however have the corresponding option, but instead relies on this issue to accept both forms, which is usually not what is wanted, and comes with the unwanted consequences mentioned in the issue in Serde. Either the deserializer should have this option added, or even better, remove the option from the serializer and let the serialize implementation of the struct decide the format. The correct way to specify that a struct is going to be serialized without field names is in the serialize implementation of the struct. A container attribute can be added to Serde Derive for this purpose.
+
+Example code adapted to Serde Msgpack:
+```rust
+use serde_derive::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct Person {
+    first_name: String,
+    last_name: String,
+}
+
+fn main() {
+    let data = rmp_serde::to_vec(&("John", "Doe")).unwrap();
+    eprintln!("{:?}", data);
+    eprintln!("{:#?}", rmp_serde::from_slice::<Person>(&data));
+}
+```
+Howdy!
+
+I'm using serde_transcode to go from msgpack -> json without a problem. Sadly, once I needed to go the other direction I'm unable to.
+
+```
+let msg = r#"{
+    "channel": "/kmsg/test",
+    "message": [0, "Hello"]
+}"#;
+
+// assert that the test json string can be parsed and decoded.
+let res = serde_json::from_str::<serde_json::Value>(msg);
+assert!(res.is_ok());
+
+let mut deserializer = serde_json::Deserializer::from_str(msg);
+let mut bytes = Vec::new();
+let mut serializer = rmps::Serializer::new(&mut bytes);
+
+let res = transcode(&mut deserializer, &mut serializer);
+dbg!(&res);
+assert!(res.is_ok()); // <--- test fails on this assert
+assert!(!bytes.is_empty());
+```
+
+The error I'm getting is `attempt to serialize struct, sequence or map with unknown length`, with the line an column listed of the first member of the object.
+Hey there,
+I just noticed using `#[serde(flatten)]` causes serializations to fail with `UnknownLength`. 
+
+Quick repro :
+
+```rust
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Test {
+    #[serde(flatten)] // comment this and serialization works
+    flat: Nested,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Nested {
+    more: Vec<u8>,
+}
+
+fn main() {
+    let nested = Nested {
+        more: vec![1, 2, 3],
+    };
+
+    let test = Test { flat: nested };
+    let serialized = rmp_serde::to_vec(&test);
+    println!("{:?}", serialized); // Err(UnknownLength)
+}
+```
+Being a newcomer to `rmp`, I needed some struggle to understand that I have to enable the `with-serde` feature of the `rmpv` crate for de/serializing data of type `rmpv::Value`. So far so good, e.g. now I can nicely convert a type into a `Value` with `mpv::ext::to_value()`.
+
+However, such `Value`s are always created as `Value::Array`s during serialization and there seems to be no way influencing this behavior. For serialization, usually there's a **pair** of functions where the default serializes into an array (e.g. `rmp_serde::encode::to_vec`) and there's a variant creating a map (e.g. `rmp_serde::encode::to_vec_named`). I cannot see anything similar for values, there's only `to_value()` without `to_value_named()` or anything similar.
+
+Is there any way to serialize a type into a `Value::Map` with the current codebase? Would this require extra development efforts within the library? I even thought of customizing `rmpv::ext::se::Serializer` which seems to cause this behavior, but it's even private in the module.
+Thanks for this library!
+
+Is there any interest from the devs in `no_std` support?
+
+We have been using `corepack` as an alternative but it is inferior to `rmp` in a number of ways unrelated to the `std` support.
+
+I might be willing to provide a patch along the lines of, 
+1. adding a feature `nightly` which will allow using nightly-only features like `alloc` crate
+2. selecting `serde` and `byteorder` with `default-features = false` in the `Cargo.toml` in nightly mode
+3. Replacing most uses of `std` prefix with either `core` or `alloc` as appropriate
+The `toml` crate has a trick for this. Their `serialize_struct` recognises their built-in `datetime` type by name, and delegates to a specialised serializer:
+https://github.com/alexcrichton/toml-rs/blob/c1a369f44762045e65989caa9491e153d1f358e6/src/ser.rs#L949-L952
+
+Likewise to deserialize:
+https://github.com/alexcrichton/toml-rs/blob/c1a369f44762045e65989caa9491e153d1f358e6/src/de.rs#L582-L589
+With serde newer than 1.0.38, the tests fail:
+
+```
+---- round_trip_untagged_enum_with_enum_associated_data stdout ----
+thread 'round_trip_untagged_enum_with_enum_associated_data' panicked at 'called `Result::unwrap()` on an `Err` value: Syntax("data did not match any variant of untagged enum Foo")', src/libcore/result.rs:1009:5
+```
+
+The test failure can be seen by `cargo update`ing, which will bring you to serde 1.0.80 (or higher)!
+
+To go back in time, try:
+```
+serde = "=1.0.38"
+serde_derive = "=1.0.38"
+```
+
+1.0.39 has a different error to the one we see today.
+
+Currently, the Serializer and Deserializer pairs in `rmp-serde` do not implement [`is_human_readable`](https://docs.serde.rs/serde/trait.Serializer.html#method.is_human_readable). As a consequence of this, types that support a more compact representation serialize and deserialize inefficiently: for example, IPv4 addresses should take something like 4 bytes, but currently use an annoying 17 bytes, as they serialize as regular strings (my qualm stems from serializing [`IpNet`](https://docs.rs/ipnet/2.0.0/ipnet/#serde-support) structs).
+
+Has this issue been discussed before? While I do think this is a reasonable request to make, it is nevertheless a breaking change (mentioned on the serde docs—previously serialized types that support a compact representation will fail at deserialization).
+
+I am currently using a [forked repo](https://github.com/aszkid/msgpack-rust/tree/rmps-human_readable) implementing this change; merging would be extremely easy from a technical point of view (an effective 2 lines of code addded), but there is a discussion to be had.

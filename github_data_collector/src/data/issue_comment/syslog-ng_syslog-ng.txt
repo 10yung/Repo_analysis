@@ -1,0 +1,308 @@
+This is a workaround for an OpenSSL TLS 1.3 bug that results in data loss when one-way protocols are used and a connection is closed by the client right after sending data.
+
+"TLS 1.3 session tickets make it impossible to reliably implement communication patterns where the server never sends application-level data."
+
+- https://github.com/openssl/openssl/issues/10880
+- https://github.com/openssl/openssl/issues/7948
+
+`SSL_CTX_set_num_tickets(0)` disables TLS 1.3 session tickets (no session ticket will be sent to the client after a full handshake). Tickets are used for session resumption.
+
+An alternative workaround would be doing a bidirectional SSL shutdown (finishing #2811), but syslog-ng is usually used together with other applications that may not take the bidi shutdown step (it is not mandatory, not even in RFC5425).
+Originated from: https://lists.balabit.hu/pipermail/syslog-ng/2020-January/025657.html
+
+# syslog-ng
+## Version of syslog-ng
+3.25.1
+
+## Platform
+Any platform. (Ubuntu Xenial in my case)
+
+# Issue
+## Failure
+`kafka-c` destination halts if consumer is down, and kafka's queue is filled. This does not fix itself after restarting the kafka consumer.
+
+Per my current understanding the root cause is the following:
+We call `rd_kafka_produce()` from the worker thread with the `RD_KAFKA_MSG_F_BLOCK` flag, which makes it a blocking call:
+```
+static gboolean
+_publish_message(KafkaDestWorker *self, LogMessage *msg)
+{
+  KafkaDestDriver *owner = (KafkaDestDriver *) self->super.owner;
+
+  if (rd_kafka_produce(owner->topic,
+                       RD_KAFKA_PARTITION_UA,
+                       RD_KAFKA_MSG_F_FREE | RD_KAFKA_MSG_F_BLOCK,
+                       self->message->str, self->message->len,
+                       self->key->len ? self->key->str : NULL, self->key->len,
+                       log_msg_ref(msg)) == -1)
+```
+and we poll the client from the same worker thread:
+```
+static void
+_drain_responses(KafkaDestWorker *self)
+{
+  KafkaDestDriver *owner = (KafkaDestDriver *) self->super.owner;
+
+  /* we are only draining responses in the first worker thread, so all
+   * callbacks originate from the same thread and we don't need to
+   * synchronize between workers */
+  if (self->super.worker_index != 0)
+    return;
+
+  gint count = rd_kafka_poll(owner->kafka, 0);
+```
+The `rdkafka` API tells us to poll from a different thread:
+```
+ *    RD_KAFKA_MSG_F_BLOCK - block \p produce*() call if
+ *                           \p queue.buffering.max.messages or
+ *                           \p queue.buffering.max.kbytes are exceeded.
+ *                           Messages are considered in-queue from the point they
+ *                           are accepted by produce() until their corresponding
+ *                           delivery report callback/event returns.
+ *                           It is thus a requirement to call 
+ *                           rd_kafka_poll() (or equiv.) from a separate
+ *                           thread when F_BLOCK is used.
+ *                           See WARNING on \c RD_KAFKA_MSG_F_BLOCK above.
+```
+
+## Steps to reproduce
+ 1. Start a kafka consumer, with a test topic. (https://kafka.apache.org/quickstart)
+ 2. Start `syslog-ng` with the config below.
+ 3. Send one message to the UDP source. `echo "asd" > /dev/udp/localhost/9999`
+ 4. Close the kafka consumer.
+ 5. Send 2 messages to the UDP source, this will completely fill kafka's queue.
+ 6. Send another message, which will cause the worker thread to block on the `rd_kafka_produce()` call.
+ 7. Restart the kafka consumer, and observe, that syslog-ng still halts.
+
+## Configuration
+```
+@version: 3.25
+@include "scl.conf"
+
+@define kafka-implementation kafka-c
+
+source s_msg {
+  udp(port(9999));
+};
+
+destination d_test {
+  kafka(
+    bootstrap-servers("localhost")
+    topic("test")
+    config("queue.buffering.max.messages" => 2);
+};
+
+log {
+  source (s_msg);
+  destination (d_test);
+};
+
+```
+
+## Input and output logs
+```
+[2020-01-16T14:08:42.063459] Incoming log entry; line='asd\x0a'
+[2020-01-16T14:08:42.063496] Initial message parsing follows;
+[2020-01-16T14:08:42.063520] Setting value; name='PROGRAM', value='asd', msg='0x7fd060014610'
+[2020-01-16T14:08:42.063538] Setting value; name='LEGACY_MSGHDR', value='asd', msg='0x7fd060014610'
+[2020-01-16T14:08:42.063555] Setting value; name='MESSAGE', value='', msg='0x7fd060014610'
+[2020-01-16T14:08:42.063581] >>>>>> Source side message processing begin; instance='0.0.0.0', location='/home/alltilla/Work/install/OSE/etc/syslog-ng.conf:7:3', msg='0x7fd060014610'
+[2020-01-16T14:08:42.063605] Setting value; name='HOST_FROM', value='localhost', msg='0x7fd060014610'
+[2020-01-16T14:08:42.063621] Setting value; name='HOST', value='localhost', msg='0x7fd060014610'
+[2020-01-16T14:08:42.063640] Setting value; name='SOURCE', value='s_msg', msg='0x7fd060014610'
+[2020-01-16T14:08:42.063666] <<<<<< Source side message processing finish; instance='0.0.0.0', location='/home/alltilla/Work/install/OSE/etc/syslog-ng.conf:7:3', msg='0x7fd060014610'
+[2020-01-16T14:08:42.063688] Window size adjustment; old_window_size='99', window_size_increment='1', suspended_before_increment='FALSE', last_ack_type_is_suspended='FALSE'
+[2020-01-16T14:08:42.063807] Message(s) available in queue, starting inserts; driver='d_test#0', worker_index='0'
+[2020-01-16T14:08:50.393800] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+[2020-01-16T14:09:00.393457] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+[2020-01-16T14:09:08.475075] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+[2020-01-16T14:09:18.474603] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+[2020-01-16T14:09:28.473921] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+[2020-01-16T14:09:38.473568] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+[2020-01-16T14:09:48.473084] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+[2020-01-16T14:09:58.472719] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+[2020-01-16T14:10:08.472632] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+[2020-01-16T14:10:18.472279] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+[2020-01-16T14:10:26.144803] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+[2020-01-16T14:10:36.144364] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+[2020-01-16T14:10:46.144993] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+[2020-01-16T14:10:56.144662] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+[2020-01-16T14:11:05.033570] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+[2020-01-16T14:11:14.136196] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+[2020-01-16T14:11:24.136138] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+[2020-01-16T14:11:34.135760] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+[2020-01-16T14:11:44.135464] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+[2020-01-16T14:11:54.135287] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+[2020-01-16T14:12:04.135062] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+[2020-01-16T14:12:14.134931] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+[2020-01-16T14:12:24.134568] librdkafka: REQTMOUT(4): [thrd:alltilla-Precision-5530:9092/0]: alltilla-Precision-5530:9092/0: Timed out 0 in-flight, 1 retry-queued, 0 out-queue, 0 partially-sent requests;
+
+```
+
+Azure auth header is a signal-slot plugin that generates authorization header for applications connecting to Azure.
+
+Original version developed by Ferenc Sipos.
+
+Differences from original version:
+ * interface cleanups
+ * code cleanups
+ * use signal-slot mechanism instead of the  `HttpAuthHeader`  interface (which will be removed soon)
+ * GLib HMAC functions replaced by OpenSSL HMAC implementation
+    This branch introduces a new parameter for disk based buffers, for example:
+    
+        tcp("127.0.0.1" port(2001) disk-buffer(compaction(yes) disk-buf-size(10M)));
+    
+    Note the "compaction" argument, it can either be "yes" or "no". With
+    compaction(yes), syslog-ng will prune the unused space in the LogMessage
+    representation, making the representation of the LogMessage more
+    compact. This is useful when syslog-ng uses a lot of name-value pairs during
+    processing that become unused when delivering to a destination.
+    
+    Simply unsetting these values using the unset() rewrite operation does not
+    help, as the internal representation of a LogMessage will not release
+    the memory associated with these name-value pairs due to performance
+    reasons that help when syslog-ng is CPU bound.
+    
+    In some cases however, the size of this overhead becomes significant (I've
+    heard of 4x raw message size in some cases), which becomes unbearable.
+    
+    For these cases, the compaction will drop "unset" values, making the Logessage
+    representation smaller at the cost of some CPU time that is needed to
+    perform compaction
+
+
+The branch also contains a couple of fixes and code improvements in NVTable, which I tried to describe in their respective commit messages, so please review the branch patch-by-patch.
+
+At this point I have added a number of follow-up patches to the compaction related changes that improve readability or performance. Let me know if you want me to shove them into a separate PR.
+
+Tested with this mornings git snapshot, when I try to build CentOS 7 binaries with ```dbld/rules rpm-centos-7``` it fails with the following error:
+
+```
+[...]
+tardir=syslog-ng-3.25.1.65.gb4accf6 && tar --format=ustar -chf - "$tardir" | eval GZIP= gzip --best -c >syslog-ng-3.25.1.65.gb4accf6.tar.gz
+if test -d "syslog-ng-3.25.1.65.gb4accf6"; then find "syslog-ng-3.25.1.65.gb4accf6" -type d ! -perm -200 -exec chmod u+w {} ';' && rm -rf "syslog-ng-3.25.1.65.gb4accf6" || { sleep 5 && rm -rf "syslog-ng-3.25.1.65.gb4accf6"; }; else :; fi
+Your tarball is in /build, also available on the host in $(top_srcdir)/dbld/build
+docker run -e USER_NAME_ON_HOST=root --network=host --privileged --ulimit nofile=1024:1024 -v /root/syslog-ng:/source -v /root/syslog-ng/dbld/build:/build -v /root/syslog-ng/dbld/install:/install -e CONFIGURE_OPTS="${CONFIGURE_OPTS:---enable-debug --enable-manpages --with-python=2 --prefix=/install }" -e CCACHE_DIR=/build/ccache -e VERSION=3.25.1.65.gb4accf6 -e PATH=/usr/lib/ccache:/usr/lib64/ccache:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin -e GRADLE_USER_HOME=/build/gradle-home -e GRADLE_PROJECT_CACHE_DIR=/build/gradle-cache -e GRADLE_FLAGS=--build-cache  --rm -i balabit/syslog-ng-ubuntu-bionic /source/dbld/pkg-tarball snapshot
+Generating snapshot version in debian/
+Generating snapshot version in syslog-ng.spec
+docker run -e USER_NAME_ON_HOST=root --network=host --privileged --ulimit nofile=1024:1024 -v /root/syslog-ng:/source -v /root/syslog-ng/dbld/build:/build -v /root/syslog-ng/dbld/install:/install -e CONFIGURE_OPTS="${CONFIGURE_OPTS:---enable-debug --enable-manpages --with-python=2 --prefix=/install }" -e CCACHE_DIR=/build/ccache -e VERSION=3.25.1.65.gb4accf6 -e PATH=/usr/lib/ccache:/usr/lib64/ccache:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin -e GRADLE_USER_HOME=/build/gradle-home -e GRADLE_PROJECT_CACHE_DIR=/build/gradle-cache -e GRADLE_FLAGS=--build-cache  --rm -i  balabit/syslog-ng-centos-7 /source/dbld/rpm
+Running build as:  env rpmbuild --define _dbld 1 -ta syslog-ng-3.25.1.65.gb4accf6.tar.gz --without kafka --with python2
+error: File /build/syslog-ng-3.25.1.tar.gz: No such file or directory
+make: *** [dbld/rules:122: rpm-centos-7] Error 1
+```
+
+## Description
+
+The default RPM behaviour is to treat the syslog-ng.conf file as a configuration file and NOT replace it during RPM update. Although this is appropriate for a configuration file the result is that the @Version configuration item remains unchanged which forces the updated syslog-ng into compatibility mode.
+
+## Proposed solution
+
+For those users who wish to change the syslog-ng.conf file, but wish to keep up to date with the @Version configuration I propose that the version.conf file be included in the RPM so that it can be included into the user configured syslog-ng.conf with the outcome that compatibility mode is not forced.
+
+## Alternatives
+
+Devise a versioning of the configuration file that is not locked to the version of syslog-ng. The configuration version would only change when a backwards compatibility break occurs in the configuration. New configuration items can be added without a break in backwards compatibility, so it would be rare to require a configuration version change, and would be appropriate to force compatibility mode under such a condition. For example, @Version:3.9 through @Version 3.18 might all be the same meaning, and be accepted by all versions of syslog-ng 3.9 through 3.18 because there were nod breaking changes in the configuration syntax. Then starting in 3.19 the @Version would require an update and a verification that the client configuration file meets the new changed requirements.
+
+
+## Additional context
+
+A patch file for the syslog-ng.spec file has been attached.
+[syslog-ng-version-conf.patch.gz](https://github.com/syslog-ng/syslog-ng/files/4050926/syslog-ng-version-conf.patch.gz)
+
+
+
+How to create a newsfile entry
+==============================
+
+ 1. Create a file in the `news/` directory called `<type>-<pr-num>.md`, where `<type>` is either:
+     * `feature`: New functionality.
+     * `bugfix`: Fix to a reported bug.
+     * `developer-note`: Changes, that are only interesting to developers. (internal API change, etc...)
+     * `other`: Other important, but not categorized change.
+    You can calculate your PR number, by checking the most recent Issue or PR on github,
+    but it could be a good practice to add the commit, containing the news entry, after you
+    have opened your PR, as you know your PR number already.
+ 2. Fill it with the summary of the PR.
+     * You can use any markdown formatting.
+     * Please make sure, that there are no lines longer than 120 characters.
+     * Make it 2-3 sentences at most.
+     * Start the entry with the affected modules then a colon. For example: "`network-dest`: Added..."
+ 3. Commit it with the message: "news: <type>-<pr-num>", for example: "news: bugfix-1234"
+
+
+How to create the `NEWS.md` file for the release
+================================================
+
+ 1. Run `news/create-newsfile.py` (`python3` required)
+ 2. Fill the `Highlights` section in the newly created `NEWS.md` file.
+ 3. Fill the contributors part of the `Credits` section.
+    The internal news file creating tool can generate it for you.
+
+Note, the script uses the `VERSION` file, so it is advised to run the script, after the version is bumped,
+or make sure, that you fill the version correctly by yourself.
+I noticed that there is code in afsocket which looks like it should be setting a 60 second keepalive interval on the socket:
+
+https://github.com/syslog-ng/syslog-ng/blob/master/modules/afsocket/socket-options-inet.c#L234
+```
+#if defined(TCP_KEEPTIME) && defined(TCP_KEEPIDLE) && defined(TCP_KEEPCNT)
+  self->tcp_keepalive_time = 60;
+  self->tcp_keepalive_intvl = 10;
+  self->tcp_keepalive_probes = 6;
+#endif
+```
+In practice these lines of code have no effect because the Linux header files do not define `TCP_KEEPTIME`. Looking earlier in the file, it looks like the intention was to test for `TCP_KEEPINTVL` instead, i.e.
+```
+diff --git a/modules/afsocket/socket-options-inet.c b/modules/afsocket/socket-options-inet.c
+index f610a89cc..cc777bc94 100644
+--- a/modules/afsocket/socket-options-inet.c
++++ b/modules/afsocket/socket-options-inet.c
+@@ -231,7 +231,7 @@ socket_options_inet_new_instance(void)
+   socket_options_init_instance(&self->super);
+   self->super.setup_socket = socket_options_inet_setup_socket;
+   self->super.so_keepalive = TRUE;
+-#if defined(TCP_KEEPTIME) && defined(TCP_KEEPIDLE) && defined(TCP_KEEPCNT)
++#if defined(TCP_KEEPINTVL) && defined(TCP_KEEPIDLE) && defined(TCP_KEEPCNT)
+   self->tcp_keepalive_time = 60;
+   self->tcp_keepalive_intvl = 10;
+   self->tcp_keepalive_probes = 6;
+```
+With the patch above applied the socket sends keepalive messages by default:
+```
+15:36:56.442303 IP 192.0.2.2.43210 > 192.0.2.1.6514: Flags [S], seq 341681766, win 29200, options [mss 1460,sackOK,TS val 82132 ecr 0,nop,wscale 7], length 0
+15:36:56.442334 IP 192.0.2.1.6514 > 192.0.2.2.43210: Flags [S.], seq 219356288, ack 341681767, win 28960, options [mss 1460,sackOK,TS val 82132 ecr 82132,nop,wscale 7], length 0
+15:36:56.442347 IP 192.0.2.2.43210 > 192.0.2.1.6514: Flags [.], ack 1, win 229, options [nop,nop,TS val 82132 ecr 82132], length 0
+15:37:56.518541 IP 192.0.2.2.43210 > 192.0.2.1.6514: Flags [.], ack 1, win 229, options [nop,nop,TS val 97152 ecr 82132], length 0
+15:37:56.518572 IP 192.0.2.1.6514 > 192.0.2.2.43210: Flags [.], ack 1, win 227, options [nop,nop,TS val 97152 ecr 82132], length 0
+15:38:56.678541 IP 192.0.2.2.43210 > 192.0.2.1.6514: Flags [.], ack 1, win 229, options [nop,nop,TS val 112192 ecr 97152], length 0
+15:38:56.678572 IP 192.0.2.1.6514 > 192.0.2.2.43210: Flags [.], ack 1, win 227, options [nop,nop,TS val 112192 ecr 82132], length 0
+15:39:56.838544 IP 192.0.2.2.43210 > 192.0.2.1.6514: Flags [.], ack 1, win 229, options [nop,nop,TS val 127232 ecr 112192], length 0
+15:39:56.838576 IP 192.0.2.1.6514 > 192.0.2.2.43210: Flags [.], ack 1, win 227, options [nop,nop,TS val 127232 ecr 82132], length 0
+```
+While this looks good, I see that the documentation states that keepalive is expected to be disabled by default and the parameters set to 0:
+https://www.syslog-ng.com/technical-documents/doc/syslog-ng-open-source-edition/3.25/administration-guide/so-keepalive
+https://www.syslog-ng.com/technical-documents/doc/syslog-ng-open-source-edition/3.25/administration-guide/tcp-keepalive-time
+https://www.syslog-ng.com/technical-documents/doc/syslog-ng-open-source-edition/3.25/administration-guide/tcp-keepalive-intvl
+https://www.syslog-ng.com/technical-documents/doc/syslog-ng-open-source-edition/3.25/administration-guide/tcp-keepalive-probes
+
+It is not clear to me whether this means that the code is working as intended and perhaps these lines of code should instead be deleted?
+In many places the current `template()` option handled semi-transparent the quoted and non-quoted templates.
+
+The result in both cases are expanding the macro into `foo`. (inlined template)
+```
+file("/dev/stdout" template(foo)); //non-quoted
+file("/dev/stdout" template("foo")); //quoted
+```
+
+The result in both cases are expanding the macro into `bar`. (referenced template)
+```
+template foo "bar";
+file("/dev/stdout" template(foo)); //non-quoted
+file("/dev/stdout" template("foo")); //quoted
+```
+
+The template in this case prefers: referenced over inline template regardless of the quoting.
+
+The proposal is to remove the behaviour with qoute and non-qouted templates.
+The qouted template `template("foo")` should always imply inlined template.
+The non-qouted template `template(foo)` should always imply referenced template.
+

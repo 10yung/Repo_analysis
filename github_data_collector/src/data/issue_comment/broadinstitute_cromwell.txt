@@ -1,0 +1,390 @@
+
+
+
+Hi
+
+I'm trying to enable call caching using a local file database and I can't seem to get it to work. Everything that I try does not seem to make a difference, and each run always starts from the first task.
+
+I'm running cromwell in run mode from the command line, and I am testing on both cromwell 43 and cromwell 47.
+
+I also have write-to-cache and read-from-cache set to true in my options.json (although I understand that is the default behaviour).
+
+I am unable to use a mySQL or postgres database at this current time.
+
+Is there something that I'm missing? Is there any additional information that is needed to help diagnose this?
+
+My cromwell.conf is as follows:
+
+    backend {
+    default = LSF
+    providers {
+        LSF {
+            actor-factory = "cromwell.backend.impl.sfs.config.ConfigBackendLifecycleActorFactory"
+            config {
+                exit-code-timeout-seconds = 600
+
+                runtime-attributes = """
+                Int cpus
+                Float memory_mb
+                String lsf_queue
+                String lsf_project
+                """
+
+                submit = """
+                bsub \
+                -q ${lsf_queue} \
+                -P ${lsf_project} \
+                -J ${job_name} \
+                -cwd ${cwd} \
+                -o ${out} \
+                -e ${err} \
+                -n ${cpus} \
+                -R rusage[mem=${memory_mb}] \
+                /usr/bin/env bash ${script}
+                """
+
+                job-id-regex = "Job <(\\d+)>.*"
+
+                kill = "bkill ${job_id}"
+                check-alive = "bjobs ${job_id}"
+
+                filesystems {
+                    local {
+                        localization: [
+                            "soft-link", "copy", "hard-link"
+                        ]
+                        caching {
+                            duplication-strategy: [
+                                "soft-link", "copy", "hard-link"
+                            ]
+                            hashing-strategy: "path"
+                        }
+                    }
+                }
+            }
+        }
+    }
+    }
+    call-caching {
+      enabled = true
+      invalidate-bad-cache-results = true
+    }
+    database {
+    profile = "slick.jdbc.HsqldbProfile$"
+    db {
+        driver = "org.hsqldb.jdbcDriver"
+        url = """
+        jdbc:hsqldb:file:cromwell-executions/cromwell-db/cromwell-db;
+        shutdown=false;
+        hsqldb.default_table_type=cached;hsqldb.tx=mvcc;
+        hsqldb.result_max_memory_rows=100000;
+        hsqldb.large_data=true;
+        hsqldb.applog=1;
+        hsqldb.lob_compressed=true;
+        hsqldb.script_format=3
+        """
+        connectionTimeout = 86400000
+        numThreads = 1
+    }
+    }
+
+
+I am following up on a [report](https://gatkforums.broadinstitute.org/wdl/discussion/23250/wdl-1-0-wont-let-me-call-an-optional-task-with-an-optional-input) (by someone else) filed over a year ago.
+Now I have a slightly different need, that is, the task 2 will take the optional input `input_2_opt` for its required input.
+So, the following is what I want to achieve
+
+```
+version 1.0
+
+workflow my_workflow {
+  input {
+    File input_1
+    File? input_2_opt
+  }
+
+  call task1 {
+    input:
+      input_1 = input_1
+  }
+
+  if (defined(input_2_opt)) {
+    call task2 {
+      input:
+        input_2 = input_2_opt
+    }
+  }
+
+  output {
+    File output_1 = task1.output_1
+    File? output_2 = task2.output_2
+  }
+}
+
+task task1 {
+  input{
+    File input_1
+  }
+  command {
+    echo "Hello, world!" > hello.txt
+  }
+  output {
+    File output_1 = "hello.txt"
+  }
+}
+
+task task2 {
+  input{
+    File input_2
+  }
+  command {
+    cat ${input_2} > goodbye.txt
+  }
+  output {
+    File output_2 = "goodbye.txt"
+  }
+}
+
+```
+
+Running `womtool validate` on this gives
+
+```
+Failed to process workflow definition 'my_workflow' (reason 1 of 1): Failed to process 'call task2' (reason 1 of 1): Failed to supply input input_2 = input_2_opt (reason 1 of 1): Cannot coerce expression of type 'File?' to 'File'
+```
+
+But like in the original post, if I take out the version specification and the `input` braces in the workflow and tasks, womtool thinks the WDL is OK.
+
+Can you please explain what is the cause? And is there a solution on my end?
+
+Thanks.
+
+----------------------
+### The Jira interface is way too overwhelming 
+###
+### IMPORTANT: Please file new issues over in our Jira issue tracker!
+###
+### https://broadworkbench.atlassian.net/projects/BA/issues
+###
+### You may need to create an account before you can view/create issues.
+###
+
+
+
+
+
+This PR adds a workflow specific option (similar to `monitoring_script`) that will spin up an SSH server in a container on Google Genomics workers.
+
+It essentially uses the approach discussed [here](https://github.com/broadinstitute/cromwell/issues/4966#issuecomment-492863979) in an earlier GitHub issue, adding an additional Action that creates a Docker container with Google Genomics Tools'`ssh-server` entrypoint. (See [here]( https://github.com/googlegenomics/pipelines-tools/blob/749315a73e6c3bd5277351e32a365f42198db1ae/pipelines/internal/commands/run/run.go#L759-L766) for Google's implementation.)
+
+I also updated the documentation to include the new parameter, and have tested it in our GCP environment with the attached files.
+
+There is a corresponding JIRA issue here: https://broadworkbench.atlassian.net/browse/BA-4966
+
+Happy to add or fix up anything on here, just let me know.
+
+Thanks!
+Adam
+
+`workflow.cwl`
+```
+#!/usr/bin/env cwl-runner
+
+cwlVersion: v1.0
+class: CommandLineTool
+baseCommand: sleep
+requirements:
+  - class: DockerRequirement
+    dockerPull: "debian:stretch"
+inputs:
+  time:
+    type: int
+    inputBinding:
+      position: 1
+outputs: []
+```
+
+`workflow-inputs.yml`
+```
+time: 600
+```
+
+`options.json`
+```
+{
+  "enable_remote_access": true
+}
+```
+
+I have a simple workflow with the following input cache structure:
+
+```json
+{
+    "String sampleName": "1B5BE2D031348FBA1A6E8624811B57E3",
+    "File reference": "1f6b1b1dff750c107f19d3fbc4c7ac90",
+    "File reference_bwt": "1f6b1b1dff750c107f19d3fbc4c7ac90",
+    "File reads": [
+        "fa22ef528d4abd40315c885e784ff6c2",
+        "df337314b38af64554899eb5ebe81c74"
+    ]
+}
+```
+
+When I rerun the workflow I purely get a `cacheMiss`, but the metadata comparison between two of the inputs gives the following error:
+
+```
+{
+  "status": "error",
+  "message": "Failed to calculate diff for call A and call B:\nFailed to extract relevant metadata for call A (f9a2bfe7-a173-439f-8c39-4bca22552a22 / BwaAligner.bwamem:-1) (reason 1 of 1): Cannot extract hashes for File reads. Expected JsString or JsObject but got JsArray [\"ec4ed7c97d38063d4ad0587812c034e8\",\"083ce2cf30923ff510378b1c63feb0b6\"]\nFailed to extract relevant metadata for call B (e6f82c61-4d10-4c7e-9122-815658bb874c / BwaAligner.bwamem:-1) (reason 1 of 1): Cannot extract hashes for File reads. Expected JsString or JsObject but got JsArray [\"fa22ef528d4abd40315c885e784ff6c2\",\"df337314b38af64554899eb5ebe81c74\"]",
+  "errors": {
+    "JsArray": {
+      "elements": [
+        {
+          "JsString": {
+            "value": "Failed to extract relevant metadata for call A (f9a2bfe7-a173-439f-8c39-4bca22552a22 / BwaAligner.bwamem:-1) (reason 1 of 1): Cannot extract hashes for File reads. Expected JsString or JsObject but got JsArray [\"ec4ed7c97d38063d4ad0587812c034e8\",\"083ce2cf30923ff510378b1c63feb0b6\"]"
+          }
+        },
+        {
+          "JsString": {
+            "value": "Failed to extract relevant metadata for call B (e6f82c61-4d10-4c7e-9122-815658bb874c / BwaAligner.bwamem:-1) (reason 1 of 1): Cannot extract hashes for File reads. Expected JsString or JsObject but got JsArray [\"fa22ef528d4abd40315c885e784ff6c2\",\"df337314b38af64554899eb5ebe81c74\"]"
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+I presume this means that `processField` [[CallCacheDiffActor.scala#L164-L168](https://github.com/broadinstitute/cromwell/blob/8415afa3ee7ffe83e163cce3cbd8e1c1446db372/engine/src/main/scala/cromwell/engine/workflow/lifecycle/execution/callcaching/CallCacheDiffActor.scala#L164-L168)] is missing a `case (key, subObject: JsArray)`.
+
+I confirmed this by adding the case (I don't know scala, nor inner workings of Cromwell except enough to know this probably isn't a good way to do it, but just wanted to see if my suspicion was correct):
+
+```scala
+      case (key, subObject: JsArray) => Map(keyPrefix + key -> subObject.elements.mkString("|")).validNel
+```
+
+Which fixed the error.
+Hi,
+
+_I'll manually synchronise this issue with Jira, I've raised it here as I think it has better exposure, might be useful as a reference and I'm going to reference it from a different issue: https://broadworkbench.atlassian.net/browse/BA-6172_
+
+I'm trying to get call-caching working for my workflows, and having some trouble identifying a config that will work for the following requirements:
+
+- Using containers (both Singularity and Docker)
+- Initial localisation strategy: `[hard-link, cached-copy]`
+- Local SFS environment
+- My input files can be fairly large (~250GB per Bam with up to 16 Bams). 
+
+If I can get this working, I'll happily document and update the CallCaching documentation page with what I've found.
+
+## Background information
+
+Version: Cromwell-47
+
+Documentation:
+- https://cromwell.readthedocs.io/en/stable/cromwell_features/CallCaching/
+- https://cromwell.readthedocs.io/en/stable/Configuring/#local-filesystem-options
+- https://cromwell.readthedocs.io/en/stable/backends/HPC/#shared-filesystem
+
+Cache duplication strategies:
+- `hard-link`
+- `soft-link` - This strategy is not applicable for tasks which specify a Docker image and will be ignored.
+- `copy`
+- ~`cached-copy`~ - This is non-cache duplication strategy
+
+Cache hashing strategies:
+- `file` - (default) computes an md5 hash of the file content. [Code: `tryWithResource(() => file.newInputStream) { DigestUtils.md5Hex }`]
+- `path` - computes an md5 hash of the file path. This strategy will only be effective if the duplication-strategy (above) is set to "soft-link".
+- `path+modtime` - compute an md5 hash of the file path and the last modified time. The same conditions as for "path" apply here. [Code: `md5Hex(file.toAbsolutePath.pathAsString + file.lastModifiedTime.toString)`]
+
+Other caching options:
+
+- `system.file-hash-cache` - Prevent repeatedly requesting the hashes of the same files multiple times
+
+- `backend.providers.Local.caching.check-sibling-md5` - will check if a sibling file with the same name and the .md5 extension exists, and if it does, use the content of this file as a hash.
+
+## My takeaway
+
+- I can't use a `softlink` cache duplication strategy as it's not allowed for containers.
+
+- If I select the `path+modtime` hashing strategy, only the first task in a workflow will succeed, as the hard-link duplication strategy will cause the path "absolute" be different (causing a hash differential).
+
+## Questions
+
+- ~What defines a cache hit, or exactly which information is used to the call hash?~
+> I'll answer this one myself, by looking at the metadata returned from `/api/workflows/{version}/{id}/metadata`, within the `calls.$yourstepname.callCaching`, the hashes field has the following attributes:
+> - `output count`
+> - `runtime attribute`
+> - `output expression`
+> - `input count`
+> - `backend name`
+> - `command template`
+> - `input`
+
+  - ~When does the command section get hashed (before or after replacements)?~
+> The template gets cached
+
+  - ~What other elements go into the building the cache?~
+> output count, runtime attribute, output expression, input count, backend name, command template, input
+
+- What are the downsides with `check-sibling-md5`, can it be used in conjunction with `system.file-hash-cache`.
+
+- **Is the only way to use call-caching with containers without fully hashing the file?**
+
+## Possible resolutions
+
+I was thinking the following might be potential solutions for my problem, but I don't know how good / bad they are, and they'd require changes to Cromwell.
+
+- Potential for a _cheaper_ (and potentially dirtier) hash for files? 
+- When cromwell links from a cached result, store a map of { newpath : original } link to use or call caching, so when the hashDifferential is calculated, it uses the hash of the original cached result. (This would mean we could use the path+modtime strategy).
+
+
+## Current attempt
+
+I realised I may have run into another error here: https://github.com/broadinstitute/cromwell/issues/5348
+
+This is my current configuration, it will successfully pull cache for the FIRST step in a workflow, but then fail afterwards.
+
+<details><summary>Click to show configuration</summary><p>
+
+```hocon
+include required(classpath("application"))
+
+system: {
+  "job-shell": "/bin/sh",
+  "cromwell_id": "cromwell-fdcce1",
+  "cromwell_id_random_suffix": false
+}
+database: {
+  "db": {
+    "driver": "com.mysql.cj.jdbc.Driver",
+    "url": "jdbc:mysql://localhost/cromwell?rewriteBatchedStatements=true&useSSL=false&serverTimezone=UTC",
+    "user": "root",
+    "connectionTimeout": 5000
+  },
+  "profile": "slick.jdbc.MySQLProfile$"
+}
+backend: {
+  "default": "Local",
+  "providers": {
+    "Local": {
+      "actor-factory": "cromwell.backend.impl.sfs.config.ConfigBackendLifecycleActorFactory",
+      "config": {
+        "root": "/Users/franklinmichael/janis/cache_test/20200110_090106_f8ee04/janis/execution",
+        "filesystems": {
+          "local": {
+            "caching": {
+              "hashing-strategy": "path+modtime"
+            }
+          }
+        }
+      }
+    }
+  }
+}
+call-caching: {
+  "enabled": true
+}
+```
+</p></details>
+
+Thanks in advance for your help!

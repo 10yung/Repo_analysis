@@ -1,0 +1,80 @@
+When I did vulnerability diagnosis at my company, the vulnerability scanner found the delayed/search page is susceptible to XSS.
+This fixes that issue.
+There doesn't seem to be a simple way to "turn off" the scheduler once it has started. If I have 3 queues each processing jobs at a certain interval what is the recommended way to halt one queue from processing but allow another queue to keep processing? 
+
+If this is not possible is there a simple way to turn off the scheduler altogether?
+see https://github.com/resque/resque-scheduler/issues/677
+`delayed_cancel_now` calls `Resque.remove_delayed_job_from_timestamp` which expects the job to be queued in the queue that defined in the job class.
+But it's not always the case. In our codebase, we sometimes don't define queues at all and either defining the queue in `resque_scheduler.yml` or `Resque.enqueue_at_with_queue`.
+
+I suggest showing "queue" column in the delayed jobs search result, passing the queue as a parameter to `/delayed/cancel_now` and using `job_to_hash_with_queue` to encode the job.
+
+This will also help it deal with constants that are not autoloaded and dependent on Rails lazy load.
+I am unable to start resque:scheduler process in the background by using the `BACKGROUND=yes` flag. The command which i am using is: 
+`BACKGROUND=yes /usr/bin/bundle exec /usr/bin/rake environment resque:scheduler RAILS_ENV=development`
+resque:scheduler process starts successfully after running this but the rake process doesn't exit as it should after providing the BACKGROUND=yes flag. After the schedules get loaded, instead of running the scheduler in the background, jobs start getting enqueued in the foreground:
+```
+resque-scheduler: [INFO] [Rails:4] 2019-07-17T18:50:18+00:00: Schedules Loaded
+resque-scheduler: [INFO] [Rails:4] 2019-07-17T18:49:06+00:00: queueing RequeueThrottledJob (requeue_throttled_job)
+```
+Checked this on a different terminal:
+```
+[ec2-user@ip-10-146-98-218 ~]$ ps aux | grep resque | grep scheduler
+ec2-user 24515 14.7  1.2 860552 380748 ?       Sl   18:50   0:04 resque-scheduler-4.2.0[development]: Schedules Loaded
+```
+Strange thing to note here is that this issue doesn't appear when using rails3 application. The rake process exits and resque:scheduler starts running in the background as soon as the schedules get loaded.
+These are the OS and package versions i'm using:
+* OS - Amazon Linux 2
+* resque:scheduler - 4.2.0
+* ruby - 2.1.6
+* rails - 4.2.11
+
+I have a situation where ~80K dynamic jobs were created before we realized that this approach was not going to work (we're using a static schedule now that is much saner). To clean up all of the persisted schedules using the public interface is straightforward:
+
+```ruby
+(Resque.schedule.keys - YAML.load_file("path", "to", "schedule", "file").keys).each do |to_remove|
+  Resque.remove_schedule(to_remove)
+end
+```
+
+However, this will not only make one `hdel` call to redis for each key, but will also re-load the entire schedule each time!
+
+I can imagine a simple change to the `remove_schedule` method that would allow a variable number of schedules to be removed at once:
+
+```ruby
+def remove_schedule(*schedules)
+  schedules.each { |schedule| non_persistent_schedules.delete(schedule) }
+  redis.hdel(:persistent_schedules, *schedules)
+  redis.sadd(:schedules_changed, schedules.first)
+  reload_schedule!
+end
+```
+
+What do you guys think about that? Happy to make a PR if that makes sense.
+As the fix in https://github.com/resque/resque-scheduler/pull/671 is merged onto master, it will make sense to make a new release, semantically versioned as a patch release for v4.4.0, since it fixes a bug in v4.4.0
+
+Although I wrote this in the merged PR #671, I am creating this as a separate issue for you maintainers to keep track of.
+
+* [ ] Release patch for v4.4.0 containing PR #671
+
+Once again, thanks for your work of maintaining this library. Open source maintentance sometimes is hard, boring, and perhaps even unrelated, as maintainers often move forward to other projects. Thanks for your work!
+find_delayed_selection works, but not the enqueue function. The jobs remain queued up. Here's what I was trying to do:
+
+```
+result = Resque.find_delayed_selection { |args| args[0]['job_id'] == self.showing_meta.autocancel_job_id }
+ap result
+# => [
+    [0] "{\"class\":\"ActiveJob::QueueAdapters::ResqueAdapter::JobWrapper\",\"args\":[{\"job_class\":\"AdvanceShowingJob\",\"job_id\":\"3bfce2cd-ec38-49bc-a875-f3c5b03a1060\",\"provider_job_id\":null,\"queue_name\":\"default\",\"priority\":null,\"arguments\":[{\"_aj_globalid\":\"gid://schedulerapi/Showing/39\"},\"e_autocancel!\"],\"executions\":0,\"locale\":\"en\"}],\"queue\":\"default\"}"
+]
+result = Resque.enqueue_delayed_selection { |args| args[0]['job_id'] == self.showing_meta.autocancel_job_id }
+ap result
+# => 0
+```
+
+Right now we're using a TimeWithZone date saved on an object for the enqueue_at time. In some cases it won't properly enqueue unless I add a duration, for instance:
+`enqueue_at(object.time_with_zone, HandlerClass, object.id)`
+vs.
+`enqueue_at(object.time_with_zone + 1.seconds, HandlerClass, object.id)`
+In both cases the time passed to `enqueue_at()` is a TimeWithZone.
+
+The interesting thing is I can see the second job appear in the delayed queue but not the first. However if I use `remove_delayed()` it will remove both jobs making me think it might be something to do with the timestamp.

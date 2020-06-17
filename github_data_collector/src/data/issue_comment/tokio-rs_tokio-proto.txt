@@ -1,0 +1,200 @@
+Other tokio crates have been using this, e.g. tokio-threadpool.
+Is this library still being maintained? Please upgrade the version of smallvec and release the latest tokio-proto. The old version of this library was checked for security holes.
+
+```
+cargo audit
+    Fetching advisories `https://raw.githubusercontent.com/RustSec/advisory-db/master/Advisories.toml`
+    Scanning 340 crates for vulnerabilities (8 advisories in database)
+     Warning Vulnerable crates found!
+
+ID: RUSTSEC-2018-0003
+Crate: smallvec
+Version: 0.2.1
+Date: 2018-07-19
+URL: https://github.com/servo/rust-smallvec/issues/96
+Title: Possible double free during unwinding in SmallVec::insert_many
+Solution: upgrade to: >= 0.6.3
+
+ID: RUSTSEC-2018-0003
+Crate: smallvec
+Version: 0.6.1
+Date: 2018-07-19
+URL: https://github.com/servo/rust-smallvec/issues/96
+Title: Possible double free during unwinding in SmallVec::insert_many
+Solution: upgrade to: >= 0.6.3
+
+error: 2 vulnerabilities found!
+```
+
+relate ：https://github.com/tokio-rs/tokio-proto/pull/198
+
+Writing a library that depends on `tokio` cannot use `tokio-proto::TcpClient` of course:
+```
+   = note: expected type `&tokio_core::reactor::Handle`
+              found type `&tokio::reactor::Handle`
+```
+Updating the dependency would solve that problem but it's a breaking change, isn't it?
+Signed-off-by: Igor Gnatenko <i.gnatenko.brain@gmail.com>
+As a library author I'd love to get some more clarity about the future of `tokio-proto`. 
+Within the [tokio-reform](https://github.com/aturon/tokio-rfcs/blob/tokio-reform/tokio-reform.md#tokio-proto) I can read the following: 
+
+> So, in general: the future direction for `tokio-proto` is unclear.
+
+This is not a good foundation for tokio-library developers, is it?
+
+> We need to be driven by strong, concrete use-cases.
+
+What exactly do you mean by "strong"?
+
+> If you have one of these, we'd love to hear about it!
+
+It might not the most popular use case but nevertheless it is one of many: [tokio-modbus](https://github.com/slowtec/tokio-modbus/).
+I recently [added a server implementation](https://github.com/slowtec/tokio-modbus/commit/b7a7edb7e233555c2ed4c920249716daf43e479c#diff-4ce93534efc34e923ce01e975eb7ed80) based on  `tokio_proto::TcpServer`. It kind of works but I don't see that this is the best solution. E.g. there is no way to configure the `TcpStream` (timeouts etc.).
+
+I love to spend a lot of time to improve the tokio project and the rust ecosystem in general. And to do so clarity would help a lot :)
+I really would like to get some feedback on how I should behave.
+
+
+Update smallvec to a current release
+Fixed BoxFuture-related warnings
+
+Dependency updates
+
+- futures 0.1.14 -> 0.1.17
+- log 0.3.6 -> 0.3.8
+- smallvec 0.4.0 -> 0.6.0
+- tokio-core 0.1.8 -> 0.1.12
+I implemented the code from the [echo server example](https://tokio.rs/docs/getting-started/simple-server/) (pasted below for your convenience)
+
+Throughput decreases dramatically as the number of requests (=lines, the request type for `Echo as Service` because of the `LineCodec`) submitted increases:
+
+Number of requests | Requests/second
+----- | -----
+10,000 | 94,900
+500,000 | 1,170
+10,000,000 | 150
+
+The server process is spinning at 100% CPU while doing this.
+
+Benchmark:
+```sh
+yes|dd bs=2 count=10MB|nc localhost 12345|dd bs=2|pv -i 10 > /dev/null 
+```
+
+You have to divide the bytes/s by two to get requests/s since each request (line) is 2 bytes. You can also wait for the command to finish and divide the time reported by the second dd instance by the count= number.
+
+This was previously filed as https://github.com/tokio-rs/tokio/issues/14
+
+Code:
+```rust
+// [dependencies]
+// bytes = "0.4"
+// futures = "0.1"
+// tokio-io = "0.1"
+// tokio-core = "0.1"
+// tokio-proto = "0.1"
+// tokio-service = "0.1"
+
+extern crate bytes;
+extern crate futures;
+extern crate tokio_io;
+extern crate tokio_proto;
+extern crate tokio_service;
+
+use std::io;
+use std::str;
+
+use bytes::BytesMut;
+use futures::{future, Future, BoxFuture};
+use tokio_io::{AsyncRead, AsyncWrite};
+use tokio_io::codec::{Encoder, Decoder, Framed};
+use tokio_proto::pipeline::ServerProto;
+use tokio_proto::TcpServer;
+use tokio_service::Service;
+
+pub struct LineCodec;
+
+impl Decoder for LineCodec {
+    type Item = String;
+    type Error = io::Error;
+
+    fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<String>> {
+        if let Some(i) = buf.iter().position(|&b| b == b'\n') {
+            // remove the serialized frame from the buffer.
+            let line = buf.split_to(i);
+
+            // Also remove the '\n'
+            buf.split_to(1);
+
+            // Turn this data into a UTF string and return it in a Frame.
+            match str::from_utf8(&line) {
+                Ok(s) => Ok(Some(s.to_string())),
+                Err(_) => Err(io::Error::new(io::ErrorKind::Other,
+                                             "invalid UTF-8")),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl Encoder for LineCodec {
+    type Item = String;
+    type Error = io::Error;
+
+    fn encode(&mut self, msg: String, buf: &mut BytesMut) -> io::Result<()> {
+        buf.extend(msg.as_bytes());
+        buf.extend(b"\n");
+        Ok(())
+    }
+}
+
+pub struct LineProto;
+
+impl<T: AsyncRead + AsyncWrite + 'static> ServerProto<T> for LineProto {
+    /// For this protocol style, `Request` matches the `Item` type of the codec's `Decoder`
+    type Request = String;
+
+    /// For this protocol style, `Response` matches the `Item` type of the codec's `Encoder`
+    type Response = String;
+
+    /// A bit of boilerplate to hook in the codec:
+    type Transport = Framed<T, LineCodec>;
+    type BindTransport = Result<Self::Transport, io::Error>;
+    fn bind_transport(&self, io: T) -> Self::BindTransport {
+        Ok(io.framed(LineCodec))
+    }
+}
+
+pub struct Echo;
+
+impl Service for Echo {
+    // These types must match the corresponding protocol types:
+    type Request = String;
+    type Response = String;
+
+    // For non-streaming protocols, service errors are always io::Error
+    type Error = io::Error;
+
+    // The future for computing the response; box it for simplicity.
+    type Future = BoxFuture<Self::Response, Self::Error>;
+
+    // Produce a future for computing a response from a request.
+    fn call(&self, req: Self::Request) -> Self::Future {
+        // In this case, the response is immediate.
+        future::ok(req).boxed()
+    }
+}
+
+fn main() {
+    // Specify the localhost address
+    let addr = "0.0.0.0:12345".parse().unwrap();
+
+    // The builder requires a protocol and an address
+    let server = TcpServer::new(LineProto, addr);
+
+    // We provide a way to *instantiate* the service for each new
+    // connection; here, we just immediately return a new instance.
+    server.serve(|| Ok(Echo));
+}
+```

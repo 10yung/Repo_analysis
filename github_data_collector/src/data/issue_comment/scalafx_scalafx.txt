@@ -1,0 +1,218 @@
+Scala 2.13 brings significant changes in collections. ScalaFX provides several custom collections, like `ObservableBuffer`. [scala-collection-compat](https://github.com/scala/scala-collection-compat) provides tools for using the same collection code in 2.11, 2.12, and 2.13, no support for 2.10.
+
+In other words, 2.10 needs to be dropped to enable 2.13 support.
+From a checkout of openjfx:
+
+> rg "`@since` 11" -c ./modules/javafx.* -g '!*module-info.java'
+> 
+> ./modules/javafx.graphics/src/main/java/javafx/geometry/Bounds.java:3
+> ./modules/javafx.graphics/src/main/java/javafx/scene/robot/Robot.java:1
+> ./modules/javafx.controls/src/main/java/javafx/scene/control/Spinner.java:4
+
+- [x] Bounds: add 3 missing properties (with PR #293)
+- [ ] Robot: requires to wrap the new `Robot` class from `javafx.scene.robot`
+- [ ] Spinner:
+  - [x] initialDelay (as part of changeset 97516ded06be)
+  - [x] repeatDelay (as part of changeset 97516ded06be)
+  - [ ] getClassCssMetaData: returns a CssMetaData, do we need to wrap that too?
+  - [ ] getControlCssMetaData: same
+
+At least for some types of ScalaFX properties operations such as `+=` does not work while manually rewriting the assignment works well.
+
+# How to reproduce
+
+Tested on Scala 2.12.3:
+```scala
+import scalafx.beans.property.IntegerProperty
+
+object ScalaFxPropertyBug {
+  val property = IntegerProperty(1)
+
+  // Compiles well
+  property.value = property.value + 1
+
+  // Error: Expression does not convert to assignment because receiver is not assignable.
+  property.value += 1
+}
+```
+
+# Debugging
+
+Looks like the `value_=()` method is defined in the `IntegerProperty` class while `value` is defined in `ReadOnlyIntegerProperty`. Maybe this confuses the Scala compiler.
+The `lookup` method on `javafx.scene.Node` is usually used along with a type cast to the expected Node subclass.
+
+This lets you do things like:
+
+`val chartTitle = pane.lookup("#myChart").asInstanceOf[LineChart].getTitle()`
+
+However, the `scalafx.scene.Node` implementation of `lookup` wraps the result in a scalafx Node. When you try to cast this wrapped value, you get a ClassCastException at runtime:
+
+`Caused by: java.lang.ClassCastException: scalafx.scene.LowerPriorityIncludes$$anon$4 cannot be cast to scalafx.scene.chart.LineChart`
+
+I suggest that scalafx should provide its own lookup-by-id mechanism which returns the scalafx-wrapped values. Then these values can be safely cast to the desired type.
+JavaFX requires that custom cell factories are implemented in such a way that `javafx.scene.control.Cell[T]#updateItem(T item, boolean empty)` is implemented correctly. Quite from [JavaFX documentation for `updateItem`](https://docs.oracle.com/javase/8/javafx/api/javafx/scene/control/Cell.html#updateItem-T-boolean-]): 
+
+> It is **very important** that subclasses of Cell override the `updateItem` method properly, as failure to do so will lead to issues such as blank cells or cells with unexpected content appearing within them.
+
+Current implementation of helper `cellFactory` assignment is not suitable to handle that. Consider  `TreeCell#cellFactory_=(v: (TreeView[T] => TreeCell[T]))`. Current suggestions is to use it like this:
+
+```scala
+cellFactory = (v: TreeView[Person]) => new TreeCell[Person] {
+  treeItem.onChange { (_, _, p) =>
+    text = if (p != null) p.value().firstName + " " + p.value().lastName else null
+    graphic = null
+  }
+}
+```
+Above implementation will results in rendering artifacts as empty cells cannot be handled correctly, the `empty` flag is not available. The proper way would be to extends 'javafx.scene.control.Cell':
+```scala
+cellFactory = _ =>
+  new javafx.scene.control.TreeCell[Person] {
+
+  // We are deriving from JavaFX, for easier use add ScalaFX wrapper for  `this`
+  val self: TreeCell[Person] = this
+
+  override def updateItem(item: Person, empty: Boolean): Unit = {
+     super.updateItem(item, empty)
+     self.graphic = null
+     self.text =
+       if (empty) 
+         null
+       else item match {
+         case p: Person => p.firstName + " " + p.lastName
+         case null => null
+       }
+   }
+ }
+```
+This is a lot of boilerplate code. There should be a helper `cellFactory` assignment that would promote ability to write correct code. Mot of the boilerplate would be generated automatically, user would only handle rendering and be provided with `empty` flag. Consider assignment with signature:
+
+```scala
+def cellFactory_=(u: ((TreeCell[T], T, Boolean) => Unit))
+```
+
+It would be used like this:
+```scala
+        cellFactory = (treeCell, item, empty) => {
+          treeCell.graphic = null
+          treeCell.text =
+            if (empty)
+              null
+            else
+              item match {
+                case p: Person => item.firstName + " " + item.lastName
+                case null => null
+              }
+        }
+```
+
+Maybe it should be even simpler. Code for resetting `graphic` and `text` when item is `null` or empty would be generated automatically. A cell factory would only handle non-null items and non-empty cells:
+```scala
+        cellFactory = (treeCell, item) => {
+          treeCell.text =  item.firstName + " " + item.lastName
+        }
+```
+
+This would be for all classes that have cell factories, not only `TreeView`.
+I had a talk with @jpsacha  and planned to initiate the steps to make ScalaFX as part of Typelevel project. https://github.com/typelevel/general/issues/46
+
+Typelevel wants following things from our contributors/Committers 
+
+> (1) There must be a consensus amongst the project's stakeholders that they want to join Typelevel.
+
+Please post who are all like to join Typelevel as part of ScalaFx project
+
+> (2) The project must be willing to support the Typelevel code of conduct or something equivalent.
+
+http://typelevel.org/about.html
+
+[Scala Community builds](https://github.com/scala/community-builds) test new Scala builds against open source projects. 
+From the project [README](https://github.com/scala/community-builds): "The main goal [of the Scala Community builds] is to guard against regressions in new versions of Scala (language, standard library, and modules). It's also a service to the open source community, providing early notice of issues and incompatibilities."
+
+The implicit conversion from `scalafx.beans.property.IntProperty` to `scalafx.beans.values.ObservableValue[Int, Int]` is missing. This implicit conversion works for `String` and generic types, but not for primitive types such as `Int`, `Long`, `Double`. 
+
+A minimal example to show this issue
+
+``` scala
+1   import scalafx.beans.property._
+2   import scalafx.scene.control._
+3
+4   object ConversionIssue extends App {
+5   
+6     class Person(_name: String, _age: Int) {
+7       val name = new StringProperty(this, "name", _name)
+8       val age = new IntegerProperty(this, "age", _age)
+9     }
+10   
+11    val nameColumn = new TableColumn[Person, String] {
+12      cellValueFactory = { _.value.name }
+13    }
+14  
+15    val ageColumn = new TableColumn[Person, Int] {
+16      cellValueFactory = { _.value.age }
+17    }
+18  
+19  }
+```
+
+Line 12 is okay, but line 16 fails with the following error:
+
+> Error: type mismatch;
+>  found   : scalafx.beans.property.IntegerProperty
+>  required: scalafx.beans.value.ObservableValue[Int,Int]
+>     cellValueFactory = { _.value.age }
+>                                  ^
+
+Hi.
+
+I suggest that we should define `map` for `ReadOnlyProperty`.
+Generally speaking, I think it is called [`fmap`](https://hackage.haskell.org/package/reactive-0.11.5/docs/FRP-Reactive-Behavior.html) in functional reactive programming.
+It is very simple, easy to read, and can be considered as Scala-style programs.
+
+For example, if we have `map` for `StringProperty`, we can write programs like following:
+
+``` scala
+object Main extends JFXApp {
+  val a = StringProperty("")
+  val b = a.map((s: String) => s + "!")
+  val c = b.map((s: String) => s + "?")
+  a.value = "i"
+  println(a.value) // => i
+  println(b.value) // => i!
+  println(c.value) // => i!?
+}
+```
+
+(this program cannot be compiled)
+
+How do you think about this?
+
+EDIT:
+
+I just wrote working prototype for `StringProperty`
+
+``` scala
+import scalafx.application.JFXApp
+import scalafx.beans.property.StringProperty
+
+object Main extends JFXApp {
+  // NOTE: this is just prototype, proof of concept.
+  // We should define more generic and safe way.
+  def mapProperty(v: StringProperty, f: (String) => String) : StringProperty = {
+    val r = StringProperty(f(v.value)) // initialize with current value
+    def update(): Unit = {
+      r.value = f(v.value)
+    }
+    v.onChange(update)
+    r
+  }
+  val a = StringProperty("")
+  val b = mapProperty(a, (s: String) => s + "!")
+  val c = mapProperty(b, (s: String) => s + "?")
+
+  a.value = "i"
+  println(a.value) // => i
+  println(b.value) // => i!
+  println(c.value) // => i!?
+}
+```

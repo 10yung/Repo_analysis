@@ -1,0 +1,461 @@
+**Describe the bug**
+
+track_script doesn’t work when running in a container, keepalived logs:
+
+    Failed to set/clear process event listen - errno 111 - Connection refused
+
+I found one relevant SO topic about the issue with using netlink inside a namespace: https://stackoverflow.com/questions/35987286/sendmsg-to-netlink-fails-with-econnrefused-if-application-is-running-in-lxc-cont/36786152
+
+**Keepalived version**
+v2.0.16
+
+**Distro (please complete the following information):**
+- Alpine Linux
+- v3.10
+- x86_64 
+ 
+**Details of any containerisation or hosted service (e.g. AWS)**
+Running in a privileged LXC container, the host system is SUSE Linux Enterprise Server 15.1. 
+
+**Configuration file:**
+
+```
+global_defs {
+	enable_script_security
+	script_user nobody
+	vrrp_version 3
+}
+
+vrrp_track_process check_nginx_proc {
+	process "nginx"
+	quorum 3
+	fork_delay 2
+	terminate_delay 1
+}
+
+vrrp_instance vi_ipv4 {
+	interface eth0
+	state MASTER
+	virtual_router_id 42
+	priority 150
+	track_process {
+		check_nginx_proc
+	}
+	virtual_ipaddress {
+		1.2.3.4/24 dev eth1
+	}
+	virtual_routes {
+		default via 1.2.3.1 dev eth1
+	}
+}
+```
+
+**System Log entries**
+
+```
+Dec 21 11:53:33 test-1 daemon.info Keepalived[9608]: Starting Keepalived v2.0.16 (06/02,2019)
+Dec 21 11:53:33 test-1 daemon.info Keepalived[9608]: WARNING - keepalived was build for newer Linux 4.19.36, running on Linux 4.12.14-197.26-default #1 SMP Wed Nov 6 13:59:49 UTC 2019 (493622b)
+Dec 21 11:53:33 test-1 daemon.info Keepalived[9608]: Command line: '/usr/sbin/keepalived' '--dont-fork' '--use-file=/etc/keepalived/keepalived.conf'
+Dec 21 11:53:33 test-1 daemon.info Keepalived[9608]:               '--config-id=master'
+Dec 21 11:53:33 test-1 daemon.info Keepalived[9608]: Opening file '/etc/keepalived/keepalived.conf'.
+Dec 21 11:53:33 test-1 daemon.info Keepalived[9608]: Starting VRRP child process, pid=9615
+Dec 21 11:53:33 test-1 local1.info Keepalived_vrrp[9615]: Registering Kernel netlink reflector
+Dec 21 11:53:33 test-1 local1.info Keepalived_vrrp[9615]: Registering Kernel netlink command channel
+Dec 21 11:53:33 test-1 local1.info Keepalived_vrrp[9615]: Opening file '/etc/keepalived/keepalived.conf'.
+Dec 21 11:53:33 test-1 local1.info Keepalived_vrrp[9615]: Failed to set/clear process event listen - errno 111 - Connection refused
+Dec 21 11:53:33 test-1 local1.info Keepalived_vrrp[9615]: (vi_ipv4) entering FAULT state
+Dec 21 11:53:33 test-1 local1.info Keepalived_vrrp[9615]: Registering gratuitous ARP shared channel
+```
+
+**Did keepalived coredump?**
+No.
+
+This adds initial mkosi support to keepalived and will deliver bootable fedora test vm with changes in current git, the other distro's probably needs some work since I just threw this together in a jiffie and Arch usually has some packaging quirks while Debian is usually far behind other distro's etc.  
+
+Basically what needs to be done is
+
+Arch
+pacman -S mkosi
+Debian
+apt-get install -y mkosi
+Fedora
+dnf install mkosi
+git clone https://github.com/acassen/keepalived.git
+cd keepalived && sudo "mkosi" and it will built an Fedora image with current git and run it and you should be able to ssh into it as root with the root password CHANGEME.
+If you want to throw away the build simply delete the clone of the repo
+
+This setup is a throw away one time use test vm setup of the git repository as in you cannot update or install anything on the image but you can log into it and make local modifications. If the intent is to deliver a full blown vm, tightly integrated with tests or act as an deliverable for customers to deploy in cloud or on premis or on hardware this needs more work.
+
+If the intent would be to just use mkosi to check "does keepalive build on X distro's"  stuff can be removed ( you dont need bootable vm's for that just the output from mkosi when it generates the image ).
+
+It's just a matter of were to go from here if mkosi built images are considered useful for the project.
+**Disclaimer**
+I know I am using `sorry_server` feature in wrong way, but since I spent some time with debugging I want to share my findings and I believe even discussion could be helpful for the project.
+
+**Issue**
+When there is virtual server configuration with `sorry_server` exactly same like one of `real_server`, service is unable to recover properly during transition from sorry server stage back when "twin" `real_server` comes up first.
+
+Keepalived simply failed to add `real_server` because of duplicity in IPVS, but thinks everything is OK.
+
+I am using this setup to mitigate complete out of service when backend health checks are implemented incorrectly.
+
+**My solution**
+I can see two minor caveants in my solution:
+* When `inhibit_on_failure` is used for real servers it has to be used for sorry server also, or same behavior occurs
+* There is very short moment during status transition when no server is present in IPVS structure which may result in dropping some connections in very high load
+**Describe the bug**
+We have Keepalived handling Tarantool in multi-shard configuration. We have 4 shards on a server, each could be master or replica and should then set specified IP address on a specified device name. Basically, we have two vrrp_instance for each shard because 'master' and 'replica' could became MASTER (in terms of KA) according to Tarantool chard state. We use scripts to control the state of a Tarantool shard. Here is a typical shard configuration:
+```
+vrrp_script chk_tnt_filedb1_pri {
+  script "/etc/keepalived/scripts/checkn.sh 11013 primary"
+  interval 1
+  timeout 3
+  fall 2
+  rise 1
+}
+
+vrrp_script chk_tnt_filedb1_rpl {
+  script "/etc/keepalived/scripts/checkn.sh 11013 connected"
+  interval 1
+  timeout 3
+  fall 2
+  rise 1
+}
+
+vrrp_instance TNT_FILEDB1_PRI {
+  interface eth0
+  state BACKUP
+  nopreempt
+  virtual_router_id 1
+  priority 100
+  advert_int 1
+  authentication {
+    auth_type AH
+    auth_pass PASS
+  }
+  unicast_src_ip 10.x.x.x
+  unicast_peer {
+    10.x.x.x
+  }
+  virtual_ipaddress {
+    10.x.x.x/32 dev master11011
+  }
+  track_script {
+    chk_tnt_filedb1_pri
+  }
+}
+
+vrrp_instance TNT_FILEDB1_RPL {
+  interface eth0
+  state BACKUP
+  nopreempt
+  virtual_router_id 128
+  priority 100
+  advert_int 1
+  authentication {
+    auth_type AH
+    auth_pass PASS
+  }
+  unicast_src_ip 10.x.x.x
+  unicast_peer {
+    10.x.x.x
+  }
+  virtual_ipaddress {
+    10.x.x.x/32 dev slave11011
+  }
+  track_script {
+    chk_tnt_filedb1_rpl
+  }
+}
+```
+The opposite side configuration is the same except IP addresses - they point one on each other. The other 3 shard configuration is equal except port.
+The script content is the fallows:
+```
+#!/bin/bash
+/usr/bin/echo "lua box.info.status" | /usr/bin/nc -w 3 localhost "$1" | /usr/bin/grep -q "$2"
+```
+Since we have 4 shards on the same server, we have the above script that uses netcat for one couple of shards, and the other couple have bash magic:
+```
+#!/bin/bash
+exec 5<>/dev/tcp/localhost/"$1" && /usr/bin/timeout 3 /usr/bin/echo -e "lua box.info.status\nexit" >&5 && /usr/bin/timeout 3 /usr/bin/grep -q "$2" <&5
+```
+All two scripts have timeouts hardcoded into them. Both accept two parameters: port and the word we expect from Tarantool to determine if it is master or replica.
+
+What we found is that at some random moment KA will start showing errors in logs:
+```
+2019-07-21T16:15:11.068 o-cld-filedb1   Keepalived_vrrp Track script chk_tnt_filedb2_pri is already running, expect idle - skipping run                                                                                                       
+2019-07-21T16:15:11.069 o-cld-filedb1   Keepalived_vrrp Track script chk_tnt_filedb2_rpl is already running, expect idle - skipping run                                                                                                       
+2019-07-21T16:15:11.069 o-cld-filedb1   Keepalived_vrrp Track script chk_tnt_filedb3_pri is already running, expect idle - skipping run                                                                                                       
+2019-07-21T16:15:11.069 o-cld-filedb1   Keepalived_vrrp Track script chk_tnt_filedb4_pri is already running, expect idle - skipping run                                                                                                       
+2019-07-21T16:15:11.069 o-cld-filedb1   Keepalived_vrrp Track script chk_tnt_filedb4_rpl is already running, expect idle - skipping run                                                                                                       
+2019-07-21T16:15:11.069 o-cld-filedb1   Keepalived_vrrp Track script chk_tnt_filedb1_pri is already running, expect idle - skipping run                                                                                                       
+2019-07-21T16:15:11.069 o-cld-filedb1   Keepalived_vrrp Track script chk_tnt_filedb1_rpl is already running, expect idle - skipping run                                                                                                       
+2019-07-21T16:15:11.069 o-cld-filedb1   Keepalived_vrrp Track script chk_tnt_filedb2_pri is already running, expect idle - skipping run                                                                                                       
+2019-07-21T16:15:12.070 o-cld-filedb1   Keepalived_vrrp Track script chk_tnt_filedb3_pri is being timed out, expect idle - skipping run                                                                                                       
+2019-07-21T16:15:12.070 o-cld-filedb1   Keepalived_vrrp Track script chk_tnt_filedb4_pri is being timed out, expect idle - skipping run                                                                                                       
+2019-07-21T16:15:12.070 o-cld-filedb1   Keepalived_vrrp Track script chk_tnt_filedb4_rpl is being timed out, expect idle - skipping run                                                                                                       
+2019-07-21T16:15:13.072 o-cld-filedb1   Keepalived_vrrp Track script chk_tnt_filedb3_pri is being timed out, expect idle - skipping run                                                                                                       
+2019-07-21T16:15:13.072 o-cld-filedb1   Keepalived_vrrp Track script chk_tnt_filedb4_pri is being timed out, expect idle - skipping run                                                                                                       
+2019-07-21T16:15:13.072 o-cld-filedb1   Keepalived_vrrp Track script chk_tnt_filedb4_rpl is being timed out, expect idle - skipping run                                                                                                       
+2019-07-21T16:15:13.072 o-cld-filedb1   Keepalived_vrrp Child (PID 7370) failed to terminate after kill
+2019-07-21T16:15:13.072 o-cld-filedb1   Keepalived_vrrp Child (PID 7376) failed to terminate after kill
+2019-07-21T16:15:13.072 o-cld-filedb1   Keepalived_vrrp Child (PID 7373) failed to terminate after kill
+2019-07-21T16:15:14.071 o-cld-filedb1   Keepalived_vrrp Track script chk_tnt_filedb3_pri is being timed out, expect idle - skipping run                                                                                                       
+2019-07-21T16:15:14.071 o-cld-filedb1   Keepalived_vrrp Track script chk_tnt_filedb4_pri is being timed out, expect idle - skipping run                                                                                                       
+2019-07-21T16:15:14.071 o-cld-filedb1   Keepalived_vrrp Track script chk_tnt_filedb4_rpl is being timed out, expect idle - skipping run                                                                                                       
+2019-07-21T16:15:14.072 o-cld-filedb1   Keepalived_vrrp Child (PID 7370) failed to terminate after kill
+2019-07-21T16:15:14.072 o-cld-filedb1   Keepalived_vrrp Child (PID 7376) failed to terminate after kill
+2019-07-21T16:15:14.072 o-cld-filedb1   Keepalived_vrrp Child (PID 7373) failed to terminate after kill
+2019-07-21T16:15:15.071 o-cld-filedb1   Keepalived_vrrp Track script chk_tnt_filedb3_pri is being timed out, expect idle - skipping run                                                                                                       
+2019-07-21T16:15:15.071 o-cld-filedb1   Keepalived_vrrp Track script chk_tnt_filedb4_pri is being timed out, expect idle - skipping run                                                                                                       
+2019-07-21T16:15:15.071 o-cld-filedb1   Keepalived_vrrp Track script chk_tnt_filedb4_rpl is being timed out, expect idle - skipping run
+```
+'Already running' message seems to be reasonable as scripts tend not to end in 1 second interval, as well as 'being timing out'. Both seems to be peak load related. This messages start to appear time to time and then gone after several repetitions without triggering state change. But 'failed to terminate after kill' once appeared will keep on repeating in log each 'interval' seconds (each 1 second in our case) until KA reload or restart. More interesting, none of this PIDs exist in system at the moment I find KA in that condition:
+```
+/etc/keepalived # ps aux | grep -E '7376|7373|7370'
+root     31499  0.0  0.0 112704   988 pts/2    S+   14:19   0:00 grep --colour=auto -E 7376|7373|7370
+```
+Besides, I've seen KA triggering state change on Tarantool failing to respond in timeout and then returning MASTER back again a couple of seconds later without going into 'failed to terminate after kill' condition. So, this seems to be KA internal error not related to load.
+
+The worst part of this is once KA failed this way, it will loose control over affected instances! I have modified check_script to always return non zero return code and chk_tnt_filedb1_pri remained in the MASTER state even the corresponding script was returning 1. chk_tnt_filedb2_pri (monitored by the same script) switched to the FAULT state.
+
+**Expected behavior**
+KA is not triggered on missing PIDs. No false error messages in logs.
+
+**Keepalived version**
+```Keepalived v2.0.17 (06/25,2019)
+
+Copyright(C) 2001-2019 Alexandre Cassen, <acassen@gmail.com>
+
+Built with kernel headers for Linux 3.10.0
+Running on Linux 3.10.0-862.3.2.el7.x86_64 #1 SMP Mon May 21 23:36:36 UTC 2018
+
+configure options: --build=x86_64-redhat-linux-gnu --host=x86_64-redhat-linux-gnu --program-prefix= --disable-dependency-tracking --prefix=/usr --exec-prefix=/usr --bindir=/usr/bin --sbindir=/usr/sbin --sysconfdir=/etc --datadir=/usr/share --includedir=/usr/include --libdir=/usr/lib64 --libexecdir=/usr/libexec --localstatedir=/var --sharedstatedir=/var/lib --mandir=/usr/share/man --infodir=/usr/share/info --disable-nftables --disable-libiptc --disable-libipset --disable-libipset-dynamic --disable-snmp-reply-v3-for-v2 --enable-dbus --with-init=systemd build_alias=x86_64-redhat-linux-gnu host_alias=x86_64-redhat-linux-gnu PKG_CONFIG_PATH=:/usr/lib64/pkgconfig:/usr/share/pkgconfig CFLAGS=-O2 -g -pipe -Wall -Wp,-D_FORTIFY_SOURCE=2 -fexceptions -fstack-protector-strong --param=ssp-buffer-size=4 -grecord-gcc-switches -m64 -mtune=generic LDFLAGS=-Wl,-z,relro 
+
+Config options:  IPTABLES_CMD LVS VRRP VRRP_AUTH OLD_CHKSUM_COMPAT FIB_ROUTING DBUS
+
+System options:  PIPE2 SIGNALFD INOTIFY_INIT1 VSYSLOG EPOLL_CREATE1 IPV6_ADVANCED_API RTA_ENCAP RTA_EXPIRES RTA_PREF FRA_TUN_ID RTAX_CC_ALGO RTAX_QUICKACK FRA_OIFNAME IFA_FLAGS IP_MULTICAST_ALL NET_LINUX_IF_H_COLLISION LIBIPTC_LINUX_NET_IF_H_COLLISION VRRP_VMAC IFLA_LINK_NETNSID CN_PROC SOCK_NONBLOCK SOCK_CLOEXEC O_PATH GLOB_BRACE INET6_ADDR_GEN_MODE SO_MARK SCHED_RT SCHED_RESET_ON_FORK
+```
+
+**Distro (please complete the following information):**
+CentOS Linux release 7.5.1804 (Core) 
+3.10.0-862.3.2.el7.x86_64(x86_64) on o-cld-filedb1.q
+   4 x "Intel Core Processor (Broadwell)", total 4 cores
+
+**Details of any containerisation or hosted service (e.g. AWS)**
+oVirt VM
+
+**System Log entries**
+Once started to 'fail to terminate' log will became endless.
+
+**Did keepalived coredump?**
+Never.
+
+**Additional context**
+This happen only on master and never seen on a replica. Even they are both equal oVirt VMs.
+
+**Describe the bug**
+
+We've experienced some issues with the automatic (security) updates of keepalived. This happens when installing the keepalived package either via Ubuntu packages (having automatic security updates activated) or when installing the snap package (as recommended iirc), which has automatic updates that apparently [cant' be disabled](https://forum.snapcraft.io/t/disabling-automatic-refresh-for-snap-from-store/707/4).  When the update is triggered, it results in a restart of the keepalived daemon (not reload), which causes a failover (we currently do not use `nopreempt`).
+
+- What's the recommended way of handling automatic (security) updates?
+- Is there a posibility to configure keepalived in a way that doesn't failover upon restarts?
+
+**To Reproduce**
+
+Install keepalived and wait for an update
+
+**Expected behavior**
+
+The update process should never hard-restart the daemon, unless it can be done so without any interuption of services.
+
+**Keepalived version**
+
+- Keepalived v1.3.9 (10/21,2017) (Ubuntu apt package)
+- v2.0.16-11-g1b96509+ (from snap)
+
+**Distro (please complete the following information):**
+
+Ubuntu 18.04 LTS (bionic beaver)
+
+**Did keepalived coredump?**
+
+No.
+
+**Describe the bug**
+
+The following error appears in the logs:
+
+```
+Error: Please add a #! shebang to script myscript.sh
+```
+
+The script has a `#!/bin/sh` shebang and `file` detects them as `POSIX shell script, ASCII text executable`.
+
+I suppose this is a false positive of the magic library?
+
+[Refrence code section](https://github.com/acassen/keepalived/blob/ef48b007a04c1f4b874709bcb85bb4a232cb3d3b/lib/notify.c#L913)
+
+
+**Expected behavior**
+
+Shebang is correctly recognized
+
+**Keepalived version**
+
+`v2.0.16-11-g1b96509+` (worked fine with `2.0.15`)
+
+**Distro (please complete the following information):**
+ - Name Ubuntu
+ - Version 18.04
+ - Architecture  x86_64
+
+**Did keepalived coredump?**
+
+No.
+Just installed keepalived-1.4.4 and tested the SNMP-fix
+
+Sorry, but with the fix from #850 a new issue was possibly added. While debugging the mentioned perl-script in #850 again, I found that the KEEPALIVED-MIB::virtualServerAddress is somehow a little bit strange.
+
+```
+# snmpwalk -v2c -c public localhost KEEPALIVED-MIB::virtualServerAddress
+KEEPALIVED-MIB::virtualServerAddress.1 = STRING: "
+0,"
+KEEPALIVED-MIB::virtualServerAddress.2 = STRING: "
+0,"
+KEEPALIVED-MIB::virtualServerAddress.3 = STRING: "
+0-"
+KEEPALIVED-MIB::virtualServerAddress.4 = STRING: "
+0-"
+KEEPALIVED-MIB::virtualServerAddress.5 = STRING: "
+0."
+KEEPALIVED-MIB::virtualServerAddress.6 = STRING: "
+0."
+```
+Hello,
+I found an issue in latest beta (as of 2018-03-12):
+When we build vmac on top of an LACP bond, when the bond is set down, only the last 9 vmac interfaces  go to fault.
+
+The issue was **not** reproduced under version 1:1.2.19-1ubuntu0.2 (latest version available over public Ubuntu repos).
+The issue was **not** reproduced when shutting physical interfaces.
+
+Setup:
+My machine has physical interface e0-1-1 and e0-1-2 which are part of bond0.
+Both physical interfaces, as well as bond0, are up.
+I create 16 vlan subinterfaces (bond0.10 to bond0.25).
+I then create 16 vmac interfaces with  a similar config:
+```
+vrrp_instance 410 { 
+    state BACKUP
+    interface bond0.10
+    use_vmac vrrp4.10.1
+    virtual_router_id 1
+    priority 115
+    advert_int 1
+    preempt_delay 60
+    authentication {
+        auth_type PASS
+        auth_pass a3dswd3410
+    }
+    virtual_ipaddress { 
+        172.16.10.254/24
+    }
+    mcast_src_ip 172.16.10.254    
+}
+
+```
+and start keepalived:
+`[root@bz-perflab-6-vr /home/dclabaut/vrouter-2195] keepalived -f /run/conf/keepalived.conf`
+
+**Under version  1:1.2.19-1ubuntu0.2:**
+I can see that I have indeed 16 IPs on vrrp interfaces:
+```
+[root@bz-perflab-6-vr /home/dclabaut/vrouter-2195] ip a | grep vrrp4 | grep inet | wc -l
+16
+```
+I shut bond0, then I do not have any IP left (because all instances went to FAULT state):
+```
+[root@bz-perflab-6-vr /home/dclabaut/vrouter-2195] ip link set down dev bond0
+[root@bz-perflab-6-vr /home/dclabaut/vrouter-2195] ip a | grep vrrp4 | grep inet | wc -l
+0
+```
+**Under latest Beta version:**
+I create the same setup (physical, bond0, bond0.vlan, keepalived) as before.
+At the beginning I have the same result:
+```
+[root@bz-perflab-6-vr /home/dclabaut/vrouter-2195] ip a | grep vrrp4 | grep inet | wc -l
+16
+```
+Then if I shut bond0, I can see that I still have IPs:
+```
+[root@bz-perflab-6-vr /home/dclabaut/vrouter-2195] ip link set down dev bond0
+[root@bz-perflab-6-vr /home/dclabaut/vrouter-2195] ip a | grep vrrp4 | grep inet | wc -l
+7
+```
+We activated the json output, so we can have a better view of the situation:
+```
+[root@bz-perflab-6-vr /home/dclabaut/vrouter-2195] vrrp_recap 
++----------+------------+---------------+---------+----------+-------------+--------+----------------------------+
+| Instance | Interface  |   Addresses   | Version | Priority | Master prio | State  |      Last Transition       |
++----------+------------+---------------+---------+----------+-------------+--------+----------------------------+
+|   410    | vrrp4.10.1 | 172.16.10.254 |    2    |   115    |      0      | Master | 2018-03-12 21:38:40.397383 |
+|   411    | vrrp4.11.1 | 172.16.11.254 |    2    |   115    |      0      | Master | 2018-03-12 21:38:40.380336 |
+|   412    | vrrp4.12.1 | 172.16.12.254 |    2    |   115    |      0      | Master | 2018-03-12 21:38:40.381755 |
+|   413    | vrrp4.13.1 | 172.16.13.254 |    2    |   115    |      0      | Master | 2018-03-12 21:38:40.380944 |
+|   414    | vrrp4.14.1 | 172.16.14.254 |    2    |   115    |      0      | Master | 2018-03-12 21:38:40.383032 |
+|   415    | vrrp4.15.1 | 172.16.15.254 |    2    |   115    |      0      | Master | 2018-03-12 21:38:40.382409 |
+|   416    | vrrp4.16.1 | 172.16.16.254 |    2    |   115    |      0      | Master | 2018-03-12 21:38:40.392074 |
+|   417    | vrrp4.17.1 | 172.16.17.254 |    2    |   115    |      0      | Fault  | 2018-03-12 21:38:49.726513 |
+|   418    | vrrp4.18.1 | 172.16.18.254 |    2    |   115    |      0      | Fault  | 2018-03-12 21:38:49.725825 |
+|   419    | vrrp4.19.1 | 172.16.19.254 |    2    |   115    |      0      | Fault  | 2018-03-12 21:38:49.725098 |
+|   420    | vrrp4.20.1 | 172.16.20.254 |    2    |   115    |      0      | Fault  | 2018-03-12 21:38:49.723655 |
+|   421    | vrrp4.21.1 | 172.16.21.254 |    2    |   115    |      0      | Fault  | 2018-03-12 21:38:49.722732 |
+|   422    | vrrp4.22.1 | 172.16.22.254 |    2    |   115    |      0      | Fault  | 2018-03-12 21:38:49.721391 |
+|   423    | vrrp4.23.1 | 172.16.23.254 |    2    |   115    |      0      | Fault  | 2018-03-12 21:38:49.720467 |
+|   424    | vrrp4.24.1 | 172.16.24.254 |    2    |   115    |      0      | Fault  | 2018-03-12 21:38:49.719139 |
+|   425    | vrrp4.25.1 | 172.16.25.254 |    2    |   115    |      0      | Fault  | 2018-03-12 21:38:49.717802 |
++----------+------------+---------------+---------+----------+-------------+--------+----------------------------+
+```
+
+Now, if I:
+- Set bond0 up
+- Set down the physical interfaces that are part of the bond
+then all interfaces do go to fault state:
+
+```
+[root@bz-perflab-6-vr /home/dclabaut/vrouter-2195] ip link set up dev bond0
+[root@bz-perflab-6-vr /home/dclabaut/vrouter-2195] ip a | grep vrrp4 | grep inet | wc -l
+16
+[root@bz-perflab-6-vr /home/dclabaut/vrouter-2195] ip link set down dev e0-1-1
+[root@bz-perflab-6-vr /home/dclabaut/vrouter-2195] ip link set down dev e0-1-2
+[root@bz-perflab-6-vr /home/dclabaut/vrouter-2195] ip a | grep vrrp4 | grep inet | wc -l
+0
+[root@bz-perflab-6-vr /home/dclabaut/vrouter-2195] vrrp_recap 
++----------+------------+---------------+---------+----------+-------------+-------+----------------------------+
+| Instance | Interface  |   Addresses   | Version | Priority | Master prio | State |      Last Transition       |
++----------+------------+---------------+---------+----------+-------------+-------+----------------------------+
+|   410    | vrrp4.10.1 | 172.16.10.254 |    2    |   115    |      0      | Fault | 2018-03-12 21:52:52.286841 |
+|   411    | vrrp4.11.1 | 172.16.11.254 |    2    |   115    |      0      | Fault | 2018-03-12 21:52:52.287536 |
+|   412    | vrrp4.12.1 | 172.16.12.254 |    2    |   115    |      0      | Fault | 2018-03-12 21:52:52.290016 |
+|   413    | vrrp4.13.1 | 172.16.13.254 |    2    |   115    |      0      | Fault | 2018-03-12 21:52:52.292280 |
+|   414    | vrrp4.14.1 | 172.16.14.254 |    2    |   115    |      0      | Fault | 2018-03-12 21:52:52.294247 |
+|   415    | vrrp4.15.1 | 172.16.15.254 |    2    |   115    |      0      | Fault | 2018-03-12 21:52:52.295319 |
+|   416    | vrrp4.16.1 | 172.16.16.254 |    2    |   115    |      0      | Fault | 2018-03-12 21:52:52.296034 |
+|   417    | vrrp4.17.1 | 172.16.17.254 |    2    |   115    |      0      | Fault | 2018-03-12 21:52:52.296741 |
+|   418    | vrrp4.18.1 | 172.16.18.254 |    2    |   115    |      0      | Fault | 2018-03-12 21:52:52.297548 |
+|   419    | vrrp4.19.1 | 172.16.19.254 |    2    |   115    |      0      | Fault | 2018-03-12 21:52:52.303626 |
+|   420    | vrrp4.20.1 | 172.16.20.254 |    2    |   115    |      0      | Fault | 2018-03-12 21:52:52.304714 |
+|   421    | vrrp4.21.1 | 172.16.21.254 |    2    |   115    |      0      | Fault | 2018-03-12 21:52:52.305200 |
+|   422    | vrrp4.22.1 | 172.16.22.254 |    2    |   115    |      0      | Fault | 2018-03-12 21:52:52.305709 |
+|   423    | vrrp4.23.1 | 172.16.23.254 |    2    |   115    |      0      | Fault | 2018-03-12 21:52:52.306235 |
+|   424    | vrrp4.24.1 | 172.16.24.254 |    2    |   115    |      0      | Fault | 2018-03-12 21:52:52.306812 |
+|   425    | vrrp4.25.1 | 172.16.25.254 |    2    |   115    |      0      | Fault | 2018-03-12 21:52:52.307331 |
++----------+------------+---------------+---------+----------+-------------+-------+----------------------------+
+```
+
+Which limits the scope of the problem: in case of hardware failure on the other side (switch down / cable down / etc) then the interfaces do go to fault.
+Hi,
+
+Want to check if there is a docker image/Dockerfile for keepalived which is officially supported? I could not find one under dockerhub official images https://hub.docker.com/explore/
+
+If not, want to check if there is any plan to add an official keepalived image to dockerhub? https://docs.docker.com/docker-hub/official_repos/#how-do-i-create-a-new-official-repository

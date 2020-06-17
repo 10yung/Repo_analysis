@@ -1,0 +1,209 @@
+When using acyclic with settings
+```
+    lazy val acyclicSettings = Seq(
+      libraryDependencies += "com.lihaoyi" %% "acyclic" % acyclicVersion.value % "provided",
+      autoCompilerPlugins := true,
+      scalacOptions += "-P:acyclic:force",
+      libraryDependencies += compilerPlugin("com.lihaoyi" %% "acyclic" % acyclicVersion.value)
+    )
+```
+Sbt console crashes with 
+```
+[IJ]sbt:proj1> console
+[info] Starting scala interpreter...
+Welcome to Scala 2.13.1 (OpenJDK 64-Bit Server VM, Java 1.8.0_232).
+Type in expressions for evaluation. Or try :help.
+
+scala> val a = 1
+java.util.NoSuchElementException: key not found: <console>
+	at scala.collection.immutable.Map$Map1.apply(Map.scala:240)
+	at acyclic.plugin.PluginPhase$$anon$1.$anonfun$run$8(PluginPhase.scala:96)
+	at scala.collection.IterableOps.groupBy(Iterable.scala:557)
+	at scala.collection.IterableOps.groupBy$(Iterable.scala:552)
+	at scala.collection.AbstractIterable.groupBy(Iterable.scala:921)
+	at acyclic.plugin.PluginPhase$$anon$1.$anonfun$run$2(PluginPhase.scala:96)
+	at scala.collection.immutable.List.map(List.scala:219)
+	at scala.collection.immutable.List.map(List.scala:79)
+	at acyclic.plugin.PluginPhase$$anon$1.run(PluginPhase.scala:83)
+	at scala.tools.nsc.Global$Run.compileUnitsInternal(Global.scala:1506)
+	at scala.tools.nsc.Global$Run.compileUnits(Global.scala:1490)
+	at scala.tools.nsc.interpreter.IMain$ReadEvalPrint.compile(IMain.scala:704)
+	at scala.tools.nsc.interpreter.IMain$Request.$anonfun$compile$7(IMain.scala:913)
+	at scala.runtime.java8.JFunction0$mcZ$sp.apply(JFunction0$mcZ$sp.scala:17)
+	at scala.tools.nsc.interpreter.IMain.$anonfun$withoutWarnings$1(IMain.scala:1334)
+	at scala.tools.nsc.interpreter.shell.ReplReporterImpl.withoutPrintingResults(Reporter.scala:64)
+	at scala.tools.nsc.interpreter.IMain.withoutWarnings(IMain.scala:99)
+	at scala.tools.nsc.interpreter.IMain$Request.compile(IMain.scala:913)
+	at scala.tools.nsc.interpreter.IMain.compile(IMain.scala:493)
+	at scala.tools.nsc.interpreter.IMain.interpret(IMain.scala:487)
+	at scala.tools.nsc.interpreter.IMain.interpret(IMain.scala:470)
+	at scala.tools.nsc.interpreter.shell.ILoop.interpretStartingWith(ILoop.scala:931)
+	at scala.tools.nsc.interpreter.shell.ILoop.command(ILoop.scala:788)
+	at scala.tools.nsc.interpreter.shell.ILoop.processLine(ILoop.scala:462)
+	at scala.tools.nsc.interpreter.shell.ILoop.loop(ILoop.scala:485)
+	at scala.tools.nsc.interpreter.shell.ILoop.run(ILoop.scala:1020)
+	at xsbt.ConsoleInterface.run(ConsoleInterface.scala:78)
+	at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.lang.reflect.Method.invoke(Method.java:498)
+	at sbt.internal.inc.AnalyzingCompiler.call(AnalyzingCompiler.scala:248)
+	at sbt.internal.inc.AnalyzingCompiler.console(AnalyzingCompiler.scala:210)
+	at sbt.Console.console0$1(Console.scala:48)
+	at sbt.Console.$anonfun$apply$2(Console.scala:51)
+	at scala.runtime.java8.JFunction0$mcV$sp.apply(JFunction0$mcV$sp.java:23)
+	at sbt.util.InterfaceUtil$$anon$1.get(InterfaceUtil.scala:10)
+	at sbt.TrapExit$App.run(TrapExit.scala:257)
+	at java.lang.Thread.run(Thread.java:748)
+
+That entry seems to have slain the compiler.  Shall I replay
+your session? I can re-run each line except the last one.
+[y/n]
+```
+
+sbt version 1.3.4
+
+This would help to identify and break the big (most impactful) cycles first. 
+
+One could also add options to filter the results by a minimum cycle length.
+Hi, 
+
+I noticed that even if the force flag is set, cycles between packages are not checked until an explicit package object is provided. This is quite cumbersome since it required manually adding such package object whenever a new package is created.
+
+This PR adds `forcePkg` flag which fixes that behavior.
+A.scala:
+```
+package skip
+package a
+
+import acyclic.skipped
+
+trait A {
+  val b: B
+}
+```
+
+B.scala:
+```
+package skip
+package a
+
+import acyclic.skipped
+
+trait B {
+  val a: A
+}
+```
+
+build.sbt:
+```
+organization in ThisBuild := "skip"
+version in ThisBuild := "1.0-SNAPSHOT"
+scalaVersion in ThisBuild := "2.12.5"
+
+val acyclicVersion = "0.1.7"
+val acyclicDep = "com.lihaoyi" %% "acyclic" % acyclicVersion % Provided
+lazy val acyclicCompilerPlugin = addCompilerPlugin("com.lihaoyi" %% "acyclic" % acyclicVersion)
+
+autoCompilerPlugins in ThisBuild := true
+
+lazy val `acyclic` = (project in file("."))
+  .settings(settings)
+
+lazy val settings = Seq(
+  libraryDependencies ++= Seq(
+    acyclicDep
+  ),
+  acyclicCompilerPlugin
+)
+
+scalacOptions in ThisBuild ++= Seq(
+  "-P:acyclic:force",                  // Run cyclic dependencies check on all files
+)
+```
+
+If you change
+```
+package skip
+package a
+```
+to
+`package skip.a`
+in both files, then it compiles fine.
+I wanted this when retrofitting a project with acyclic after it was written so it can be done a bit more piece by piece. WDYT?
+We use `-Ywarn-unused-import` (and `-Xfatal-warnings`), and get
+
+```
+Unused import
+import acyclic.file
+```
+
+on any file I add it to.
+
+I don’t know of any way to silence an unused import warning (e.g., using `@SuppressWarnings`), but I’d happily do that if possible.
+
+We’re trying to modularize a largish code base, and it would be great if acyclic could help us see where there are branches we could move into their own subprojects.
+
+Periodically after saving a single file and attempting to run tests in IDEA, I get the following exception from Acyclic. Exception goes away if I do a complete rebuild. Exception is not thrown when compiling with SBT.
+
+```
+Error:scalac: Error: key not found: /foo/bar.scala
+java.util.NoSuchElementException: key not found: /foo/bar.scala
+    at scala.collection.MapLike$class.default(MapLike.scala:228)
+    at scala.collection.AbstractMap.default(Map.scala:59)
+    at scala.collection.MapLike$class.apply(MapLike.scala:141)
+    at scala.collection.AbstractMap.apply(Map.scala:59)
+    at acyclic.plugin.PluginPhase$$anon$1$$anonfun$6$$anonfun$apply$8.apply(PluginPhase.scala:84)
+    at acyclic.plugin.PluginPhase$$anon$1$$anonfun$6$$anonfun$apply$8.apply(PluginPhase.scala:84)
+    at scala.collection.TraversableLike$$anonfun$groupBy$1.apply(TraversableLike.scala:321)
+    at scala.collection.TraversableLike$$anonfun$groupBy$1.apply(TraversableLike.scala:320)
+    at scala.collection.mutable.ResizableArray$class.foreach(ResizableArray.scala:59)
+    at scala.collection.mutable.ArrayBuffer.foreach(ArrayBuffer.scala:48)
+    at scala.collection.TraversableLike$class.groupBy(TraversableLike.scala:320)
+    at scala.collection.AbstractTraversable.groupBy(Traversable.scala:104)
+    at acyclic.plugin.PluginPhase$$anon$1$$anonfun$6.apply(PluginPhase.scala:84)
+    at acyclic.plugin.PluginPhase$$anon$1$$anonfun$6.apply(PluginPhase.scala:71)
+    at scala.collection.immutable.Stream$$anonfun$map$1.apply(Stream.scala:418)
+    at scala.collection.immutable.Stream$$anonfun$map$1.apply(Stream.scala:418)
+    at scala.collection.immutable.Stream$Cons.tail(Stream.scala:1233)
+    at scala.collection.immutable.Stream$Cons.tail(Stream.scala:1223)
+    at scala.collection.immutable.Stream$$anonfun$map$1.apply(Stream.scala:418)
+    at scala.collection.immutable.Stream$$anonfun$map$1.apply(Stream.scala:418)
+    at scala.collection.immutable.Stream$Cons.tail(Stream.scala:1233)
+    at scala.collection.immutable.Stream$Cons.tail(Stream.scala:1223)
+    at scala.collection.immutable.Stream.foreach(Stream.scala:595)
+    at scala.collection.TraversableOnce$class.toMap(TraversableOnce.scala:316)
+    at scala.collection.AbstractTraversable.toMap(Traversable.scala:104)
+    at acyclic.plugin.PluginPhase$$anon$1.run(PluginPhase.scala:89)
+    at scala.tools.nsc.Global$Run.compileUnitsInternal(Global.scala:1501)
+    at scala.tools.nsc.Global$Run.compileUnits(Global.scala:1486)
+    at scala.tools.nsc.Global$Run.compileSources(Global.scala:1481)
+    at scala.tools.nsc.Global$Run.compile(Global.scala:1582)
+    at xsbt.CachedCompiler0.run(CompilerInterface.scala:115)
+    at xsbt.CachedCompiler0.run(CompilerInterface.scala:94)
+    at xsbt.CompilerInterface.run(CompilerInterface.scala:22)
+    at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+    at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+    at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+    at java.lang.reflect.Method.invoke(Method.java:498)
+    at sbt.compiler.AnalyzingCompiler.call(AnalyzingCompiler.scala:101)
+    at sbt.compiler.AnalyzingCompiler.compile(AnalyzingCompiler.scala:47)
+    at sbt.compiler.AnalyzingCompiler.compile(AnalyzingCompiler.scala:41)
+    at org.jetbrains.jps.incremental.scala.local.IdeaIncrementalCompiler.compile(IdeaIncrementalCompiler.scala:29)
+    at org.jetbrains.jps.incremental.scala.local.LocalServer.compile(LocalServer.scala:26)
+    at org.jetbrains.jps.incremental.scala.remote.Main$.make(Main.scala:67)
+    at org.jetbrains.jps.incremental.scala.remote.Main$.nailMain(Main.scala:24)
+    at org.jetbrains.jps.incremental.scala.remote.Main.nailMain(Main.scala)
+    at sun.reflect.GeneratedMethodAccessor4.invoke(Unknown Source)
+    at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+    at java.lang.reflect.Method.invoke(Method.java:498)
+    at com.martiansoftware.nailgun.NGSession.run(NGSession.java:319)
+```
+
+Thanks for creating the plugin. Starting a fresh project and want to have clean code. :)
+
+I'm testing out the plugin to make sure I've configured it correctly. It doesn't seem to detect package cycles in test code, See https://github.com/gshakhn/acyclic-test for a sample project.
+
+Running `sbt test:compile` doesn't cause a compilation error. If classes `A` and `B` are moved to the source directory, running `sbt compile` makes the compile fail as expected.
+
+Am I missing a configuration option, or does the plugin not support test code?

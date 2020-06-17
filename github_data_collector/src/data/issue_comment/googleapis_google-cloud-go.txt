@@ -1,0 +1,436 @@
+**PROBLEM**
+Spanner's Nullable types (e.g. `NullString`, `NullDate`, etc) don't have support for Go's native JSON marshaling/unmarshaling, which results in displaying the guts of the nullable type instead of a reasonable output, and makes it hard to accept JSON input without manual surgery and intermittent structs. For example:
+
+```golang
+type Blog struct {
+  Post spanner.NullString `json:"post"`
+}
+
+blog := Blog{
+  Post: spanner.NullString{
+    StringVal: "this is a post!",
+    Valid:     true,
+  },
+}
+
+json, _ := json.MarshalIndent(blog, "", "  ")
+fmt.Println(string(json))
+```
+prints:
+```json
+{
+  "post": {
+    "StringVal": "this is a post!",
+    "Valid": true
+  }
+}
+```
+
+**PROPOSED SOLUTION**
+I would like to ask for `json.Marshaller` and `json.Unmarshaller` interfaces to be implemented. For example for `NullString` it could simply be:
+
+```golang
+// NullString copied from spanner
+type NullString struct {
+  StringVal string
+  Valid     bool
+}
+
+// convention to represent null in JSON
+// doc: https://godoc.org/encoding/json#Unmarshaler
+var jsonNull = []byte("null")
+
+// json.Marshaller interface
+func (n *NullString) MarshalJSON() ([]byte, error) {
+  if n.Valid {
+    return []byte(fmt.Sprintf("%q", n.StringVal)), nil
+  }
+  return jsonNull, nil
+}
+
+// json.Unmarshaller interface
+func (n *NullString) UnmarshalJSON(payload []byte) error {
+  if payload == nil || bytes.Equal(payload, jsonNull) {
+    return nil
+  }
+
+  n.StringVal = string(payload)
+  n.Valid = true
+  return nil
+}
+```
+
+which then lets `json` to nicely marshal/unmarshal nullable strings into the proper `spanner.NullString` object. Then this:
+
+```golang
+type Blog struct {
+  Post NullString `json:"post"`
+}
+
+blog := Blog{
+  Post: NullString{
+    StringVal: "this is a post!",
+    Valid:     true, // change this to false to test the null case
+  },
+}
+
+marshalled, _ := json.Marshal(&blog)
+fmt.Printf("Marshaled: %v\n", string(marshalled))
+
+var unmarshalled Blog
+json.Unmarshal(marshalled, &unmarshalled)
+fmt.Printf("Unmarshalled: %+v\n", unmarshalled)
+```
+would print (`Valid: true`):
+```yaml
+Marshaled: {"post":"this is a post!"}
+Unmarshalled: {Post:{StringVal:"this is a post!" Valid:true}}
+```
+and for when `Valid: false`:
+```yaml
+Marshaled: {"post":null}
+Unmarshalled: {Post:{StringVal: Valid:false}}
+```
+
+Go Playground with the above code: https://play.golang.org/p/R_PONus4YnW
+**Client**
+
+storage
+
+**Expected behavior**
+
+For gzip compressed files, obj.NewRangeReader(ctx, offset, length) should return a partial reader for that range that starts at offset for the uncompressed file.
+
+**Actual behavior**
+
+If length < 0, it returns a NewReader for the entire file with offset=0 instead of the requested range (though it does read it uncompressed as desired). If length > 0 but offset != 0, it returns a "partial request not satisfied" error.
+
+## Client
+PubSub
+
+## Describe Your Environment
+
+locally. But same behaviour on GKE.
+
+I have a fairly simple subscriber (tried both synchronous and asynchronous) that should constantly check for new messages and handle a bulk of messages.
+
+This is the code you can run to reproduce:
+
+```go
+package main
+
+import (
+	"context"
+	"os"
+	"time"
+
+	"cloud.google.com/go/pubsub"
+	log "github.com/sirupsen/logrus"
+)
+
+func main() {
+	ctx := context.Background()
+	projectID := os.Getenv("GCLOUD_PROJECT_ID")
+	subscriptionID := os.Getenv("SUBSCRIPTION_ID")
+
+	client, err := pubsub.NewClient(ctx, projectID)
+	if err != nil {
+		panic(err)
+	}
+	defer client.Close()
+
+	sub := client.Subscription(subscriptionID)
+	// sub.ReceiveSettings.Synchronous = true
+	// sub.ReceiveSettings.MaxOutstandingMessages = 0
+	// sub.ReceiveSettings.MaxOutstandingBytes = 1000
+	// sub.ReceiveSettings.MaxExtension = 10
+	for {
+		// Receive messages constantly
+		log.Infof("check for new messages in subscription %v...", subscriptionID)
+		tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		// Create a channel to handle messages to as they come in.
+		cm := make(chan *pubsub.Message)
+
+		messages := 0
+		finished := false
+		go func() {
+			for {
+				select {
+				case msg := <-cm:
+					log.Infof("received message: %v", string(msg.Data))
+					messages++
+					// make acks conditional
+					defer func() {
+						if finished {
+							msg.Ack()
+						} else {
+							msg.Nack()
+						}
+					}()
+				case <-tctx.Done():
+					if messages > 0 {
+						log.Info("here we do something, only if it suceeds we acknowledge the messages")
+						finished = true
+					}
+					log.Infof("number of messages: %v", messages)
+					messages = 0
+					return
+				}
+			}
+		}()
+
+		// Receive blocks until the context is cancelled or an error occurs.
+		err = sub.Receive(tctx, func(ctx context.Context, msg *pubsub.Message) {
+			cm <- msg
+		})
+		if err != nil && status.Code(err) != codes.Canceled {
+			log.Errorf("Receive: %v", err)
+		}
+		close(cm)
+	}
+}
+
+```
+
+## Expected Behavior
+
+this program constantly checks for new messages in the subscription. If new messages arrive, it picks up as many messages as possible within 5 seconds, process them and acknowledge them. If a lot of messages arrive in the subscription, the program should still be able to handle them by processing bulks of messages one by another.
+
+## Actual Behavior
+
+All works fine if there are only few messages in the subscription. If I start putting load onto it, say produce 2000 messages, the program gets stuck after printing the log info `number of messages: X`.
+
+## Client
+
+Pubsub
+
+## Describe Your Environment
+
+MacOS Mojave
+
+## Expected Behavior
+
+Querying for topics with emulator returns true if exists, false otherwise
+
+## Actual Behavior
+
+Function hangs and does not return until timeout
+
+```
+es, err = pubsub.NewClient(ctx, "dev")
+if err != nil {
+	log.Fatalf("Failed to create client: %v", err)
+}
+topic := es.Topic("hello")
+ok, err := topic.Exists(ctx)
+if err != nil {
+	i.Fatalf("failed to check if topic exists: %v", err)
+}
+if ok {
+	if err := topic.Delete(ctx); err != nil {
+		i.Fatalf("failed to cleanup the topic (%q): %v", "hello", err)
+	}
+}
+```
+## Client
+
+firestore
+
+## Describe Your Environment
+Using firestore for web services deployed on Google App Engine 
+
+We have used firestore as our backend to serve static data from our web services. However, while we batch 50 documents from the firestore in some scenarios we do not require the entire documents, we need only 5 fields out of the entire documents. But because there is no way you can pass projection/fields to be selected from documents during batch query we saw our API was taking more time to respond.
+
+In the source code, we saw:
+
+```func (c *Client) getAll(ctx context.Context, docRefs []*DocumentRef, tid []byte) ([]*DocumentSnapshot, error)```
+
+It creates 
+```
+req := &pb.BatchGetDocumentsRequest{
+		Database:  c.path(),
+		Documents: docNames,
+	}
+```
+This BatchGetDocumentsRequest has `Mask *DocumentMask` field which only returns the selected fields from the resultset or query the firestore only for the given data. But there is no provision in the `GetAll()` method to pass the fields. We have created a wrapper in our code that takes an array of field paths `fieldPaths []string` and create a `DocumentMask` with this array and pass it to the `BatchGetDocumentsRequest` instance. After doing this we again did a performance test of our application and the result showed us a 77% improvement in total response time. I am raising this Issue so that If approved I will like to raise a PR where the `GetAll` method also takes fieldPaths array and pass it to `BatchGetDocumentsRequest` or have another method in the API that allows projection. This will help others also who are having the same scenario as ours and using the same API to use Projection.
+
+## Expected Behavior
+Should allow the user to pass FieldsPath to `GetAll()` Method and Only return the requested fields by the user and if fieldPaths is `nil` then return the entire document.
+
+## Actual Behavior
+Current API doesn't allow a user to do projects for `GetAll()` method call.
+Following up on https://github.com/googleapis/google-cloud-go/issues/1689
+
+We're using Spanner as the backing storage for a resource oriented API (we're using the [Cloud API design guide](https://cloud.google.com/apis/design/standard_fields)).
+
+This means we're storing a [standard set](https://cloud.google.com/apis/design/standard_fields) of `created_at`, `updated_at` and `deleted_at` timestamps for our resources, using [TIMESTAMP](https://cloud.google.com/spanner/docs/data-types#timestamp-type) as the column type.
+
+Support for `TIMESTAMP` in [spannertest](https://github.com/googleapis/google-cloud-go/tree/master/spanner/spannertest) is the one thing blocking us from covering these APIs with `spannertest`-based unit tests (offset support would enable unit testing of list pagination, but that's a separate, smaller issue).
+
+We're currently strapped for time and are not able to take on implementation of this ourselves.
+
+Creating this issue on the off-chance you are able to up-prioritize it.
+## Client
+
+StackDriver 
+
+## Describe Your Environment
+
+MacOS
+
+## Expected Behavior
+
+`(monitoredres.MonitoredResourceMetadata).GetUserLabels()` returns labels that are defined by users on GCP objects like compute VMs or CloudSQL instances.
+
+## Actual Behavior
+
+Always returns empty map whenever object has or does not have user-defined labels.
+
+To reproduce: 
+
+1. Create a VM and assign some labels to it, like `test: 123`
+2. Create a SA with read permissions on StackDriver API and put it to `sa.json` file next to the `main.go`
+
+
+Replace `$YOUR_PROJECT_IS_HERE` and `$YOUR_VM_IS_HERE` hardcoded in the following snippet with GCP project where your VM is located and name of the VM you just created accordingly. 
+
+Put the code snippet to the `main.go`. Then just `go run main.go`
+
+As output you will always see `map[]` (instead of real user-defined labels that I'd expect as output from `fmt.Println(series.GetMetadata().GetUserLabels())` in the end of the snippet)
+
+Code snippet (I'm sorry for the code quality, I did not have much time to prepare anything clean and beautiful): 
+```go
+package main
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"github.com/golang/protobuf/ptypes/timestamp"
+	"github.com/googleapis/gax-go/v2"
+	"google.golang.org/api/iterator"
+	"github.com/prometheus/common/log"
+	"google.golang.org/api/option"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"io"
+	"time"
+
+	monitoring "cloud.google.com/go/monitoring/apiv3"
+	monitoringpb "google.golang.org/genproto/googleapis/monitoring/v3"
+)
+
+const (
+	timeRange         time.Duration = 5 * time.Minute
+)
+
+func main () {
+	var buf bytes.Buffer
+	if err := printUserLabels(&buf, "$YOUR_PROJECT_IS_HERE", "compute.googleapis.com/instance/cpu/utilization"); err != nil {
+		log.Errorln(err)
+	}
+	result := buf.String()
+	fmt.Printf(result)
+}
+
+
+func printUserLabels(w io.Writer, projectID, metricType string) error {
+	ctx := context.Background()
+	c, err := monitoring.NewMetricClient(ctx)
+	if err != nil {
+		return fmt.Errorf("NewMetricClient: %v", err)
+	}
+	req := &monitoringpb.GetMetricDescriptorRequest{
+		Name: fmt.Sprintf("projects/%s/metricDescriptors/%s", projectID, metricType),
+	}
+	resp, err := c.GetMetricDescriptor(ctx, req)
+	if err != nil {
+		return fmt.Errorf("could not get custom metric: %v", err)
+	}
+	filter := "( metric.type = \"" + resp.Type + "\" ) AND metric.label.instance_name = \"$YOUR_VM_IS_HERE\""
+	endTime := time.Now().UTC()
+	startTime := endTime.Add(-timeRange)
+
+
+	mClient, err := monitoring.NewMetricClient(ctx, option.WithCredentialsFile("./sa.json"))
+	if err != nil {
+		log.Errorln(err)
+	}
+	it := mClient.ListTimeSeries(ctx, &monitoringpb.ListTimeSeriesRequest{
+		Name:   "projects/" + projectID,
+		Filter: filter,
+		Interval: &monitoringpb.TimeInterval{
+			StartTime: &timestamp.Timestamp{Seconds: startTime.Unix()},
+			EndTime:   &timestamp.Timestamp{Seconds: endTime.Unix()},
+		},
+		View: monitoringpb.ListTimeSeriesRequest_FULL,
+	}, gax.WithGRPCOptions())
+	for {
+		series, err := it.Next()
+		if err == iterator.Done ||
+			status.Code(err) == codes.NotFound ||
+			status.Code(err) == codes.Canceled ||
+			err == context.Canceled {
+			break
+		}
+		if err != nil {
+			log.Errorf("Error retrieve %s: %s", resp.Type, err)
+			break
+		}
+		fmt.Println(series.GetMetadata().GetUserLabels())
+	}
+	return nil
+}
+```
+pstest is great for testing pubsub, makes using queues so much easier.
+
+
+Could there be an option to simulate a `Queue()` failure? Maybe something along the lines of:
+
+```
+srv := pstest.NewServer()
+...
+srv.NextQueueError(errors.New("oops"))
+```
+
+It could either return an error only for the next call to `Queue()`, or for every call after this.
+I'm using the Spanner Go client in an application I'm building. I'm running this application on GKE using the alpine docker image.
+
+Every now and then I get an error message like this
+
+> The transaction contains too many mutations. Insert and update operations count with the multiplicity of the number of columns they affect. For example, inserting values into one key column and four non-key columns count as five mutations total for the insert. Delete and delete range operations count as one mutation regardless of the number of columns affected. The total mutation count includes any changes to indexes that the transaction generates. Please reduce the number of writes, or use fewer indexes. (Maximum number: 20000)
+
+
+I'm trying to make sense of this error message, and I can't find any documentation on it on Google's documentation pages.
+
+----
+
+I'd like to know how to programmatically calculate the maximum number of objects (e.g. rows) that I can insert given this mutation limit. For example, let's say I have a table with 10 columns and 2 of the columns compose the primary key. Additionally, there are 3 secondary indexes on the table.
+
+As I understand from that error statement, if
+
+* R (number of rows/objects being inserted)
+* C (number of columns in the table)
+* I (number of secondary indexes on the table)
+* M (max number of mutations)
+
+then
+
+`R <= floor((M - I) / C)`
+
+which means `R <= floor((20000 - 3) / 10)`. So I should only be able to insert 1,999 objects into the table in one transaction. I know this formula isn't correct though, because I regularly still get this error even using this formula.
+
+Can someone help me understand what the formula is? I don't understand how the row and column multiplicity comes into play with secondary indexes and primary keys and also interleaved tables. What's the formula??
+
+Flakes for multiple spanner integration tests over the past day:
+
+TestIntegration_DML: https://sponge.corp.google.com/target?id=88c22d5e-bb5c-4965-acb8-021c8346d4cc&target=cloud-devrel/client-libraries/go/google-cloud-go/continuous/go113&searchFor=&show=ALL&sortBy=STATUS
+
+TestBatchDML_TwoStatements: https://sponge.corp.google.com/target?id=d7c51dd9-ba08-47f6-9305-2ad6438e0fc0&target=cloud-devrel/client-libraries/go/google-cloud-go/continuous/go112&searchFor=&show=ALL&sortBy=STATUS
+
+TestIntegration_QueryExpressions: https://sponge.corp.google.com/target?id=cf295096-310f-4d5d-b806-a07a5bab09dd&target=cloud-devrel/client-libraries/go/google-cloud-go/continuous/go113&searchFor=&show=ALL&sortBy=STATUS
+
+multiple tests failed: https://sponge.corp.google.com/target?id=6106295f-6a4b-403f-b637-091ea191529b&target=cloud-devrel/client-libraries/go/google-cloud-go/continuous/go113&searchFor=&show=ALL&sortBy=STATUS
+
+Please fix these (and/or disable flaky tests for the time being if there's not a quick fix).

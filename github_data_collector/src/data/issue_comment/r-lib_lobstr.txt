@@ -1,0 +1,309 @@
+
+Hi, 
+My aim is to replace `&` with function `min()` and replace `|` with `max()`. So, ` a & (b | c) ` should be rewritten as `min(a, max(b,c))`. I thought modifying the syntax tree is the way to go. Is it possible to modify `ast()` output and then convert back into an expression?
+
+I'm sharing a small example:
+```R
+a <- 5
+b <- 10
+c <- 4
+express <- a & (b | c)
+express_adv <- (c & b) & (a & (b | c))
+```
+
+The rewritten `express` should evaluate to `5` and `express_adv` should evaluate to `4`. Expected expressions are :
+```R
+min(a, max(b,c))  # modified express 
+min( min(c,b), min(a, max(b,c)))  # modified express_adv
+```
+So, this is before:
+```
+ast( a & (b | c) )
+
+█─`&` 
+├─a 
+└─█─`(` 
+  └─█─`|` 
+    ├─b 
+    └─c 
+```
+
+and this is after:
+```
+ast(min(a,(max(b,c))))
+
+█─min 
+├─a 
+└─█─`(` 
+  └─█─max 
+    ├─b 
+    └─c 
+```
+
+To print ALTREP objects. The inspect method typically provides more information about the object. E.g.
+
+```r
+❯ .Internal(inspect(1:100))
+@7fa458bec718 13 INTSXP g0c0 [NAM(7)]  1 : 100 (compact)
+
+❯ lobstr::sxp(1:100)
+[1:0x7fa458be6a60] <INTSXP[100]> (altrep named:7)
+
+❯ .Internal(inspect(tl))
+@7fa458bec8d8 13 INTSXP g1c0 [MARK,NAM(7)]  ALTREP progress::tick_along
+  @7fa458bec868 13 INTSXP g1c0 [MARK,NAM(7)]  1 : 10000 (compact)
+
+❯ lobstr::sxp(tl)
+[1:0x7fa458bec8d8] <INTSXP[10000]> (altrep named:7)
+```
+Prepare for release: 
+ 
+* [x] Check that description is informative 
+* [x] Check licensing of included files 
+* [x] `usethis::use_cran_comments()` 
+* [x] `devtools::check()` 
+* [x] `devtools::check_win_devel()` 
+* [x] `rhub::check_for_cran()` 
+* [x] `rhub::check(platform = 'ubuntu-rchk')` 
+* [x] `rhub::check_with_sanitizers()` 
+* [x] Polish pkgdown reference index 
+
+Submit to CRAN: 
+ 
+* [x] `usethis::use_version('minor')` 
+* [x] Update `cran-comments.md` 
+* [x] `devtools::submit_cran()` 
+* [x] Approve email 
+ 
+Wait for CRAN... 
+ 
+* [x] Accepted :tada: 
+* [x] `usethis::use_github_release()` 
+* [x] `usethis::use_dev_version()` 
+* [ ] Finish blog post 
+* [ ] Tweet 
+* [ ] Add link to blog post in pkgdown news menu 
+
+Would either take expression + env, or quosure.
+
+Prints parent envs at end, and printing an indexing into them with numbers/colours next to each symbol.
+``` r
+library(rlang)
+library(lobstr)
+
+q1 <- new_quosure(expr(x), env(x = 1))
+q2 <- new_quosure(expr(x), env(x = 10))
+
+lobstr::ast(!!q1 + !!q2)
+#> Warning: `quo_expr()` is soft-deprecated as of rlang 0.2.0.
+#> Please use `quo_squash()` instead
+#> This warning is displayed once per session.
+#> █─`+` 
+#> ├─x 
+#> └─x
+```
+
+<sup>Created on 2018-11-08 by the [reprex package](https://reprex.tidyverse.org) (v0.2.1)</sup>
+
+(Probably what I was thinking in #6)
+As discussed in r-lib/rlang#678 I recently needed to log what symbols are getting hit in my data_mask using `eval_tidy`. @lionel- thought this might be a more appropriate home.
+
+I have prototype using `makeActiveBinding`, although Lionel suggested there's a cleaner alternative using objectable.
+
+The protoype is here: https://gist.github.com/cfhammill/4244e29bc667455a2406bf972e4287c6
+
+I'm happy to open this as a PR with the active bindings version, although I'm not sure if/when I would be able to switch this to objectable.
+(I'm happy to take a stab at this if it seems useful! cc @filipsch who is interested in this issue)
+
+Really enjoyed the NYC R conference talk on lobstr! This might be outside the scope of lobstr, but it seems like being able to enhance the AST with line / column info could lead to useful ways of allowing people to explore the AST, and its relationship back to their code.
+
+I worked briefly on connecting AST and parse data while flying somewhere, but never finished. I think the key points are...
+
+1. getParseData returns a data.frame, but there is a handy function in  https://github.com/halpo/parser to turn it into a tree (and plot it)
+2. In the AST, a node's first child is always the function called, but in the parse data their order corresponds to their position in the code (shown below).
+3. As far as I can tell, the layers of the AST and parse data graph match, so relating them requires...
+  - filtering parse data nodes corresponding to "expr" tokens
+  - potentially finding a non-"expr" token corresponding to leftmost AST child node in other tokens (e.g. in `1 + 2`, the `+`  is not an expr token)
+
+There may be a much easier way to do this. Here's is a comparison of the parse data for a binary operator.
+
+![image](https://user-images.githubusercontent.com/2574498/39193751-3dedc93e-47aa-11e8-9373-97981d34f5da.png)
+
+**Code used to graph parsed data**
+
+
+```
+# taken from https://github.com/halpo/parser/blob/master/R/plot.parser.R
+library(igraph)
+plot.parser <- function(x, ...){
+  y = getParseData(x)
+  stopifnot(require(igraph))
+  y$new.id <- seq_along(y$id)
+  h <- graph.tree(0) + vertices(id = y$id, label= y$text)
+  for(i in 1:nrow(y)){
+    if(y[i, 'parent'])
+      h <- h + edge(c(y[y$id == y[i, 'parent'], 'new.id'], y[i, 'new.id']))
+  }
+  plot(h, layout=layout.reingold.tilford, ...)   
+}
+
+create_parse_graph <- function(pd) {
+  pd$new.id <- seq_along(pd$id)
+  h <- graph.tree(0) + vertices(id = pd$id, label= pd$text)
+  for(i in 1:nrow(pd)){
+    if(pd[i, 'parent'])
+      h <- h + edge(c(pd[pd$id == pd[i, 'parent'], 'new.id'], pd[i, 'new.id']))
+  }
+  
+  h
+}
+
+```
+
+**Some notes on matching nodes**
+
+```
+# Steps to map to AST from parse data
+#   1. start at root AST node (call ast), and PD node (call pd)
+#
+#   2a. if is.atomic(ast), build atomic node by returning ast[1]. Otherwise...
+#   2b. if is.call(ast) and is.name(ast[[1]]), then ast[[1]] is child token of pd
+#     i. standard call will make it the first child token
+#    ii. binary will be in the middle (so easier to search for ast[[1]])
+#   2c. if is.call(ast) and is.call(ast[[1]]), then it is first child of pd
+#
+#   3. Get all child exprs of pd (in order), move one matching ast[[1]] to front
+#
+#   4. You have matched up ast to pd! Recurse
+```
+
+Starting to noodle on this idea because I think it will be useful for the data structures chapter in R4DS
+
+``` R
+# Atomic vectors ----------------------------------------------------------
+
+# Compactly displays type and length
+somethingstr(1:100)
+#> int[100]
+somethingstr(letters)
+#> chr[26]
+
+# Also displays attributes. 
+# Class gets special handling
+somethingstr(factor(letters))
+#> int[26] <factor>
+#> @ levels: chr[26]
+
+# (I imagine this being used once you've taught basic data structures
+# and purrr, so it's useful to see the details, instead the helpful
+# lies that str() tells you.)
+
+somethingstr(Sys.time())
+#> dbl[1] <POSIXct, POSIXt>
+#> @ tzone: chr[1]  
+
+# Lists -------------------------------------------------------------------
+
+# Shows hierarchy
+x <- list(
+  list(
+    1, 
+    2
+  ),
+  list(
+    3,
+    4
+  )
+)
+somethingstr(x)
+#> list[4]
+#> - 1: list[2]
+#>    - 1: dbl[1]
+#>    - 2: dbl[1]
+#> - 2: list[2]
+#>    - 1: dbl[1]
+#>    - 2: dbl[1]
+
+# Very long lists are truncated
+x <- replicate(100, list(runif(5)))
+somethingstr(x)
+
+#> list[100]
+#> - 1: dbl[5]
+#> - 2: dbl[5]
+#> - 3: dbl[5]
+#> - 4: dbl[5]
+#> - 5: dbl[5]
+#> ...
+
+# So are very deep lists
+x <- list()
+for (i in 1:100) x$x <- list(x)
+somethingstr(x)
+
+#> list[1]
+#> 1. list[1]
+#>    1. list[1]
+#>       1. list[1]
+#>          1. ...
+
+# And length and depth interplay in some complicated way. Maybe the way
+# to think about it is that you want to (say) print at most 100 lines.  
+# How should you allocate those lines to best display the structure of
+# the object? I don't think simple cut-offs for length vs. depth will
+# work in general. 
+
+# Think about something() on a data frame containing models etc.
+# Maybe can assume unnamed lists are generally homogeneous?
+
+# Names get special treatment
+somethingstr(mtcars)
+#> list[11] <data.frame>
+#> $ mpg : dbl[32]
+#> $ cyl : dbl[32]
+#> $ disp: dbl[32]
+#> $ hp  : dbl[32]
+#> $ drat: dbl[32]
+#> $ wt  : dbl[32]
+#> $ qsec: dbl[32]
+#> $ vs  : dbl[32]
+#> $ am  : dbl[32]
+#> $ gear: dbl[32]
+#> $ carb: dbl[32]
+#> @ row.names: chr[32]
+
+# Very long names get truncted
+x <- list(this_is_a_very_very_very_very_long_name = 1:10)
+somethingstr(x)
+#> list[1]
+#> $ this_is_a_very_...: int[10]
+
+
+# Environments ----------------------------------------------------------------
+
+# Need someway to control recursion into environments. Probably don't
+# want it on by default because there are too many objects that have 
+# (possibly big) environments attached (e.g. formulas)
+somethingstr(globalenv())
+#> env[2] [R_GlobalEnv]
+
+somethingstr(globalenv(), show_env = 0L)
+#> env[2] [R_GlobalEnv]
+#> $ df: list[1] <data.frame>
+#>       $x: int[100]
+#>       @row.names: int[1]
+#> $ i:  int[10]
+#> @parent.env: env[10] [tools:rstudio]
+
+# show_env = 0L would also show the contents of parent.env.
+
+# Functions ---------------------------------------------------------------
+
+somethingstr(function(x = 1:10, y = x) {})
+#> func[2] 
+#>   $x: `1:10
+#>   $y: `x
+#> * env: env[4] [R_GlobalEnv]
+```
+
+cc @jennybc, @lionel-

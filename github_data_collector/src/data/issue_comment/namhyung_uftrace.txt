@@ -1,0 +1,417 @@
+In Ubuntu 19.04, I compiled a simple binary as follows:
+```
+$ cat /etc/os-release | grep PRETTY_NAME
+PRETTY_NAME="Ubuntu 19.04"
+
+$ gcc -pg -g -o t-abc s-abc.c 
+$ gcc -pg -g -fno-plt -o t-abc-no-plt s-abc.c
+```
+Their tracing result is different and uftrace cannot trace library calls for `-fno-plt` compiled binary.
+```
+$ uftrace -F main t-abc
+# DURATION     TID     FUNCTION
+            [ 32144] | main() {
+            [ 32144] |   a() {
+            [ 32144] |     b() {
+            [ 32144] |       c() {
+   0.538 us [ 32144] |         getpid();
+   1.786 us [ 32144] |       } /* c */
+   2.032 us [ 32144] |     } /* b */
+   2.288 us [ 32144] |   } /* a */
+   2.711 us [ 32144] | } /* main */
+
+$ uftrace -F main t-abc-no-plt 
+# DURATION     TID     FUNCTION
+            [ 32179] | main() {
+            [ 32179] |   a() {
+            [ 32179] |     b() {
+   0.586 us [ 32179] |       c();
+   1.506 us [ 32179] |     } /* b */
+   1.782 us [ 32179] |   } /* a */
+   2.224 us [ 32179] | } /* main */
+```
+It makes `t212_noplt_libcall` failed.
+```diff
+$ ./runtest.py -vdp -O0 212
+    ...
+t212_noplt_libcall: diff result of -pg -O0
+--- expect      2020-01-13 16:39:57.727608520 +0900
++++ result      2020-01-13 16:39:57.727608520 +0900
+@@ -3,5 +3,3 @@
+      b() {
+-       c() {
+-         getpid();
+-       } /* c */
++       c();
+      } /* b */
+
+212 noplt_libcall       : NG
+```
+Here is GCC compiler info.
+```
+$ gcc -v
+Using built-in specs.
+COLLECT_GCC=gcc
+COLLECT_LTO_WRAPPER=/usr/lib/gcc/x86_64-linux-gnu/8/lto-wrapper
+OFFLOAD_TARGET_NAMES=nvptx-none
+OFFLOAD_TARGET_DEFAULT=1
+Target: x86_64-linux-gnu
+Configured with: ../src/configure -v --with-pkgversion='Ubuntu 8.3.0-6ubuntu1' --with-bugurl=file:///usr/share/doc/gcc-8/README.Bugs --enable-languages=c,ada,c++,go,brig,d,fortran,objc,obj-c++ --prefix=/usr --with-gcc-major-version-only --program-suffix=-8 --program-prefix=x86_64-linux-gnu- --enable-shared --enable-linker-build-id --libexecdir=/usr/lib --without-included-gettext --enable-threads=posix --libdir=/usr/lib --enable-nls --enable-bootstrap --enable-clocale=gnu --enable-libstdcxx-debug --enable-libstdcxx-time=yes --with-default-libstdcxx-abi=new --enable-gnu-unique-object --disable-vtable-verify --enable-libmpx --enable-plugin --enable-default-pie --with-system-zlib --with-target-system-zlib --enable-objc-gc=auto --enable-multiarch --disable-werror --with-arch-32=i686 --with-abi=m64 --with-multilib-list=m32,m64,mx32 --enable-multilib --with-tune=generic --enable-offload-targets=nvptx-none --without-cuda-driver --enable-checking=release --build=x86_64-linux-gnu --host=x86_64-linux-gnu --target=x86_64-linux-gnu
+Thread model: posix
+gcc version 8.3.0 (Ubuntu 8.3.0-6ubuntu1)
+```
+This PR contains various script fixes including
+- build: Fix `--without-libpython` for python3
+- script: Show an warning if interpreter is not available
+- tests: Fix script engine tests
+
+Signed-off-by: Honggyu Kim <honggyu.kp@gmail.com>
+This PR mainly fixes the problems when testing i386 under x86_64.
+
+It fixes tests in i386 under x86_64 environment:
+```
+043 full_demangle       : NG NG NG NG NG NG NG NG NG NG
+058 arg_int             : NG NG NG NG NG SK SK SK SK SK
+063 retval              : NG NG NG NG NG SK SK SK SK SK
+065 arg_order           : NG NG NG NG NG SK SK SK SK SK
+083 arg_float           : NG NG NG NG NG SK SK SK SK SK
+084 arg_mixed           : NG NG NG NG NG SK SK SK SK SK
+086 arg_stack           : NG NG NG NG NG SK SK SK SK SK
+087 arg_variadic        : NG NG NG NG NG SK SK SK SK SK
+```
+It fixes tests in arm 32-bit environment:
+```
+048 malloc_impl         : TM TM TM TM TM TM TM TM TM TM
+058 arg_int             : NG NG NG NG NG SK SK SK SK SK
+063 retval              : NG NG NG NG NG SK SK SK SK SK
+065 arg_order           : NG NG NG NG NG SK SK SK SK SK
+119 malloc_hook         : TM TM TM TM TM TM TM TM TM TM
+120 malloc_tsd          : TM TM TM TM TM TM TM TM TM TM
+121 malloc_fork         : TM TM TM TM TM TM TM TM TM TM
+```
+Fixed: #1083
+
+Signed-off-by: Honggyu Kim <honggyu.kp@gmail.com>
+Here is a test program.
+```c
+$ cat float.c
+#include <stdio.h>
+
+float float_add(float a, float b)
+{
+        fprintf(stderr, "a = %f, b = %f\n", a, b);
+        return a + b;
+}
+
+int main(int argc, char *argv[])
+{
+        double a;
+
+        a = float_add(-0.1, 0.2);
+        return a > 0;
+}
+```
+It shows floating point numbers in normal execution.
+```
+$ gcc -pg -g float.c
+
+$ file a.out
+a.out: ELF 32-bit LSB executable, ARM, EABI5 version 1 (SYSV), ...
+
+$ ./a.out
+a = -0.100000, b = 0.200000
+```
+It also shows correct numbers with simple uftrace record execution.
+```
+$ uftrace record --no-libcall --no-event a.out
+a = -0.100000, b = 0.200000
+
+$ uftrace record --no-libcall --no-event --debug-domain uftrace:1 a.out
+uftrace: checking binary a.out
+uftrace: removing uftrace.data.old directory
+uftrace: creating 1 thread(s) for recording
+uftrace: using /home/honggyu/usr/lib/libmcount.so library for tracing
+a = -0.100000, b = 0.200000
+uftrace: child terminated with exit code: 1
+uftrace: reading uftrace.data/task.txt file
+uftrace: flushing /uftrace-3a8039083d891c45-17880-000
+```
+However, the floating point numbers are somehow printed incorrect values if uftrace tries to record an argument.
+```
+$ uftrace record -A float_add@fparg1 --no-libcall --no-event a.out
+a = 0.000000, b = 0.000000
+
+$ uftrace replay
+# DURATION     TID     FUNCTION
+            [ 17914] | main() {
+  47.760 us [ 17914] |   float_add(0.000000);
+  54.740 us [ 17914] | } /* main */
+```
+The result is same with `--auto-args`.
+```
+$ uftrace record -a --no-libcall --no-event a.out
+a = 0.000000, b = 0.000000
+```
+Hey, before talking about the commit details I want to wish you all the joy of a Happy New Year !
+
+This commit is about saving _RFLAGS_ in stack prior to calling _mcount_entry_ and similar functions that could change it. _GDB_ and other tracing/debugging tools save it as well [1].
+
+I only modified these 3 files for tonight:
+
+_arch/x86_64/mcount.S
+arch/x86_64/dynamic.S
+arch/x86_64/fentry.S_
+
+The ones left for _x86_64_ are _xray.S_, _cyg_profile_ and _plthook.S_ 
+@namhyung  Thank you for your review ! I'll update the ones left in parallel with the review.
+
+[1] https://github.com/bminor/binutils-gdb/blob/master/gdb/gdbserver/linux-x86-low.c
+line 1084.
+
+EDIT: I'm not really sure about the need to save the flag for PLT hooks.
+
+
+
+Here is the test result in i386.
+```diff
+$ ./runtest.py 012 -vdp -O0
+    ...
+t012_demangle: diff result of -pg -O0 -m32
+--- expect      2020-01-02 14:44:06.242166144 +0900
++++ result      2020-01-02 14:44:06.242166144 +0900
+@@ -9 +9,2 @@
+  } /* main */
++ __libc_start_main();
+
+012 demangle            : NG
+```
+Here is the test result in ARM 32-bit.
+```diff
+$ ./runtest.py 012 -vdp -O0
+    ...
+t012_demangle: diff result of -pg -O0
+--- expect      2019-11-14 10:49:25.152065578 +0900
++++ result      2019-11-14 10:49:25.152065578 +0900
+@@ -9 +9,2 @@
+  } /* main */
++ <1061c>();
+
+012 demangle            : NG
+```
+There are many argument test failures in i386 arch.
+```
+058 arg_int             : NG NG NG NG NG SK SK SK SK SK
+063 retval              : NG NG NG NG NG SK SK SK SK SK
+065 arg_order           : NG NG NG NG NG SK SK SK SK SK
+083 arg_float           : NG NG NG NG NG SK SK SK SK SK
+084 arg_mixed           : NG NG NG NG NG SK SK SK SK SK
+085 arg_reg             : NG NG NG NG NG SK SK SK SK SK
+086 arg_stack           : NG NG NG NG NG SK SK SK SK SK
+087 arg_variadic        : NG NG NG NG NG SK SK SK SK SK
+```
+The test was done with compiling uftrace as follows:
+```
+$ ARCH=i386 CFLAGS=-m32 LDFLAGS=-m32 ./configure
+$ make
+```
+The `runtest.py` has to be modified to compile target programs in `i386` mode as follows:
+```diff
+diff --git a/tests/runtest.py b/tests/runtest.py
+index 2056395..8a3ab14 100755
+--- a/tests/runtest.py
++++ b/tests/runtest.py
+@@ -30,6 +30,7 @@ class TestBase:
+
+     default_cflags = ['-fno-inline', '-fno-builtin', '-fno-ipa-cp',
+                       '-fno-omit-frame-pointer', '-D_FORTIFY_SOURCE=0']
++    default_cflags.append('-m32')
+
+     def __init__(self, name, result, lang='C', cflags='', ldflags='', sort='task', serial=False):
+         _tmp = tempfile.mkdtemp(prefix='test_%s_' % name)
+```
+Here are the test details.
+```diff
+$ ./runtest.py 058 -vdp -O0
+    ...
+t058_arg_int: diff result of -pg -O0 -m32
+--- expect      2020-01-02 10:10:46.742822529 +0900
++++ result      2020-01-02 10:10:46.742822529 +0900
+@@ -3,3 +3,3 @@
+    int_sub(1, 2);
+-   int_mul(3, 4);
++   int_mul(3, 0);
+    int_div(4, -2);
+
+058 arg_int             : NG
+```
+```diff
+$ ./runtest.py -vdp -O0 063
+    ...
+t063_retval: diff result of -pg -O0 -m32
+--- expect      2020-01-02 10:11:05.546687764 +0900
++++ result      2020-01-02 10:11:05.546687764 +0900
+@@ -3,3 +3,3 @@
+    int_sub(1, 2) = -1;
+-   int_mul(3, 4) = 12;
++   int_mul(3, 0) = 12;
+    int_div(4, -2) = -2;
+
+063 retval              : NG
+```
+```diff
+$ ./runtest.py -vdp -O0 065
+    ...
+t065_arg_order: diff result of -pg -O0 -m32
+--- expect      2020-01-02 10:11:14.898624644 +0900
++++ result      2020-01-02 10:11:14.898624644 +0900
+@@ -3,3 +3,3 @@
+    int_sub(1, 2);
+-   int_mul(0x4, 3);
++   int_mul(0, 3);
+    int_div(4, -2);
+
+065 arg_order           : NG
+```
+```diff
+$ ./runtest.py -vdp -O0 083
+    ...
+t083_arg_float: diff result of -pg -O0 -m32
+--- expect      2020-01-02 10:12:23.914234207 +0900
++++ result      2020-01-02 10:12:23.914234207 +0900
+@@ -3,4 +3,4 @@
+    float_sub(0.100000, 0.200000) = -0.100000;
+-   float_mul(300.000000, 400.000000) = 120000.000000;
+-   float_div(40000000000.000000, -0.020000) = -2000000000000.000000;
++   float_mul(300.000000, 3.792969) = 120000.000000;
++   float_div(40000000000.000000, 19991592893437257463236597020847243264.000000) = -2000000000000.000000;
+  } /* main */
+
+083 arg_float           : NG
+```
+```diff
+$ ./runtest.py -vdp -O0 084
+    ...
+t084_arg_mixed: diff result of -pg -O0 -m32
+--- expect      2020-01-02 10:17:20.157752538 +0900
++++ result      2020-01-02 10:17:20.157752538 +0900
+@@ -1,6 +1,6 @@
+ main() {
+-   mixed_add(-1, 0.200000) = -0.800000;
++   mixed_add(-1, -nan) = -0.800000;
+    mixed_sub(0x400000, 2048) = 0x3ff800;
+-   mixed_mul(-3.000000, 80000000000) = -240000000000;
+-   mixed_div(4, -0.000002) = -2000000.000000;
++   mixed_mul(-3.000000, -4609434218613702656) = -240000000000;
++   mixed_div(4, nan) = -2000000.000000;
+    mixed_str("argument", 0.000000) = "return";
+
+084 arg_mixed           : NG
+```
+```diff
+$ ./runtest.py -vdp -O0 085
+    ...
+t085_arg_reg: diff result of -pg -O0 -m32
+--- expect      2020-01-02 10:17:47.381783444 +0900
++++ result      2020-01-02 10:17:47.381783444 +0900
+@@ -1,7 +1,7 @@
+ main() {
+-   mixed_add(-1, 0.200000);
+-   mixed_sub(0x400000, 2048);
+-   mixed_mul(-3.000000, 80000000000);
+-   mixed_div(4, -0.000002);
+-   mixed_str("argument", 0.000000);
++   mixed_add();
++   mixed_sub();
++   mixed_mul(0.000000, -4609434218613702656);
++   mixed_div(4, nan);
++   mixed_str();
+  } /* main */
+
+085 arg_reg             : NG
+```
+```diff
+$ ./runtest.py -vdp -O0 086
+    ...
+t086_arg_stack: diff result of -pg -O0 -m32
+--- expect      2020-01-02 10:18:22.273837551 +0900
++++ result      2020-01-02 10:18:22.273837551 +0900
+@@ -12,3 +12,3 @@
+    } /* foo */
+-   many(8, 13, 21, 34, 55, 89, 144);
++   many(12, 1, 1, 2, 3, 5, 8);
+    pass() {
+
+086 arg_stack           : NG
+```
+```diff
+$ ./runtest.py -vdp -O0 087
+    ...
+t087_arg_variadic: diff result of -pg -O0 -m32
+--- expect      2020-01-02 10:18:48.517888381 +0900
++++ result      2020-01-02 10:18:48.517888381 +0900
+@@ -1,3 +1,3 @@
+ main() {
+-   variadic("print %c %s %d %ld %lu %lld %f", 'a', "hello", 100, 1234, 5678, 9876543210, 3.141592) {
++   variadic("print %c %s %d %ld %lu %lld %f", 'a', "hello", 100, 1234, 5678, 9876543210, 0.000000) {
+      vsnprintf(256, "print %c %s %d %ld %lu %lld %f");
+
+087 arg_variadic        : NG
+```
+It might be failed to find a correct python3 version used for scripting.
+It's because python3 version is found by the python3 binary, but not by
+finding python3 library actually used.
+
+The current implementation finds python3 version as follows:
+```
+  $ python3 -c 'import sysconfig; print(sysconfig.get_config_vars()["LDVERSION"])'
+  3.7m
+```
+However, python3-config finds different version.
+
+This patch is to find the correct version by parsing the output of
+'python3-config --libs'.
+```
+  $ python3-config --libs | sed 's/-l\(python[0-9\.m]\+\) .*/\1/g'
+  python3.5m
+
+  $ python3.7-config --libs | sed 's/-l\(python[0-9\.m]\+\) .*/\1/g'
+  python3.7m
+```
+This might be a corner case fix but to support many more different
+environments.
+
+Signed-off-by: Honggyu Kim <honggyu.kp@gmail.com>
+This patch is to fix the following crash.
+```
+  $ uftrace script -S scripts/count.py --record t-abc
+  WARN: libpython3.7m.so cannot be loaded!
+
+  Segmentation fault (core dumped)
+```
+Signed-off-by: Honggyu Kim <honggyu.kp@gmail.com>
+The following example records library calls of `uftrace` itself.
+```
+$ uftrace record --force ./uftrace --no-pager t-abc
+# DURATION     TID     FUNCTION
+   1.044 us [ 11841] | __monstartup();
+   0.940 us [ 11841] | __cxa_atexit();
+            [ 11841] | main() {
+            [ 11841] |   a() {
+            [ 11841] |     b() {
+            [ 11841] |       c() {
+   0.764 us [ 11841] |         getpid();
+   1.750 us [ 11841] |       } /* c */
+   2.267 us [ 11841] |     } /* b */
+   2.650 us [ 11841] |   } /* a */
+   3.096 us [ 11841] | } /* main *
+```
+The following example only wants to record arguments of `uftrace` itself, not the arguments of target `t-abc` binary. But it fails as follows:
+```
+$ uftrace record --force -a ./uftrace --no-pager t-abc
+# DURATION     TID     FUNCTION
+   1.557 us [ 11870] | __monstartup();
+   0.826 us [ 11870] | __cxa_atexit();
+fstack: /home/honggyu/work/uftrace/utils/fstack.c:1424:read_task_ustack
+ ERROR: record missing argument info for getpid
+```
+It's because `UFTRACE_*` related environmental variables are passed unexpectly so we need to reset all the environmental variables when new `uftrace` is started.

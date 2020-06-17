@@ -1,0 +1,103 @@
+Is there any technical reason for `gaol` to provide its own `Command` abstraction over using what's available in `std::process::Command`? The biggest functional difference I noticed is that the `gaol` provided `Command` uses [execve()](https://linux.die.net/man/2/execve) to specify the environment on the spawned process while `std::process::Command` uses [execvp()](https://linux.die.net/man/3/execvp). Despite this difference, however, `std::process::Command` also allows for the command environment to be set with the `env()` and `envs()` methods. Is there any particular barrier preventing `gaol` from switching wholesale to the `std` implementation?
+
+I ask because there are some useful crates, e.g. [tokio-process](https://github.com/alexcrichton/tokio-process), which directly accept or implement extra traits on top of `std::process::Command`, and it would be quite nice to use `gaol` with these libraries.
+Hello,
+
+i am wondering if it is possible to isolate an external command using gaol.
+
+i tryed something like this:
+
+```rust
+fn handle_child()
+{
+    let cmd = env::args().skip(2).next().expect("cmd ...");
+    let args = env::args().skip(3).map(|v| v.to_string()).collect::<Vec<_>>();
+
+    println!("??? {}, {:?}", &cmd, &args);
+
+    ChildSandbox::new( profile()).activate().unwrap();
+
+    ::std::process::Command::new(&cmd)
+        .args(&args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .spawn()
+        .expect("command failed")
+    ;
+}
+
+fn main() {
+
+    if env::args().skip(1).next().is_some() && env::args().skip(1).next().expect("...") == "child" {
+        return handle_child();
+    }
+
+    println!("???");
+
+    let sandbox = Sandbox::new( profile());
+
+    let args = env::args().skip(2).map(|v| v.to_string()).collect::<Vec<_>>();
+
+    let res = sandbox.start(
+        Command::me().unwrap()
+            .arg("child")
+            .arg("/usr/bin/true")
+           // .args(&args)
+    ).unwrap().wait();
+
+}
+```
+i don't want to give the child the ability to run `::std::process::Command::new(&cmd)`.
+
+thanks for any kind of help :)
+Per https://www.reddit.com/r/rust/comments/8mpzr6/sandboxing_rust_on_osx/ we may need to go looking for another mechanism if we want to maintain sandboxing on macOS.
+If one takes a relative path, the path protection does not work.
+Using the given example: 
+Just change the file access to:
+` match File::open(&PathBuf::from("../../../../../bin/sh")) { ... } ` 
+will show this behavior.
+After spawning a jailed subprocess, its current working directory is unchanged, so it can actually be outside the subprocess' sandbox which I believe means it can access files outside the sandbox. This is bad.
+i'm trying to use gaol to sandbox a fuzzer for [ion](github.com/redox-os/ion).
+
+i'm new to sandboxing and fuzzing, so bear with me.
+
+anyway, here's the full stacktrace: [pastebin](https://pastebin.com/7gcJebt0)
+
+the fun parts are:
+
+`'main' panicked at 'assertion failed: unshare(CLONE_NEWUSER | CLONE_NEWPID) == 0'`
+
+and
+
+`'main' panicked at 'assertion failed: libc::read(pipe_fds[0], &mut grandchild_pid as *mut i32 as *mut c_void,
+           mem::size_of::<pid_t>() as size_t) ==
+    mem::size_of::<pid_t>() as ssize_t'`
+
+i'm a little hazy on what a namespace is supposed to be in this context. i've seen other threads that say that i need a kernel compiled with certain flags. i've seen threads from 2016 that reference this same stacktrace but with no solution. 
+
+the crash happens when i call sandbox.start(command). i'm unable to match the result. it just fails the assertions and closes.
+
+my kernel:
+Linux dirt 4.9.0-4-amd64 #1 SMP Debian 4.9.51-1 (2017-09-28) x86_64 GNU/Linux
+
+i've also testing this on arch linux with the latest kernel. i can grab that too if it'll help, but i'm away from that machine.
+
+i can't reproduce the error on my macbook however:
+Darwin mymacbook 15.6.0 Darwin Kernel Version 15.6.0: Sun Jun  4 21:43:07 PDT 2017; root:xnu-3248.70.3~1/RELEASE_X86_64 x86_64
+
+i would just run it on my macbook, but afl-rs has an issue with mac that hasn't been resolved.
+
+i may be stuck in an x-y problem. any help is appreciated.
+glibc 2.26 switches from using open(2) to openat(2). And now everyone on earth with a seccomp filter gets to update it :)
+I have two needs not currently supported by `gaol`:
+* I want to run code in the child process after forking but before the sandbox is in place, e.g. to run `prctl(PR_SET_PDEATHSIG)` and to set up stdio redirection. 
+* I want to activate the sandbox before exec because I don't control the execed binary. I only need this to work on Linux.
+
+I think these should be supported by providing hooks similar to `std::os::unix::process::CommandExt::before_exec`. I've named them `before_sandbox` and `before_exec`. On Linux a `before_exec` hook can call `ChildSandbox::activate` and do extra setup work after entering the sandbox, if desired (e.g. configuring the new namespaces).
+
+To get this to work I had to fix a number of bugs and other issues. In particular, to test that `ChildSandbox::activate` works in `before_exec` I had to make it possible to start a glibc-based process in the Linux sandbox, which meant adding `Operation::CreateNewProcesses` and whitelisting some more system calls. I also had to make substantial fixes the error handling in Linux's `start()`.
+
+The Mac support doesn't propagate errors from `before_sandbox`/`before_exec` because I didn't want to try to write that code without being able to test it.
+FYI, there is some crates implementing AppContainer: [appjaillauncher-rs](https://github.com/trailofbits/appjaillauncher-rs) and [flying-sandbox-monster](https://github.com/trailofbits/flying-sandbox-monster)
+
+cc @yying

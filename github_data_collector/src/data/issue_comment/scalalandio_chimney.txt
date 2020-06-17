@@ -1,0 +1,134 @@
+This PR reduces object allocations in Transformer/Patcher DSLs in methods that refers only to type-level info. In such cases, instead of new object allocation, we can use `this.asInstanceOf[...]` and lift to correct type.
+
+Proposed by @MateuszKubuszok
+This PR brings flag `.ignoreNoneInPatch` for patching, requested in #123.
+This PR introduces support for patches with redundant fields:
+
+```scala
+case class Foo(a: A, b: B)
+case class Patch(b: B, c: C)
+
+// so far it led to compile error: no accessor named c in source type Foo
+Foo(...).patchUsing(Bar(...)) 
+
+// now we have an option to ignore redundant fields in patch
+Foo(...).using(Bar(...)).ignoreRedundantPatcherFields.patch
+// it patches only value of b: B of Foo
+```
+
+It addresses #106 and partially #98 
+This PR provides new way to define transformer instances.
+
+### Motivation
+So far it was only possible to implement `Transformer[A, B]` type class by hand. A common use case for such definitions was to use Chimney's DSL to derive such transformation with less boilerplate. But it has few drawbacks:
+- assigning an instance immediately to implicit val/dev (which is common practice) may lead to stack overflows (at runtime) or `wrong forward reference` errors (at compile time), as reported in #105 
+- a programmer was forced to work with additional variable which usually was not really important from the point of transformer definition, like:
+
+```scala
+implicit val aToBtransformer: Transformer[A, B] = (aValue: A) => {
+  aValue.into[B]
+    .withFieldConst(...)
+    .withFieldRenamed(...)
+    // other modifiers
+    .transform
+}
+```
+In such examples `aValue` is not really used in other way than to begin work with Chimney DSL. Indeed it's a little additional boilerplate.
+
+### Proposal
+
+This PR intoruces new way of defining implicit instances:
+
+```scala
+implicit val aToBtransformer: Transformer[A, B] =
+  Transformer.define[A, B]
+    .withFieldConst(...)
+    .withFieldRenamed(...)
+    // other modifiers
+    .buildTransformer
+}
+```
+
+Note that:
+- all DSL modifiers like (`withFieldConst`, `withFieldComputed`, etc.) are supported in definition DSL; in fact, code was reorganized in such way that their actual implementation is shared between those two DSLs
+- with using `Transformer.define` we are able to specify definition scope when doing type class derivation which allows us to avoid looking up for local implicit instance and fix #105 in more compatible way
+- few tests were added to verify that recursive data structures are supported (including mutually recursive data types) as long as their instances are derived and put into `implicit def`
+- this PR also addresses issue with `Transformer.derive[A, B]`, as [commented here](https://github.com/scalalandio/chimney/issues/105#issuecomment-568081277)
+
+It doesn't automatically fix problems with old style definitions (so manual intervention will be required in order to fix the code), but at least we will have one blessed way of defining transformers which I believe solve 99% of use cases in elegant way.
+```
+object Test {
+
+  import io.scalaland.chimney.dsl._
+
+  case class Boo(i: Int, s: String) {
+    def d: Double = 5
+  }
+
+  case class Foo(i: Int, s: String, d: Double)
+
+  Boo(1, "").into[Foo].transform
+
+}
+```
+
+This compiles on version 0.3.5, but doesn't feel like it should. Should we only consider case class constructor fields for automatic field mapping?
+Derivation fails when the target contains a mixed in trait:
+
+```scala
+import io.scalaland.chimney.dsl._
+
+trait B {
+  val b : Int
+}
+
+case class A(a : Boolean)
+
+A(true)
+  .into[A with B]
+  .withFieldConst(_.b, 1)
+  .transform
+```
+
+results in `Chimney can't derive transformation ...`
+Hi,
+First of all, thanks for all the great work!
+
+Recently I came across use case that I believe is not covered by chimney.
+
+I have
+```case class A(int: Int, stringOpt: Option[String], doesntChange: Boolean)```
+and then I'd like to do a `PUT`-like update with a case class
+```case class PatchA(int: Int, stringOpt: Option[String])```
+which is a subset of `A`.
+
+Using `patchWith` would result in checking if `stringOpt` is defined in `PatchA` and appling change only if it's `Some`. However, I'd expect a direct assignment, so if `stringOpt` in `PatchA` is None, `stringOpt` in patched version of `A` should be `None` as well.
+
+Use case: it's very useful if you're working on some REST service and you support both PATCH (partial update) and PUT.
+This PR adds chimney-validated module with VTransformer, which can use unsafe transformations like Option unwrapping (can be usefull with proto3 generated case classes (#118)), int from string parsing etc, but unlike  enableUnsafeOption all errors are aggregated to chain and contains full path to failed fields. In my code I use cats.data.Validated, but it can be rewritten by own error-chaining semigroup implementations.
+
+Also. now it's limited by 22 fields in single case class.
+
+I'd be thankful for review and feedback
+It's ok to patch a subset of fields on the top level, but not on deeper levels.
+
+```scala
+  import io.scalaland.chimney.dsl._
+  case class Foo(x: Int, y: String)
+  case class FooPatch(x: Int)
+  case class Bar(foo: Foo, z: Long)
+  case class BarPatch(foo: FooPatch)
+  val foo = Foo(1, "2")
+  val bar = Bar(foo, 3)
+  val fooPatch = FooPatch(4)
+  val barPatch = BarPatch(fooPatch)
+  foo.patchWith(fooPatch) // ok
+  bar.patchWith(barPatch) // y: java.lang.String - no accessor named y in source type FooPatch
+```
+
+Awesome library btw :+1: 
+Would it be possible to have a slightly different variant of `TransformerInto.enableUnsafeOption`, which instead of throwing exceptions would return a value, like `cats.data.Validated` (or something analogous, like `Either`).
+
+Our use case is that we would like to convert ScalaPB generated case classes (where everything is `Option`al) to our domain case classes where some fields are mandatory. It would help us a lot, if the convertor method returned just a plain value (Validated, Either,...) instead of throwing and us having to catch the exceptions.
+
+It would behave similar to [`henkan`](https://github.com/kailuowang/henkan#transform-between-case-classes-with-optional-field) which also has `validate` method to return `cats.data.Validated`.

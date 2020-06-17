@@ -1,0 +1,168 @@
+Posted this in #928, but referencing here for visibility. Minimal reproducible example and details are here: https://github.com/thrust/thrust/issues/928#issuecomment-573793092
+
+This issue is also present in the reduction operation in CUB v1.8.0.
+Hi,
+
+First of all, thank you for developing and maintaining this amazing library. It makes CUDA programming drastically easier and fun.
+
+Today I found a problem. When I defined a function that returns `thrust::future` like the following,
+
+```cpp
+#include <thrust/future.h>
+#include <iostream>
+
+// the definition is in a .cu file and will be linked later
+thrust::system::cuda::unique_eager_future<int> do_something();
+
+int main()
+{
+    auto f = do_something();
+    std::cout << f.get() << std::endl;
+    return 0;
+}
+```
+
+and compiled with gcc-8.2.0 (nvcc also shows the same result), the compilation fails with an error message like this.
+
+```console
+$ g++-8 -std=c++11 -O2 -c main.cpp -I/usr/local/cuda/include/
+In file included from /usr/local/cuda/include/thrust/system/cuda/detail/future.inl:26,
+                 from /usr/local/cuda/include/thrust/system/cuda/future.h:71,
+                 from /usr/local/cuda/include/thrust/future.h:55,
+                 from main.cpp:1:
+/usr/local/cuda/include/thrust/detail/event_error.h:110:19: error: explicit specialization of ‘template<class T> struct thrust::system::is_error_code_enum’ outside its namespace must use a nested-name-specifier [-fpermissive]
+ template<> struct is_error_code_enum<event_errc> : true_type {};
+                   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+```
+
+I also found that this error can be avoided by applying the patch I'm now sending.
+
+I have tested it only with thrust 1.9.4 that is installed with CUDA 10.1 because it is the version installed in my environment. If the same problem has already been reported and solved, please just close this.
+
+Could you please check it?
+Judging by the name of the functor `predicate_to_integral` and the explicit construction of `IntegralType` in the function, the return type should be `IntegralType` instead of `bool`.
+Obviously, the primary goal of the examples is to show how one uses the library.
+
+However, they are also adding to the overall C++ knowledge: people using `thrust` are very likely to also learn the standard library algorithms, and take over the style presented (if not even copy-paste-adapt the examples).
+
+So there would be value in making the example code exemplary, 'modern' C++.
+
+Some instances of example code that could  be modernized:
+
+```
+    thrust::device_vector<int> stencil(8);
+    stencil[0] = 0;
+    stencil[1] = 1;
+...
+```
+could make use of `std::initializer_list<int>` to direct initialize the vector.
+
+```
+std::cout << "found " << (indices_end - indices.begin()) ...
+```
+Should really use `std::distance(begin(indices), indices_end)`
+
+```
+// reduce a pair of bounding boxes (a,b) to a bounding box containing a and b
+struct bbox_reduction : public thrust::binary_function<bbox,bbox,bbox>
+```
+Is a poor choice of name: it tells you what function it's going to be used in (reduce), not what it does (bounding box of bounding boxes); it may be replaced by a lambda expression.
+
+...
+
+I think it would be a good idea to set up an 'example-wide' code review and try to exemplify that code.
+
+(cf. also the very limited pull request #753)
+```
+    thrust::device_vector<int> aa;
+    int* final_indices;
+```
+
+Any way copy a aa to a cuda memory address?
+Please, can you tell me if is there a way to visualize which specific assertions in an unit test failed ?
+
+Both `uninitialized_fill` and `uninitialized_copy` (as well as their `*_n` versions) use the copy constructor to copy element(s) to the provided range of memory. While the basic implementation is rather straightforward and compliant, thrust seems to use an optimization for certain types/classes. In particular, it tries to detect whether the underlying type `T` is trivially copy constructible and then calls the regular `fill` and `copy` algorithms (same for `*_n` versions). However, the latter functions use the copy assignment operator to copy the element(s) which may lead to compilation failures in case a class has a (trivial) copy constructor but no copy assignment operator. Consider this example:
+```
+using T = thrust::pair<const int, float>;
+T x(10, 2.0f);
+thrust::device_vector<T> d_v(1000);
+thrust::uninitialized_fill(d_v.begin(), d_v.end(), x); // May fail to compile
+```
+To be more precise, the optimization uses the type trait `thrust::detail::has_trivial_copy_constructor` which is incorrect in above case as `T` obviously has a trivial copy constructor but no copy assignment operator, so the executed `fill` operation will fail to compile. Even worse, this error only triggers if the OpenMP (and maybe also TBB) backend is used because the implementation is compiler-dependent, i.e. contains additional checks for GCC, Clang, and MSVC. For the (default) CUDA backend and the nvcc compiler, the error does not occur.
+
+At first glance, the solution would be to use `thrust::detail::has_trivial_assign` which is also provided. However, this also does not work for the above example using the OpenMP (and TBB) backend (CUDA backend still not affected):
+```
+using T = thrust::pair<const int, float>;
+
+// true, does not trigger -> false positive
+static_assert(thrust::detail::has_trivial_assign<T>()(), "C++98 thrust implementation");
+
+// false, triggers as expected
+static_assert(std::is_trivially_copy_assignable<T>::value, "C++11 standard implementation");
+```
+The reason for this lies in the fact that it uses the compiler-specific type trait `__has_trivial_assign` which is used only for GCC, Clang and MSVC and has a too permissive behavior causing false positives (see e.g. https://gcc.gnu.org/onlinedocs/gcc-4.7.4/gcc/Type-Traits.html).
+
+Therefore, there as several possibilities to fix this issue which I would like to discuss first before going ahead and providing a fix:
+
+1. Remove the optimization. This is the easiest and most reliable solution to make the implementation compliant for all use cases and also works for C++98. The downside of this solution is that there might be performance regressions. I have not measured the performance difference between the uninitialized and the regular algorithms. Note that `thrust::detail::has_trivial_assign` still needs to be fixed to avoid false positives (see 2.).
+
+2. Use `thrust::detail::has_trivial_assign` and remove the unreliable and compiler-dependent `__has_trivial_assign` expression (which makes it equal to `thrust::detail::is_pod` and the version used for the CUDA backend). This keeps the optimization at least for POD types and stills works as expected. As for 1. the performance may degrade.
+
+3. Use 2. and conditionally define `thrust::detail::has_trivial_assign` to be equivalent to (i.e. make use of) `std::is_trivially_copy_assignable<T>` if C++11 or a higher standard is detected. This is probably the fastest solution although there might be still performance regressions (however, in C++98 only).
+
+Solution 2 is probably a good compromise if the optimization should be kept. The last solution also takes advantage of the more recent C++11 standard (which most users probably already use).
+
+As a final remark: Although this example may look like an uninteresting/artificial corner case, there are real-world uses cases for this. An example is the stdgpu library (https://github.com/stotko/stdgpu) and its `stdgpu::unordered_map` container which uses `thrust::pair<const Key, T>`. To circumvent this issue, it currently implements a workaround which is equivalent to solution 1 (see https://github.com/stotko/stdgpu/pull/26).
+Hi all,
+
+In https://github.com/thrust/thrust/blob/324243f6bb70687aeaeb2419193a335648c5869d/thrust/detail/type_traits.h#L177
+
+The trait `has_trivial_destructor` is implemented as `is_pod`.  But in c++11 there's dedicated function for it called `std::is_trivially_destructible`: https://en.cppreference.com/w/cpp/types/is_destructible .  Being POD is a stricter requirement than being trivially destructible.
+
+In my case I expect `thrust::detail::destroy_range` as a no-op when input type is trivially destructible but with a user defined constructor.  This way I can have a library (XGBoost) compiled with CUDA and uses `thrust::device_vector`, but run on CPU without error as long as I don't call any cuda function in the code path.  But with thrust shipped with CUDA 10.1 I got the following error in `device_vector`'s destructor:
+```
+terminate called after throwing an instance of 'thrust::system::system_error'
+  what():  for_each: failed to synchronize: cudaErrorNoDevice: no CUDA-capable device is detected
+Aborted (core dumped)
+```
+
+It maybe worth mentioning that data size is 0.
+`std::complex` guarantees array-oriented access behavior:
+
+> For any object `z` of type `complex<T>`, `reinterpret_cast<T(&)[2]>(z)[0]` is the real part of `z` and `reinterpret_cast<T(&)[2]>(z)[1]` is the imaginary part of `z`. For any pointer to an element of an array of `complex<T>` named `p` and any valid array index `i`, `reinterpret_cast<T*>(p)[2*i]` is the real part of the complex number `p[i]`, and `reinterpret_cast<T*>(p)[2*i + 1]` is the imaginary part of the complex number `p[i]`. The intent of this requirement is to preserve binary compatibility between the C++ library complex number types and the C language complex number types (and arrays thereof), which have an identical object representation requirement.
+
+See: https://en.cppreference.com/w/cpp/numeric/complex
+
+Does thrust provide such behavior? This would allow casting between `std::complex` and `thrust::complex` at zero cost using `reinterpret_cast`.
+
+Currently the casting between `std::complex` and `thrust::complex` is host-only:
+```C++
+__host__ complex (const std::complex< T > &z)
+__host__  operator std::complex< T > () const
+```
+Trying to compile the following example:
+
+```C++
+#include <thrust/device_vector.h>
+
+int main(void)
+{
+    thrust::device_vector<float> A(1);
+    return 0;
+}
+```
+
+with Clang 8 or Clang 10 yields the following error:
+
+```
+/usr/local/cuda-10.0/include/thrust/system/cuda/detail/core/agent_launcher.h:557:11: error: use of undeclared identifier 'va_printf'
+
+/usr/local/cuda-10.0/include/thrust/system/cuda/detail/cub/device/dispatch/../../util_debug.cuh:134:42: note: expanded from macro '_CubLog'
+            #define _CubLog(format, ...) va_printf("[block (%d,%d,%d), thread (%d,%d,%d)]: " format, __VA_ARGS__);
+
+...
+```
+
+Compiling with nvcc works.
+
+Checking the code after pre-processing shows that the `va_printf()` function indeed lives under `thrust::cuda_cub::cub` while in `agent_launcher.h` it is called from within `thrust::cuda_cub::core`.

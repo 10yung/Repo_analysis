@@ -1,0 +1,97 @@
+Hello again
+We're using your work around for getting the assets for the S3 file, but now we're encountering `Stack level too deep` errors when running certain jobs.  Is there a way to keep the gem from running in our jobs layer, but keep it running in our rails layer? I'm not seeing a config option for that, but I may be missing it.  
+This is ironically the opposite as the problem we were discussing last week ... load time coverage is being reported as runtime ...
+
+The readme mentions that `COVERBAND_DISABLE_AUTO_START ` can be used to prevent `require 'coverband'` from automatically starting coverage. This is our use-case - we want to use a feature flag to _enable_ coverband.
+
+1. In the Gemfile, I have `require 'coverband'`
+2. Start rails console with `COVERBAND_DISABLE_AUTO_START=true`
+3. Inside `config/intitializers/coverband.rb`, call `Coverband.start`
+4. Observe on the web interface that all coverage is being reported as runtime
+
+
+### Before
+
+![image](https://user-images.githubusercontent.com/96786/68353642-375d0380-00d8-11ea-94bf-faadccc51a70.png)
+
+```
+runs benchmarks on reporting large sets of files to redis
+Warming up --------------------------------------
+   store_reports_all     1.000  i/100ms
+Calculating -------------------------------------
+   store_reports_all      3.192  (± 0.0%) i/s -     48.000  in  15.146428s
+Warming up --------------------------------------
+store_reports_subset     9.000  i/100ms
+Calculating -------------------------------------
+store_reports_subset     95.632  (± 9.4%) i/s -      1.899k in  20.066744
+```
+
+### After
+
+![image](https://user-images.githubusercontent.com/96786/68353800-a2a6d580-00d8-11ea-8236-697854e2c791.png)
+
+```
+Warming up --------------------------------------
+   store_reports_all     1.000  i/100ms
+Calculating -------------------------------------
+   store_reports_all      3.564  (± 0.0%) i/s -     54.000  in  15.242361s
+Warming up --------------------------------------
+store_reports_subset    10.000  i/100ms
+Calculating -------------------------------------
+store_reports_subset    102.395  (± 9.8%) i/s -      2.030k in  20.031830s
+```
+
+Using msg_pack gives around a 6.8% speed increase along with a moderate decrease in memory usage.  CPU utilization does go up but that seems to correlate to more commands per second.
+```
+Warning: coverage data from Coverage [49] exceeds line count in /Users/karlbaum/workspace/foo/app/workers/bar_worker.rb [45]
+```
+When not tracking gems, coverband should use the gem paths to ignore any non-standard gem paths that happen to be located within the project directory.
+
+See #351 for more context.
+
+
+We have one particular controller file that is not showing up in our coverband reports and we're trying to figure out why.
+
+I've looked at this, but it doesn't offer any clues:
+```irb
+> Coverband.configuration.ignore
+=> [".erb$", ".slim$", "/tmp", "vendor/ruby-*"]
+```
+
+The controller in question is `app/controllers/users/registrations_controller.rb` and coverage data for it IS generated locally, but not in production. And we know that it's used in production and handling traffic.
+
+We _also_ have a file at `app/controllers/registrations_controller.rb`. (Yeah, I know, don't ask...) Is it possible that there's a name collision of some sort?
+
+Any suggestions for how to debug this since it's only happening in prod?
+
+In deployments with numerous ruby processes, coverband may be reporting to redis from multiple projects at the same time. When the HashRedisStore is used this may cause contention on the redis instance since it is single threaded. Perhaps each coverband ruby instance should vary on reporting interval by a random number of seconds?
+
+Might also be able to leverage a redis incr so that the reporting interval is not so random for each process.
+We're trying to use a custom config to set the `store` to a different redis URL, but coverband is picking up `ENV['REDIS_URL']` instead.
+
+It seems like coverband goes for the ENV var when it's first loaded, which seems to happen _before_ our config file is fired. And then it seems like calling `config.store = ...` has no effect.
+
+Our config looks like this:
+
+```
+coverband_redis_url = ENV.fetch(ENV.fetch('COVERBAND_REDIS_PROVIDER'))
+Coverband.configure do |config|
+  config.store = Coverband::Adapters::RedisStore.new(Redis.new(url: coverband_redis_url))
+end
+```
+Hey! Wanted to follow up. We fixed [our issue](https://github.com/danmayer/coverband/issues/312) from a while ago. We also added some metrics to determine the impact of Coverband. I wanted to bring up our findings as they seem significantly worse than the [blog post benchmarks](https://www.mayerdan.com/ruby/2018/10/03/coverband-3). I know that post is a year old, (exactly actually), and Coverband is on v4 now, but it seems to be the latest benchmark figures, so it's what I was hoping to see.
+
+What we found was that the 50th percentile for "No Coverband" vs. "Coverband" is about what the blogpost mentions, but the tail latency is quite sizeable. As you go up in the percentiles of each, you see progressively worse relative performance. See below...
+
+![image](https://user-images.githubusercontent.com/2524396/66156255-2bac8780-e5d6-11e9-9efa-b8b9cef9642e.png)
+
+To help you parse that... the "group" is on the right. Notice, it's 3 pairs of "coverband:false", and "coverband: true". The first pair represent false/true of 50th percentile. The next pair is false/true of 75th percentile, and finally 99th percentile. 
+
+The numbers are total request time in ms, for all requests coming through the middleware, and we log it in a request-end middleware. These stats were gleaned over a 4-hour period with 5 min rollup on Datadog. That's about 500 req/min during the 4 hr period hitting Coverband, and far far more hitting as non-coverband. The choosing of Coverband processes is totally random.
+
+Due to the tail latency, we're hesitant to roll out Coverband beyond our very very small percentage of processes that we currently have. We have no custom configuration on the coverband, save for setting the background sleep time to be 240s instead of 30. We also have no special anything on Coverband. We removed all that after the previous discussion, and went with a `require: false` + use a random number threshold to gate doing the `require` inside `application.rb` as our way of "turning on" Coverband. 
+
+Curious what your thoughts are. Is this expected? Any way to decrease the tail latency?
+
+PS: It would be cool if you had a built in mechanism for doing process or thread based activation thresholds. Eg. roll out to 0.5% of your processes, or threads. 
+

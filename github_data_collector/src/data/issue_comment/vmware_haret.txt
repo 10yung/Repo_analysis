@@ -1,0 +1,75 @@
+I'm not sure if this is a big deal or not, but clippy is reporting that a number of variants have large size differences, which can result in lots of wasted space, or excessive memcpys.
+
+```
+warning: large size difference between variants
+  --> src/admin/messages.rs:13:5
+   |
+13 |     Rpy(AdminRpy)
+   |     ^^^^^^^^^^^^^
+   |
+   = note: #[warn(large_enum_variant)] on by default
+   = help: for further information visit https://github.com/Manishearth/rust-clippy/wiki#large_enum_variant
+help: consider boxing the large fields to reduce the total size of the enum
+   |     Rpy(Box<AdminRpy>)
+
+warning: large size difference between variants
+  --> src/admin/messages.rs:36:5
+   |
+36 |     ReplicaState(VrState),
+   |     ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://github.com/Manishearth/rust-clippy/wiki#large_enum_variant
+help: consider boxing the large fields to reduce the total size of the enum
+   |     ReplicaState(Box<VrState>),
+
+warning: large size difference between variants
+  --> src/vr/vr_fsm.rs:82:5
+   |
+82 |     Recovery(Recovery),
+   |     ^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://github.com/Manishearth/rust-clippy/wiki#large_enum_variant
+help: consider boxing the large fields to reduce the total size of the enum
+   |     Recovery(Box<Recovery>),
+
+warning: large size difference between variants
+  --> src/msg.rs:15:5
+   |
+15 |     AdminRpy(AdminRpy),
+   |     ^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://github.com/Manishearth/rust-clippy/wiki#large_enum_variant
+help: consider boxing the large fields to reduce the total size of the enum
+   |     AdminRpy(Box<AdminRpy>),
+```
+
+Are there any downsides on introducing boxes in these structures? This ended up being a big win for the compiler's AST.
+Right now the log is only GC'd during commits when the `global_min_accept` and `commit_num` align. The other opportunity to do this is when `global_min_accept` is incremented to reach the` commit_num`. This occurs when a node has been down and then recovers. If operations were committed while this node was down they won't be garbage collected because they don't exist on all nodes. When the down node recovers those commits will be reflected before the primary receives the `prepareOk` messages and sends the updated `global_min_accept`. It is now possible to garbage collect, although garbage collection doesn't happen until the next commit. We can optimize this to free memory earlier by doing the garbage collection when the `global_min_accept` count changes also.
+
+This isn't crucial right now since reads and writes are in the log and commits are frequent. However if writes are few and far between and reads don't cause commits (as is planned) then this will become a necessary optimization.
+The cli command `metrics <Pid>` causes the admin server to crash: `ajs@shelbs:~/haret$ thread '<unnamed>' panicked at 'internal error: entered unreachable code', haret/src/admin/connection_handler.rs:93`
+
+Oddly enough this only brings down that thread. The rest of the system, including clients continues to work. That seems to be an error in the thread join code that also could use fixing.
+This root consensus group is used for administrative commands that need to be consistent across the cluster. 
+
+Things it's used for are:
+ * Creating and Deleting namespaces
+ * Global Configuration (such as changing the idle timeouts of replicas)
+* Bulk key loading
+* Crash/Recovery
+
+Instead of running each operation in quickcheck serially and then sending all the VR messages corresponding to that operation, allow running multiple operations in parallel and interleaving the VR messages until a desired state is reached or an error or timeout occurs. 
+
+Right now, when an [Op::ViewChange](https://github.com/vmware/haret/blob/245fc99fa7e6c069d8cdf1f68c609e76fdbd210a/tests/static_membership_qc.rs#L75) is run it results in a `Tick` message being send to a backup node to trigger a view change. It then plays all resulting VR messages: `StartViewChange`, `DoViewChange`, and `StartView` until there are no more messages left to send. What I'd like to do is be able to run multiple ops and interleave these view change messages with recovery messages. If a view change is going on a recovery cannot successfully complete and must retry. When the view change then completes, retry to recover and ensure it does or the test times out and fails, or some invariant is violated. This should lead to more interesting histories.
+
+The goal is not to do this per operation but to allow writing tests to run operations in parallel and interleave the resulting VR messages. Postconditions can be waited on to result in retries where necessary to bring the system back to a healthy state. Note that it would be handy to also allow dropping messages and simulating partitions during these tests.
+
+The key challenge is how to enforce the determinism of VR msg interleavings so rerunning the same test results in the same order of messages being sent from and arriving at each node. Since all replicas in these tests run in a single thread it should be possible to maintain the same exact linear order of messages processed given the same random seed value. The reason for trying to maintain this order is to be able to reliably reproduce failures and replay the failing history with debugging messages turned on.
+Hello! As part of cleaning up `HaretClient::exec`, the first thing I'm seeing is it's a bit hard to tell [here](https://github.com/vmware/haret/blob/e8f9a7fc9ed6c1b40851dff7495e5a5461d9cf84/haret-client/src/lib.rs#L282) which operation needs which optional message. Since things are pretty early, I was wondering what you thought about restructuring TreeOp into a series of operation-specific request and response messages, similar to [etcd](https://coreos.com/etcd/docs/latest/dev-guide/api_reference_v3.html). The advantage here we wouldn't have the ambiguity of doing a `blob_put` and having the possibility the response containing namespaces.
+In the [why.md](https://github.com/vmware/haret/blob/master/docs/why.md) document, there is a discussion about how haret was designed to isolate off the protocol from the client-facing and data-storage parts of the system. Would there be any interest in formalizing this into multiple libraries? I'm personally interested in exploring a Zookeeper client wire-compatible frontend a la [zetcd](https://coreos.com/blog/introducing-zetcd), so having a looser coupling between the subsystems would make this a bit easier to do.
+Reads don't need to go into the log. They just need to receive quorum in order to be linearizable. When a read occurs and there are no outstanding prepare messages, the data is read at the primary and a commit message is broadcast with a `Read` flag set. If the `Read` flag is set, the backups respond with a `CommitOk` message containing the `epoch`, `view` and `commit_num`. If the `Read` flag is not set, backups don't respond at all (normal VRR protocol). When quorum is received, the already read data is returned to the user.
+
+If there are multiple pending prepare requests due to retries, the read is tracked with the last outstanding prepare at the primary, which has not yet gone out. When the last prepare is sent it's roundtrip counts as the read quorum as well. When a quorum of prepareOk messages is received, the commit for the latest write is made, and the data is read from the primary and returned to the client. Note however that if there is only one outstanding prepare request already in flight, the primary must wait an extra round trip before returning the read. It either waits for quorum on the retry of the prepare if it times out or the next commit or prepare request that was received after the read request.
+
+This change also requires checking client requests to see if they are reads or writes. Right now this isn't indicated in the vr specific client request itself. It should be however, as we want to keep the VR protocol itself agnostic to substance of state machine operations. It *only* has to know if they are reads or writes. Note that this information doesn't need to be added to the client protocol as that would be redundant for users. It can be added when the the messages are received by the api server and converted to VR client requests.
+

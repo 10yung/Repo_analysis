@@ -1,0 +1,295 @@
+I create a custom load strategy
+
+```
+module Draper
+  module QueryMethods
+    module LoadStrategy
+      class ActiveRecordWithKlass
+        def allowed?(method)
+          @allowed ||=
+            ::ActiveRecord::Relation::VALUE_METHODS +
+            [:klass, :reflect_on_association]
+          @allowed.include? method
+        end
+      end
+    end
+  end
+end
+```
+
+It tries to decorate nil class in `lib/draper/query_methods.rb:7`
+because 
+```markdown
+`scope`.reflect_on_association
+``` 
+
+is returning nil
+
+It should return the value as is
+Rails 6.0.0
+Draper 3.1.0
+
+Steps to reproduce:
+* in a view helper (under app/helpers) add a constant like `MY_CONSTANT = 'const'`
+* restart the rails server
+
+Buggy behavior:
+```
+/app/helpers/test_helper.rb:2: warning: already initialized constant TestHelper::MY_CONSTANT
+app/helpers/test_helper.rb:2: warning: previous definition of MY_CONSTANT was here
+```
+
+This seems to be due to draper loading all the helpers so it can use the `h` method, and then zeitwerk autoloading everything again (or the other way, I'm not sure).
+When we add `gem 'draper'`  to our Gemfile in our Rails 5.0.x project, it breaks our ActionController::API requests by causing an empty string to be returned. I believe this is due to our use of the `responders` gem as well. 
+
+We see the debugger hit the following:
+
+```
+# .rbenv/versions/2.5.1/lib/ruby/gems/2.5.0/gems/responders-2.4.0/lib/action_controller/responder.rb
+  184:     def to_format
+   185:       if !get? && has_errors? && !response_overridden?
+   186:         display_errors
+   187:       elsif has_view_rendering? || response_overridden?
+=> 188:         default_render
+   189:       else
+   190:         api_behavior
+   191:       end
+```
+
+```
+# .rbenv/versions/2.5.1/lib/ruby/gems/2.5.0/gems/responders-2.4.0/lib/action_controller/responder.rb
+   278:     def has_view_rendering?
+=> 279:       controller.class.include? ActionView::Rendering
+   280:     end
+```
+
+So, `has_view_rendering?` returns true due to the injection of ActionView::Rendering into the class hierarchy by Draper in the Draper::Compatability::ApiOnly module. This causes the `default_render` to be called and not the `api_behavior` which is what we need and see when we don't have the Draper gem in the Gemfile.
+ 
+The ApiOnly module is run automatically upon gem load to "temporarily" add view_context support to ActionController::API. In the comments it explicitly calls this a "hack" and "temporary solution". If so, there should be a way for developers to opt out of this functionality.
+
+https://github.com/drapergem/draper/blob/aaa06bd2f1e219838b241a5534e7ca513edd1fe2/lib/draper/compatibility/api_only.rb#L1-L23
+
+ It seems like a very bad practice to modify class hierarchies just by adding a gem.  Is it possible to add a setting to opt out of this behavior - or better, make it opt-in. 
+
+PS. Other than this, love the gem. 
+If you aren't using `delegate_all` in your decorator, draper breaks calling #== to compare an ActiveRecord model to a Decorator decorating an instance of the same class as the model. 
+
+Why does this matter, why would you ever do it? Not sure, but rspec is trying to do it when reporting a spec failure. 
+
+## Reproduction
+
+```ruby
+# table must exist
+class Widget < ApplicationRecord
+end
+
+class WidgetDecorator < Draper::Decorator
+end
+
+widget = Widget.create!
+other_widget = Widget.create!
+widget_decorator = WidgetDecorator.new(other_widget)
+
+widget == widget_decorator
+```
+
+Will raise: 
+
+    *** NoMethodError Exception: undefined method `id' for #<WidgetDecorator:0x00007fbadcf65060>
+
+## Why does it happen?
+
+`widget#==` is from [Draper::Decorator::Equality](https://github.com/drapergem/draper/blob/aaa06bd2f1e219838b241a5534e7ca513edd1fe2/lib/draper/decoratable/equality.rb#L7). The first thing it does is call `super`. 
+
+The super method is [ActiveRecord::Core#==](https://github.com/rails/rails/blob/v5.2.3/activerecord/lib/active_record/core.rb#L421-L425)
+
+That method first calls `super` (and gets false from BasicObject#==). Then it checks to see if `widget_decorator.instance_of?(widget.class)`.  Because draper [overrides instance_of on decorators](https://github.com/drapergem/draper/blob/aaa06bd2f1e219838b241a5534e7ca513edd1fe2/lib/draper/decorator.rb#L200-L202), it says that `widget_decorator` _is_ an instance of `Widget`. 
+
+Then ActiveRecord will [try to compare widget_decorator.id to widget.id](https://github.com/rails/rails/blob/v5.2.3/activerecord/lib/active_record/core.rb#L425) and get the NoMethodException, because `WidgetDecorator` does not `delegate_all` (or specifically delegate `id`), so widget_decorator has no `#id`. 
+
+## Why does it matter, why would you do this?
+
+I'm not totally sure, but in my actual rspec suite, a failing spec triggered something in rspec to try to compare a Widget to a WidgetDecorator, raising and interrupting rspec before it even got to give me details of failing test spec. 
+
+I'm not totally sure what's going on, but here's an actual exception backtrace. (This one involves LazyHelpers because that's in my actual app, but LazyHelpers is NOT necessary to reproduce the problem). 
+
+<details><summary>stack trace</summary>
+<pre>
+	34: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/exe/rspec:4:in `<top (required)>'
+	33: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/runner.rb:45:in `invoke'
+	32: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/runner.rb:71:in `run'
+	31: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/runner.rb:87:in `run'
+	30: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/runner.rb:110:in `run_specs'
+	29: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/reporter.rb:76:in `report'
+	28: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/reporter.rb:166:in `finish'
+	27: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/reporter.rb:186:in `close_after'
+	26: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/reporter.rb:170:in `block in finish'
+	25: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/reporter.rb:200:in `notify'
+	24: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/reporter.rb:200:in `each'
+	23: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/reporter.rb:201:in `block in notify'
+	22: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/formatters/base_text_formatter.rb:32:in `dump_failures'
+	21: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/notifications.rb:113:in `fully_formatted_failed_examples'
+	20: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/notifications.rb:113:in `each_with_index'
+	19: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/notifications.rb:113:in `each'
+	18: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/notifications.rb:114:in `block in fully_formatted_failed_examples'
+	17: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/notifications.rb:200:in `fully_formatted'
+	16: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/formatters/exception_presenter.rb:78:in `fully_formatted'
+	15: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/formatters/exception_presenter.rb:86:in `fully_formatted_lines'
+	14: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/formatters/exception_presenter.rb:240:in `formatted_message_and_backtrace'
+	13: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/formatters/exception_presenter.rb:72:in `colorized_formatted_backtrace'
+	12: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/formatters/exception_presenter.rb:41:in `formatted_backtrace'
+	11: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/formatters/exception_presenter.rb:46:in `formatted_cause'
+	10: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/formatters/exception_presenter.rb:101:in `final_exception'
+	 9: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/formatters/exception_presenter.rb:99:in `final_exception'
+	 8: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/formatters/exception_presenter.rb:99:in `include?'
+	 7: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/formatters/exception_presenter.rb:99:in `=='
+	 6: from /Users/jrochkind/.gem/ruby/2.6.3/gems/rspec-core-3.8.0/lib/rspec/core/formatters/exception_presenter.rb:99:in `=='
+	 5: from /Users/jrochkind/.gem/ruby/2.6.3/gems/draper-3.1.0/lib/draper/decorator.rb:169:in `=='
+	 4: from /Users/jrochkind/.gem/ruby/2.6.3/gems/draper-3.1.0/lib/draper/decoratable/equality.rb:16:in `test'
+	 3: from /Users/jrochkind/.gem/ruby/2.6.3/gems/draper-3.1.0/lib/draper/decoratable/equality.rb:8:in `=='
+	 2: from /Users/jrochkind/.gem/ruby/2.6.3/gems/activerecord-5.2.3/lib/active_record/core.rb:426:in `=='
+	 1: from /Users/jrochkind/.gem/ruby/2.6.3/gems/draper-3.1.0/lib/draper/lazy_helpers.rb:7:in `method_missing'
+/Users/jrochkind/.gem/ruby/2.6.3/gems/draper-3.1.0/lib/draper/lazy_helpers.rb:10:in `rescue in method_missing': undefined method `id' for #<DownloadDropdownDisplay:0x00007fab77a64f58> (NoMethodError)
+</pre>
+</details>
+
+## How to fix it?
+
+I have no idea, it's the result of a strange interaction of several odd meta-programming functions in both Draper and ActiveRecord. Pretty unclear how to cleanly fix it. 
+
+In general, overriding `instance_of?` to say that the decorator **is** an ActiveRecord, when if it doesn't use `delegate_all` it doesn't *really* have the API/type of an ActiveRecord... is a very dangerous thing to do. 
+
+But it's probably there for a reason? Or perhaps you should only get the `instance_of` override *if* you have `delegate_all` -- that would fix this issue, not sure if it would break something else. 
+
+## Workaround?
+
+If you aren't using `delegate_all`, you probably still want to `delegate :id` just to avoid messing things up in this case, or any other case that might use `==` where the operands include a Decorator and an ActiveRecord. 
+
+That's what I did, tested, it resolves the issue. 
+
+The draper README examples of not using `delegate_all` and selectively delegating methods do not show delegating `:id` -- but you probably always should to avoid this issue. 
+My decorators sometimes need to access the `current_user?` helper, from devise. 
+
+If I mock a current user using Devise::Test::ControllerHelpers sign_in, like so:
+
+```ruby
+before do
+  sign_in create(:user)
+end
+```
+
+That works, no problem. My decorators that access current_user get back that specified user when run under the spec, all is good. 
+
+But my app has public facing pages that have no signed in user, current_user is nil. 
+
+If I run a spec that has not done a Devise::Test::ControllerHelpers `sign_in` with a user -- because I am trying to test the scenario where there is no logged_in user, current_user is nil -- and that spec tries to exersize a decorator which asks for `current_user`, I get the dreaded:
+
+```
+     Devise::MissingWarden:
+       Devise could not find the `Warden::Proxy` instance on your request environment.
+       Make sure that your application is loading Devise and Warden as expected and that the `Warden::Manager` middleware is present in your middleware stack.
+       If you are seeing this on one of your tests, ensure that your tests are either executing the Rails middleware stack or that your tests are using the `Devise::Test::ControllerHelpers` module to inject the `request.env['warden']` object for you.
+```
+
+Very simple reproduction (Devise 4.6.2, Draper 3.1.0, Rails 5.2.3):
+
+```ruby
+# app/decorators/test_decorator.rb
+class TestDecorator < Draper::Decorator
+  def has_current_user?
+    h.current_user.present?
+  end
+end
+
+# spec/decorators/test_decorator_spec.rb
+require 'rails_helper'
+
+describe TestDecorator do
+  let(:decorator) { TestDecorator.new(Object.new) }
+  it "can answer has_current_user?" do
+    expect(decorator.has_current_user?).to be false
+  end
+end
+```
+
+That will raise the Devise::MissingWarden
+
+Is there a way to set up my :decorator specs so `h.current_user` works, even when I am not mocking a logged in user, I want no logged in user?  
+
+Ideally it would be something I could set up globally that would Just Work, and then specs which *do* want a logged in user would use Devise::Test::ControllerHelpers#sign_in as ordinary. If I need to do completely different mutually exclusive set up for "a mocked logged in user" vs "no mocked logged in user, current_user should be nil", that would be unfortunate. But would still at least get my tests possible again!  
+I suggest including support for decorating `ActiveStorage` attachment. Since `ActiveStorage` does not derive from `ActiveRecord`, this is not automatic. I currently do it by putting
+
+```
+Draper.setup_orm(ActiveStorage::Attached)
+```
+in a initializer. Thanks!
+## Description
+This branch continues the work started in https://github.com/drapergem/draper/pull/692. My plan is to fix the conflicts and extract out / revert any unrelated changes.
+
+## Testing
+Run the test suite.
+
+## To-Dos
+- [ ] tests
+
+## References
+* [Initial pull request](https://github.com/drapergem/draper/pull/692)
+
+I can define a virtual attribute in an ActiveRecord model class like
+```ruby
+def virtual_attr
+  ...
+end
+
+def virtual_attr=(val)
+  ...
+end
+```
+It allows me to make calls like `model.update(virtual_attr: 'Hi!')`
+
+When I try to do the same for a decorated model class it fails in internal `_assign_attribute` method. I think the reason is that it tries to do `send(:virtual_attr=)` **for the model object** and does not find such a method there.
+
+What is the recommended way to create virtual attributes in decorator classes so that I could do `decorated_model.update(virtual_attr: 'Hi!')`?
+## Description
+I have the same issue as author of the issue #809: Our app has two set of decorators: top level decorators and `Admin::*` decorators. Right now I have to explicitly specify `:with` option for every `decorates_association` call inside my admin decorators. This PR helps to simplify the process. All associations will be decorated using decorators from the same namespace as current decorator. 
+#### Bonus: 
+It is now possible to decorate object with namespaced decorator using `object.decorate(namespace: "Admin"` method instead of using `Admin::ObjectDecorator.new(object)` approach which is harder to automate.
+
+I don't like my current implementation too much. All that passing of `:namespace` option from `DecoratedAssociation#initialize` deep into `Decoratable.decorator_class`looks too complicated . It would be easier to build namespaced decorator class name inside `DecoratedAssociation#initialize` and set it as value of `:with` option (if not present). This approach would look a lot cleaner but from architectural point of view it seems wrong because it is not `DecoratedAssociation`'s responsibility to build decorator class names.
+
+## Testing
+You can use any rails project that has `has_many->belongs_to` relation to test this feature. Let's assume that you have `User` model that `has_many :comments`. Sounds a bit too familiar, eh? 😄 
+```ruby
+# app/decorators/admin/user_decorator.rb
+class Admin::UserDecorator < Draper::Decorator
+  decorates_association :comments
+end
+
+# app/decorators/admin/comment_decorator.rb
+class Admin::CommentDecorator < Draper::Decorator
+  decorates_association :user
+end
+
+comment = Comment.first.decorate(namespace: "Admin")
+decorated_comment.class # => Admin::CommentDecorator
+
+decorated_user = decorated_comment.user
+decorated_user.class # => Admin::UserDecorator
+
+decorated_comment = decorated_user.comments.first
+decorated_comment.class # => Admin::CommentDecorator
+```
+
+
+## To-Dos
+- Check if we need to document this feature in README
+- I think that there's not enough tests for this feature. Does anyone have any advice on what else to cover with unit tests?
+
+## References
+[Issue #809](https://github.com/drapergem/draper/issues/809)
+
+Is there a way to wrap all attributes of a model with a decorator? Similar to the way forms are wrapped with errors on the invalid form field, is there a conditional way to wrap each attribute being decorated with a error?
+
+For example, in my model I have a `data_results` of `jsonb` which contains a json list of which attributes have errors as well as their descriptions of what the error messages are. If the there is an error present, I want to wrap that attribute on the `show` page with the error if it is present in the `data_results`. 
+
+I thought that a helper would be good for this possibility, but I'm not sure if draper should be doing this instead. 

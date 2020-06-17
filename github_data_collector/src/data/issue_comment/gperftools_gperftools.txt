@@ -1,0 +1,526 @@
+gperftools cpu profiler coroutine process cause segmentation fault, does cpu profiler conflict with  coroutine implemented with  assembly instruction?
+Building gperftools 2.7 with gcc 8.3.1 on Ubuntu 19.10, I get this warning:
+
+.../src/tcmalloc.cc:1996:36: warning: 'void tc_delete_nothrow(void*, const std::nothrow_t&)' alias between functions of incompatible types 'void(void*, const std::nothrow_t&)' and 'void(void*)' [-Wattribute-alias]
+ extern "C" PERFTOOLS_DLL_DECL void tc_delete_nothrow(void* p, const std::nothrow_t&) PERFTOOLS_NOTHROW
+                                    ^~~~~~~~~~~~~~~~~
+.../src/tcmalloc.cc:1893:6: note: aliased declaration here
+ void tc_free(void* ptr) PERFTOOLS_NOTHROW {
+      ^~~~~~~
+
+And indeed they do seem to be incompatible.  Probably a tc_free_nothrow routine should be introduced and used as the alias (it would just call tc_free and ignore the extra argument).  If that sounds right to you I can whip up a patch.
+Safe-Linking is a security mechanism that protects single-linked
+lists (such as the Free Lists) from being tampered by attackers. The
+mechanism makes use of randomness from ASLR (```mmap_base```), and when
+combined with object alignment integrity checks, it protects the
+pointers from being hijacked by an attacker.
+
+While Safe-Unlinking protects double-linked lists (such as the Small
+Bins in ptmalloc), there wasn't any similar protection for attacks
+against single-linked lists. This solution protects against three
+common attacks:
+  * Partial pointer override: Modified the lower bytes (Little Endian)
+  * Full pointer override: Hijacks the pointer to an attacker's location
+  * Unaligned objects: pointing the list to an unaligned address
+
+The design assumes an attacker doesn't know where the heap is located,
+and uses the ASLR randomness to "sign" the single-linked pointers. We
+mark the pointer as P and the location in which it is stored as L, and
+the calculation will be:
+```PROTECT(P) := (L >> PAGE_SHIFT) XOR (P)```
+```*L = PROTECT(P)```
+
+This way, the random bits from the address L (which start at the bits
+in the PAGE_SHIFT position), will be merged with the LSB of the stored
+protected pointer. This protection layer prevents an attacker from
+modifying the pointer into a controlled value.
+
+An additional check that the objects are kAligned adds an important
+layer:
+  * Attackers can't point to illegal (unaligned) memory address
+  * Attackers must guess correctly the alignment bits
+
+Due to kAlignment being 8, an attacker will be directly fail 7 out of 8
+times. And this could be improved in the future if the alignment will
+match the class size, per Free List.
+
+This proposed patch was benchmarked and on the worst test case it has
+an additional overhead of 1.5%, while the overhead for the average test
+case was a negligible 0.02%. In addition, in 2013 a similar mitigation
+was incorporated into Chromium's Free List (FL) implementation in their
+version of TCMalloc (branched out from gperftools 2.0). According to
+Chromium's documentation, the added overhead was less than 2%.
+
+For more information, feel free to read our full white-paper (attached):
+[Safe-Linking-White-Paper.txt](https://github.com/gperftools/gperftools/files/4023520/Safe-Linking-White-Paper.txt)
+
+My program overrides the new/delete operators and forwards them to malloc/free after some additional bookkeeping.  This works fine with jemalloc however because TCMalloc calles new as part of it's initialization this causes a recursive loop.
+
+My analysis of the code shows this could be resolved with static object instead of one dynamically allocated.
+
+My questions are:
+1) Is there some special method that already exists to solve this use case?  I've seen issues in the past about overriding new/delete so my understanding is this use case is supported.
+
+2) Would a PR changing these dynamic allocations in the initialization path to static objects be accepted?
+My process had a deadlock between thread 1 and 8 :
+
+thread 1 -> connect_oracle (shlib) -> dl_open -> dl_close locks dl_load_write_lock in glibc -> free locks pageheap_lock
+thread 8 -> malloc locks pageheap_lock -> GetStackTrace -> __GI___dl_iterate_phdr locks dl_load_write_lock in glibc
+
+glibc does locking and calls tcmalloc, while tcmalloc also does locking and calls glibs, this is clearly a risky design.
+
+Detail :
+
+Thread 1 is trying to get a lock in a free() :
+
+#5  tcmalloc::ThreadCache::IncreaseCacheLimit (this=0x83a3c40) at src/thread_cache.cc:246
+
+void ThreadCache::IncreaseCacheLimit() {
+  SpinLockHolder h(Static::pageheap_lock());  !!!!!
+  IncreaseCacheLimitLocked();
+}
+
+This is called from glibc dl-close.c called from dl_open to load a shlib :
+#7  0x00007ffff7df049b in _dl_close_worker (map=<optimized out>) at dl-close.c:695
+#8  0x00007ffff7deebbd in _dl_open (file=0x7ffffffe20b0 "/cm/local_build/opt/oracle/product/12.2.0.1.200/lib/libnque12.so["00"]", 
+    mode=<optimized out>, caller_dlopen=<optimized out>, nsid=<optimized out>, argc=1, argv=0x7fffffff0778, env=0x7fffffff0788) at dl-open.c:674
+
+But on frame 7 we can see that dl_close_worker locked mutex dl_load_write_lock :
+
+	  free (imap);
+	}
+    }
+
+  __rtld_lock_unlock_recursive (GL(dl_load_write_lock));   !!!!!
+
+All this called from the main process connecting to oracle, complete trace :
+
+#0  0x00000000042cc24b in sys_futex (v3=0, a2=0x0, t=0x7ffffffe1b50, v=2, o=128, a=0x831bc28 <tcmalloc::Static::pageheap_lock_>)
+    at ./src/base/linux_syscall_support.h:2485
+#1  base::internal::SpinLockDelay (w=w@entry=0x831bc28 <tcmalloc::Static::pageheap_lock_>, value=2, loop=loop@entry=333498)
+    at ./src/base/spinlock_linux-inl.h:84
+#2  0x00000000042cc15f in SpinLock::SlowLock (this=this@entry=0x831bc28 <tcmalloc::Static::pageheap_lock_>) at src/base/spinlock.cc:119
+#3  0x00000000042cb648 in SpinLock::Lock (this=<optimized out>) at src/base/spinlock.h:71
+#4  SpinLockHolder::SpinLockHolder (l=<optimized out>, this=<synthetic pointer>) at src/base/spinlock.h:133
+#5  tcmalloc::ThreadCache::IncreaseCacheLimit (this=0x83a3c40) at src/thread_cache.cc:246
+#6  0x00000000042cb710 in tcmalloc::ThreadCache::Scavenge (this=<optimized out>) at src/thread_cache.cc:242
+#7  0x00007ffff7df049b in _dl_close_worker (map=<optimized out>) at dl-close.c:695
+#8  0x00007ffff7deebbd in _dl_open (file=0x7ffffffe20b0 "/cm/local_build/opt/oracle/product/12.2.0.1.200/lib/libnque12.so["00"]", 
+    mode=<optimized out>, caller_dlopen=<optimized out>, nsid=<optimized out>, argc=1, argv=0x7fffffff0778, env=0x7fffffff0788) at dl-open.c:674
+#9  0x00007ffff749ffab in dlopen_doit (a=a@entry=0x7ffffffe2000) at dlopen.c:66
+#10 0x00007ffff7dea7a4 in _dl_catch_error (objname=0x9751930, errstring=0x9751938, mallocedp=0x9751928, operate=0x7ffff749ff50 <dlopen_doit>, 
+    args=0x7ffffffe2000) at dl-error.c:177
+#11 0x00007ffff74a05ad in _dlerror_run (operate=operate@entry=0x7ffff749ff50 <dlopen_doit>, args=args@entry=0x7ffffffe2000) at dlerror.c:163
+#12 0x00007ffff74a0041 in __dlopen (file=<optimized out>, mode=<optimized out>) at dlopen.c:87
+#13 0x000000000376e789 in snldlldl ()
+#14 0x0000000003746bbe in ntevgblini ()
+#15 0x0000000003748e7d in ntgblini ()
+#16 0x00000000036ef959 in nsgblini ()
+#17 0x0000000003691067 in niotns ()
+#18 0x000000000367ca66 in osncon ()
+#19 0x000000000323fccd in kpuadef ()
+#20 0x00000000032dee87 in upiini ()
+#21 0x000000000323e90c in kpuatch ()
+#22 0x00000000031ee78b in OCIServerAttach ()
+
+The other thread 8 is trying to lock the same mutex in glibc to read dwarf info :
+
+#3  0x00007ffff69aa0ef in __GI___dl_iterate_phdr (callback=callback@entry=0x42dcf90 <_ULx86_64_dwarf_callback>, data=data@entry=0x7ffff7e5f910)
+    at dl-iteratephdr.c:41
+   /* Make sure nobody modifies the list of loaded objects.  */
+    __rtld_lock_lock_recursive (GL(dl_load_write_lock));    !!!!!
+
+#4  0x00000000042dd5be in _ULx86_64_dwarf_find_proc_info (as=0x8323460 <local_addr_space>, ip=ip@entry=43377961, pi=pi@entry=0x7ffff7e604a0, 
+    need_unwind_info=need_unwind_info@entry=1, arg=0x7ffff7e60340) at dwarf/Gfind_proc_info-lsb.c:729
+#5  0x00000000042dd7e5 in fetch_proc_info (c=c@entry=0x7ffff7e60340, ip=43377961, need_unwind_info=need_unwind_info@entry=1) at dwarf/Gparser.c:437
+
+This unwind is called from GetStackTrace (which could have been avoided by !scope.IsStacktraceAllowed() :
+
+#10 0x00000000042ccf84 in GetStackTrace (result=result@entry=0x83643a8, max_depth=max_depth@entry=30, skip_count=skip_count@entry=3)
+    at src/stacktrace.cc:295
+
+PERFTOOLS_DLL_DECL i(void** result, int max_depth,
+                                     int skip_count) {
+  StacktraceScope scope;
+  if (!scope.IsStacktraceAllowed()) {
+    return 0;
+  }
+  init_default_stack_impl_inner();
+  return frame_forcer(get_stack_impl->GetStackTracePtr(result, max_depth, skip_count));
+
+but this is called from tcmalloc doing a malloc which needs to get more memory after grabbing the same pageheap_lock spinlock : 
+
+#14 0x00000000042c37a9 in tcmalloc::CentralFreeList::Populate (this=this@entry=0x8316b20 <tcmalloc::Static::central_cache_+99712>)
+    at src/central_freelist.cc:329
+ Span* span;
+  {
+    SpinLockHolder h(Static::pageheap_lock());     !!!!!
+    span = Static::pageheap()->New(npages);
+
+All this called from thread 8 calling malloc, complete trace :
+
+#0  __lll_lock_wait () at ../nptl/sysdeps/unix/sysv/linux/x86_64/lowlevellock.S:135
+#1  0x00007ffff7066eb6 in _L_lock_941 () from /lib64/libpthread.so.0
+#2  0x00007ffff7066daf in __GI___pthread_mutex_lock (mutex=0x7ffff7ffd930 <_rtld_local+2352>) at ../nptl/pthread_mutex_lock.c:113
+#3  0x00007ffff69aa0ef in __GI___dl_iterate_phdr (callback=callback@entry=0x42dcf90 <_ULx86_64_dwarf_callback>, data=data@entry=0x7ffff7e5f910)
+    at dl-iteratephdr.c:41
+#4  0x00000000042dd5be in _ULx86_64_dwarf_find_proc_info (as=0x8323460 <local_addr_space>, ip=ip@entry=43377961, pi=pi@entry=0x7ffff7e604a0, 
+    need_unwind_info=need_unwind_info@entry=1, arg=0x7ffff7e60340) at dwarf/Gfind_proc_info-lsb.c:729
+#5  0x00000000042dd7e5 in fetch_proc_info (c=c@entry=0x7ffff7e60340, ip=43377961, need_unwind_info=need_unwind_info@entry=1) at dwarf/Gparser.c:437
+#6  0x00000000042dec19 in _ULx86_64_dwarf_find_save_locs (c=c@entry=0x7ffff7e60340) at dwarf/Gparser.c:885
+#7  0x00000000042dc889 in _ULx86_64_dwarf_step (c=c@entry=0x7ffff7e60340) at dwarf/Gstep.c:34
+#8  0x00000000042dc481 in _ULx86_64_step (cursor=0x7ffff7e60340) at x86_64/Gstep.c:71
+#9  0x00000000042cc4bb in GetStackTrace_libunwind (result=<optimized out>, max_depth=30, skip_count=<optimized out>)
+    at src/stacktrace_libunwind-inl.h:138
+#10 0x00000000042ccf84 in GetStackTrace (result=result@entry=0x83643a8, max_depth=max_depth@entry=30, skip_count=skip_count@entry=3)
+    at src/stacktrace.cc:295
+#11 0x00000000042c8e2e in tcmalloc::RecordGrowth (growth=1048576) at src/page_heap.cc:618
+#12 tcmalloc::PageHeap::GrowHeap (this=this@entry=0x81fde20 <tcmalloc::Static::pageheap_>, n=n@entry=3) at src/page_heap.cc:644
+#13 0x00000000042c90d3 in tcmalloc::PageHeap::New (this=0x81fde20 <tcmalloc::Static::pageheap_>, n=n@entry=3) at src/page_heap.cc:154
+#14 0x00000000042c37a9 in tcmalloc::CentralFreeList::Populate (this=this@entry=0x8316b20 <tcmalloc::Static::central_cache_+99712>)
+    at src/central_freelist.cc:329
+#15 0x00000000042c39a8 in tcmalloc::CentralFreeList::FetchFromOneSpansSafe (this=this@entry=0x8316b20 <tcmalloc::Static::central_cache_+99712>, 
+    N=N@entry=1, start=start@entry=0x7ffff7e60950, end=0x7ffff7e60958) at src/central_freelist.cc:284
+#16 0x00000000042c3a32 in tcmalloc::CentralFreeList::RemoveRange (this=0x8316b20 <tcmalloc::Static::central_cache_+99712>, 
+    start=start@entry=0x7ffff7e60950, end=end@entry=0x7ffff7e60958, N=1) at src/central_freelist.cc:264
+#17 0x00000000042cb1da in tcmalloc::ThreadCache::FetchFromCentralCache (this=0x83a6d40, cl=<optimized out>, byte_size=98304, 
+    oom_handler=0x6171b40 <tcmalloc::malloc_oom(unsigned long)>) at src/thread_cache.cc:126
+#18 0x00000000043459ef in __gnat_malloc ()
+
+Technology used :
+
+Linux kernel 3.10.0-1062.1.2.el7.x86_64
+glibc-common-2.17-292.el7.x86_64
+gperftools-2.7
+libunwind-1.2.1
+oracle OCI 12.2.0.1.200
+gcc (GCC) 8.3.1 20190923 (for GNAT Pro 20.0 20191009)
+
+tcmalloc was built using :
+
+$ CC='/usr/bin/gcc -m64' ./configure --prefix=$PREFIX --exec-prefix=$PREFIX CXXFLAGS='-m64 -ggdb3 -O0' CPPFLAGS='-m64 -ggdb3 -O0' CFLAGS='-m64 -ggdb3 -O0' --with-tcmalloc-pagesize=64 --with-tcmalloc-alignment=8 --target=x86_64-unknown-linux-gnu 
+$ make -j 10; make -j 10 check; make install   
+
+so we do not use what is documented in configure as risky :
+
+  --enable-stacktrace-via-backtrace
+                          enable use of backtrace() for stacktrace capturing
+                          (may deadlock)
+
+As usual, such deadlocks are very rare and I have not yet found a way to reproduce the problem.
+
+This seems a hairy issue, so ideally would like some info how to build tcmalloc without this stack trace, if IsStacktraceAllowed would have returned false there would have been no such risk, but I don't see a configure option --disable-stacktrace.
+
+P.S. Avoiding shared libs would also have avoided this particular risk for deadlock but both Oracle and RedHat support are unhelpful to get this implemented, so that is no option in the near future.
+I complied gpreftools by mingw( i686-8.1.0-release-posix-dwarf-rt_v6-rev0)
+when run test, I got "Unable to patch because function is too short"
+code is preamble_patcher_with_stub.cc line 174
+    } else if (IT_RETURN == instruction_type) {
+      SIDESTEP_ASSERT(false &&
+                      "Unable to patch because function is too short");
+      return SIDESTEP_FUNCTION_TOO_SMALL;
+
+my app is using tcmalloc (it significantly boosted the performance of our app - thanks)
+I'm trying to use openvino library.  MLKDNNplugin.dll (that is causing the issue is a part of openvino) is using xbyak library where the issue actually occurs.
+
+xbyak library uses a combination of _aligned_malloc and VirtualProtect to allocate an aligned memory and set it to RWE mode.
+After several successful allocations (it is always a pair of _aligned_malloc and VirtualProtect), VirtualProtect fails with ERROR_INVALID_ADDRESS error (code 487 (0x1E7) - Attempt to access invalid address).
+both disabling tcmalloc and replacing _aligned_malloc with VirtualAlloc resolve the issue.
+
+Is there a proper way to resolve the issue?
+Is there a way to prevent tcmalloc from handling _aligned_malloc?
+
+---
+Windows 10 x64, visual C++2015, release x64
+I'm having the exact same problem in #589 & #899 .
+
+My program is built with the flags below
+```
+clang++
+"-std=c++17",
+"-g",
+"-O2",
+"...includes...",
+"...cpp files...",
+"-o",
+"~/cpp/hmiss/hmiss",
+"/usr/local/Cellar/gperftools/2.7/lib/libprofiler.dylib",
+```
+
+I'm enabling and running CPU profiling with the following line,
+`DYLD_FALLBACK_LIBRARY_PATH=/opt/local/lib CPUPROFILE=hmiss.prof ./hmiss`
+
+After running the profiling I run pprof and get the following output.
+```
+s979258ca% pprof --text ./hmiss hmiss.prof                              
+Using local file ./hmiss.
+Using local file hmiss.prof.
+Total: 444 samples
+     154  34.7%  34.7%      154  34.7% 0x0000000105c4ad65
+      49  11.0%  45.7%       49  11.0% 0x0000000105c6708a
+      40   9.0%  54.7%       40   9.0% 0x0000000105c4a385
+      37   8.3%  63.1%       37   8.3% 0x0000000105c4a391
+      30   6.8%  69.8%       30   6.8% 0x0000000105c4a37a
+      10   2.3%  72.1%       10   2.3% 0x00007fff63f409da
+      ...
+       0   0.0% 100.0%        2   0.5% _NC3__enddef
+       0   0.0% 100.0%        2   0.5% _NC3_inq_var_fill
+       0   0.0% 100.0%      366  82.4% __mh_execute_header
+       0   0.0% 100.0%        2   0.5% _ex__leavedef
+       0   0.0% 100.0%        2   0.5% _ex_put_block
+       0   0.0% 100.0%        2   0.5% _ex_put_block_param
+       0   0.0% 100.0%        2   0.5% _ex_put_block_params
+       0   0.0% 100.0%        2   0.5% _nc_enddef
+       0   0.0% 100.0%        2   0.5% _ncio_move
+       0   0.0% 100.0%        2   0.5% _posixio_open
+```
+
+Weirdly, I'm getting function names for linked libraries, just not my program.
+I've seen people include the -lprofiler flag in the build process, but it doesn't change anything for me.
+Is there something else I need to do here to get the function names in the profiling data?
+
+
+Thanks for any help,
+Max 
+```
+diff -wcr /Users/barto/Downloads/gperftools-master/src/tests/tcmalloc_unittest.cc src/tests/tcmalloc_unittest.cc
+*** /Users/barto/Downloads/gperftools-master/src/tests/tcmalloc_unittest.cc	Mon Apr 22 00:14:40 2019
+--- src/tests/tcmalloc_unittest.cc	Mon Nov  4 15:20:27 2019
+***************
+*** 1344,1353 ****
+      delete p2;
+      VerifyDeleteHookWasCalled();
+  
+!     p2 = new char[100];
+!     CHECK(p2 != NULL);
+      VerifyNewHookWasCalled();
+!     delete[] p2;
+      VerifyDeleteHookWasCalled();
+  
+      p2 = new(std::nothrow) char;
+--- 1344,1353 ----
+      delete p2;
+      VerifyDeleteHookWasCalled();
+  
+!     char *p3 = new char[100];
+!     CHECK(p3 != NULL);
+      VerifyNewHookWasCalled();
+!     delete[] p3;
+      VerifyDeleteHookWasCalled();
+  
+      p2 = new(std::nothrow) char;
+***************
+*** 1356,1365 ****
+      delete p2;
+      VerifyDeleteHookWasCalled();
+  
+!     p2 = new(std::nothrow) char[100];
+!     CHECK(p2 != NULL);
+      VerifyNewHookWasCalled();
+!     delete[] p2;
+      VerifyDeleteHookWasCalled();
+  
+      // Another way of calling operator new
+--- 1356,1365 ----
+      delete p2;
+      VerifyDeleteHookWasCalled();
+  
+!     p3 = new(std::nothrow) char[100];
+!     CHECK(p3 != NULL);
+      VerifyNewHookWasCalled();
+!     delete[] p3;
+      VerifyDeleteHookWasCalled();
+  
+      // Another way of calling operator new
+***************
+*** 1383,1392 ****
+      ::operator delete(p2, sizeof(char));
+      VerifyDeleteHookWasCalled();
+  
+!     p2 = new char[100];
+!     CHECK(p2 != NULL);
+      VerifyNewHookWasCalled();
+!     ::operator delete[](p2, sizeof(char) * 100);
+      VerifyDeleteHookWasCalled();
+  #endif
+  
+--- 1383,1392 ----
+      ::operator delete(p2, sizeof(char));
+      VerifyDeleteHookWasCalled();
+  
+!     p3 = new char[100];
+!     CHECK(p3 != NULL);
+      VerifyNewHookWasCalled();
+!     ::operator delete[](p3, sizeof(char) * 100);
+      VerifyDeleteHookWasCalled();
+  #endif
+  
+***************
+*** 1399,1409 ****
+      delete poveraligned;
+      VerifyDeleteHookWasCalled();
+  
+!     poveraligned = new overaligned_type[10];
+!     CHECK(poveraligned != NULL);
+!     CHECK((((size_t)poveraligned) % OVERALIGNMENT) == 0u);
+      VerifyNewHookWasCalled();
+!     delete[] poveraligned;
+      VerifyDeleteHookWasCalled();
+  
+      poveraligned = new(std::nothrow) overaligned_type;
+--- 1399,1409 ----
+      delete poveraligned;
+      VerifyDeleteHookWasCalled();
+  
+!     overaligned_type* poveraligned2 = new overaligned_type[10];
+!     CHECK(poveraligned2 != NULL);
+!     CHECK((((size_t)poveraligned2) % OVERALIGNMENT) == 0u);
+      VerifyNewHookWasCalled();
+!     delete[] poveraligned2;
+      VerifyDeleteHookWasCalled();
+  
+      poveraligned = new(std::nothrow) overaligned_type;
+***************
+*** 1413,1423 ****
+      delete poveraligned;
+      VerifyDeleteHookWasCalled();
+  
+!     poveraligned = new(std::nothrow) overaligned_type[10];
+!     CHECK(poveraligned != NULL);
+!     CHECK((((size_t)poveraligned) % OVERALIGNMENT) == 0u);
+      VerifyNewHookWasCalled();
+!     delete[] poveraligned;
+      VerifyDeleteHookWasCalled();
+  
+      // Another way of calling operator new
+--- 1413,1423 ----
+      delete poveraligned;
+      VerifyDeleteHookWasCalled();
+  
+!     poveraligned2 = new(std::nothrow) overaligned_type[10];
+!     CHECK(poveraligned2 != NULL);
+!     CHECK((((size_t)poveraligned2) % OVERALIGNMENT) == 0u);
+      VerifyNewHookWasCalled();
+!     delete[] poveraligned2;
+      VerifyDeleteHookWasCalled();
+  
+      // Another way of calling operator new
+```
+```
+*** /Users/barto/Downloads/gperftools-master/src/base/basictypes.h	Mon Apr 22 00:14:40 2019
+--- src/base/basictypes.h	Mon Nov  4 14:36:05 2019
+***************
+*** 308,314 ****
+   public:
+    AssignAttributeStartEnd(const char* name, char** pstart, char** pend) {
+      // Find out what dynamic library name is defined in
+!     if (_dyld_present()) {
+        for (int i = _dyld_image_count() - 1; i >= 0; --i) {
+          const mach_header* hdr = _dyld_get_image_header(i);
+  #ifdef MH_MAGIC_64
+--- 308,317 ----
+   public:
+    AssignAttributeStartEnd(const char* name, char** pstart, char** pend) {
+      // Find out what dynamic library name is defined in
+! #if !defined(__APPLE__)
+!     if (_dyld_present())
+! #endif
+!     {
+        for (int i = _dyld_image_count() - 1; i >= 0; --i) {
+          const mach_header* hdr = _dyld_get_image_header(i);
+  #ifdef MH_MAGIC_64
+*** /Users/barto/Downloads/gperftools-master/src/base/sysinfo.cc	Mon Apr 22 00:14:40 2019
+--- src/base/sysinfo.cc	Mon Nov  4 14:47:48 2019
+***************
+*** 88,104 ****
+  #ifdef HAVE_SYS_SYSCALL_H
+  # include <sys/syscall.h>
+  #endif
+! #ifdef SYS_open   // solaris 11, at least sometimes, only defines SYS_openat
+  # define safeopen(filename, mode)  syscall(SYS_open, filename, mode)
+  #else
+  # define safeopen(filename, mode)  open(filename, mode)
+  #endif
+! #ifdef SYS_read
+  # define saferead(fd, buffer, size)  syscall(SYS_read, fd, buffer, size)
+  #else
+  # define saferead(fd, buffer, size)  read(fd, buffer, size)
+  #endif
+! #ifdef SYS_close
+  # define safeclose(fd)  syscall(SYS_close, fd)
+  #else
+  # define safeclose(fd)  close(fd)
+--- 88,104 ----
+  #ifdef HAVE_SYS_SYSCALL_H
+  # include <sys/syscall.h>
+  #endif
+! #if defined(SYS_open) && !defined(__APPLE__)   // solaris 11, at least sometimes, only defines SYS_openat
+  # define safeopen(filename, mode)  syscall(SYS_open, filename, mode)
+  #else
+  # define safeopen(filename, mode)  open(filename, mode)
+  #endif
+! #if defined(SYS_read) && !defined(__APPLE__)
+  # define saferead(fd, buffer, size)  syscall(SYS_read, fd, buffer, size)
+  #else
+  # define saferead(fd, buffer, size)  read(fd, buffer, size)
+  #endif
+! #if defined(SYS_close) && !defined(__APPLE__)
+  # define safeclose(fd)  syscall(SYS_close, fd)
+  #else
+  # define safeclose(fd)  close(fd)
+***************
+*** 398,403 ****
+--- 398,404 ----
+    return result;
+  }
+  
++ #if !defined(__APPLE__)
+  static char *CopyStringUntilChar(
+      char *text, unsigned out_len, int c, char *out) {
+    char *endptr;
+***************
+*** 411,416 ****
+--- 412,418 ----
+    SkipWhileWhitespace(&endptr, c);
+    return endptr;
+  }
++ #endif
+  
+  template<typename T>
+  static bool StringToIntegerUntilCharWithCheck(
+***************
+*** 421,426 ****
+--- 423,429 ----
+    return true;
+  }
+  
++ #if !defined(__APPLE__)
+  static bool ParseProcMapsLine(char *text, uint64 *start, uint64 *end,
+                                char *flags, uint64 *offset,
+                                int *major, int *minor, int64 *inode,
+***************
+*** 462,467 ****
+--- 465,471 ----
+    return false;
+  #endif
+  }
++ #endif
+  
+  ProcMapsIterator::ProcMapsIterator(pid_t pid) {
+    Init(pid, NULL, false);
+diff -wcr /Users/barto/Downloads/gperftools-master/src/base/sysinfo.h src/base/sysinfo.h
+*** /Users/barto/Downloads/gperftools-master/src/base/sysinfo.h	Mon Apr 22 00:14:40 2019
+--- src/base/sysinfo.h	Mon Nov  4 14:40:08 2019
+***************
+*** 215,221 ****
+--- 215,223 ----
+    int fd_;            // filehandle on /proc/*/maps
+  #endif
+    pid_t pid_;
++ #if !defined(__APPLE__)
+    char flags_[10];
++ #endif
+    Buffer* dynamic_buffer_;  // dynamically-allocated Buffer
+    bool using_maps_backing_; // true if we are looking at maps_backing instead of maps.
+  };
+```

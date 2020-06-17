@@ -1,0 +1,262 @@
+Sometimes you want to write a test that causes a process to exit or abort, e.g. due to assertion failure.
+
+Google Test offers a facility for testing these cases, using subprocess spawning: [ASSERT_DEATH](https://github.com/google/googletest/blob/8b4817e3df3746a20502a84580f661ac448821be/googletest/docs/advanced.md).
+
+I hope DocTest can offer this as well.
+
+PS - In some cases, an actual exit or abort can be averted, e.g. by overriding the `assert()` macro in header-only code, or dynamically replacing the symbol for the abort or exit functions etc. This would be flakier, but not as heavy as launching another process.
+## Description
+Doctest will report exceptions even if code exists that uses Windows `__try`/`__except` Structured-Exception Handlers.
+
+
+### Steps to reproduce
+This test case will report a SIGSEGV even though the crash is handled by SEH:
+```
+#ifdef _MSC_VER
+static void NoCrash()
+{
+    __try
+    {
+        int* p = 0;
+        *p = 1;
+    }
+    __except (1)
+    {
+        // Caught!
+    }
+}
+
+TEST_CASE("SEH Avoided Crash")
+{
+    NoCrash();
+    CHECK(1);
+}
+#endif
+```
+<!--
+This is only relevant for bug reports, but if you do have one,
+please provide a minimal set of steps to reproduce the problem.
+
+Usually this means providing a small and self-contained code using Catch
+and specifying compiler flags/tools used if relevant.
+-->
+
+
+### Extra information
+<!--
+Fill in any extra information that might be important for your issue.
+
+If your issue is a bugreport, definitely fill out at least the following.
+-->
+* doctest version: **v2.3.6**
+* Operating System: **Windows 10 x64**
+* Compiler+version: **MS Visual Studio 2017**
+
+This code compiles:
+```
+MESSAGE(kernel_name << " check " << std::setw(4) << (i+1) << " failed.");
+```
+this code doesn't:
+```
+CHECK_MESSAGE(false, kernel_name << " check " << std::setw(4) << (i+1) << " failed.");
+```
+It gives me:
+```
+/path/to/doctest.h(1582): error: static assertion failed with "Cannot pass temporaries or rvalues
+to the streaming operator because it caches pointers to the passed objects for lazy evaluation!"
+```
+
+
+* doctest version: **v2.3.0**
+* Operating System: Devuan GNU/Linux 3.0
+* Compiler+version: GCC 9.2.1
+
+This is a feature request.
+
+doctest supporting skipping test suites and test cases. But - if you've started running a test case, it will either succeed or fail. I want to have a function or a macro using which the testcase's _own code_ can decide "Nope, we can't really run the test, let's mark it as skipped". This is relevant when the conditions for running a test cannot be determined at compile time, and are impossible or at least inconvenient to determine at test-program-invoke time (when we would typically decide on skipping tests).
+
+
+
+* doctest version: **v42.42.42**
+* Operating System: **Devuan GNU/Linux 3.0**
+* Compiler+version: **GCC 9.2.1**
+
+## Description
+
+Value parameterization appears to be on the roadmap for doctest 2.4.0. After much difficulty, I have managed to add my own implementation of value parameterization.
+
+- It works much like `pytest.mark.parameterize` (https://docs.pytest.org/en/latest/parametrize.html).
+- However each parameter name and set of values is a free function, which can be used in multiple test cases.
+    - This is also possible in pytest via `range_0_3 = pytest.mark.parameterize("range_0_3", [0, 1, 2])`.
+- Unlike pytest, it does not support assigning multiple values at once (at the moment): `@pytest.mark.parametrize("test_input,expected", [("3+5", 8), ("2+4", 6), ("6*9", 42)])`
+- To do so, my code would need to be modified:
+    - (difficult) Change PARAMETERIZE() to accept more than 1 parameter type/name (difficult).
+    - (easy) Change OPTION() to accept more than 1 assignment. Just replace `k, v` with `k_eq_v`, and `#k " = " #v` with `#k_eq_v`.
+
+## Usage
+
+https://gitlab.com/nyanpasu64/exotracker-cpp/blob/cycle-skip/tests/test_utils/test_parameterize.cpp
+
+I've posted a shortened "usage example" here:
+
+```cpp
+PARAMETERIZE(range_0_3, int, x,
+    OPTION(x, 0);
+    OPTION(x, 1);
+    OPTION(x, 2);
+)
+PARAMETERIZE(range_0_4, int, x,
+    OPTION(x, 0);
+    OPTION(x, 1);
+    OPTION(x, 2);
+    OPTION(x, 3);
+)
+TEST_CASE("Generate the product set of all subcases.") {
+    int x, y;
+    PICK(range_0_3(x, range_0_4(y)));
+}
+```
+
+My implementation is here: https://gitlab.com/nyanpasu64/exotracker-cpp/tree/cycle-skip/tests/test_utils.
+
+- [parameterize.h](https://gitlab.com/nyanpasu64/exotracker-cpp/blob/cycle-skip/tests/test_utils/parameterize.h)
+- [parameterize.cpp](https://gitlab.com/nyanpasu64/exotracker-cpp/blob/cycle-skip/tests/test_utils/parameterize.cpp)
+
+My parameterization implementation is built off subcases, and if you use multiple parameters in one TEST_CASE, doctest's support for nested subcases. doctest distinguishes subcases via `(name, filename, line number)` tuples. If I construct a subcase tree, filename and line number are not unique. To ensure doctest distinguishes each subcase, for each point on the subcase tree, I pass in a unique `name` based on the stringified form of each `OPTION` between the root and the current node.
+
+The `PICK` macro takes the "leaf" subcase name (AKA the current parameter values) and logs it via `INFO()`. The subcase name will show up in failed assertions until the object created by `INFO()` is destroyed (when its scope ends). My subcase name generation is a bit ugly and adds a trailing `", "` after the final subcase; it's good enough for my own use case, but should be fixed before upstreaming to doctest.
+
+The macros are very fiddly and I am not confident they are free of undefined behavior.
+
+My initial implementation had a use-after-free in `PARAMETERIZE` where `inner` (stack variable) was captured by reference, and the resulting function returned a lambda with a stale reference. This UB produced no visible signs on GCC, and std::bad_function_call on MSVC. I fixed this (https://gitlab.com/nyanpasu64/exotracker-cpp/blob/cycle-skip/tests/test_utils/parameterize.h#L52-56) by capturing `[&, inner]` instead. I still don't know what happens when you capture `T & parameter` via `[&]`. Do you get a reference, not a reference to a reference? 
+
+I developed my implementation based on doctest 2.3.4. Since then, https://github.com/onqtam/doctest/issues/282 seems to have changed how SUBCASE works. My implementation seems to works fine on 2.3.6, but it was not what I studied while building my implementation.
+
+### Extra information
+* doctest version: **2.3.4**
+* Operating System: **Windows 10 and Linux**
+* Compiler+version: **MSVC, GCC**
+## Description
+
+The "Catch2 and Google Test Explorer" Extension for Visual Studio Code has experimental support for doctest. However, several tests with the same name but in different tests suites can't be run. Also, the test results can't be displayed reliably inline in the source code. This could be fixed if some additional information was available from the command line.
+
+Could you add the possibility to list the test suites and test cases with file names and line numbers from the command line?
+
+This would make it possible for the extension to work reliably and give VS Code users much better usability while using doctest.
+
+See: https://github.com/matepek/vscode-catch2-test-adapter/issues/143#issuecomment-566092840
+And: https://github.com/matepek/vscode-catch2-test-adapter/issues/143#issuecomment-566139062
+## Description
+It would be wonderful if doctest supported checking compile-time expressions and run-time expressions _together_. I'd like to check that my `constexpr` functions indeed work as compile-time, and at run-time.
+
+### Example
+
+```cpp
+template<typename T>
+constexpr T square(T const& t) noexcept
+{
+   if (std::is_constant_evaluated()) {
+      return t * t * t; // contrived, but hopefully communicates what's missing
+   }
+   return t * t;
+}
+
+// current
+TEST_CASE("only happens at run-time AFAIU") {
+   CHECK(square(0) == 0);
+   CHECK(square(1.0) == 1.0);
+   CHECK(square(2) == 4); // error not caught
+}
+
+// proposed
+CONSTEXPR_TEST_CASE("happens at both compile-time and run-time") {
+   CHECK(square(0) == 0);
+   CHECK(square(1.0) == 1.0);
+   CHECK(square(2) == 4); // error in the constexpr case
+}
+```
+
+### Extra information
+I doubt this is possible in C++17, but it is certainly doable from C++20 onward (even if it's a bit clunky for now). `static_assert` is also not helpful here, since only guaranteed constant expressions are allowed to be checked using a `static_assert`.
+I would just like to add some weight to the requirement for a Junit reporter; I know it's scheduled for the 2.4 release, but currently it is what is stopping me from moving to doctest from Catch2. Otherwise I'm very impressed with doctest.
+
+Junit is a very useful format for interacting with CI systems like Team City, Jenkins, and in my case GitLab.
+
+As such, the output format does **NOT** need to support all of the Junit schema, in fact it is better to provide the absolute minimum that will be parsed by these systems. By the way, the one that seems to cause the most issues is the 'classname' attribute which needs to be present, even though its not much use if the source language is not Java.
+
+The tricky issues would seem to be:
+
+1. Dealing with SUBCASES
+2. Junit seems to imply that the test statistics must be emitted as attributes in the opening tag of a testcase; which causes a problem with a lightweight framework, as we dont want to have to store intemediate results.
+
+My thoughts on these points:
+
+1. Is something specific to Doctest, so I think you are the best person to have an opinion.
+2. This can be sidestepped by NOT emitting the statistics attributes. Most CI frameworks are just interested in detecting a `failure` tag.
+
+In any event, if we need to emit attribute tags, it is fairly straightforward to build a post-processor program that can be run over the file. I built a simple one using a python package I found somewhere (can't remember the name now).
+
+It looks as though it should be possible to provide a Junit reporter by modifying the example XML reporter; in fact by dropping about 90% of the code! I did a quick trial to confirm this, but it's not suitable for a PR as my understanding of the API and subcases is poor.
+## Description
+
+This is a release-only mac-only issue, so I would dub it relatively low priority.
+
+doctest crashes even with the most simple test on mac with `-fsanitize=address,undefined` on this line: https://github.com/onqtam/doctest/blob/master/doctest/parts/doctest.cpp#L3049 (`p->cout = &std::cout;`)
+
+### Steps to reproduce
+
+* A single line simple test case `CHECK(true);`
+* Build on mac with `cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-g -fsanitize=address,undefined"`
+* Run test. Crash on the line from above
+
+Can't be reproduced on anything other than mac and Release.
+
+### Extra information
+
+An example log from the crash
+
+```
+==3100==ERROR: AddressSanitizer: unknown-crash on address 0x000104ce4048 at pc 0x000104be6861 bp 0x7ffeeb053b10 sp 0x7ffeeb053b08
+READ of size 8 at 0x000104ce4048 thread T0
+    #0 0x104be6860 in doctest::Context::run() doctest_impl.h:3049
+    #1 0x104bee421 in main doctest_impl.h:3316
+    #2 0x7fff69620114 in start (libdyld.dylib:x86_64+0x1114)
+Address 0x000104ce4048 is a wild pointer.
+SUMMARY: AddressSanitizer: unknown-crash doctest_impl.h:3049 in doctest::Context::run()
+Shadow bytes around the buggy address:
+  0x10002099c7b0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x10002099c7c0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x10002099c7d0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x10002099c7e0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x10002099c7f0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+=>0x10002099c800: 00 00 00 00 00 00 00 00 00[00]00 00 00 00 00 00
+  0x10002099c810: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x10002099c820: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x10002099c830: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x10002099c840: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x10002099c850: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07 
+  Heap left redzone:       fa
+  Freed heap region:       fd
+  Stack left redzone:      f1
+  Stack mid redzone:       f2
+  Stack right redzone:     f3
+  Stack after return:      f5
+  Stack use after scope:   f8
+  Global redzone:          f9
+  Global init order:       f6
+  Poisoned by user:        f7
+  Container overflow:      fc
+  Array cookie:            ac
+  Intra object redzone:    bb
+  ASan internal:           fe
+  Left alloca redzone:     ca
+  Right alloca redzone:    cb
+==3100==ABORTING
+```
+
+A travis-ci build can be seen here: https://travis-ci.org/iboB/dynamix/builds/623850241
+
+As per https://github.com/rollbear/trompeloeil/pull/169#issuecomment-554357125 it would be nice to have a ADD_SUCCESS_AT to inform doctest of a successful assert in the same way ADD_FAIL_AT informs it of a failed assert.

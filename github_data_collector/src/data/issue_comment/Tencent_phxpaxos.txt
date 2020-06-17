@@ -1,0 +1,106 @@
+When I run the autoinstall.sh, there is an error "phxpaxos/third_party/protobuf/include not found please make sure PROTOBUF has been placed on third party directory"
+1. 编译和安装: 原来脚本第149行 执行 `./autogen.sh` 进行glog configure,而现版本glog已无脚本。
+建议改成 `./configure`  
+2. Spelling. 项目实现清晰，但是在代码和注释中有比较多的拼写错误。
+譬如:src/algorithm/learner_sender.h 47行:
+`  const bool Comfirm(const uint64_t llBeginInstanceID, const nodeid_t iSendToNodeID);`
+应为`const bool Confirm(const uint64_t llBeginInstanceID, const nodeid_t iSendToNodeID);`
+
+腾讯的大神好，请教一个问题
+文档描述：
+设置oOptions.iGroupCount为1，标识我们想同时运行多少个PhxPaxos实例。我们通过GroupIdx来标识实例，
+其范围为[0,oOptions.iGroupCount)，我们支持并行运行多个实例，每个实例独立运作。不同实例直接无任何关联，
+支持多实例的目的仅仅是为了让它们可以共享同一个IP/PORT。
+
+我的目的：是运行多个Group 提高系统性能
+我的问题：我写了一个启动多个group 的程序， 但是性能结果并没有提高，反而下降.
+我的环境：4核心 8G内存， 一台物理机上部署了3个进程. 每个进程有（1，n） 个group, 一个group 有（1， N） 个状态机. 一个进程里线程个数和group 数字相同
+
+初始化：大概如下
+
+int PhxEngine::RunPaxos()
+{
+                 。。。。。，，
+                 。。。。。
+                //添加group
+		for( int i = 0 ; i < gsum ; i++)
+		{
+			GroupSMInfo oSMInfo;
+			oSMInfo.iGroupIdx = i;
+			if( i == 0 )
+			{
+				oSMInfo.bIsUseMaster = true;
+			}
+			for( int i = 1 ; i <= max ; i++)
+			{
+				OrderSync* tmp = new OrderSync;
+				tmp->id = i;
+                                //每个group 添加状态机
+				oSMInfo.vecSMList.push_back(tmp);
+			}
+                        //添加group
+			oOptions.vecGroupSMInfoList.push_back(oSMInfo);
+		}
+		oOptions.pMasterChangeCallback = &PhxEngine::OnMasterChange;
+                。。。。。
+             
+		for( int i = 0 ; i< gsum ; i++)
+		{
+			m_poPaxosNode->SetMasterLease(i, 3000);
+                        //设置每个group线程数分配一个线程. i 是group id 。
+			m_poPaxosNode->SetMaxHoldThreads(i, 1);
+			m_poPaxosNode->SetLogSync(i,false);
+		}
+	        LOGS<<"run paxos ok"<<std::endl;
+}
+
+发其调用， 思路是，随机的分配到每一个group ，随机的使用每个group 里面状态机， 进行提交。
+最后统计提交总是和成功总数.  按成功总是计算tps
+{
+                string oid = buffer;
+		total++;
+		long long rm = tars::TC_Common::now2us();
+		srandom(rm);
+		int gid  = random()%gsum;
+		int matchid ;
+		matchid = random()%max + 1;
+		SMCtx oCtx;
+		OrderSMCtx tx;
+		oCtx.m_pCtx = (void *)&tx;
+		oCtx.m_iSMID = matchid;
+		
+		
+		nodeid_t id = m_poPaxosNode->GetMyNodeID();
+		m_poPaxosNode->SetProposeWaitTimeThresholdMS(id, 1000);
+		
+		int ret = m_poPaxosNode->Propose(gid, buffer, llInstanceID, &oCtx);
+}
+
+我的结论： 多个group 反而性能没有什么提升。测试性能 total = 13880 succ=13876 tps=1387 大概1387 左右。 如果每个进程都发起提按，性能在500 左右，错误码爆 -14
+
+我如何实现多个group 导致性能提升呢？ 我该怎么做？ 你们是怎么做的！！！！拜托了，大神
+if I have 5 nodes, the node 5th need to get the checkpoint. When the 5th receive three node checkpoint's ack  (for example :1,2,3), 3th node is  ready to transmit its checkpoint and jump into begin,  but now 5th node receive 4th checkpoint's ack and 4th also goes  into begin states  to transmit its checkpoint. In such case, 4th node will override 3th node checkpoint. My question is how to avoid it? I can't find the result in source code. Please release me!!!!! Thank you!
+
+看到tcp接收数据的模块。首先新的TCP连接进来，TcpAccepter会接受该连接，然后调用TcpAcceptor :: AddEvent()函数将其加入到一个负载最低的EventLoop中，在EventLoop :: AddEvent()将该文件句柄加入到m_oFDQueue之后，是否需要调用EventLoop :: JumpoutEpollWait()函数以通知EventLoop尽快将队列中的fd加入到epoll中，否则需要等到下一次超时后才能处理。
+
+因此将EventLoop::AddEvent()改为如下是否较为合适：
+void EventLoop :: AddEvent(int iFD, SocketAddress oAddr)
+{
+    std::lock_guard<std::mutex> oLockGuard(m_oMutex);
+    m_oFDQueue.push(make_pair(iFD, oAddr));
+
+   //新添加行
+    JumpoutEpollWait();
+}
+在prepare阶段，节点发起请求，将这次提议的值存储在 ProposerState对象中，只携带提案号n1发起请求, (此时提案值v1, 但不携带提案值）。
+在收到response时如果有应答中有提案值v2，保留提案号最大对应的值 v2，这时是直接用 v2 覆盖了 v1，详情见void Proposer :: OnPrepareReply(const PaxosMsg & oPaxosMsg)，这样在accept阶段，确实可以快速达成一致，与协议描述一致。
+考虑这样场景：3节点的group。节点1请求 set<k1, v1>, 节点2请求 set<k2, v2>, 如果节点2先发起提议，但还未通过整个协议阶段，此时节点1也发起提议，根据paxos协议。
+这2个请求在同一时间段冲突，为了尽快达成一致，导致所有节点都执行 set<k2, v2>的操作，数据在3个节点中确实保持一致了，但是节点2明显没有达到自己的目标，此时提议值被覆盖了，业务没有收到任何消息，这次的提议也成功了(value被改变了)。针对这样的场景，在不使用leader的情况下，业务有什么好的方式可以处理一下？或者说我的理解有误。还望不吝赐教，谢谢！！！
+思考：是否在ProposerState中，存储2个值，在发送propose冲突时，随机一个时间，再次发起提议，直到提议超时，让业务决定是否再次发起提议？
+The author of the article "Paxos made simple" says in his website that this article contains an ambiguous sentence that may lead to incorrect implementations:
+http://lamport.azurewebsites.net/pubs/pubs.html#paxos-simple
+
+He explicitly says: "Do not try to implement the algorithm from this paper.  Use [122] instead."
+Looking at the README file of this project, I'm concern if you are aware of such ambiguity, and if your implementation is correct?
+在3台机器的时候，发送accept之前，proposer自己先accept，成功后发送，acceptor接受到后，只要自己accept，就认为这个proposal被chosen。
+容灾有个很基本的要求，是副本不能都在一个机房。phxpaxos是严格串行，且不支持pipeline，我们部署三台机器，两台同IDC不同机架，一台不同IDC，只要同IDC的备机挂了，延时飙升，几乎不可用。这有可能进行改进吗？难道微信的备份都是在同一个IDC的？？

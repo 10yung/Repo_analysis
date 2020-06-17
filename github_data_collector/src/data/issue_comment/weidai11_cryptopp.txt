@@ -1,0 +1,131 @@
+The Ethereum network recently went through a hardfork which allows users to call the Blake2b compression function `F` directly in their smart contracts (to offer better interoperability with ZCash network). See details of the EIP here, including a link to the specification of the function `F` in question: https://eips.ethereum.org/EIPS/eip-152
+
+Currently all the clients are rolling their own implementation of function `F` because no libraries expose this one directly. We develop [KEVM](https://github.com/kframework/evm-semantics), a K implementation of the EVM, and rely on cryptopp for several other cryptographic primitives.
+
+For now, we will roll our own implementation of `F` as well, but this is a shame because it means that all the clients are not benefiting from having a single well-tested implementation of this function, even though the function already exists (for the most part).
+
+The function in question in this library is the following: https://github.com/weidai11/cryptopp/blob/90d957c09b6c19027ce96288c42e70fee32b3621/blake2.cpp#L717
+
+One key difference is that the exposed `F` needed by Ethereum clients must be parametric in the number of rounds run, whereas the implementation here hardcodes 12 rounds.
+
+Is it possible to expose (in the header) an implementation of `F` which Ethereum clients can use (must be parametric in the number of rounds)? If people are agreeable to this, we can offer to make the implementation/PR ourselves and submit it here.
+I'm just wondering if there's any appetite for this really. Right now internal headers, public headers, implementation and test files are all piled together into a jumbled mess.
+
+Would it not be much better to clean this up? I'd be happy to help with this effort
+
+I think it would also make things much simpler with respect to other build systems. I maintain a cmake build file for the project and I keep getting odd regressions due to not knowing which files I need for the build and which ones are part of the testing and benchmarking.
+As reported on the mailing list by Philippe Antoine at [Regression in Elliptic Curve Operation on brainpoolP256r1](https://groups.google.com/d/msg/cryptopp-users/RfAFR3_y1sI/qYH2rTavBQAJ):
+
+```
+...
+I have been doing differential fuzzing about elliptic curve cryptography with different libraries including cryptopp.
+
+On August the 6th, oss-fuzz found the first regression after about one year.
+I think this is dut to commit https://github.com/weidai11/cryptopp/commit/c9ef9420e762b91cc06463d349cf06e04c749b9d
+
+My output is the following
+
+point=04202020202020ffffff2020202020200020ffffffff20202020ff20ff20ff200104c8423eb699c3ace2e623855cb9238cb43971464f4b6686765c46ed4ce035dc
+
+bignum=000000000000000000000000000000000000000000000000000000000000000a
+
+mbedlts:045de6bae41907dbe3f0aa32b272add6b92fb2b79fdc49af35fb844be1c4c629e899295109c41cfe76a9c06c23d95b2d4be3b6f61a476acf1a67a0d848abba89e1
+
+libecc:045de6bae41907dbe3f0aa32b272add6b92fb2b79fdc49af35fb844be1c4c629e899295109c41cfe76a9c06c23d95b2d4be3b6f61a476acf1a67a0d848abba89e1
+
+libecc:045de6bae41907dbe3f0aa32b272add6b92fb2b79fdc49af35fb844be1c4c629e899295109c41cfe76a9c06c23d95b2d4be3b6f61a476acf1a67a0d848abba89e1
+
+openssl:045de6bae41907dbe3f0aa32b272add6b92fb2b79fdc49af35fb844be1c4c629e899295109c41cfe76a9c06c23d95b2d4be3b6f61a476acf1a67a0d848abba89e1
+
+gcrypt:045de6bae41907dbe3f0aa32b272add6b92fb2b79fdc49af35fb844be1c4c629e899295109c41cfe76a9c06c23d95b2d4be3b6f61a476acf1a67a0d848abba89e1
+
+cryptopp:0407f16bad8b16f5441f1a15f8e7eca364d97bb3a3c09b320bb9807ee26857b66f882ba526e55ebbf22342ae5a0186ed0ca1db8870fd001c63ae36dc72ee15f6e7
+
+
+That means when I multiply by 10 the point on the curve brainpoolP256r1
+
+x = 202020202020ffffff2020202020200020ffffffff20202020ff20ff20ff2001
+
+y = 04c8423eb699c3ace2e623855cb9238cb43971464f4b6686765c46ed4ce035dc
+
+I get a different result than all the other libraries.
+```
+
+From a private email by Ján Jančár:
+ 
+
+> Message-ID: <93874bd8-653e-33e9-c429-93712c3f30ba@mail.muni.cz>
+> Subject: Vulnerability disclosure
+> ...
+> 
+> During our research into security of elliptic curve cryptography implementations on smart-cards and in software libraries [1], we have discovered timing leakage in the ECDSA signature generation in the Crypto++ library.
+> 
+> *Vulnerability description*
+> 
+> When performing ECDSA over binary field curves, Crypto++ leaks the bit-length of the nonce used in scalar multiplication. It also leaks some other currently unknown information, see the attached plots, specifically the 'msb_hist.png' plot.
+> 
+> This leakage can be abused if an attacker is able to measure the duration of signing of a few hundreds or thousands of known messages. The attacker can then use a lattice attack based on the Hidden Number Problem [2] to reconstruct the private key used, as demonstrated in [3] (even remotely!).
+> 
+> See the attached plots and heatmaps for details of the leakage on the standard sect233r1 curve. based on the level of noise present in the attacker's measurements (the lattice attack is very sensitive to noise) and willingness to trade-off computation time, the attack would require from 500 to 10k signatures.
+> 
+> The private key recovery itself, assuming a noise free set of just enough signatures, would then take a few minutes. The leakage is somewhat present in ECDSA over prime field curves as well, but much smaller, I do not know the cause of this.
+> 
+> [1]: ECTester: https://crocs-muni.github.io/ECTester/
+> 
+> [2]: D. Boneh, R. Venkatesan: Hardness of computing the most significant bits of secret keys in Diffie-Hellman and related schemes; https://crypto.stanford.edu/~dabo/abstracts/dhmsb.html
+> 
+> [3]: B. B. Brumley, N. Tuveri: Remote Timing Attacks are Still Practical; https://eprint.iacr.org/2011/232.pdf
+
+It appears nearly all versions of Crypto++ are affected. Based on some research of antique Crypto++, I believe that means Crypto++ 3.2 and forward. Crypto++ 3.2 was released March 20, 2000.
+
+Also posted to the mailing list at [ECDSA timing leaks](https://groups.google.com/forum/#!topic/cryptopp-users/1GGTAh4CEdA).
+I've build a [cryptography implementation differential fuzzer](https://github.com/guidovranken/cryptofuzz) that has been running on OSS-Fuzz for a few weeks and has found some [nice bugs](https://github.com/guidovranken/cryptofuzz#hall-of-fame).
+
+I will be integrating Crypto++ support for my fuzzer into OSS-Fuzz shortly. Would any of the maintainers like to be notified of automated bug reports? If so, please give me one or more e-mail addresses linked to a Google account.
+
+I noticed that someone had commenced [OSS-Fuzz integration](https://github.com/weidai11/cryptopp/issues/602#issuecomment-376222204), did anything come of this?
+
+I'm also running a [bignum differential fuzzer](https://github.com/guidovranken/bignum-fuzzer) on OSS-Fuzz. Would you be interested in writing Crypto++ support for this fuzzer?
+
+As reported on the mailing list at [Stream Cipher (Panama) & Decoder question](https://groups.google.com/d/msg/cryptopp-users/sHCHSjM7scY/PkcSbIo-DQAJ). The issue appears to affect builds where the inline assembly is engaged. GCC and MS have the issue, Clang does not have the issue. The issue is also present in Crypto++ 5.6.2.
+
+```
+AutoSeededRandomPool prng;
+std::string plain("High-school students - who have been protesting against changes to colleges and the university system - also seized on the mood of protest and stepped up their blockades.");
+std::string cipher_hex, recover1, recover2, cipher_bin;
+
+SecByteBlock key(32), iv(32);
+prng.GenerateBlock(key, key.size());
+prng.GenerateBlock(iv, iv.size());
+
+PanamaCipher<LittleEndian>::Encryption enc;
+enc.SetKeyWithIV(key, key.size(), iv, iv.size());
+PanamaCipher<LittleEndian>::Decryption dec;
+dec.SetKeyWithIV(key, key.size(), iv, iv.size());
+
+StringSource (plain, true, new StreamTransformationFilter(enc, new HexEncoder(new StringSink(cipher_hex))));
+
+// works fine, recover1 = plain
+StringSource (cipher_hex, true, new HexDecoder(new StringSink(cipher_bin)));
+StringSource (cipher_bin, true, new StreamTransformationFilter(dec, new StringSink(recover1)));
+
+enc.Resynchronize(iv, iv.size());
+dec.Resynchronize(iv, iv.size());
+
+// does not work, recover2 = "High-school students – who have been protesting against changes –Ö)‘à« ç›áS` ¥¨~]Šm Q­ÿö:Û (...) "
+StringSource (cipher_hex, true, new HexDecoder(new StreamTransformationFilter(enc, new StringSink(recover2))));
+
+std::cout << "One: ";
+std::cout << recover1 << std::endl;
+
+std::cout << "Two: ";
+std::cout << recover2 << std::endl;
+```
+ARMv8.4 adds cpu support for SHA512, SHA3, SM3 and SM4. This ticket will track the changes to the CPU gear to support ARMv8.4. SHA512, SHA3, SM3 and SM4 will be added under different tickets.
+SM2 is a 4-part Chinese national standard for public key algorithms, including digital signatures and elliptic curves. See [SM2 Digital Signature Algorithm](https://tools.ietf.org/html/draft-shen-sm2-ecdsa-02). We recently received some private emails asking for several Chinese algorithms. The email also pointed out US and some European algorithms have good coverage in the library.
+This issue is a follow up to #113 - Add support for EC-GDSA and EC-KCDSA - specifically about the support of EC-KCDSA after the implementation of EC-GDSA.
+Thanks for your hard work on this library!
+
+Argon2 winning the [PHC](https://password-hashing.net/) made it a great choice for a memory hard KDF. BLAKE2 is already implemented here so I think it would be a bit less work than a fresh implementation. 
+
+I've found some useful writeups [here](https://wiki.mozilla.org/NSS/ARGON2) although there doesn't seem to be any work in the past couple months. 

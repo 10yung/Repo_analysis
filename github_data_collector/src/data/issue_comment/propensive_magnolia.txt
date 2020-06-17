@@ -1,0 +1,142 @@
+We have a simple use case which is similar to the **decode.scala** example, https://github.com/propensive/magnolia/blob/master/examples/shared/src/main/scala/decode.scala#L49
+
+We want to decode _sth_ into an instance of a Scala case class, given the type of the root sealed trait of all possible case classes, the root sealed trait also has many other sealed traits who extends it at different levels on the hierarchy.
+
+It seems actually the code in **decode.scala** is not valid, since actually the subtypes of ctx in dispatch function also contains sealed traits, which are "CallByNeed", so if we do "ctx.subtypes.find(_.typeName.full == name).get" and if the case class that we want to find is actually one of the subtype of a sealed trait which is "CallByNeed" we cannot find the case class since it is not in subtypesArray.
+
+I think it will be beneficial if we can somehow expose the names of all case class subtypes of a root sealed trait so that "ctx.subtypes.find(_.typeName.full == name).get" can be a valid check ?
+Would be very useful if we could find out if a subtype is an object when using subtypes in dispatch.
+Eg,
+
+`case class TransientFoo(a: String, @transient b: String, c: String)`
+
+The annotations array for all 3 params is empty.
+This code, which used to compile with Magnolia 0.7.1, fails with 0.10.0
+```scala
+import magnolia._
+
+trait Eq[T] { def equal(value: T, value2: T): Boolean }
+
+object Eq extends PrimitiveEq with ListEq with OptionEq with EitherEq {
+  type Typeclass[T] = Eq[T]
+  def combine[T](ctx: CaseClass[Eq, T]): Eq[T] = (value1: T, value2: T) => ctx.parameters.forall { param =>
+    param.typeclass.equal(param.dereference(value1), param.dereference(value2))
+  }
+  def dispatch[T](ctx: SealedTrait[Eq, T]): Eq[T] = (value1: T, value2: T) => ctx.dispatch(value1) {
+    case sub =>
+      sub.cast.isDefinedAt(value2) && sub.typeclass.equal(sub.cast(value1), sub.cast(value2))
+  }
+  implicit def gen[T]: Eq[T] = macro Magnolia.gen[T]
+}
+
+trait PrimitiveEq{
+  implicit val string: Eq[String] = ???
+}
+
+trait ListEq {
+  implicit def listEq[A](implicit eq: Eq[A]): Eq[List[A]] = ???
+}
+
+trait EitherEq {
+  implicit def eitherEq[A, B](implicit eqA: Eq[A], eqB: Eq[B]): Eq[Either[A, B]] = ???
+}
+
+trait OptionEq {
+  implicit def optionEq[A](implicit eq: Eq[A]): Eq[Option[A]] = ???
+}
+
+case class Guest(name: String, child: Option[Guest])
+case class Organizer(name: String)
+case class BirthdayParty(people: List[Either[Guest, Organizer]])
+
+object BirthdayParty {
+  implicit val eq: Eq[BirthdayParty] = Eq.gen
+}
+```
+But compiles if the implicit from `EitherEq` is moved to Eq companion object. Probably, this happens because of the low priority of implicits which come with mixed traits.
+I couldn't find how to install magnolia in the documentation, I think we should make it more obvious
+I was trying to make a small change to the `default` example, and wanted to test that my change didn't break anything. The compilation error I see looks like it's an issue between Mercator and Either, my guess is because Either has two type parameters (for Left and Right) and Monad only has one (equivalent to Right), but I don't know enough to submit a PR to fix. Please let me know if there's any more information I can provide!
+
+```
+sbt:root> test
+[info] Compiling 9 Scala sources to /home/anned/github/magnolia/examples/native/target/scala-2.11/classes ...
+[error] /home/anned/github/magnolia/examples/shared/src/main/scala/default.scala:31:23: no type parameters for method constructMonadic: (makeParam: magnolia.Param[magnolia.examples.Default,T] => Monad[PType])(implicit monadic: mercator.Monadic[Monad])Monad[T] exist so that it can be applied to arguments (magnolia.Param[magnolia.examples.Default,T] => scala.util.Either[String,magnolia.Param[magnolia.examples.Default,T]#PType])
+[error]  --- because ---
+[error] argument expression's type is not compatible with formal parameter type;
+[error]  found   : magnolia.Param[magnolia.examples.Default,T] => scala.util.Either[String,magnolia.Param[magnolia.examples.Default,T]#PType]
+[error]  required: magnolia.Param[magnolia.examples.Default,T] => ?Monad[?PType]
+[error]     def default = ctx.constructMonadic { param =>
+[error]                       ^
+[error] /home/anned/github/magnolia/examples/shared/src/main/scala/default.scala:31:48: type mismatch;
+[error]  found   : magnolia.Param[magnolia.examples.Default,T] => scala.util.Either[String,magnolia.Param[magnolia.examples.Default,T]#PType]
+[error]  required: magnolia.Param[magnolia.examples.Default,T] => Monad[PType]
+[error]     def default = ctx.constructMonadic { param =>
+[error]                                                ^
+[error] /home/anned/github/magnolia/examples/shared/src/main/scala/default.scala:31:40: could not find implicit value for parameter monadic: mercator.Monadic[Monad]
+[error]     def default = ctx.constructMonadic { param =>
+[error]                                        ^
+[error] three errors found
+```
+In 2.11.12, I'm seeing this compile error at calls to the `Magnolia.gen` macro, where deriving the instance requires some other implicit evidence instances to be materialized (which themselves may call some shapeless macros?)
+
+I don't have an easy/minimal repro atm but wanted to mention in case it's clear what the problem / possible fix might be (e.g. is this a hard-coded instance-name string that is colliding with other macro-generated instances from shapeless?)
+When we use derivation on a user-defined case class, some type-class instances might be missing. Magnolia at the moment may only report on the first missing instance.
+
+Is it possible to change the way errors are collected so we could see all the missing instances? 
+
+```scala
+test("show error for multiple missing implicits") {
+      scalac"""
+        case class Alpha(dbl:Double, str:String)
+        Show.gen[Alpha]
+      """
+    }.assert(_ == TypecheckError(
+      txt"""magnolia: could not find Show.Typeclass for type Double
+           |    in parameter 'dbl' of product type Alpha
+           |magnolia: could not find Show.Typeclass for type String
+           |    in paramater 'str' of product type String"""))
+```
+
+
+Magnolia can not derive typeclasses instances for the following class:
+
+```scala
+class PrivateClass private (val value: Long) extends AnyVal
+object PrivateClass {
+  def apply(l: Long) = new PrivateClass(l)
+}
+```
+
+The derived instance will contain something along the line of:
+
+```scala
+new PrivateClass(makeParam(parameters$macro$262(0)).asInstanceOf[Long]);
+```
+
+Which will fail to compile with the following error:
+
+```
+[error] constructor PrivateClass in class PrivateClass cannot be accessed in <$anon: magnolia.CaseClass[MyTypeclass.Typeclass, PrivateClass]>
+[error]     MyTypeclass.gen[PrivateClass]
+[error]              ^
+```
+This happened while calling magnolia to derive a typeclasse instance for  `com.google.bigtable.v2.Mutation.MutationCase`:
+
+```
+<console>:16: error: exception during macro expansion:
+scala.ScalaReflectionException: Java enum DELETE_FROM_FAMILY is not a type
+	at scala.reflect.api.Symbols$SymbolApi.asType(Symbols.scala:183)
+	at scala.reflect.api.Symbols$SymbolApi.asType$(Symbols.scala:183)
+	at scala.reflect.internal.Symbols$SymbolContextApiImpl.asType(Symbols.scala:94)
+	at magnolia.Magnolia$.$anonfun$gen$56(magnolia.scala:403)
+	at scala.collection.immutable.List.map(List.scala:283)
+	at magnolia.Magnolia$.directInferImplicit$1(magnolia.scala:402)
+	at magnolia.Magnolia$.$anonfun$gen$68(magnolia.scala:480)
+	at scala.Option.orElse(Option.scala:289)
+	at magnolia.Magnolia$.$anonfun$gen$1(magnolia.scala:480)
+	at magnolia.CompileTimeState$Stack$.withContext(magnolia.scala:627)
+	at magnolia.Magnolia$.gen(magnolia.scala:85)
+	at com.spotify.scio.coders.CoderMacros$.wrappedCoder(CoderMacros.scala:125)
+```
+
+While magnolia can't possibly derive an typeclasse instance for this type, it should still be able to use `fallback` instead.

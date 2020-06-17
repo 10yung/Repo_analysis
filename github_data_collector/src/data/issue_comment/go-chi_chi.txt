@@ -1,0 +1,200 @@
+When using stream compression in combination with (SSE) event streams, you need to flush every time you sent an event (to ensure data still in the compression buffer is effectively sent).
+
+The compression middleware's Flush doesn't flush compressed data, because the underlying writer (e.g. gzip.Writer)'s Flush doesn't have the http.Flusher signature (because it has an error return argument). 
+
+This patch flushes the underlying stream if it implements gzip's flush signature. 
+
+After flushing the GZip stream, the underlying response writer will have pending data as well, and so needs to be flushed too.
+Add go mod (and .sum) files .
+
+This makes the list of dependencies clearer (even if none exists outside stdlib in this case). 
+
+It also prevents the ugly +incompatible suffix that is added in downstream projects dependent on this.
+- Include `Allow` Header for `405 MethodNotAllowed` responses. Context [RFC](https://tools.ietf.org/html/rfc7231#section-6.5.5)
+- Include tests for default `methodNotAllowed` handler
+- improve performance in the [node routes](https://github.com/go-chi/chi/compare/master...bernardopericacho:allow_header?expand=1#diff-37cf0fd7a164303538a2d22d965646dfR625) checking existence on a map instead of doing a loop calling [`methodTypString`](https://github.com/go-chi/chi/compare/master...bernardopericacho:allow_header?expand=1#diff-37cf0fd7a164303538a2d22d965646dfL750)
+- adds tests for `AllowContentType` middleware
+- use map for better lookup performance
+Go `1.13` is out, `GOPATH` is gone. Most of the packages have go module support.
+
+What's holding Chi back? How can I help?
+I'm trying to learn Chi coming from Python/Flask background 
+
+I assume that this is a proper way to get Url parameters: 
+`id := chi.URLParam(r, "id")
+`
+
+```
+@app.route('/post/<int:post_id>')
+def show_post(post_id):
+    # show the post with the given id, the id is an integer
+    return 'Post %d' % post_id
+```
+
+I'm not sure what sync should do. 
+
+Is there a shorthand for yielding status code errors? 
+```
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte("404 HTTP status code returned!"))
+```
+
+Shorthand in flask ( for comparison ) 
+```
+[from flask import abort
+
+abort(404)](url)
+```
+The Go documentation states the following on `http.Request.RemoteAddr`: 
+```
+The HTTP server in this package sets RemoteAddr to an "IP:port" address before invoking a handler.
+```
+
+Therefore, you could expect that a code like this is correct:
+
+```go
+package main
+
+import (
+	"fmt"
+	"net"
+	"net/http"
+
+	"github.com/go-chi/chi"
+	"github.com/go-chi/chi/middleware"
+)
+
+func main() {
+	r := chi.NewMux()
+	r.Use(middleware.RealIP)
+	r.Get("/test", func(rw http.ResponseWriter, r *http.Request) {
+		host, port, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			fmt.Fprintf(rw, "Error: %v\n", err)
+		} else {
+			fmt.Fprintf(rw, "Host: %s\nPort: %s\n", host, port)
+		}
+	})
+	http.ListenAndServe(":8000", r)
+}
+```
+
+However, the RealIP middleware is just copying the `X-Forwarded-For` value into `r.RemoteAddr`, which usually does not contain a port, making the code fail:
+
+```
+[dirbaio@mars]$ curl localhost:8000/test
+Host: ::1
+Port: 40188
+[dirbaio@mars]$ curl localhost:8000/test -H 'X-Forwarded-For: 1.2.3.4'
+Error: address 1.2.3.4: missing port in address
+[dirbaio@mars]$ curl localhost:8000/test -H 'X-Forwarded-For: ::1'
+Error: address ::1: too many colons in address
+
+```
+
+Perhaps RealIP should try to parse `X-Forwarded-For` for a `host:port`, and if it isn't, add a port? Maybe `0` to denote the port is unknown, like `1.2.3.4` -> `1.2.3.4:0`?
+
+This is particularly frustrating with IPv6 addresses because they have colons but they're not the `host:port` colon, making it hard to parse the RemoteAddr in user code.
+I've been scratching my head for the past day where the chi wouldn't route the request properly. Here are the registered routes.
+
+```go
+r.Route("/accounts/{id:(me|[a-zA-Z0-9]{10,})})", func(r chi.Router) {
+//works
+})
+r.Route("/accounts/{id:(me|[a-zA-Z0-9]{10,})})/new_link", func(r chi.Router) {
+//works
+})
+r.Route("/accounts/{id:(me|[0-9]+)}/Backward_compat_link, func(r chi.Router) {
+//no request won't be routed here debugger shows that this route has been added under /accounts/{id:(me|[a-zA-Z0-9]{10,})})
+})
+```
+Fixes #336 
+```go
+r := NewRouter()
+
+// A handler that does not use middleware
+r.Post("/parent", postHandler)
+
+r.Group(func(r Router) {
+	r.Use(mw)
+
+	r.Route("/parent", func(r Router) {
+		r.Get("/", getHandler)
+		// ... other routes at or under `/parent` that use the middleware
+	})
+})
+```
+
+Requests to `GET /parent` hit the middleware and handler, as expected.
+
+Requests to `POST /parent` hit the middleware, and not the handler (`405 Method Not Allowed` is returned). Neither of those things are expected.
+
+Simplifying to this produces the same result (`GET` handler works, `POST` handler does not):
+
+```go
+r := NewRouter()
+r.Post("/parent", postHandler)
+
+r.Route("/parent", func(r Router) {
+	r.Get("/", getHandler)
+	// ...
+})
+```
+
+Here is a test demonstrating the issue:
+
+```go
+
+func TestRouteAndStandalone(t *testing.T) {
+	handlerCalled := false
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		// t.Logf("Called %s handler", r.Method)
+		handlerCalled = true
+	}
+
+	r := NewRouter()
+	r.Post("/parent", handler)
+
+	r.Route("/parent", func(r Router) {
+		r.Get("/", handler)
+	})
+
+	ts := httptest.NewServer(r)
+	defer ts.Close()
+
+	resp, _ := testRequest(t, ts, http.MethodPost, "/parent", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Failed to reach POST handler: %s", resp.Status)
+	}
+
+	if !handlerCalled {
+		t.Error("Expected to reach POST handler, but did not")
+	}
+
+	handlerCalled = false
+
+	resp, _ = testRequest(t, ts, http.MethodGet, "/parent", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Failed to reach GET handler: %s", resp.Status)
+	}
+
+	if !handlerCalled {
+		t.Error("Expected to reach GET handler, but did not")
+	}
+}
+```
+
+The output is:
+
+```text
+$ go test -v -run TestRouteAndStandalone
+=== RUN   TestRouteAndStandalone
+--- FAIL: TestRouteAndStandalone (0.00s)
+	mux_test.go:1311: Failed to reach POST handler: 405 Method Not Allowed
+	mux_test.go:1315: Expected to reach POST handler, but did not
+FAIL
+exit status 1
+FAIL	github.com/go-chi/chi	0.015s
+```
+
+This is true of v3.3.2, and master @ 0c5e7ab.

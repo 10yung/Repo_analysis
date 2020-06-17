@@ -1,0 +1,168 @@
+during unit-testing with the thread-sanitizer on, setLoggerLevel: was
+flagged unnecessarily as a potential data-race.
+
+__sharedLoggerLevel is already marked volatile, and the location of
+the data race indicated was a debug logging message .
+Only see in the unit test.
+The connectedMs field in the metadata is the time the request started relative to the time the connection started. Because we dispatch the first request into the socket and THEN do the connection, it is essentially 0 for the first request, and the total duration of that first request includes the TCP connection time.
+
+Let's break out the TCP connection time into its own field. Maybe consider then subtracting that time from the duration of the first request.
+
+Server set window size is 2^31-1 for speed , so server don't send window update, and setting feedback wind size。 in code , _initialSendWindowSize is update in SPDYSession.m , _sessionSendWindowSize not update,  but sending data use MIN(_initialSendWindowSize,_sessionSendWindowSize)
+
+Right now we do a ping at the very beginning and store that value for the life of the connection. We should update it "periodically", but first have to define exactly when & how often.
+
+like
+353: Inflation failed. Aborting.
+
+Frame 655: 648 bytes on wire (5184 bits), 648 bytes captured (5184 bits) on interface 0
+Raw packet data
+Internet Protocol Version 4, Src: 119.167.232.102, Dst: 10.25.51.220
+Transmission Control Protocol, Src Port: 7777 (7777), Dst Port: 60292 (60292), Seq: 147267, Ack: 317, Len: 608
+SPDY: SYN_REPLY, Stream: 1147 [Error: Header decompression failed]
+    1... .... .... .... = Control frame: Yes
+    .000 0000 0000 0011 = Version: 3
+    Type: SYN_REPLY (2)
+    Flags: 0x00
+    Length: 600
+    .000 0000 0000 0000 0000 0100 0111 1011 = Stream ID: 1147
+    Header block: 004a02b5fd0000000f000000083a76657273696f6e000000...
+    [Expert Info (Error/Undecoded): Inflation failed. Aborting.]
+        [Inflation failed. Aborting.]
+        [Severity level: Error]
+        [Group: Undecoded]
+
+In -allSPDYHeader of NSURLRequest + SPDYURLRequest.m.
+1. \-  NSMutableDictionary *spdyHeaders = [[NSMutableDictionary alloc] initWithDictionary:@{
+2. \- @":method"  : self.HTTPMethod,
+3. \- @":path"    : path,
+4. \- @":version" : @"HTTP/1.1",
+5. **_\- @":host"    : url.host,_**
+6. \- @":scheme"  : url.scheme
+7. \-  }];
+
+the host should is host:port。
+
+(http://dev.chromium.org/spdy/spdy-protocol/spdy-protocol-draft3#TOC-3.2.1-Request)
+":host" - the hostport (See RFC1738) portion of the URL for this request (e.g. "www.google.com:1234"). This header is the same as the HTTP 'Host' header.
+
+When we visit "http://wsq.discuz.qq.com/"，we get a sub request "http:/"(NSURLConnecction + (BOOL)canHandleRequest:(NSURLRequest *)request; return YES,so this is a valid request)，get a crash on [- (NSDictionary *)allSPDYHeaderFields] of NSURLRequest+SPDYURLRequest.m.
+The reason is host is nil，causes crash to initialize NSMutableDictionary
+Now I modify the code as follows:
+
+```
+NSMutableDictionary *spdyHeaders = [[NSMutableDictionary alloc] initWithDictionary:@{
+         @":method"  : self.HTTPMethod ? self.HTTPMethod : @"GET",
+         @":path"    : path ? path : @"/",
+         @":version" : @"HTTP/1.1",
+         @":host"    : url.host ? url.host : @"",
+         @":scheme"  : url.scheme ? url.scheme : @"",
+         }];
+```
+
+I try to use CocoaSPDY visit our SPDY Proxy Server in my QQ Browser，meet a bug: 
+
+Visit http://m.sohu.com/n/452167131/?wscrid=15084_2，get a 301 redirect，the reason is that we have a error path:'/n/452167131?wscrid=15084_2',lost '/' when we use 'url.path'.
+
+```
+- (NSDictionary *)allSPDYHeaderFields
+{
+    NSDictionary *httpHeaders = self.allHTTPHeaderFields;
+    NSURL *url = self.URL;
+
+    static NSSet *invalidKeys;
+    static NSSet *reservedKeys;
+    static dispatch_once_t initialized;
+    dispatch_once(&initialized, ^{
+        invalidKeys = [[NSSet alloc] initWithObjects:
+            @"connection", @"keep-alive", @"proxy-connection", @"transfer-encoding", nil
+        ];
+
+        reservedKeys = [[NSSet alloc] initWithObjects:
+            @"method", @"path", @"version", @"host", @"scheme", nil
+        ];
+    });
+
+    //----by rex----begin
+    //Error:
+    //Visit http://m.sohu.com/n/452167131/?wscrid=15084_2，get a 301 redirect，
+    //the reason is that we have a error path:'/n/452167131?wscrid=15084_2',lost '/'
+    //when we use 'url.path'.
+    //
+    //Reason:
+    //Apple doc for 'url.path': If the path has a trailing slash, it is stripped.
+    //
+    //Solution:
+    //http://markmail.org/message/cigyetgyjcvwsyx5#query:+page:1+mid:g4pmkeourikefc3p+state:results
+    //NSString* s = @"http://example.com/path/to/id%3D8528/" ;
+    //    NSLog(@"       given: %@", s) ;
+    //    NSURL* url = [NSURL URLWithString:s] ;
+    //    NSString* cocoaPath = [url path] ;
+    //    NSString* cfPath = (NSString*)CFBridgingRelease(CFURLCopyPath((CFURLRef)url));
+    //    NSString* cfstrictPath = (NSString*)CFBridgingRelease(CFURLCopyStrictPath((CFURLRef)url, NULL)) ;
+    //    NSLog(@"   cocoaPath: %@", cocoaPath) ;
+    //    NSLog(@"      cfPath: %@", cfPath) ;
+    //    NSLog(@"cfstrictPath: %@", cfstrictPath) ;
+    //
+    //Result:
+    //given: http://example.com/path/to/id%3D8528/
+    //cocoaPath: /path/to/id=8528
+    //cfPath: /path/to/id%3D8528/
+    //cfstrictPath: path/to/id%3D8528/
+    //
+
+
+//    NSString *escapedPath = CFBridgingRelease(CFURLCreateStringByAddingPercentEscapes(
+//            kCFAllocatorDefault,
+//            (__bridge CFStringRef)url.path,
+//            NULL,
+//            CFSTR("?"),
+//            kCFStringEncodingUTF8));
+
+//    NSMutableString *path = [[NSMutableString alloc] initWithString:escapedPath];
+
+    NSMutableString *path = [[NSMutableString alloc] initWithString:(NSString*)CFBridgingRelease(CFURLCopyPath((CFURLRef)url))];
+    //----end----
+
+
+    NSString *query = url.query;
+    if (query) {
+        [path appendFormat:@"?%@", query];
+    }
+
+    NSString *fragment = url.fragment;
+    if (fragment) {
+        [path appendFormat:@"#%@", fragment];
+    }
+......
+```
+
+the test result  as followed is one url test,   i am looking forward some person to give me some suggestions to solve the question.
+
+the test Method is: the same devices(nearly 2,000 devices),  50%'s probability to use common http request when app startup, and 50%'s probability to use spdy requests.
+
+/circle_getUserHeader.html,
+WIFI_IPOD4,1        260/388 171ms/213ms (-24.31%)
+WIFI_IPHONE8,2      1912/726    128ms/108ms (15.99%)
+WIFI_IPHONE8,1      1911/1096   122ms/106ms (13.25%)
+WIFI_IPHONE7,2      3574/1752   155ms/139ms (10.60%)
+WIFI_IPHONE7,1      2399/1257   231ms/152ms (34.19%)
+WIFI_IPHONE6,2      3804/3134   227ms/259ms (-13.75%)
+WIFI_IPHONE6,1      571/174 189ms/152ms (19.64%)
+WIFI_IPHONE5,2      880/693 237ms/161ms (32.12%)
+WIFI_IPHONE4,1      1760/919    223ms/380ms (-70.53%)
+WIFI_IPHONE3,1      838/213 348ms/333ms (4.46%)
+WCDMA_IPHONE4,1     622/283 382ms/349ms (8.73%)
+LTE_IPHONE8,2       392/150 436ms/303ms (30.47%)
+LTE_IPHONE8,1       542/553 273ms/245ms (10.24%)
+LTE_IPHONE7,2       4617/1857   211ms/206ms (2.71%)
+LTE_IPHONE7,1       1111/888    205ms/231ms (-12.46%)
+LTE_IPHONE6,2       1921/1255   314ms/212ms (32.38%)
+HSDPA_IPHONE6,2     279/282 504ms/544ms (-7.80%)
+EDGE_IPHONE3,1      164/250 1366ms/1053ms   (22.91%)
+CDMAEVDOREVA_IPHONE6,1      411/367 243ms/192ms (20.75%)
+tReqs:  29774/17798 (37.41%)
+tDelays:    256ms/250ms (2.20%)
+delay:  >0.8s   >1.5s   >4.0s   >120.0s
+spdy:   (3.53%) (1.50%) (0.35%) (0.01%)
+http:   (3.81%) (1.81%) (0.49%) (0.00%)

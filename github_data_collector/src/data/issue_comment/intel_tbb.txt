@@ -1,0 +1,155 @@
+I noticed some suspicious dlopen() calls while profiling my application and I tracked the origin of the calls back to tbb::internal::governor::one_time_init().
+
+void governor::one_time_init() {
+    if( !__TBB_InitOnce::initialization_done() )
+        DoOneTimeInitializations();
+#if __TBB_SURVIVE_THREAD_SWITCH
+    atomic_do_once( &initialize_cilk_interop, cilkrts_load_state );
+#endif /* __TBB_SURVIVE_THREAD_SWITCH */
+}
+
+The line:
+atomic_do_once( &initialize_cilk_interop, cilkrts_load_state );
+calls atomic_do_once, but initialize_cilk_interop is a function that returns a bool.
+
+There is an overloaded run_initializer in atomic_do_once, and the return value of initialize_cilk_interop is passed to cilkrts_load_state. This means the initialization callback runs all the time if cilk fails to load.
+
+I think turning initialize_cilk_interop into a void callback would be enough to fix the issue.
+
+bool initialize_cilk_interop() {
+    // Pinning can fail. This is a normal situation, and means that the current
+    // thread does not use cilkrts and consequently does not need interop.
+    return dynamic_link( CILKLIB_NAME, CilkLinkTable, 1,  /*handle=*/0, DYNAMIC_LINK_GLOBAL );
+
+//! One-time initialization function
+/** /param initializer Pointer to function without arguments
+           The variant that returns bool is used for cases when initialization can fail
+           and it is OK to continue execution, but the state should be reset so that
+           the initialization attempt was repeated the next time.
+    /param state Shared state associated with initializer that specifies its
+            initialization state. Must be initially set to #uninitialized value
+            (e.g. by means of default static zero initialization). **/
+template <typename F>
+void atomic_do_once ( const F& initializer, atomic<do_once_state>& state ) {
+    // tbb::atomic provides necessary acquire and release fences.
+    // The loop in the implementation is necessary to avoid race when thread T2
+    // that arrived in the middle of initialization attempt by another thread T1
+    // has just made initialization possible.
+    // In such a case T2 has to rely on T1 to initialize, but T1 may already be past
+    // the point where it can recognize the changed conditions.
+    while ( state != do_once_executed ) {
+        if( state == do_once_uninitialized ) {
+            if( state.compare_and_swap( do_once_pending, do_once_uninitialized ) == do_once_uninitialized ) {
+                run_initializer( initializer, state );
+                break;
+            }
+        }
+        spin_wait_while_eq( state, do_once_pending );
+    }
+}
+
+// Run the initializer which can not fail
+inline void run_initializer( void (*f)(), atomic<do_once_state>& state ) {
+    f();
+    state = do_once_executed;
+}
+
+// Run the initializer which can require repeated call
+inline void run_initializer( bool (*f)(), atomic<do_once_state>& state ) {
+    state = f() ? do_once_executed : do_once_uninitialized;
+}
+
+
+
+I've noticed that www.threadingbuildingblocks.org effectively disappeared as it is redirected to this GitHub repo. Many StackOverflow answers (like [1](https://stackoverflow.com/a/29727659/2527797) [2](https://stackoverflow.com/a/45986184/2527797) [3](https://stackoverflow.com/a/23437076/2527797) and their comments below like [here](https://stackoverflow.com/a/52082642/2527797)) suffer now having incorrect link to the documentation. Also, the links to official documentation (e.g. https://software.intel.com/en-us/node/506336) are not as self-explanatory as the links to the old TBB web-site (e.g. https://www.threadingbuildingblocks.org/docs/help/reference/task_scheduler/task_arena_cls.html).
+Please fix the redirection for sake of internet users looking for answers about TBB.
+Hi, this [webpage](https://software.intel.com/en-us/blogs/2011/09/08/the-intel-threading-building-blocks-flow-graph-is-now-fully-supported) mentions that starting from TBB 4.0 the flow graph model can express cyclic messaging graphs. Is there any example to demonstrate how to create a cyclic messaging graph in TBB?
+
+Thanks.
+I'm using macOS Mavericks 10.9.5, Adobe Photoshop CS3 Extended (10.0.1) as part of Adobe CS3 and tbb 2019.9, if I use DYLD_INSERT_LIBRARIES to load libtbbmalloc (export DYLD_INSERT_LIBRARIES=~/Documents/intel-tbb-runtime/libtbbmalloc_proxy.dylib) for Photoshop, it fails sometimes. I can't exactly pinpoint when but I'm creating new image, fill it with color, I add few shapes of second color, I use filter (Rough Pastels) on shapes, save it as PNG, apply this effect again 2x, save it as same PNG, replace. When I'm not using libtbbmalloc this doesn't happen and Photoshop works fine.
+
+I attached report I get.
+[pscr.txt](https://github.com/intel/tbb/files/4008483/pscr.txt)
+
+Note: Adobe CS3 is a bit outdated but you should be able to use it with tbbmalloc.
+
+As packages were renamed, regexp in the [line]( https://github.com/intel/tbb/blob/tbb_2020/cmake/TBBGet.cmake#L201) becomes incorrect:
+```
+string(REGEX REPLACE ".*(https.*oss_${tbb_lib_archive_suffix}).*" "\\1" tbb_bin_url "${tbb_release_info}")
+```
+Beause it looks for "oss_" which is absent now: https://api.github.com/repos/01org/tbb/releases/latest
+Opencv Python write function, cycle to call this function, parallel computing how to call TBB
+Take a look at Makefile. How are we supposed to build a debug build of TBB if all paths and cfg are hard coded to release?
+When using `std::copy(std::execution::par_unseq, ...)` and compiling on GCC 9.2.1 with `-fsanitize=address`, the leak sanitizer reports a leak in `tbb::internal::task_stream`.  
+
+I posted a small CMake project that demonstrates the problem here on GitHub: https://github.com/tttapa/tbb-mem-leak
+
+The `reproduce.sh` script should build and run the example, (hopefully) reproducing the problem.  
+TBB is included in the repo as a submodule, so you'll have to clone it recursively.
+
+I get the following output when running it on a Dell XPS 9560 (Intel i7-7700HQ) running Ubuntu 16.04:
+
+```
+=================================================================
+==14864==ERROR: LeakSanitizer: detected memory leaks
+
+Direct leak of 3096 byte(s) in 3 object(s) allocated from:
+    #0 0x7fccf94a1ebf in operator new[](unsigned long) (/usr/lib/x86_64-linux-gnu/libasan.so.5+0x10debf)
+    #1 0x7fccf915782b in tbb::internal::task_stream<3>::initialize(unsigned int) /home/pieter/GitHub/tbb-mem-leak/lib/tbb/./src/tbb/task_stream.h:90
+    #2 0x7fccf9153639 in tbb::internal::arena::arena(tbb::internal::market&, unsigned int, unsigned int) /home/pieter/GitHub/tbb-mem-leak/lib/tbb/./src/tbb/arena.cpp:226
+    #3 0x7fccf9153795 in tbb::internal::arena::allocate_arena(tbb::internal::market&, unsigned int, unsigned int) /home/pieter/GitHub/tbb-mem-leak/lib/tbb/./src/tbb/arena.cpp:249
+    #4 0x7fccf914fa08 in tbb::internal::market::create_arena(int, int, unsigned long) /home/pieter/GitHub/tbb-mem-leak/lib/tbb/./src/tbb/market.cpp:313
+    #5 0x7fccf914de7f in tbb::internal::governor::init_scheduler(int, unsigned long, bool) /home/pieter/GitHub/tbb-mem-leak/lib/tbb/./src/tbb/governor.cpp:180
+    #6 0x7fccf914acef in tbb::internal::governor::local_scheduler() (/home/pieter/GitHub/tbb-mem-leak/build/tbb_cmake_build/tbb_cmake_build_subdir_debug/libtbb_debug.so.2+0x2ccef)
+    #7 0x7fccf914a582 in tbb::internal::get_initial_auto_partitioner_divisor() /home/pieter/GitHub/tbb-mem-leak/lib/tbb/./src/tbb/task.cpp:151
+    #8 0x402cf0 in tbb::interface9::internal::adaptive_mode<tbb::interface9::internal::auto_partition_type>::adaptive_mode() /home/pieter/GitHub/tbb-mem-leak/lib/tbb/include/tbb/partitioner.h:270
+    #9 0x402cf0 in tbb::interface9::internal::dynamic_grainsize_mode<tbb::interface9::internal::adaptive_mode<tbb::interface9::internal::auto_partition_type> >::dynamic_grainsize_mode() /home/pieter/GitHub/tbb-mem-leak/lib/tbb/include/tbb/partitioner.h:381
+    #10 0x402cf0 in tbb::interface9::internal::auto_partition_type::auto_partition_type(tbb::auto_partitioner const&) /home/pieter/GitHub/tbb-mem-leak/lib/tbb/include/tbb/partitioner.h:478
+    #11 0x402cf0 in tbb::interface9::internal::start_for<tbb::blocked_range<__gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > > >, __pstl::__par_backend::__parallel_for_body<__gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __pstl::__internal::__pattern_walk2_brick<__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, std::copy<__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > > >(__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >)::{lambda(__gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >)#1}>(__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, std::copy<__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > > >(__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >)::{lambda(__gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >)#1}, std::integral_constant<bool, true>)::{lambda()#1}::operator()() const::{lambda(__gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >)#1}>, tbb::auto_partitioner const>::start_for(tbb::blocked_range<__gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > > > const&, {lambda()#1} const&, __pstl::__internal::__pattern_walk2_brick<__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, std::copy<__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > > >(__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >)::{lambda(__gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >)#1}>(__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, std::copy<__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > > >(__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >)::{lambda(__gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >)#1}, std::integral_constant<bool, true>)::{lambda()#1}::operator()() const::{lambda(__gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >)#1}&) /home/pieter/GitHub/tbb-mem-leak/lib/tbb/include/tbb/parallel_for.h:58
+    #12 0x402cf0 in tbb::interface9::internal::start_for<tbb::blocked_range<__gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > > >, __pstl::__par_backend::__parallel_for_body<__gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __pstl::__internal::__pattern_walk2_brick<__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, std::copy<__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > > >(__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >)::{lambda(__gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >)#1}>(__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, std::copy<__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > > >(__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >)::{lambda(__gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >)#1}, std::integral_constant<bool, true>)::{lambda()#1}::operator()() const::{lambda(__gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >)#1}>, tbb::auto_partitioner const>::run(tbb::blocked_range<__gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > > > const&, {lambda()#1} const&, __pstl::__internal::__pattern_walk2_brick<__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, std::copy<__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > > >(__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >)::{lambda(__gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >)#1}>(__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, std::copy<__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > > >(__pstl::execution::v1::parallel_unsequenced_policy const&, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >)::{lambda(__gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >)#1}, std::integral_constant<bool, true>)::{lambda()#1}::operator()() const::{lambda(__gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >, __gnu_cxx::__normal_iterator<int*, std::vector<int, std::allocator<int> > >)#1}&) /home/pieter/GitHub/tbb-mem-leak/lib/tbb/include/tbb/parallel_for.h:91
+    #13 0x7fccfa0227ff  (<unknown module>)
+
+SUMMARY: AddressSanitizer: 3096 byte(s) leaked in 3 allocation(s).
+```
+
+Code:
+
+```cpp
+#include <algorithm>
+#include <cassert>
+#include <execution>
+#include <vector>
+
+int main() {
+  std::vector<int> a(100'000);
+  std::vector<int> b(a.size());
+  std::copy(std::execution::par_unseq, std::begin(a), std::end(a), std::begin(b));
+  assert(b == a);
+}
+```
+
+Without `-fsanitize=address`, the program works as expected.
+Hello! Since tbb malloc does not release allocated memory to operating system it is now impossible to know how much memory an application can get before running out of RAM.
+It would be nice to have a way to find out how much memory allocated through tbb malloc is really used/unused.
+
+Hi, 
+I am new to TBB. May I please request you to help me with an issue?
+I have a TBB concurrent hash map which I first populate with a bunch of insert and erase. 
+Once I am done with the above population, I wish to iterate through the entire hash map and sum all the values (i.e., the value of each key-value pair) into a single variable. I do not know how to parallelize this iteration.  Could you please help me point out what is the right syntax for that? 
+
+I am trying the following but this is not compiling:
+typedef tbb::concurrent_hash_map<int64_t,int64_t> degreeMap;
+degreeMap hMap;
+int64_t y = 0;
+
+tbb::parallel_for( hMap.range(), [y](const degreeMap::range_type &r) {
+                for( degreeMap::iterator i = r.begin(); i != r.end(); i++){
+                     compare_and_swap(&y, i->second); 
+          };
+ } );
+
+Is there any example in the TBB source code which shown how to do something like this? 
+
+Many thanks,
+Abanti
+

@@ -1,0 +1,187 @@
+Using JsValue for property access aligns better with spec and later opens us for using them directly as keys in dictionary. This will reduce back and forth transformation of keys to string and JsValue. This should not affect normal usage as there are automatic conversions between common CLR types and JsValues.
+# Jint 2.11.58
+
+We try to limit the execution time of a script using "TimeoutInterval".
+When testing with a long running c# `Delegate`, Jint does not throw a `System.TimeoutException` but keeps executing. In the worst case, you end up in an infinite loop.
+
+```csharp
+
+
+            var result = new Jint.Engine(o => o.TimeoutInterval(TimeSpan.FromMilliseconds(100)))
+                .SetValue("slowFunction", new Func<string>(() =>
+                    {
+                        System.Threading.Thread.Sleep(TimeSpan.FromMilliseconds(200));
+                        // or use spinwait...
+                        // while (true)
+                        //    System.Threading.Thread.SpinWait(1);
+                        return "tadaaa!";
+                    }))
+                .Execute("slowFunction()")
+                .GetCompletionValue()?.ToObject();
+
+            // Expected: Exception
+            // But is string "tadaaa!"
+            
+
+```
+Using the following JavaScript codes from the Mozilla website:
+```js
+const Something = function(element) {
+  // |this| is a newly created object
+  this.name = 'Something Good';
+  this.handleEvent = function(event) {
+    console.log(this.name); // 'Something Good', as this is bound to newly created object
+    switch(event.type) {
+      case 'click':
+        // some code here...
+        break;
+      case 'dblclick':
+        // some code here...
+        break;
+    }
+  };
+
+  // Note that the listeners in this case are |this|, not this.handleEvent
+  element.addEventListener('click', this, false);
+  element.addEventListener('dblclick', this, false);
+
+  // You can properly remove the listeners
+  element.removeEventListener('click', this, false);
+  element.removeEventListener('dblclick', this, false);
+}
+
+const s = new Something(window);
+```
+To this, I have created the following window object in C# to handle the `AddEventListener/removeEventListener`.
+```csharp
+namespace JintTestsForms {
+    public sealed class JsWindow {
+        private Engine _engine;
+        public JsWindow(Engine engine) {
+            _engine = engine;
+        }
+        public void addEventListener(string type, object listener) {
+        }
+        public void addEventListener(string type, object listener, bool useCapture) {
+        }
+        public void addEventListener(string type, object listener, object options) {
+        }
+        public void removeEventListener(string type, object listener, bool useCapture)
+        {
+        }
+    }
+}
+```
+For most JavaScript event listener codes, Jint correctly sets the `listener` parameter to the function (`Func<,,,>`), but for the above Jint sets the `listener` parameter to `ExpandoObject` type. How do you dispatch events in this case?
+With some other javascript engines I found that instantiating the engine was very expensive and to combat this I created an object pool of engines. Would you suggest this approach for Jint as well or is creating an engine lightweight enough that it isn't needed?
+source string:    `function aa(){return new Date().getTime();}`
+
+packed string:
+`eval(function(p,a,c,k,e,d){e=function(c){return(c<a?"":e(parseInt(c/a)))+((c=c%a)>35?String.fromCharCode(c+29):c.toString(36))};if(!''.replace(/^/,String)){while(c--)d[e(c)]=k[c]||e(c);k=[function(e){return d[e]}];e=function(){return'\\w+'};c=1;};while(c--)if(k[c])p=p.replace(new RegExp('\\b'+e(c)+'\\b','g'),k[c]);return p;}('2 1(){0 5 4().3()}',6,6,'return|aa|function|getTime|Date|new'.split('|'),0,{}))`
+
+
+I need packed string covert to source string.but not work.
+demo:
+```
+var engine = new Engine();
+var ff = "value=String(function(p,a,c,k,e,d){e=function(c){return(c<a?\"\":e(parseInt(c/a)))+((c=c%a)>35?String.fromCharCode(c+29):c.toString(36))};if(!''.replace(/^/,String)){while(c--)d[e(c)]=k[c]||e(c);k=[function(e){return d[e]}];e=function(){return'\\w+'};c=1;};while(c--)if(k[c])p=p.replace(new RegExp('\\b'+e(c)+'\\b','g'),k[c]);return p;}('2 1(){0 5 4().3()}',6,6,'return|aa|function|getTime|Date|new'.split('|'),0,{}))";
+ var kk = engine.Execute(ff).GetValue("value") ;
+```
+
+
+
+return the value "kk" is not collect.  please teach me how to write ! tanks
+
+
+Object.keys("text") should return ["0", "1", "2", "3"] (edit) but throws instead.
+Object.keys("[1,2,3") should return ["0", "1", "2"] but throws instead.
+
+In ObjectConstructor.cs the following code handles the .keys functionality in Object.
+```
+public JsValue Keys(JsValue thisObject, JsValue[] arguments)
+        {
+            var oArg = arguments.At(0);
+            var o = oArg.TryCast<ObjectInstance>();
+            if (ReferenceEquals(o, null))
+            {
+                ExceptionHelper.ThrowTypeError(Engine);
+            }
+
+            var enumerableProperties = o.GetOwnProperties()
+                .Where(x => x.Value.Enumerable)
+                .ToArray();
+            var n = enumerableProperties.Length;
+
+            var array = Engine.Array.ConstructFast((uint) n);
+            uint index = 0;
+            foreach (var prop in enumerableProperties)
+            {
+                var p = prop.Key;
+                array.SetIndexValue(index, p, updateLength: false);
+                index++;
+            }
+            return array;
+        }
+    }
+```
+And this does not handle the case when Object.keys is invoked with a string or array as input object, which is valid JS and should return an array with the characters of the string and an array with the indexes of the array respectively.
+I have a usage scenario with lots of function calls and profiling pointed out that regex executions are the most CPU intensive.
+
+I am using latest v2 release.
+Was there any work over this on v3?
+
+I have read that the static calls on .NET Regex object should have better performance, and even a [cache](https://docs.microsoft.com/en-us/dotnet/api/system.text.regularexpressions.regex.cachesize?view=netcore-3.0) for compiled expressions, which would probably have a good effect on my scenario. 
+This could be implemented on Jint?
+For my use case we need to evaluate Javascript expressions for validation. I wanted to test Jint security features to ensure that the there would be minimal impact to the application if a bad expression was run. I was testing to see if it was possible to exceed the run limits and the following test case allows the 0.5s timeout to be exceeded and the memory limit of 500 to also be exceeded.
+
+Eventually the application fails with a .NET OutOfMemoryException.
+
+```
+var javascript = "new Array(2147483647).join('*')";
+var result = new Engine(options =>
+{
+    options.LimitRecursion(1);
+    options.Strict();
+    options.DiscardGlobal();
+    options.TimeoutInterval(TimeSpan.FromSeconds(0.5));
+    options.MaxStatements(1);
+    options.LimitMemory(500);
+} )
+.Execute(javascript)
+.GetCompletionValue() 
+.ToObject();
+```
+
+From browsing the source code it looks like the timeout and memory limits are only evaluated before each statement statement. Therefore the statement can exceed these limits and the execution only stops on the next statement. If it is not possible to resolve this case it is worth documenting this as a limitation of the timeout and memory limits.
+Any source file that has `using` both `Jint.Runtime` and `Esprima` fails to compile due to ambiguous class ExceptionHelper:
+https://github.com/sebastienros/jint/blob/dev/Jint/Runtime/ExceptionHelper.cs
+https://github.com/sebastienros/esprima-dotnet/blob/dev/src/Esprima/ExceptionHelper.cs
+
+Only happens if you place Esprima source inside jint's source tree to build a single dll instead of several.
+Hi,
+I'm trying to use the debug mode but I can't seem to find any documentation on how to operate it. For example I got this little code running to log each step of my script:
+
+        jintEngine.Step += (sender, info) =>
+        {
+            Debug.Log($"{info.CurrentStatement}: Line {info.CurrentStatement.Location.Start.Line}, Col {info.CurrentStatement.Location.Start.Column}, identifier: {identifier}");
+            return Jint.Runtime.Debugger.StepMode.Into;
+        };
+
+But then I wanted to know the name of the function I was currently debugging. This is where a documentation would help me a lot. So far I'm doing it like follows, but I have no idea how to get variable names, etc.
+
+        jintEngine.Step += (sender, info) =>
+        {
+            string identifier = "";
+            var funcStatement = info.CurrentStatement.As<Jint.Parser.Ast.FunctionDeclaration>();
+
+            if (funcStatement != null)
+            {
+                identifier = funcStatement.Id.Name;
+            }
+
+            Debug.Log($"{info.CurrentStatement}: Line {info.CurrentStatement.Location.Start.Line}, Col {info.CurrentStatement.Location.Start.Column}, identifier: {identifier}");
+            return Jint.Runtime.Debugger.StepMode.Into;
+        };
+
+So is there a documentation on how to use the debug mode? Or examples?
+Thank you for your help :)

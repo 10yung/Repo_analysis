@@ -1,0 +1,150 @@
+Feature #778 adds async disposable support for ASP.NET Core, but even outside the realm of ASP.NET Core, async disposable support is useful in two places:
+
+* To asynchronously dispose of disposables on a `Scope`
+* To asynchronously dispose the `Container`.
+
+Because of the extra required `Microsoft.Bcl.AsyncInterfaces` package, I feel adding support to the core library is unsuited for v4, but we might want to reconsider for v5.
+This package should do the following:
+
+- Implement a `SimpleInjectorHubActivator<T>` class
+- Add an extension method for registration of this class
+- Add an extension method that allows auto-registration of Hub classes, similar to the `RegisterMvcControllers` of the ASP.NET Core MVC integration package. i.e. it should register Hub classes based on the selected lifestyle (`ILifestyleSelectionBehavior`) and should suppress the disposable transient components warning in case the `Hub` implementation does not override `Dispose(bool)`.
+
+Especially this last point is the main reason why we need an integration package. Integrating SignalR without an integration package would have been trivial in case `Hub` would not have implemented `IDisposable`  (and it shouln't have).
+
+There are other complications, such as discussed [here](https://github.com/aspnet/AspNetCore/issues/14247) that should be taken into consideration, which are:
+
+* Hub classes do not always run in a web request (for instance with LongPolling), which means that they can be resolved without an active Simple Injector Scope.
+* This means `SimpleInjectorHubActivator<T>` must create a new `Scope` within its `Create` method, and dispose of the `Scope` in the `Release` method.
+* Although the creation of, and disposing of a scope, could be skipped in case an active scope (i.e. a web request scope) already exists, that could lead to complications, because the request might already have ended in some cases.
+* <strike>In case the absense of an active scope, the hub activator should be able to supply the Simple Injector ASP.NET Core integration with the active `IServiceScope`/`IServiceProvider` instance to prevent Simple Injector from creating a new `IServiceScope` internal, which would, again, lead to multiple instances of scoped registrations, but now for ASP.NET Core registered types.</strike> The hub should run in its own Simple Injector scope and MS.DI scope; reusing the same incoming MS.DI scope might have hard to predict side effects.
+
+The following issues should be taken into consideration:
+* https://github.com/simpleinjector/SimpleInjector/issues/533
+* https://github.com/simpleinjector/SimpleInjector/issues/630
+With #377, Simple Injector v4.5 introduced the ability to disablee resolving concrete types. In v5 this options should be the default.
+
+Do you have sample code to register the user controls to enable dependency injection? I imagine it would have to be property injection like the web pages.
+
+
+
+`VisualizeObjectGraph` does not include component types that are part of `IEnumerable<>` dependency.
+
+### How To Reproduce
+Consider the following registrations:
+```C#
+var container = new Container();
+
+container.Collection.Register(typeof(IValidator<>), typeof(IValidator<>).Assembly);
+container.Register(typeof(IValidator<>), typeof(CompositeValidator<>));
+container.Register<MyService>();
+
+container.Verify();
+
+var actual = container.GetRegistration(typeof(MyService)).VisualizeObjectGraph();
+
+Console.WriteLine(actual);
+```
+
+Using types:
+```C#
+class MyService { public MyService(IValidator<MyModel> myModelValidator) { } }
+
+interface IValidator<T> { }
+
+class Composite<T> : IValidator<T> { public Composite(IEnumerable<IValidator<T>> v) { } }
+
+class Validator1 : IValidator<MyModel> { public Validator1(Dependency d) { } }
+class Validator2 : IValidator<MyModel> { public Validator2(Dependency d) { } }
+
+class Dependency { }
+
+class MyModel { }
+```
+
+Prints to the console
+```
+MyService( // Transient
+    Composite<MyModel>( // Transient
+        IEnumerable<IValidator<MyModel>>( // Singleton
+            Dependency(), // Transient
+            Dependency()))) // Transient
+```
+
+### Expected to print
+```
+MyService( // Transient
+    Composite<MyModel>( // Transient
+        IEnumerable<IValidator<MyModel>>( // Singleton
+            Validator1( // Transient
+                Dependency()), // Transient
+            Validator2( // Transient
+                Dependency())))) // Transient
+```
+
+### Additional context
+* SimpleInjector 4.7.1
+* .NET Core 3.0 console app
+
+The implemented feature of #555 should be enabled by default in v5.
+Integration with `IHtmlLocalizer` came up in #718. We should discuss and research whether:
+
+* This is something that people need
+* How it is used
+* Whether it would be useful to provide integration
+* How to provide integration (how to implement, which package, etc)
+Currently, a delegate, registered using RegisterResolveInterceptor, is not invoked when a non-resolvable type is requested from Simple Injector.
+
+Should this be changed?
+
+Repro:
+
+``` c#
+var container = new Container();
+            
+container.Options.RegisterResolveInterceptor((c, p) =>
+{
+    // Expected to be invoked
+    try
+    {
+        return p();
+    }
+    catch (Exception)
+    {
+        // ActivationException expected to be thrown.
+        throw;
+    }
+},
+c => true);
+
+container.GetInstance<ITimeProvider>();
+```
+**Describe the bug**
+
+The following code doesn't print the name of the type to the console.
+
+``` c#
+var container = new Container();
+            
+container.Options.RegisterResolveInterceptor((c, p) =>
+{
+    System.Console.WriteLine(c.Registration.ImplementationType.ToFriendlyName());
+    return p();
+},
+c => true);
+
+container.Collection.Append<ITimeProvider, RealTimeProvider>();
+            
+container.GetInstance<IEnumerable<ITimeProvider>>();
+```
+
+**Expected behavior**
+
+The name of the type should be written to the console.
+
+**Actual behavior**
+
+The following code doesn't print the name of the type to the console.
+
+**Additional context**
+Latest release v4.6.2.

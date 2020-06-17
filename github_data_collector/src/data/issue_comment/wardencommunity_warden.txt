@@ -1,0 +1,246 @@
+We have been experiencing an issue where the wrong locale is being used for error messages returned from the Devise FailureApp, I believe it's due to the way that warden throws and catches.
+
+The recommended way of setting the locale for a rails controller action is to use an around_action callback, e.g.
+
+```ruby
+prepend_around_action :with_locale
+
+def with_locale(action)
+  I18n.with_locale(current_locale) { action }
+end
+```
+
+When warden fails to authenticate it throws and calls a rack endpoint, the failure app... This means that the around_action is exited so the locale is no longer applied. 
+
+I don't see any way to tell warden to preserve the locale that was applied when the throw was called. Should warden do this internally?
+I noticed that CI build statuses are not being reported for this repository. Did a little investigation and found that this is something that's been around for a bit.
+
+Per https://github.com/travis-ci/travis-ci/issues/10204
+> those repositories on travis-ci.com which are managed by GitHub Apps no longer receive updates to the GitHub Commit Status API. Instead, Build Statuses will be posted to the GitHub Check Runs API.
+
+Is this something that's potentially affecting this repo? If so, the [issue](https://github.com/travis-ci/travis-ci/issues/10204) referenced above also lays out the steps that can be taken to resolve this.
+> To fix this issue, update your repositories using protected branches to require GitHub Checks as follows:
+> 1. Go to the repository’s Branch Settings page (https://github.com/OWNER/REPO/settings/branches).
+> 2. In the "Branch Protection Settings" section, click "Edit" for a protected branch
+> 3. Scroll down to the second box, "Require status checks to pass before merging." Select either "Travis CI - Pull Request" or "Travis CI - Branch" or both. (Note: "continuous-integration/travis-ci" is the Status API event which is deprecated)
+> 4. Save your changes
+
+Im my rails app with devise, when user is not logged in and try to access any app resources, i receive 'Failed to login' message, that cames from warden (lib/warden/strategies/base.rb:136 and 144). I try to translate that message but i can't find a good way to do that without a string comparison. Is there any right way to do that?
+I have an RSpec test in a Rails app that calls [`login_as`](https://github.com/wardencommunity/warden/blob/5b3cbd5bef67cbe399bb7007537bc4841bbee772/lib/warden/test/helpers.rb#L18) and looks something like this:
+
+```
+require 'rails_helper'
+
+RSpec.describe "weird behavior", type: :request do
+  let!(:user) { FactoryBot.create(:user) }
+
+  it "test a" do
+    login_as user
+    get "/"
+    puts session.to_hash
+    expect(session["warden.user.user.key"]).to_not be_blank
+  end
+
+  it "test b" do
+    get "/"
+    puts session.to_hash
+    expect(session["warden.user.user.key"]).to be_blank
+  end
+end
+```
+It passes:
+```
+$ bundle exec rspec spec/requests/settings/password_spec.rb --order defined
+
+weird behavior
+{"session_id"=>"06f305ce65e80a53f9729add786fc2d2", "warden.user.user.key"=>[[535], "$2a$04$cGbUk2KvDf/mT4tv4psQW."]}
+  test a
+{}
+  test b
+
+Finished in 0.58912 seconds (files took 3.06 seconds to load)
+2 examples, 0 failures
+```
+
+Accidentally, I added a second `login_as` in test A (and didn't notice -- in real life my test is more complicated so it was easy to miss):
+```
+require 'rails_helper'
+
+RSpec.describe "weird behavior", type: :request do
+  let!(:user) { FactoryBot.create(:user) }
+
+  it "test a" do
+    login_as user
+    get "/"
+    login_as user  # <- problematic call!
+    puts session.to_hash
+    expect(session["warden.user.user.key"]).to_not be_blank
+  end
+
+  it "test b" do
+    get "/"
+    puts session.to_hash
+    expect(session["warden.user.user.key"]).to be_blank
+  end
+end
+
+```
+This resulted in flaky tests that would fail or pass depending on the order in which RSpec chose to run them (it works if B runs before A).
+
+After hours of debugging, I realized the problem is that the second `login_as` call in test A is "leaking" to test B. Looking at the output, you can see that the Warden user key in the session printed from test B is the same as the one printed from test A!
+
+```
+$ bundle exec rspec spec/requests/settings/password_spec.rb --order defined
+
+weird behavior
+{"session_id"=>"3087df2477685b564db5f397dc1f6778", "warden.user.user.key"=>[[537], "$2a$04$zNWHx2qhfFzuO2c26MHpqO"]}
+  test a
+{"session_id"=>"21eb074aa142c542dd2fc04dc7ccaefd", "warden.user.user.key"=>[[537], "$2a$04$zNWHx2qhfFzuO2c26MHpqO"]}
+  test b (FAILED - 1)
+
+Failures:
+
+  1) weird behavior test b
+     Failure/Error: expect(session["warden.user.user.key"]).to be_blank
+       expected `[[537], "$2a$04$zNWHx2qhfFzuO2c26MHpqO"].blank?` to return true, got false
+     # ./spec/requests/settings/password_spec.rb:17:in `block (2 levels) in <top (required)>'
+
+Finished in 0.62204 seconds (files took 3.11 seconds to load)
+2 examples, 1 failure
+
+Failed examples:
+
+rspec ./spec/requests/settings/password_spec.rb:14 # weird behavior test b
+```
+
+This is very surprising and breaks test isolation in an unexpected way. Can we make the  "queue" of pending `login_as`calls automatically disappear at the end of each spec? (Not sure if this is even feasible.)
+In my RSpec suite, I start out like this:
+
+```
+login_as(admin, scope: :admin)
+visit new_admin_user_path
+# fill_in various fields on a form
+click_button('Create User')
+```
+
+All of which works fine. But when I then call #logout, either with no arguments or with :admin, and then #visit any page of the site, and insert a debugger in the controller, I can call warden.authenticate(scope: :user) and I get back an object along these lines:
+
+````
+#<User:0x007fd047239d98> {
+  :id => 1,
+  :email => "admin@fp.com", #etc }
+````
+
+I'm using Warden 1.2.6, with Devise 3.5.10 if relevant, Rspec-Rails (3.4.2) and Rails 4.2.6
+
+Advice appreciated!
+
+Thanks,
+
+Sasha
+It appears that my `env['warden'].user` is lost if my app receives a post request. 
+
+This is the test methods I am using:
+
+```
+get '/amiloggedin' do
+    puts "get user"
+    puts env['warden'].user.inspect
+    puts env['HTTP_COOKIE'] 
+    env['warden'].authenticate!
+
+    "You are logged in"
+  end
+
+  post '/amiloggedin' do 
+    puts "post user"
+    puts env['warden'].user.inspect
+    puts env['HTTP_COOKIE']
+    env['warden'].authenticate!
+
+    "Logged in after post request"
+  end
+```
+
+The `HTTP_COOKIE` is the same for both requests, but for some reason the warden user is lost when I send a post request. It is lost for that request and further all requests (including get requests).
+
+This is my a strategy:
+
+```
+
+Warden::Strategies.add(:password) do
+  def valid?
+    params['user'] && params['user']['email'] && params['user']['password']
+  end
+
+  def authenticate!
+    user = User.first(email: params['user']['email'])
+
+    if user.nil?
+      throw(:warden, message: "The email you entered does not exist.")
+    elsif user.authenticate(params['user']['password'])
+      success!(user)
+    else
+      throw(:warden, message: "The email and password combination ")
+    end
+  end
+end
+
+
+```
+
+This is my user model:
+
+```
+DataMapper.setup(:default, "sqlite://#{Dir.pwd}/db/db.sqlite")
+
+class User
+  include DataMapper::Resource
+
+  property :id, Serial, key: true
+  property :username, String, length: 128
+
+  #property :password, BCryptHash, :required => true, :length => 5..200
+  property :password, BCryptHash, :required => true
+
+  attr_accessor :password_confirmation
+  validates_confirmation_of :password, :confirm => :password_confirmation
+  validates_length_of :password_confirmation, :min => 6
+
+  property :email, String, :required => true, :unique => true,
+    :format   => :email_address,
+    :messages => {
+      :presence  => "We need your email address.",
+      :is_unique => "We already have that email.",
+      :format    => "Doesn't look like an email address to me ..."
+    }
+
+  def authenticate(attempted_password)
+    # The BCrypt class, which `self.password` is an instance of, has `==` defined to compare a
+    # test plain text string to the encrypted string and converts `attempted_password` to a BCrypt
+    # for the comparison.
+    #
+    # But don't take my word for it, check out the source: https://github.com/codahale/bcrypt-ruby/blob/master/lib/bcrypt/password.rb#L64-L67
+    if self.password == attempted_password
+      true
+    else
+      false
+    end
+  end
+end
+
+# Tell DataMapper the models are done being defined
+DataMapper.finalize
+
+# Update the database to match the properties of User.
+DataMapper.auto_upgrade!
+
+# Create a test User
+if User.count == 0
+  @user = User.create(username: "admin")
+  @user.password = "admin"
+  @user.save
+end
+```
+
+Is there something wrong with my strategy?

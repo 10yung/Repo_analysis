@@ -1,0 +1,391 @@
+As Combine is the new go to Rx framework and probably will replace RxSwift, RxCocoa, etc. in the future there is a need for a rx feedback loop  using Combine.
+
+How feasible is a port and how much work would it probably be?
+`bind` variant that takes `_ owner: WeakOwner` actually just captures an owner strongly because it is executed on `Observer.system` creation and returns closure with a captured object. I'm using `bind` without `owner` and doing strongify manually as a workaround for now.
+
+Hi there 👋
+
+My company struggled a bit after [2.0 removed react for non-equatable types](https://github.com/NoTests/RxFeedback.swift/issues/53). I think, it's absolutely reasonable to to require types returned by request be equatable.
+
+Though, we are using `Void?` in quite a few places to trigger feedback loops that don't require any parameters. Examples include anything from networking to navigation, from current location fetch to database sync.
+
+We ended up writting a custom `react` just for this case:
+
+```swift
+func react<State, Event>(request: @escaping (State) -> Void?,
+	                 effects: @escaping () -> Signal<Event>) -> (Driver<State>) -> Signal<Event> {
+    return react(request: { request($0) != nil ? true : nil }, // Bool to the rescue 🙈
+                 effects: { _ in effects() })
+}
+```
+
+Do you think it would make sense to add a react for `Void?` to RxFeedback? Have you encountered this?
+
+Thanks!
+I find that it is hard to test the event creation.For example i want to query some every 10s.And i write this in 
+
+> viewDidLoad
+
+ method.I'm wandoring how to test the request produce and the event created in the right way?
+```
+let query: (Driver<State>) -> Signal<Event> = react(
+        request: {state -> QueryRequest? in
+            ....
+            return QueryRequest()
+        },
+        effects: {request in
+        return Signal.just(Event.query)
+        })
+
+Driver<Any>.system(
+            initialState: State(),
+            reduce: State.reduce,
+            feedback: query
+            )
+            .drive()
+            .disposed(by: self.rx.disposeBag)
+````
+It seams the only way is run the app and debug.So, is anyone has the same problem as me?
+
+
+# Overview
+
+We can introduce `ObservableSystem`, this will make system chainable:
+
+### PlayCatch Example
+**Before**:
+
+```swift
+let bindUI: (ObservableSchedulerContext<State>) -> Observable<Event> = bind(self) { me, state in
+    ...
+    return Bindings(subscriptions: subscriptions, events: events)
+}
+
+Observable.system(
+    initialState: State.humanHasIt,
+    reduce: { (state: State, event: Event) -> State in
+        switch event {
+        case .throwToMachine:
+            return .machineHasIt
+        case .throwToHuman:
+            return .humanHasIt
+        }
+    },
+    scheduler: MainScheduler.instance,
+    feedback:
+        // UI is human feedback
+        bindUI,
+        // NoUI, machine feedback
+        react(request: { $0.machinePitching }, effects: { (_) -> Observable<Event> in
+            return Observable<Int>
+                .timer(.seconds(1), scheduler: MainScheduler.instance)
+                .map { _ in Event.throwToHuman }
+        })
+    )
+    .subscribe()
+    .disposed(by: disposeBag)
+```
+
+**After**:
+
+```swift
+ObservableSystem.create(
+    initialState: State.humanHasIt,
+    reduce: { (state: State, event: Event) -> State in
+        switch event {
+        case .throwToMachine:
+            return .machineHasIt
+        case .throwToHuman:
+            return .humanHasIt
+        }
+    },
+    scheduler: MainScheduler.instance
+    )
+    .binded(self) { me, state in
+        ...
+        return Bindings(subscriptions: subscriptions, events: events)
+    }
+    .reacted(request: { $0.machinePitching }, effects: { (_) -> Observable<Event> in
+        return Observable<Int>
+            .timer(.seconds(1), scheduler: MainScheduler.instance)
+            .map { _ in Event.throwToHuman }
+    })
+    .system([])
+    .subscribe()
+    .disposed(by: disposeBag)
+```
+
+
+
+# Evolution
+
+The solution is inspired by `Rx`. Let's get in.
+
+### What do we have currently in `Rx`?
+
+I will show minimal type inferface in `Rx`, as it will help us move fast to destination:
+
+```swift
+typealias Event<Element> = Element // mocked, just a name
+
+typealias Observer<Element> = (Event<Element>) -> Void
+
+typealias Disposable = () -> Void
+
+typealias Observable<Element> = (@escaping Observer<Element>) -> Disposable
+```
+
+I've removed unrelate logic to make our evolution **"pure"**.
+
+Now we can adds some operators which are free functions:
+
+```swift
+func filter<Element>(
+    _ predicate: @escaping (Element) -> Bool
+    ) -> (@escaping Observable<Element>) -> Observable<Element> {
+
+    return { source -> Observable<Element> in
+        ...
+    }
+}
+
+func map<Element, Result>(
+    _ transform: @escaping (Element) -> Result
+    ) -> (@escaping Observable<Element>) -> Observable<Result> { ... }
+
+func flatMap<Element, Result>(
+    _ transform: @escaping (Element) -> Observable<Result>
+    ) -> (@escaping Observable<Element>) -> Observable<Result> { ... }
+```
+
+As far as we can tell, **Operator** behaiver like a `Middleware`:
+
+```swift
+typealias Middleware<Element, Result> = (@escaping Observable<Element>) -> Observable<Result>
+```
+
+We can change operator a little bit to:
+
+```swift
+func fulter1<Element>(_ predicate: @escaping (Element) -> Bool) -> Middleware<Element, Element> { ... }
+
+func map1<Element, Result>(_ transform: @escaping (Element) -> Result) -> Middleware<Element, Result> { ... }
+
+func flatMap1<Element, Result>(_ transform: @escaping (Element) -> Observable<Result>) -> Middleware<Element, Result> { ... }
+```
+
+That's what we have now in `Rx`.
+
+### Port to `RxFeedback`
+
+We can find a way to port all these stuff to `RxFeedback`: 
+
+What do we have in `RxFeedback`?
+
+```swift
+typealias Feedback<State, Event> = (Observable<State>) -> Observable<Event>
+
+typealias ImmediateSchedulerType = Any // Ignored in this demo context.
+
+func system<State, Event>(
+    initialState: State,
+    reduce: @escaping (State, Event) -> State,
+    scheduler: ImmediateSchedulerType,
+    feedback: [Feedback<State, Event>]
+    ) -> Observable<State> { ... }
+```
+
+We may add a `createSystem` function:
+
+```swift
+func createSystem<State, Event>(
+    initialState: State,
+    reduce: @escaping (State, Event) -> State,
+    scheduler: ImmediateSchedulerType
+    ) -> ([Feedback<State, Event>]) -> Observable<State> {
+    
+    return { feedback -> Observable<State> in
+        ...
+    }
+}
+```
+
+By comparing function `system` with `createSystem`, It's not hard to find the return type has been changed form `Observable<State>` to `([Feedback<State, Event>]) -> Observable<State>`.
+
+Ok. This will open a new world, let's call the new return type `System`:
+
+```swift
+typealias System<State, Event> = ([Feedback<State, Event>]) -> Observable<State>
+```
+
+Then `createSystem` becomes: 
+
+```swift
+func createSystem1<State, Event>(
+    initialState: State,
+    reduce: @escaping (State, Event) -> State,
+    scheduler: ImmediateSchedulerType
+    ) -> System<State, Event> { ... }
+```
+
+Next we can introduce `SystemMiddleware`:
+
+```swift
+typealias SystemMiddleware<State, Event> = (System<State, Event>) -> System<State, Event>
+```
+
+The feedback creator funtion like `react` and `bind` in `RxFeedback` now becomes operator:
+
+```swift
+func react<State, Request: Equatable, Event>(
+    request: @escaping (State) -> Request?,
+    effects: @escaping (Request) -> Observable<Event>
+    ) -> SystemMiddleware<State, Event> { ... }
+
+func react<State, Request: Equatable, Event>(
+    requests: @escaping (State) -> Set<Request>,
+    effects: @escaping (Request) -> Observable<Event>
+    ) -> SystemMiddleware<State, Event> { ... }
+
+func bind<State, Event>(
+    _ bindings: @escaping (Observable<State>) -> (subscriptions: [Disposable], events: [Observable<Event>])
+    ) -> SystemMiddleware<State, Event> { ... }
+```
+
+# Real
+
+Let's bring this to real.
+
+Introduce `ObservableSystem` to `RxFeedback`:
+
+```swift
+public struct ObservableSystem<State, Event> {
+    public typealias Feedback = Observable<Any>.Feedback<State, Event>
+    public typealias System = ([Feedback]) -> Observable<State>
+    
+    public let system: System
+    
+    private init(_ system: @escaping System) {
+        self.system = system
+    }
+}
+
+extension ObservableSystem {
+    
+    public static func create(
+        initialState: State,
+        reduce: @escaping (State, Event) -> State,
+        scheduler: ImmediateSchedulerType
+        ) -> ObservableSystem<State, Event> {
+        return ObservableSystem { feedback in
+            return Observable<Any>.system(
+                initialState: initialState,
+                reduce: reduce,
+                scheduler: scheduler,
+                feedback: feedback
+            )
+        }
+    }
+    
+    public func reacted<Request: Equatable>(
+        request: @escaping (State) -> Request?,
+        effects: @escaping (Request) -> Observable<Event>
+        ) -> ObservableSystem<State, Event> {
+        let newFeedback: Feedback = react(request: request, effects: effects)
+        let sourceSystem = self.system
+        return ObservableSystem { feedback in sourceSystem([newFeedback] + feedback) }
+    }
+    
+    public func reacted<Request: Equatable>(
+        requests: @escaping (State) -> Set<Request>,
+        effects: @escaping (Request) -> Observable<Event>
+        ) -> ObservableSystem<State, Event> {
+        let newFeedback: Feedback = react(requests: requests, effects: effects)
+        let sourceSystem = self.system
+        return ObservableSystem { feedback in sourceSystem([newFeedback] + feedback) }
+    }
+    
+    public func binded<WeakOwner: AnyObject>(
+        _ owner: WeakOwner,
+        _ bindings: @escaping (WeakOwner, ObservableSchedulerContext<State>) -> (Bindings<Event>)
+        ) -> ObservableSystem<State, Event> {
+        let newFeedback: Feedback = bind(owner, bindings)
+        let sourceSystem = self.system
+        return ObservableSystem { feedback in sourceSystem([newFeedback] + feedback) }
+    }
+
+    // ... other operator
+
+    // There are some duplicate code in each operator, 
+    // It's fine in the demo context since this will improve readabylity.
+}
+```
+
+The `ObservableSystem` is like `Observable` in `Rx`.
+
+And `reacted`, `binded` is like **Operators** in `Rx`.
+
+Now the system can be chainable:
+
+```swift
+ObservableSystem.create(
+    initialState: State.humanHasIt,
+    reduce: { (state: State, event: Event) -> State in
+        switch event {
+        case .throwToMachine:
+            return .machineHasIt
+        case .throwToHuman:
+            return .humanHasIt
+        }
+},
+    scheduler: MainScheduler.instance
+    )
+    .binded(self) { ... }
+    .reacted(request: { $0.machinePitching }, effects: { ... })
+    .reacted(request: { ... }, effects: { ... })
+    .reacted(request: { ... }, effects: { ... })
+    .system([])
+    .subscribe()
+    .disposed(by: disposeBag)
+```
+
+It will bring us some benefits:
+
+* system has its own namespace `ObservableSystem`
+* more consist with `Rx`
+* easier to add operator
+* less typing
+
+With the benefits, I proposal to add this feature.
+
+A running example can be found [here](https://github.com/beeth0ven/RxFeedback.swift/tree/feature/introduce-system) with commit: [introduce ObservableSystem](https://github.com/beeth0ven/RxFeedback.swift/commit/a2e13a34f6dcc8451a3a7d5a433e878f8e57492f). It also handle driver version **(DriverSystem)**.
+
+I'm open to disccuss 😄, If this is accepted, I will make a PR.
+
+Thanks. 
+
+
+Hi!
+
+Are there plans to readd the hooks for non-equatable values returned from state requests? In 1.X it was possible to pass own `==` function that would always return `false` for such cases. In 2.0 there doesn't seem to be one left.
+
+Best,
+Hi,
+
+I seem to be having a problem using this. Tried also this example:
+
+https://github.com/NoTests/RxFeedback.swift/blob/master/Examples/Examples/Counter.swift
+
+And has the same issue. Can you point me to the problem or to a working example?
+<img width="1042" alt="screenshot 2019-02-22 at 15 44 03" src="https://user-images.githubusercontent.com/17700769/53240668-c516d100-36b8-11e9-9124-2fb748715aa5.png">
+![image](https://user-images.githubusercontent.com/17700769/53240848-40788280-36b9-11e9-95d5-1cba5c44a4d8.png)
+
+<img width="1057" alt="screenshot 2019-02-22 at 15 48 06" src="https://user-images.githubusercontent.com/17700769/53240871-538b5280-36b9-11e9-9bd1-620c4da95583.png">
+
+Xcode don't suggests autocomplete for function of RxFeedback. However, if I am taking complete implementation of "Driver.system" usage from examples. It's successful builds
+For some reason running `Examples/dependencies.sh` or `git submodule update --init --recursive --force` before building the `Example` target inside of the`Examples/Examples.xcodeproj` in a fresh cloned repo succeeds
+
+... but trying to build `Example` target before running the `Examples/dependencies.sh` or `git submodule update --init --recursive --force` causes build failure.
+
+I have no idea what's happening here.
+Hello. How to exchange events between different loops?

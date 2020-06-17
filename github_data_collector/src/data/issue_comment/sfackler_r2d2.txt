@@ -1,0 +1,72 @@
+Would it be possible to get an even for the `HandleEvent` trait set via the `event_handler` to get notified if all the connections are closed? Or perhaps it could just notify on connection close, as it would be then easy to get the `State` of the pool.
+
+This would be helpful as a way to clean up pools for endpoints that are no longer being used.
+### Versions
+* **Rust:** rustc 1.37.0-nightly (8ebd67e4e 2019-06-27)  and rust in https://github.com/emk/rust-musl-builder
+* **Diesel:** 1.4.2 [feature  postgres + r2d2]
+* **Database:** Postresql
+* **Operating System** Linux (Docker in aws cloud ECS And Manjaro)
+
+## Problem Description
+Pool creation panic without clear log
+This is my code :
+```
+let manager = ConnectionManager::<PgConnection>::new(DATABASE_URL);
+let pool = Pool::new(manager).expect("Failed to create pool");
+```
+But I made a mistake and I open the port of DATABASE_URL to the wrong IP (or just give it the wrong port). It panic and I have no clue to found what was the root cause.
+### What is the expected output?
+
+> thread 'main' panicked at 'Failed to create pool: Error(EXPLICIT_MESSAGE)', src/libcore/result.rs:999:5
+
+where EXPLICIT_MESSAGE could be something like "cannot reach database" or "connection failed", or even better if possible "host is up but port is filtered".
+
+### What is the actual output?
+> thread 'main' panicked at 'Failed to create pool: Error(None)', src/libcore/result.rs:999:5
+
+### Steps to reproduce
+Setup your database and do not open port on the server, or do not allow the diesel server ip or set the wrong (closed)port.
+Then start your pool.
+There should be a 30 sec wait (more or less, on my computer it's 38s)
+Then it panic with the Error(none) message
+
+Because I did not see information about cassandra on the list, so if i want to build like Sql, is there a related way?
+The way errors are reported appears to be racey/inconsistent when a connection cannot be obtained from the pool. Sometimes you will just get `Error(None)`, whilst other times you will get an actual error message from the connection manager. I assume this is because another thread happens to take the error message before the original thread gets to it.
+
+I can see why there might be reasons to not want to synchronously establish the connection from the thread that could not find an available connection in the pool (eg. so that its request could be fullfilled sooner if another connection is returned to the pool more quickly) but I think when a connection *cannot* be established, it should behave *as though* it synchronously attempted to establish the new connection (guaranteeing a 1:1 relationship between failed requests and errors).
+
+It would also be useful to distinguish failures due to hitting the "max_size" on the pool, from connection failures - at the moment you also (IIUC) get an `Error(None)` if the pool is maxed out.
+Currently `Pool` does not implement `UnwindSafe` or `RefUnwindSafe`.
+This is due to `Condvar` not implementing it in the standard library.
+That type probably should implement it, but `Pool` shouldn't be
+`UnwindSafe` prior to this commit anyway. `antidote::Mutex` incorrectly
+implements `UnwindSafe`, when it should not as it removes the poisoning
+mechanism that makes `Mutex` be `UnwindSafe` in the first place.
+
+Ultimately, prior to this commit, `Pool<M>` should only be `UnwindSafe`
+if `M: UnwindSafe` and `M::Connection: UnwindSafe`. The need for that
+bound on `M::Connection` is because we return the connection to the pool
+on panic, even if it's in a potentially invalid state.
+
+This commit adds explicit implementations of `UnwindSafe` and
+`RefUnwindSafe`, and also removes the need to bound that on the
+connection being `UnwindSafe` by only returning a connection to the pool
+if it was not dropped during a panic. This ensures that we don't end up
+in a situation where a connection is potentially returned to the pool in
+a state where `is_broken` would return `true`, but it is not in an
+expected state (e.g. having an open transaction). It also means that the
+connection can be expected to be dropped if a panic occurs while it is
+being used (e.g. ensuring the connection is terminated if there was an
+open transaction).
+
+We still need an `UnwindSafe` bound on the connection manager, as we
+can't guarantee that it will be in a reasonable internal state if a
+panic occurs in one of its methods
+
+Fixes #63
+Fixes #31
+All types which are `Sync` should also implement `RefUnwindSafe` as the former implies the latter. Currently the `Pool` type is not `RefUnwindSafe` (through no fault of its own) because it stores a `Condvar`, and `Condvar` is also (incorrectly) missing a `RefUnwindSafe` implementation in the rust standard library.
+
+However, `r2d2` could explicitly provide this implementation.
+…ing, as they might be "tainted"
+Currently `PooledConnection` unconditionally returns the connection to the pool on drop. Since a panic could happen at any time, we can't assume that the connection will be in a good state if it's being dropped as the result of unwinding. r2d2 should either check `thread::panicking` before checking the connection back into the pool, or should have a `T: UnwindSafe` constraint on the connection.

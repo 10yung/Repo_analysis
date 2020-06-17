@@ -1,0 +1,80 @@
+
+      val lolExchange = Exchange("book.lol.lol", Direct, durable = true)
+      val lolSubscriber: Subscriber[Message] = connection.publish(lolExchange.name, "")
+
+    class MessageBroadcasterActor(sub : Subscriber[Message]) extends Actor {
+
+        import com.google.common.net.MediaType
+
+        implicit def toMsg(rl : RelatedProduct) : Message = {
+          new Message(
+          body        = rl.productId.toString.getBytes(StandardCharsets.UTF_8),
+          contentType = Some(MediaType.PLAIN_TEXT_UTF_8),
+          mode = Persistent
+          )
+       }
+
+       override def receive: Receive = {
+         case x : RelatedProduct => {
+         sub.onNext(toMsg(x))
+         }
+       }
+     }
+
+I'm using the code above but I can only see the first message on rabbit. Am I doing something wrong or is it a bug?
+If there is a content-type header in a Rabbit message which is not successfully parsed by Guavas MediaType class then an exception is thrown. Although this is an invalid content type I would think that maybe this should be logged as a warning and the contentType field in the Message class just be set to a None.
+
+Am happy to try and put together a PR if people agree that this is an issue...
+
+Sample Exception:
+com.rabbitmq.client.impl.DefaultExceptionHandler: Consumer QueueSubscription(channel=AMQChannel(amqp://xxx@x.x.x.x:5671/,4), queue=xxx, subscriber=akka.stream.impl.fusing.ActorGraphInterpreter$BoundarySubscriber@4fef0dc0, demand=16, buffer.size=0) (amq.ctag-zIlVYhaNIQ8bmDQCbe-ZUA) method handleDelivery for channel AMQChannel(amqp://xxx@x.x.x.x:5671/,4) threw an exception for channel AMQChannel(amqp://xxxx@x.x.x.x:5671/,4):
+java.lang.IllegalArgumentException: Could not parse 'application-json'
+	at com.google.common.net.MediaType.parse(MediaType.java:656)
+	at io.scalac.amqp.impl.Conversions$$anonfun$toMessage$1.apply(Conversions.scala:63)
+	at io.scalac.amqp.impl.Conversions$$anonfun$toMessage$1.apply(Conversions.scala:63)
+	at scala.Option.map(Option.scala:146)
+	at io.scalac.amqp.impl.Conversions$.toMessage(Conversions.scala:63)
+	at io.scalac.amqp.impl.Conversions$.toDelivery(Conversions.scala:80)
+	at io.scalac.amqp.impl.QueueSubscription.handleDelivery(QueueSubscription.scala:44)
+	at com.rabbitmq.client.impl.ConsumerDispatcher$5.run(ConsumerDispatcher.java:144)
+	at com.rabbitmq.client.impl.ConsumerWorkService$WorkPoolRunnable.run(ConsumerWorkService.java:99)
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)
+	at java.lang.Thread.run(Thread.java:745)
+Caused by: java.lang.IllegalStateException
+	at com.google.common.base.Preconditions.checkState(Preconditions.java:159)
+	at com.google.common.net.MediaType$Tokenizer.consumeCharacter(MediaType.java:691)
+	at com.google.common.net.MediaType.parse(MediaType.java:627)
+	... 11 more
+- Rather than importing the global ExecutionContext, allow the caller to
+  specify the ExecutionContext.
+- Changed the minor version to 1.2.0 since this is a breaking change to the
+  API. All the caller needs to do to maintain the existing behaviour, however,
+  is import the global ExecutionContext, if it has not already been imported,
+  as evidenced by the changes to the tests in this commit.
+
+- add functional test for handleShutdown using scalamock
+- add a note into the readme for handleShutdown and handleBlocking
+
+Ref RabbitMQ Java Client `3.6.1`: 
+[ShutdownListener](http://www.rabbitmq.com/releases/rabbitmq-java-client/v3.6.1/rabbitmq-java-client-javadoc-3.6.1/com/rabbitmq/client/ShutdownListener.html)
+[BlockedListener](http://www.rabbitmq.com/releases/rabbitmq-java-client/v3.6.1/rabbitmq-java-client-javadoc-3.6.1/com/rabbitmq/client/BlockedListener.html)
+
+I made some changes to make the auto recovery work.
+- Ignore a channel shutdown event if it is a recoverable channel that wasn't shut down by an application.
+- Try to close the channel in `handleCancel` method.
+- `QueuePublisher` registers shutdown listeners to `QueueSubscription`.
+- Simplify `QueueSubscription` termination.
+
+Reactive streams (JVM) specification mandates some part of code to be executed synchronously (but quickly) and some other asynchronously.
+I think it is good idea to allow to pass `ExecutionContext` in each `publish` and `consume` method (as implicit with default `ExecutionContext.Implicits.global`). 
+
+Currently, messages seem to be auto-ACKed after they are pulled off the queue and submitted downstream (https://github.com/ScalaConsultants/reactive-rabbit/blob/master/src/main/scala/io/scalac/amqp/impl/QueueSubscription.scala#L39). 
+
+Have you given any thought to incorporating a way to ACK messages after they've been fully processed by the stream? If it's something you think would be worthwhile and you have some ideas on how to implement, I can take a crack at a PR. 
+
+I gave this template a try: http://typesafe.com/activator/template/rabbitmq-akka-stream
+
+I start the app with activator run, then kill the rabbitmq server and start it back up again. Nothing happened even though I have the setting recovery-interval = 5s. Am I missing something?
+
+I tried debugging it and saw that you never set factory.setAutomaticRecoveryEnabled(true). Doing that helps, but there are still issues with "com.rabbitmq.client.AlreadyClosedException: channel is already closed due to clean channel shutdown".

@@ -1,0 +1,152 @@
+When the 'tail.Tell()' method runs, the next line may have been read. This results in 'offset' not being a precise value. Whether to consider adding a configuration. When the configuration is "true", send "offset" in 'lines' channel
+
+```
+// Config is used to specify how a file must be tailed.
+type Config struct {
+	// File-specifc
+	Location    *SeekInfo // Seek to this location before tailing
+	ReOpen      bool      // Reopen recreated files (tail -F)
+	MustExist   bool      // Fail early if the file does not exist
+	Poll        bool      // Poll for file changes instead of using inotify
+	Pipe        bool      // Is a named pipe (mkfifo)
+	RateLimiter *ratelimiter.LeakyBucket
+
+	// Generic IO
+	Follow      bool // Continue looking for new lines (tail -f)
+	MaxLineSize int  // If non-zero, split longer lines into multiple lines
+
+	// Logger, when nil, is set to tail.DefaultLogger
+	// To disable logging: set field to tail.DiscardingLogger
+	Logger logger
+        // add this config 
+       LinesOffset bool // When the configuration is "true", send "offset" in 'lines' channel
+}
+```
+
+```
+type Line struct {
+	Text string
+	Time time.Time
+	Err  error // Error from tail
+        Offset int64 // this tell file offset
+}
+
+```
+When doing this on an inexist file:
+```
+tail.TailFile(outputFilename, tail.Config{
+			Follow: true, ReOpen: true, MustExist: false,
+})
+```
+It logs `waiting for file to appear`. If i create the file now in a text editor, enter some lines and save, tail correctly detect there are new lines. However, if the file is created by another program and not closed, for example, this python script:
+```
+with open(outputFilename, 'w') as f:
+    for i in range(100):
+        f.write(str(i))
+        f.write('\n')
+        f.flush()
+        time.sleep(1)
+```
+Then the tail doesn't detect file exist before the file is closed. But the file content does changed before it's closed. I can verify by 1) open the file in a text editor; or 2) rerun the go tail program, this time it can watch the file line by line.
+Hi - I've been debugging this issue and fixed it with the changes in this pull request. I'm a bit new to go - so forgive me If I misunderstand, but here's what happened. 
+
+Quick context first: I am using hpcloud/tail in [my component](https://gist.github.com/paulsc/15feacd2b4f53b3310fb02109b636c55), called "CsvTail" which tails a file, parses the CSV records in that file, and only stops when it encounters the NUL byte at the beginning of a line. The CSV files are streamed and written by another service, which uses the NUL byte to indicate the end of the file.
+
+The code would sometimes deadlock when calling [tail.Stop()](https://gist.github.com/paulsc/15feacd2b4f53b3310fb02109b636c55#file-csvtail-go-L80). Stop() internally calls tail.Wait(), which waits for the tomb to be declared as dead. 
+
+What happens is that another line comes in after [my read of the NUL byte](https://gist.github.com/paulsc/15feacd2b4f53b3310fb02109b636c55#file-csvtail-go-L46), but before [my Stop() call](https://gist.github.com/paulsc/15feacd2b4f53b3310fb02109b636c55#file-csvtail-go-L55), causing the tail library to block on [this line](https://github.com/hpcloud/tail/blob/a1dbeea552b7c8df4b542c66073e393de198a800/tail.go#L417). 
+
+Tail would never reach the end of tailFileSync() where it checks for tail.Dying(), returns, and sets the tomb as Done().
+
+My fix is to add a select and "cancel" the write if the tomb enters dying state. 
+
+Not sure if this is right though let me know if I'm misunderstanding or misusing the library.
+
+Best,
+
+Paul
+
+
+
+
+Fixes #161
+`GOOS=dragonfly go build` returns an error:
+
+```
+github.com/hpcloud/tail/tail.go:191:20: undefined: OpenFile
+```
+
+This library is a dependency of [quic-go](https://github.com/lucas-clemente/quic-go) which we use in [Caddy](https://github.com/caddyserver/caddy) and Caddy can no longer compile for Dragonfly because of this.
+This updates to use the new fsnotify import path.
+
+also, remove `vendor` to work with go modules. 
+Hello, I want to receive a notification when deleting a file or directory. What should I do
+Tailing a file that gets regularly written to, like Apache log files, can crash with message `The process cannot access the file because another process has locked a portion of the file.`. This happened on a Windows 10 (version 1903) installation.
+
+Please also see https://github.com/influxdata/telegraf/issues/6539 where I provide more details and steps that I used for reproducing including a minimal Go program that uses just the tail module. Although for reproducing I used `github.com/influxdata/tail` in that program, this probably also applies to `github.com/hpcloud/tail`, given that `influxdata/tail` and `hpcloud/tail` have minimal differences and there appear to be no differences in the relevant `tailFileSync` function.
+
+
+```
+	tailer, err := tail.TailFile(podLogPath, tail.Config{
+		ReOpen:      true,
+		MustExist:   true,
+		Follow:      true,
+		Poll:        true,
+		Logger:      tail.DiscardingLogger,
+		RateLimiter: lp.limiter,
+		Location:    &tail.SeekInfo{0, 2},
+	})
+```
+When log file being writed very fast , and rotated ,  will lose logs . 
+what I'm missed ? 
+Calling Cleanup() on a Tail can decrement the watch counter below zero, which can prevent future attempts to tail the file.
+
+Here is some code that can be used to show the issue:
+```go
+func main() {
+
+	// Setup and tail, being careful to avoid issue #93
+	t, err := tail.TailFile(os.Args[1], tail.Config{Follow: true})
+	if err != nil {
+		fmt.Println(err)
+	}
+	go func() {
+		for line := range t.Lines {
+		}
+	}()
+	t.Stop()
+	t.Cleanup()
+
+	// At this point, the watch count for this is negative, the next time we
+	// try to tail a watch will not be set.
+
+	t, err = tail.TailFile(os.Args[1], tail.Config{Follow: true})
+	if err != nil {
+		fmt.Println(err)
+	}
+	go func() {
+		for line := range t.Lines {
+			fmt.Printf("%q\n", line.Text)
+		}
+	}()
+	t.Wait()
+}
+```
+
+To duplicate:
+```
+go run ./main.go test.log
+
+# from another shell
+echo 1 >> test.log
+echo 2 >> test.log
+```
+
+Expected: the lines appended to test.log should be printed to screen.
+Actual: no output
+
+---
+
+Looking into the history of this function, it appears it was originally added to close all inotify watches before the program exists and it did not originally require access to the Tail objects.
+
+Since now you need the Tail to call, it seems preferrable to call Stop() instead.  The Cleanup function also does not ensure that the watch count goes to zero, it just does a single decrement, which won't be enough if there are multiple tails on a file.

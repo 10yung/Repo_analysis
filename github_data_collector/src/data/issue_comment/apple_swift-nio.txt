@@ -1,0 +1,162 @@
+https://github.com/apple/swift-nio/blob/976e65aba7102662533cf8c3d4969decbe52b904/Sources/NIO/Selector.swift#L552
+
+To read the bytes from timerfd, we use Glibc.read directly but we should use `try! Posix.read` instead which would’ve made debugging #1337 incredibly straightforward. We should probably also go through the codebase and find other uses of Darwin/Glib.$syscall rather than Posix.$syscall (outside of System.swift)
+`read` returning `EINVAL` is a bug in NIO and we should assert/precondition that it doesn't happen similar to what we do for `EBADF`/`EFAULT` on all syscalls. See #1337 for an example where that happens.
+If the user returns a future from a different event loop from `EventLoop.scheduleRepeatedAsyncTask` will cause a precondition in NIO. That's a bug.
+
+test case that shows the issue
+
+```swift
+    func testRepeatedTaskOffFuture() {
+        let elg1: EventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer {
+            XCTAssertNoThrow(try elg1.syncShutdownGracefully())
+        }
+
+        let elg2: EventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer {
+            XCTAssertNoThrow(try elg2.syncShutdownGracefully())
+        }
+
+        let g = DispatchGroup()
+        var callNumber = 0
+        g.enter()
+        let task = elg1.next().scheduleRepeatedAsyncTask(initialDelay: .nanoseconds(0), delay: .nanoseconds(0)) { task in
+            struct Dummy: Error {}
+
+            callNumber += 1
+            switch callNumber {
+            case 1:
+                return elg2.next().makeSucceededFuture(())
+            case 2:
+                g.leave()
+                return elg2.next().makeFailedFuture(Dummy())
+            default:
+                XCTFail("shouldn't be called \(callNumber)")
+                return elg2.next().makeFailedFuture(Dummy())
+            }
+        }
+        task.begin(in: .nanoseconds(0))
+        g.wait()
+    }
+```
+The ByteBuffer String API is tied to the concrete `String` type. Would be nice to allow arbitrary `StringProtocol` values, most importantly substrings.
+
+### SwiftNIO version/commit hash
+
+2.12.0
+
+### Swift & OS version (output of `swift --version && uname -a`)
+
+5.1 any
+Changed the HTTP response flow preconditions to allow for 100-continue heads
+
+### Motivation:
+
+Channel handlers need to be able to respond to Expect: 100-continue requests.
+
+Easy to reproduce w/ curl, e.g.:
+```
+$ curl --verbose  -F a=10 -F b=20 http://localhost:1337/
+*   Trying ::1...
+* TCP_NODELAY set
+* Connected to localhost (::1) port 1337 (#0)
+> POST / HTTP/1.1
+> Host: localhost:1337
+> User-Agent: curl/7.54.0
+> Accept: */*
+> Content-Length: 230
+> Expect: 100-continue             // need to be able to respond to this
+> Content-Type: multipart/form-data; boundary=------------------------0546700c49d7551e
+> 
+< HTTP/1.1 100 Continue           // w/ the patch
+< HTTP/1.1 200 OK
+< Content-Type: text/html
+< transfer-encoding: chunked
+```
+
+Without the patch curl still works, but will wait a second or so w/ sending the request body until some timeout. Other clients may just timeout.
+
+BTW: Not sure, maybe NIOHTTP2 needs the same patch?
+
+### Modifications:
+
+This doesn't change any actual code, just the incorrect assumptions in the preconditions.
+100-continue heads can be sent multiple times until the actual response head is sent out.
+
+### Result:
+
+Channel handlers can write 100-continue heads to the NIOHTTP1 pipeline.
+Once the 5.2 snapshots are available on swift.org/download, we should CI with them. They're not available right now yet but the `swift-5.2-branch` is cut.
+
+CC @Lukasa / @tomerd / @shahmishal 
+Motivation:
+
+Using `pread` and calculating file offsets should usually be preferred to using the kernel's seek pointer because it's often faster and there is no interference from reads happening on other threads. For some reason, we didn't support this yet in NIO.
+
+Modifications:
+
+Use & support pread where possible.
+
+Result:
+
+Faster, better, and happier @vlm
+
+### Actual behavior
+
+After the issue https://github.com/apple/swift-nio/issues/1265, I started to dig into the implementation of base64. The results of that work can be found at [fabianfett/swift-base64](https://github.com/fabianfett/swift-base64). While implementing decoding, I tested the performance of my implementation against Foundation. Since I wanted to base my work on the Base64 encoding provided by `NIOWebsocket` I also tested its performance. Surprisingly it's rather slow.
+
+Encoding 100k times the bytes from 0 to 255 produced these results:
+
+**On my MacBook Pro 2016 (2,7 GHz Intel Core i7)** 
+```
+Number of invocations: 100000
+------------------------------------------
+Encoding
+Foundation   | took: 0.24192798137664795s
+NIOWebsocket | took: 8.385756015777588s
+------------------------------------------
+```
+
+**On Linux Foundation's performance isn't great either.** Therefore the performance hit compared to Foundation is not as bad.
+```
+------------------------------------------
+Encoding
+Foundation   | took: 3.710782051086426s
+NIOWebsocket | took: 5.109261989593506s
+Base64       | took: 0.10653805732727051s
+------------------------------------------
+```
+
+### If possible, minimal yet complete reproducer code (or URL to code)
+
+The code to reproduce can be found the branch `compare-with-niowebsocket-base64` at [fabianfett/swift-base64](https://github.com/fabianfett/swift-base64)
+https://github.com/fabianfett/swift-base64/tree/compare-with-niowebsocket-base64
+
+Performance results on GitHub actions can be seen in the `Performance Tests` (Not great for detailed measuring, but we are of the target by quite a margin in this case):
+https://github.com/fabianfett/swift-base64/pull/2/checks
+
+Looking into the issue with Instruments, I'm quite sure the performance hit is based on the use of the `Unicode.Scalar` that seem to come with "some" memory overhead.
+
+<img width="930" alt="Screen Shot 2019-12-20 at 18 52 51" src="https://user-images.githubusercontent.com/6780861/71279796-f2c0bb00-2359-11ea-900d-c8b863220fa8.png">
+
+
+### SwiftNIO version/commit hash
+
+commit hash: `0ac7e2266bccd08ab174f6e2ef55522797b68343` code unchanged since Feb 14 2019.
+
+### Swift & OS version (output of `swift --version && uname -a`)
+
+```
+Target: x86_64-apple-darwin18.7.0
+Darwin xxx 18.7.0 Darwin Kernel Version 18.7.0: Thu Jun 20 18:42:21 PDT 2019; root:xnu-4903.270.47~4/RELEASE_X86_64 x86_64
+```
+we should create a bunch of _struct_s called
+
+- `NIOAtomicBool`
+- `NIOAtomicInt`
+- `NIOAtomicInt64`
+- `NIOAtomicUInt`
+- ...
+
+which clearly document that they have _reference semantics_. To start with, they should be implemented with `NIOAtomic<...>` and once Swift supports them, we should implement them with the upcoming stdlib atomics.

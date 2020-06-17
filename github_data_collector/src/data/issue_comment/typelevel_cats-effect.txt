@@ -1,0 +1,116 @@
+Looking at https://github.com/typelevel/cats-effect/issues/89 it seems this issue have been fixed at least once.
+
+```scala
+import cats.effect.{IO, Sync}
+import cats.implicits._
+object Boo {
+  def main(args: Array[String]): Unit = {
+
+    def app[F[_]: Sync](c: Int): F[Unit] = for {
+      _ <- Sync[F].delay(if (c % 1000000 == 0) {println(c)})
+      _ <- app(c + 1)
+    } yield ()
+
+    def app2[F[_]: Sync](c: Int): F[Unit] =
+      Sync[F].delay(if (c % 1000000 == 0) {println(c)})
+      .flatMap(_ => app2(c + 1))
+
+    app2[IO](0).unsafeRunSync()
+  }
+}
+```
+
+`app2` works fine. `app` leaks memory.
+
+
+```
+object ApiStarter extends IOApp {
+  def run(args: List[String]): IO[ExitCode] = Resource.make(IO(System.exit(0)))(_ => IO(())).use { _ =>
+    ???
+  }
+}
+```
+
+Hangs forever, clean exit expected.
+It seems that it deadlocks on finalizer in IOAppPlatform.
+
+cats-effect 2.0.0
+cats 2.0.0
+`val cs = IO.contextShift(ExecutionContext.global)`
+
+// throws exception
+`(IO(throw new OutOfMemoryError()) >> cs.shift >> IO()).unsafeRunSync()`
+
+// hangs forever
+`(cs.shift.productR(IO(throw new OutOfMemoryError())) >> IO()).unsafeRunSync()`
+
+cats-effect 2.0.0
+cats 2.0.0
+
+First prototype for parallel resource acquisition.
+Please only look at the implementation, I intend to expose this as a `Parallel` instance rather than the `parZip` function. 
+Needs proper testing as well
+Motivation:
+
+I found an open good first issue #732 while reading about `MVar`. This branch contains an attempt to implement it.
+
+Modification:
+
+- add `tryRead: F[Option[A]]` similar to [Control-Concurrent-MVar#tryRead](http://hackage.haskell.org/package/base-4.12.0.0/docs/Control-Concurrent-MVar.html#v:tryReadMVar)
+- add a test and a line into the docs
+
+I wonder does it do what is it intended to do? I am happy to amend it if I've missed something, suggestions are welcome. Thank you!
+Mega-change of doom! This PR does a couple of things:
+
+- Adds an implementation of @SystemFw's `mask`/`poll` combinator (called `uncancelable` for now) as described in #681 
+  + Random note: I chose to keep `bracketCase` primitive, despite the slight overlap with `uncancelable`. This is mostly because of inversion of control between `Bracket` and `Concurrent`. There is no way (that I'm aware of) to define `bracketCase` in `Bracket` in terms of `onCase` and `guarantee` without making it aware of cancelability. And if we *don't* make it aware of cancelability, then we can define it, but we would need to *override* it in every `Concurrent with Bracket` implementation, which seems very annoying. So instead I made `bracketCase` primitive while `guarantee` and `onCase` are derived from it, and we'll have a law which codifies the relationship between `uncancelable` and the `bracket`.
+- Pushes `F[A]` into the `Completed` case of `ExitCase`. This has the interesting side-effect of making `ExitCase` kind of behave like a monad transformer, but only when `F` forms a `Traverse`. When it *doesn't* form a `Traverse`, `ExitCase` is only `Applicative`! Fixes #643
+- Rewrite `PureIO` as `PureConc` (names are hard) on top of https://github.com/djspiewak/coop Eventually, if this works, I'll move coop under the Typelevel org
+
+The last point is an important one. `PureConc` is now the following:
+
+```scala
+type PureConc[E, A] =
+  Kleisli[                    // 1.
+    ThreadT[                  // 2.
+      Kleisli[                // 3.
+        ExitCase[Id, E, ?],   // 4.
+        FiberCtx[E],
+        ?],
+      ?],
+    MVar.Universe,
+    A]
+```
+
+The type seems imposing but it's actually relatively easy to deconstruct. Taking it one stage at a time:
+
+1. The ability to use `MVar` from coop
+2. Cooperative multithreading implemented with `FreeT`
+3. A lexically-scoped context for the currently running fiber
+4. Final results produced by an effect
+
+The nesting is actually somewhat arbitrary: we could have put `ThreadT` on the outside, and even merged the two `Kleisli`s together into one if we wanted to.
+
+Laws are currently not passing, presumably because of bugs. I'm working on that, and in the process working on making `ThreadT` structures a bit more introspectable for debugging purposes, but this is good enough to get some review eyes on it. Also getting it into the upstream branch allows everyone else to pitch in and help out!
+Currently `MVar` offers `read`, `put`, `take` as well as `tryPut` and `tryTake`. 
+
+It seems to me, that an atomic non-blocking `tryRead` is missing.
+Updates [org.scalameta:scalafmt-core](https://github.com/scalameta/scalafmt) [from 2.2.2 to 2.3.2](https://github.com/scalameta/scalafmt/compare/v2.2.2...v2.3.2).
+[Release Notes/Changelog](https://github.com/scalameta/scalafmt/releases/tag/v2.3.2)
+
+I'll automatically update this PR to resolve conflicts as long as you don't change it yourself.
+
+If you'd like to skip this version, you can just close this PR. If you have any feedback, just mention me in the comments below.
+
+Have a fantastic day writing Scala!
+
+<details>
+<summary>Ignore future updates</summary>
+
+Add this to your `.scala-steward.conf` file to ignore future updates of this dependency:
+```
+updates.ignore = [ { groupId = "org.scalameta", artifactId = "scalafmt-core" } ]
+```
+</details>
+
+labels: semver-minor

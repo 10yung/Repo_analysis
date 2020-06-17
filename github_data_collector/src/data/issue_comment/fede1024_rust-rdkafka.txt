@@ -1,0 +1,364 @@
+I'm having problems building my [project](https://github.com/tkasu/hsl-data-platform/tree/master/applications/vehicle-pos-data-forwarder) that is using release 0.22. 
+
+It seems that problems started after the release of rust-rdkafka 0.23 and rdkafka-sys 1.3.1.
+
+```
+   Compiling rdkafka-sys v1.3.1
+  ...
+   Compiling rdkafka v0.22.0
+error[E0425]: cannot find function `primitive_to_rd_kafka_resp_err_t` in crate `rdsys`
+   --> /Users/tkasu/.cargo/registry/src/github.com-1ecc6299db9ec823/rdkafka-0.22.0/src/client.rs:411:22
+    |
+411 |     let err = rdsys::primitive_to_rd_kafka_resp_err_t(err)
+    |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `rdsys`
+
+```
+
+Release 0.22 is fetching rdkafka-sys 1.3.1 from which the function primitive_to_rd_kafka_resp_err_t has been removed. 
+When I try to assign a `TopicPartitionList` to a `Consumer` I get compilation error in `History::get_range` async fn:
+```
+`*mut rdkafka_sys::bindings::rd_kafka_topic_partition_list_s` cannot be sent between threads safely
+```
+
+The code gets the first and the last message from a single-partition topic.
+When I remove TopicPartitionList-related lines (it's construction and consumer.assign) the code compiles successfully.
+
+```rust
+fn get_range(
+    schema: &Schema,
+    topic: String,
+    config: &ClientConfig,
+    timeout: Duration,
+) -> Result<Range, Error> {
+    let mut config = config.clone();
+    let group_id: i64 = rand::random();
+    config.set("group.id", &group_id.to_string());
+
+    let consumer: StreamConsumer = config.create()?;
+
+    log::trace!("Assigning partition");
+    let partition = 0;
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition_offset(&topic, partition, Offset::Beginning);
+    consumer.assign(&tpl)?;
+    
+    log::trace!("Assignment: {:?}", consumer.assignment()?);
+
+    log::trace!("consume first message");
+
+    let stream = consumer.start_with(timeout, true);
+
+    let (first_item, stream) = consume_one(&schema, stream).await?;
+
+    log::trace!("Seek to end");
+    consumer.seek(&topic, partition, Offset::End, timeout)?;
+
+    log::trace!("Get position");
+    let positions = consumer.position()?.to_topic_map();
+    let offset = positions
+        .get(&(topic.to_owned(), partition))
+        .ok_or_else(|| HistoryError::TopicNotFound(topic.to_owned()))?
+        .to_raw();
+
+    log::trace!("Offset: {}", offset);
+    
+    log::trace!("Seek to end - 1");
+    consumer.seek(&topic, partition, Offset::from_raw(offset - 1), Some(timeout))?;
+
+    log::trace!("consume last message");
+    let (last_item, _) = consume_one(&schema, stream).await?;
+
+    Ok(Range {
+        start: first_item,
+        end: last_item,
+    })
+}
+
+async fn consume_one<'a, C: ConsumerContext>(
+    schema: &Schema,
+    stream: MessageStream<'a, C>,
+) -> Result<(Item, MessageStream<'a, C>), Error> {
+  let (item, stream) = stream.into_future().await;
+  // deserialise item, omitted
+}
+
+#[tonic::async_trait]
+impl History for HistoryService {
+    async fn get_range(
+        &self,
+        _request: Request<GetRangeRequest>,
+    ) -> Result<Response<GetRangeResponse>, Status> {
+        let mut response = GetRangeResponse { ranges: vec![] };
+
+        for topic in self.topics.iter() {
+            let range =
+                get_range(&self.schema, symbol, &self.config, self.default_timeout).await?;
+            response.range.push(symbol);
+        }
+
+        Ok(Response::new(response))
+    }
+}
+```
+I've set up rdkafka 0.22.0 in my project with Cargo.toml like this, to use the [recently added zstd compression](https://github.com/fede1024/rust-rdkafka/issues/136) feature:
+
+```toml
+[dependencies]
+rdkafka = { version = "0.22.0", features = ["cmake-build", "zstd"] }
+```
+It seems to compile fine on Debian Stretch with zstd from backports, `libzstd-dev:amd64` `1.3.8+dfsg-3~bpo9+1`.
+
+Connecting to Kafka Cluster version 2.3.0 with brokers set to `compression.type=zstd` in `server.properties` and consuming messages fails with the following exception:
+
+```
+Message consumption error: UnsupportedCompressionType (Unsupported compression type))
+```
+
+The binary built and used *does* have zstd compiled in statically:
+```
+$ strings /path/to/binary | grep -Fi zstd
+```
+shows many many lines of the ZSTD function signatures.
+
+I wonder what I could do to debug this further. Does anyone have a successful zstd enabled setup?
+
+The other processes connecting to the Kafka cluster have no issue using zstd (JDK).
+@benesch This gets rid of the extra thread and futures executor block_on, without introducing a tokio dependency.
+
+I have a situation where I need to know from when on messages to a topic will be picked up by my consumer, so I can trigger another process to start writing to that topic after that, ensuring I will receive all its messages.
+
+Currently, I create a BaseConsumer in my main thread, and then start polling that BaseConsumer from a bunch of worker threads. I install a ConsumerContext to listen for a rebalance, and once I receive the first rebalance, I assume that all further messages will be received by my consumers. That seems to work, but takes 3-10 seconds on start-up (depending on the weather), which I find a bit too long.
+
+I've tried to speed things up by using `assign` immediately after creating the consumer and subscribing like so:
+```rust
+let m = consumer.fetch_metadata(Some(&topic), Duration::from_secs(3)).ok()?;
+let t = m.topics().iter().find(|t| t.name() == topic)?;
+let tpl: Option<HashMap<(String, i32), Offset>> = t.partitions().iter().map(|p|
+    Some(((topic.to_owned(), p.id()), Offset::Offset(
+        consumer.fetch_watermarks(&topic, p.id(), Duration::from_millis(200)).map(|(_, high)| high).ok()?
+    )))
+).collect();
+consumer.assign(&tpl).ok()?;
+Some(())
+```
+and then I don't receive any messages at all (it seems).
+
+Can I somehow trigger a rebalanced or force consumption from a certain set of offsets?
+
+(Sorry for the blatant support request. :/ If it's a "not implemented", I shall try…)
+Hi! 
+
+I recently started looking at this library and going through the examples. I'm new to Rust (but not kafka). One thing that was confusing to me right away was understanding what `message` consists of in the [simple_consumer example](https://github.com/fede1024/rust-rdkafka/blob/master/examples/simple_consumer.rs#L69-L79):
+
+```rust
+        match message {
+            Err(_) => warn!("Error while reading from stream."),
+            Ok(Err(e)) => warn!("Kafka error: {}", e),
+            Ok(Ok(m)) => {
+                let payload = match m.payload_view::<str>() {
+                    None => "",
+                    Some(Ok(s)) => s,
+                    Some(Err(e)) => {
+                        warn!("Error while deserializing message payload: {:?}", e);
+                        ""
+                    },
+                };
+                // ...
+            },
+        };
+
+```
+
+In particular, the level of nesting to unwrap to get to a payload value:: `Ok` -> `Ok` -> `Some` -> `Ok`. I eventually figured it out, but wound up wondering if there was a way to simplify this at the API level. As an experiment, I tried fiddling around with flattening the result of `MessageStream::poll`, and came up with [this](https://github.com/matthias-margush/rust-rdkafka/pull/1/files#diff-370d0daef9d576af78ac8b5e57d8eaa0R87):
+
+```diff
+--- a/src/consumer/stream_consumer.rs
++++ b/src/consumer/stream_consumer.rs
+@@ -84,17 +84,22 @@ impl<'a, C: ConsumerContext + 'static> MessageStream<'a, C> {
+ impl<'a, C: ConsumerContext + 'a> Stream for MessageStream<'a, C> {
+-    type Item = KafkaResult<BorrowedMessage<'a>>;
+-    type Error = ();
+-
+-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+-        self.receiver.poll()
+-            .map(|ready|
+-                ready.map(|option|
+-                    option.map(|polled_ptr_opt|
+-                        polled_ptr_opt.map_or(
+-                            Err(KafkaError::NoMessageReceived),
+-                            |polled_ptr| polled_ptr.into_message_of(self.consumer)))))
++    type Item = BorrowedMessage<'a>;
++    type Error = KafkaError;
++
++    fn poll(&mut self) -> Poll<Option<BorrowedMessage<'a>>, KafkaError> {
++        match self.receiver.poll() {
++            Ok(Async::NotReady) => Ok(Async::NotReady),
++            Ok(Async::Ready(Some(Some(v)))) => {
++                match v.into_message_of(self.consumer) {
++                    Ok(message) => Ok(Async::Ready(Some(message))),
++                    Err(e) => Err(e),
++                }
++            },
++            Ok(Async::Ready(None)) => Ok(Async::Ready(None)),
++            Ok(Async::Ready(Some(none))) => Err(KafkaError::NoMessageReceived),
++            Err(e) => Err(KafkaError::MessageConsumption(RDKafkaError::Fail)),
++        }
+     }
+ }
+ ```
+
+Besides reducing the unwrap() nesting, the flatter structure allows the combinators in [futures::stream::Stream](https://docs.rs/futures/0.1.26/futures/stream/trait.Stream.html), such as `map_err()`, `then()`, `for_each()` to work more naturally over the stream messages. You can see how this also [simplifies many of the examples & tests](https://github.com/matthias-margush/rust-rdkafka/pull/1/files). 
+
+- **for_each()**: Already defined to unwrap `Ok`s, so additional unwrapping isn't needed within the callback. In addition, errors don't need to be separately filtered since this already happens (they are routed to `map_err()`.
+
+- **map_err()**: Applies to all errors in the stream, not just the outer level.
+
+- **then()**: Applies to all `Result`s, so this takes the role of `for_each` if needed, in the examples.
+
+To me, this greatly improves the ergonomics of the API. 
+
+As I said, I'm new to Rust and I'm sure there are some considerations I've missed.  I'd be interested in your thoughts!
+There is a crash in rust-rdkafka that panics the program with an `Illegal instruction`.
+
+It is not easy to reproduce but it seems to be related to Kafka disconnecting and connecting.
+
+To reproduce I did:
+
+* Set up Kafka with a topic (I set it to 32 partitions, not sure that affects the result)
+* Set up a process that keeps sending data to the topic continously (~50k msg/s)
+* Connect the simple consumer to the topic
+* on the system running kafka execute: `while true; do sleep 30; systemctl stop kafka; sleep 30; systemctl start kafka; done` wait fro this to cycle through a few (can take a few hours :( )
+
+
+Plugging it in lldb I get the following message:
+```
+* thread #1: tid = 12251, 0x000055a04998376a simple_consumer`rdkafka_sys::helpers::rd_kafka_resp_err_t_to_rdkafka_error::h937fde3cbd090715(err=76) + 58, name = 'simple_consumer', stop reason = illegal instruction operand
+    frame #0: 0x000055a04998376a simple_consumer`rdkafka_sys::helpers::rd_kafka_resp_err_t_to_rdkafka_error::h937fde3cbd090715(err=76) + 58
+simple_consumer`rdkafka_sys::helpers::rd_kafka_resp_err_t_to_rdkafka_error::h937fde3cbd090715 + 58:
+-> 0x55a04998376a:  ud2
+   0x55a04998376c:  movw   $0xff38, 0x16(%rsp)
+   0x55a049983773:  jmpq   0x55a049983d6d            ; rdkafka_sys::helpers::rd_kafka_resp_err_t_to_rdkafka_error::h937fde3cbd090715 + 1597
+   0x55a049983778:  movw   $0xff39, 0x16(%rsp)
+```
+
+and the backtrace:
+```
+* thread #1: tid = 12251, 0x000055a04998376a simple_consumer`rdkafka_sys::helpers::rd_kafka_resp_err_t_to_rdkafka_error::h937fde3cbd090715(err=76) + 58, name = 'simple_consumer', stop reason = illegal instruction operand
+  * frame #0: 0x000055a04998376a simple_consumer`rdkafka_sys::helpers::rd_kafka_resp_err_t_to_rdkafka_error::h937fde3cbd090715(err=76) + 58
+    frame #1: 0x000055a04998036f simple_consumer`_$LT$rdkafka_sys..types..RDKafkaError$u20$as$u20$core..convert..From$LT$rdkafka_sys..bindings..rd_kafka_resp_err_t$GT$$GT$::from::h5c87f5f40f8a8e70(err=76) + 15
+    frame #2: 0x000055a04994120f simple_consumer`_$LT$T$u20$as$u20$core..convert..Into$LT$U$GT$$GT$::into::hf21794e88530de30(self=76) + 15
+    frame #3: 0x000055a0497bae85 simple_consumer`rdkafka::message::BorrowedMessage::from_consumer::h8a6675c1a5896483(ptr=0x00007f876c001878, _consumer=0x00007ffebeb0ab68) + 181
+    frame #4: 0x000055a0497ba075 simple_consumer`rdkafka::consumer::stream_consumer::PolledMessagePtr::into_message_of::hdee5383f58841b07(self=PolledMessagePtr at 0x00007ffebeb09bb0, consumer=0x00007ffebeb0ab68) + 53
+    frame #5: 0x000055a0497b8a9a simple_consumer`_$LT$rdkafka..consumer..stream_consumer..MessageStream$LT$$u27$a$C$$u20$C$GT$$u20$as$u20$futures..stream..Stream$GT$::poll::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::hbe7aba8dc172033d(polled_ptr=PolledMessagePtr at 0x00007ffebeb09c40) + 42
+    frame #6: 0x000055a0497b3a75 simple_consumer`_$LT$core..option..Option$LT$T$GT$$GT$::map_or::h42e4454c44e986ab(self=Option<rdkafka::consumer::stream_consumer::PolledMessagePtr> at 0x00007ffebeb09c78, default=Result<rdkafka::message::BorrowedMessage, rdkafka::error::KafkaError> at 0x00007ffebeb09d08, f=closure at 0x00007ffebeb09c88) + 165
+    frame #7: 0x000055a0497b8a55 simple_consumer`_$LT$rdkafka..consumer..stream_consumer..MessageStream$LT$$u27$a$C$$u20$C$GT$$u20$as$u20$futures..stream..Stream$GT$::poll::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::hf47f8c00572ab593(polled_ptr_opt=Option<rdkafka::consumer::stream_consumer::PolledMessagePtr> at 0x00007ffebeb09cf8) + 165
+    frame #8: 0x000055a0497b0c89 simple_consumer`_$LT$core..option..Option$LT$T$GT$$GT$::map::h24f8dfd73a6fdf3f(self=Option<core::option::Option<rdkafka::consumer::stream_consumer::PolledMessagePtr>> at 0x00007ffebeb09df0, f=closure at 0x00007ffebeb09e00) + 233
+    frame #9: 0x000055a0497b8998 simple_consumer`_$LT$rdkafka..consumer..stream_consumer..MessageStream$LT$$u27$a$C$$u20$C$GT$$u20$as$u20$futures..stream..Stream$GT$::poll::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::h3b6f6894c7b13e20(option=Option<core::option::Option<rdkafka::consumer::stream_consumer::PolledMessagePtr>> at 0x00007ffebeb09eb0) + 56
+    frame #10: 0x000055a0497c02f9 simple_consumer`_$LT$futures..poll..Async$LT$T$GT$$GT$::map::h1e6e1fba41ef387b(self=Async<core::option::Option<core::option::Option<rdkafka::consumer::stream_consumer::PolledMessagePtr>>> at 0x00007ffebeb09f00, f=closure at 0x00007ffebeb09f10) + 233
+    frame #11: 0x000055a0497b8948 simple_consumer`_$LT$rdkafka..consumer..stream_consumer..MessageStream$LT$$u27$a$C$$u20$C$GT$$u20$as$u20$futures..stream..Stream$GT$::poll::_$u7b$$u7b$closure$u7d$$u7d$::he71b8e4ba802cff0(ready=Async<core::option::Option<core::option::Option<rdkafka::consumer::stream_consumer::PolledMessagePtr>>> at 0x00007ffebeb09fc0) + 56
+    frame #12: 0x000055a0497b7159 simple_consumer`_$LT$core..result..Result$LT$T$C$$u20$E$GT$$GT$::map::h56a219bef339c4cf(self=Result<futures::poll::Async<core::option::Option<core::option::Option<rdkafka::consumer::stream_consumer::PolledMessagePtr>>>, ()> at 0x00007ffebeb0a010, op=closure at 0x00007ffebeb0a020) + 249
+    frame #13: 0x000055a0497b8904 simple_consumer`_$LT$rdkafka..consumer..stream_consumer..MessageStream$LT$$u27$a$C$$u20$C$GT$$u20$as$u20$futures..stream..Stream$GT$::poll::h509b1a61a33a854b(self=0x00007ffebeb0ad50) + 84
+    frame #14: 0x000055a0497aa4ea simple_consumer`_$LT$futures..task_impl..Spawn$LT$T$GT$$GT$::poll_stream_notify::_$u7b$$u7b$closure$u7d$$u7d$::hfd3db15e889a4c2d((null)=closure at 0x00007ffebeb0a108, s=0x00007ffebeb0ad50) + 26
+    frame #15: 0x000055a0497aa7d7 simple_consumer`_$LT$futures..task_impl..Spawn$LT$T$GT$$GT$::enter::_$u7b$$u7b$closure$u7d$$u7d$::h81878271456e8a28 + 39
+    frame #16: 0x000055a0497b45c9 simple_consumer`futures::task_impl::std::set::hec5adfb222cee03e(task=0x00007ffebeb0a200, f=closure at 0x00007ffebeb0a178) + 233
+    frame #17: 0x000055a0497aa5f3 simple_consumer`_$LT$futures..task_impl..Spawn$LT$T$GT$$GT$::enter::h083262a198e48673(self=0x00007ffebeb0ad28, unpark=<unavailable>, f=closure at 0x00007ffebeb0a1f8) + 243
+    frame #18: 0x000055a0497aa2a5 simple_consumer`_$LT$futures..task_impl..Spawn$LT$T$GT$$GT$::poll_fn_notify::hbb8ed580e825601c(self=0x00007ffebeb0ad28, notify=0x00007f8782fec3c0, id=0, f=closure at 0x00007ffebeb0a2c0) + 133
+    frame #19: 0x000055a0497aa4be simple_consumer`_$LT$futures..task_impl..Spawn$LT$T$GT$$GT$::poll_stream_notify::hea4270151d2d9eba(self=0x00007ffebeb0ad28, notify=0x00007f8782fec3c0, id=0) + 46
+    frame #20: 0x000055a0497b4ae8 simple_consumer`futures::task_impl::std::_$LT$impl$u20$futures..task_impl..Spawn$LT$S$GT$$GT$::wait_stream::_$u7b$$u7b$closure$u7d$$u7d$::h427d009c6fdf3932(notify=0x00007f8782fec3c0) + 104
+    frame #21: 0x000055a0497b437f simple_consumer`futures::task_impl::std::ThreadNotify::with_current::_$u7b$$u7b$closure$u7d$$u7d$::hd9109b2355ebf174(notify=0x00007f8782fec3c0) + 47
+    frame #22: 0x000055a0497aae48 simple_consumer`_$LT$std..thread..local..LocalKey$LT$T$GT$$GT$::try_with::h3bd209a70b18e652(self=0x000055a049f817d8, f=closure at 0x00007ffebeb0a648) + 456
+    frame #23: 0x000055a0497aac51 simple_consumer`_$LT$std..thread..local..LocalKey$LT$T$GT$$GT$::with::hac896e7e34f427f8(self=0x000055a049f817d8, f=closure at 0x00007ffebeb0a728) + 49
+    frame #24: 0x000055a0497b42fe simple_consumer`futures::task_impl::std::ThreadNotify::with_current::h7f7f8a71051ed99a(f=closure at 0x00007ffebeb0a798) + 46
+    frame #25: 0x000055a0497aa884 simple_consumer`futures::task_impl::std::_$LT$impl$u20$futures..task_impl..Spawn$LT$S$GT$$GT$::wait_stream::h34e7fa71e12d5c5e(self=0x00007ffebeb0ad28) + 36
+    frame #26: 0x000055a0497b5fbb simple_consumer`_$LT$futures..stream..wait..Wait$LT$S$GT$$u20$as$u20$core..iter..traits..iterator..Iterator$GT$::next::h54ddfb75b614c072(self=0x00007ffebeb0ad28) + 27
+    frame #27: 0x000055a0497c506e simple_consumer`simple_consumer::consume_and_print::h08052063f478bf93(brokers=&str at 0x00007ffebeb0ab30, group_id=&str at 0x00007ffebeb0ab40, topics=&[&str] at 0x00007ffebeb0ab50) + 894
+    frame #28: 0x000055a0497c7125 simple_consumer`simple_consumer::main::h76b582bf36c46e59 + 2645
+    frame #29: 0x000055a0497bd400 simple_consumer`std::rt::lang_start::_$u7b$$u7b$closure$u7d$$u7d$::haa1b61bdec249fda + 16
+    frame #30: 0x000055a049c3aec3 simple_consumer`do_call<closure,i32> [inlined] {{closure}} + 19
+    frame #31: 0x000055a049c3aeb7 simple_consumer`do_call<closure,i32> + 7
+    frame #32: 0x000055a049c3e1fa simple_consumer`__rust_maybe_catch_panic + 26
+    frame #33: 0x000055a049c3b9cd simple_consumer`lang_start_internal [inlined] try<i32,closure> + 62
+    frame #34: 0x000055a049c3b98f simple_consumer`lang_start_internal [inlined] catch_unwind<closure,i32>
+    frame #35: 0x000055a049c3b98f simple_consumer`lang_start_internal + 799
+    frame #36: 0x000055a0497bd3d9 simple_consumer`std::rt::lang_start::hd58f62b9f7dfcaa7(main=0x000055a0497c66d0, argc=7, argv=0x00007ffebeb0f9f8) + 73
+    frame #37: 0x000055a0497c72ca simple_consumer`main + 42
+    frame #38: 0x00007f8781fd83d5 libc.so.6`__libc_start_main + 245
+```
+
+Note:
+
+I could no t replicate this behaviour with the librdkafka sample_consumer
+I am trying to send/produce 10 concurrent message.
+
+I am using tokio::spawn to spawn a future producer inside a mpsc receiver with below code.
+```
+let f2 = rx.for_each(move|res| {
+        debug!("kakfa producer channel input data : {}", res.input);
+        println!("received data start_producer {}",res.input);
+        let mut modified_res = res.input.clone();
+        let tx = res.sender;
+        let pipe_offset = modified_res.rfind('|').unwrap_or(res.input.len());
+        let key = modified_res.split_off(pipe_offset + 1);
+        let len = modified_res.len();
+        modified_res.truncate(len -1);
+        // producer.send_copy::<String, String>(&topic_name, None, Some(&modified_res), Some(&key), None, 1000)
+        let t =
+         producer.send::<String, String>(FutureRecord::to(&topic_name)
+                        .key(&key)
+                        .payload(&modified_res),
+                                 1000)
+                          .then(|res|{
+                               match res{
+                                   Err(_) => {
+                                       error!("could not deliver message to topic as future is canceled");
+                                       match tx{
+                                           Some(txi) => {
+                                               txi.send(Err(
+                                                "Future canceled, can not confirm if message delivered to kafka topic"
+                                                .to_string()));
+                                           },
+                                           None => (),
+                                       }
+                                   },
+                                   Ok(res_in) => match res_in{
+                                       Ok((partition, offset)) => {
+                                           debug!("successfully sent message to kafka at partition {}, offset {}",
+                                                  partition, offset);
+                                           match tx{
+                                               Some(txi) => {
+                                                   txi.send(Ok("result is ok".to_string()));
+                                               },
+                                               None => (),
+                                           }
+                                       },
+                                       Err((err, msg)) => {
+                                           error!("failed to send message, error is {:?}", msg);
+                                           match tx{
+                                               Some(txi) => {
+                                                   txi.send(Err(
+                                                    format!("error occurred while sending message to kafka topic {:?}", msg))
+                                                    );
+                                               },
+                                   },
+                               };
+                               Ok(())
+                          });
+        tokio::spawn(t);
+        Ok(())
+    });
+    tokio::spawn(f2);
+```
+
+
+It only process first message sent(out of N concurrent request) and does not process other messages. Although, i can see that DeliveryFuture's poll function is getting called for each request. 
+
+I am facing this issue only when i use tokio::spawn(). 
+
+If instead of using tokio::spawn(Method 1), If i chain to to main future f2 by returning t from for_each(Method 2), it works fine.
+
+Method 2 makes it sequential that is if one of message takes time to be delivered, it does not execute message until current message is sent successfully. I don't desire this behavior and want to make it parallel that's why i want to use method 1.
+
+
+Please not that key are same in all the request. Does key need to be unique?
+
+This would give a good idea of the overhead compared to rdkafka itself.

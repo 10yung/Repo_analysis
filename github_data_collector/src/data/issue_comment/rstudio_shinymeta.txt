@@ -1,0 +1,90 @@
+Will propagate https://github.com/rstudio/shinymeta/commit/9616eabbde2d96334e9f8077c188484ffe033ae8
+As pointed out by @schloerke, `expandChain(output$Summary)` this is likely more intuitive than `expandChain(output$Summary())`. It seems like we could support either way?
+
+```r
+library(shiny)
+library(shinymeta)
+
+ui <- fluidPage(
+  selectInput("var", label = "Choose a variable", choices = names(cars)),
+  verbatimTextOutput("Summary"),
+  verbatimTextOutput("code")
+)
+
+server <- function(input, output) {
+  var <- metaReactive({
+    cars[[..(input$var)]]
+  })
+  output$Summary <- metaRender(renderPrint, {
+    summary(..(var()))
+  })
+  output$code <- renderPrint({
+    expandChain(output$Summary())
+  })
+}
+
+shinyApp(ui, server)
+```
+Fixes #60
+The `{{` / `}}` `knit_expand` mechanism is a bit too low-level; since it works on a purely textual level, it's easy for values intended to be text to be interpreted as code instead.
+
+e.g. an Rmd template that contains this snippet (not in a code block):
+
+```
+The variable we'll be focusing on in this report is {{col_name}}.
+```
+
+And then `buildRmdBundle(..., vars = list(col_name = input$col_name))`.
+
+A malicious client could easily send a `col_name` value of `"\n```{r}\nunlink("whatever", recursive=TRUE)\n```\n"`, which would expand into the Rmd template as
+
+    The variable we'll be focusing on in this report is 
+    ```{r}
+    unlink("whatever", recursive=TRUE)
+    ```
+    .
+
+Some ideas:
+
+* ~~We could add the values in `vars` to the knitr environment, then tell people to do `` `r col_name` `` instead of `{{col_name}}`.~~ (Won't work, see my next comment)
+* ~~We could recommend people pass non-code values through `params`. That seems like a higher-overhead version of the previous option though.~~ (Won't work, see my next comment)
+* We could error on suspicious `vars` or `{{`/`}}` substitutions. Yuck, security heuristics.
+* We could stop using `knit_expand` altogether, and use a different chunk type to insert code dynamically. This would probably be a considerable amount of knitr hacking, I think I looked at this last time and I couldn't find an obvious way to preprocess a chunk and then have knitr treat it as code.
+
+Note: builds on PR #69 (because it relies on the scope correction of `metaExpr` in that branch)
+Fixes #69 
+```r
+> exists("foo")
+[1] FALSE
+> shinymeta::metaExpr({foo <- TRUE})
+[1] TRUE
+> exists("foo")
+[1] FALSE
+```
+
+I think this is due to the use of `rlang::eval_tidy`:
+
+```r
+> rlang::eval_tidy(quote(foo <- TRUE))
+[1] TRUE
+> exists("foo")
+[1] FALSE
+```
+
+Switching to `base::eval` will fix this.
+Currently input values are inlined into the generated code, which makes it cumbersome to change an input value in the generate code
+One of my preferred debugging techniques in a problematic reactive is to insert  `browser()` in the relevant construct.  Looking at the modules example app in PR #59 I tried this out:
+
+```r
+values <- metaReactive2({
+    req(input$col)
+    bb <- metaExpr({
+      browser()
+      ..(df()) %>%
+        dplyr::pull(!!..(input$col))
+    })
+  })
+```
+
+If I assign the complete chain above to an object, everything works perfect.  But if I try assigning `..(df())` to an object, I get an error about not finding function `..`.  Of course I can simply use `df()` instead, but it might help to talk about the nuances of using or not using `..()` when debugging the app.
+https://github.com/rstudio/shinymeta/blob/master/inst/examples/interactive-lm/app.R

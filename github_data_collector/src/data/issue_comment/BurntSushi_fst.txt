@@ -1,0 +1,104 @@
+Currently, the primary way to load an fst object (Map/Set/Raw) from a byte slice is to use `from_static_slice`. While that solves the use case of loading data that lives for the lifetime of the program, it appears to be overly-restrictive for other use cases.
+
+For example, I have fst data that I've written into a network buffer:
+
++ I do not want to give ownership of that buffer to fst, so using `from_bytes` won't work.
++ The fst data is not `'static`, so `from_static_slice` won't work.
++ The fst data is a subslice of a greater slice (the network buffer), so to make it work with `from_shared_bytes` I would need to change my internal APIs to use `Arc<Vec<u8>>` instead of `&[u8]` (which may add bugs and performance regressions) .
+
+While I could try to use the existing mmap API, I believe I would need to create a file-like object that wraps my byte slice, and then memory map it, which is unergonomic and error-prone.
+
+My recommendation is to add a `from_slice(bytes: &[u8])` constructor to Map, Set, and Raw. My understanding is that this is unfortunately not trivial, because the `FstData` type does not take a lifetime parameter, which would be required while it holds a reference to the byte slice.
+
+Nevertheless, is there interest in adding this feature?
+
+Thanks!
+Similarly to #70, `fst-levenshtein` inherits the `mmap` feature, which means it can't be used in WebAssembly without forking and modifying locally.
+
+Hopefully you would consider this addition as well.
+
+Thanks!
+I got 3 warnings when compiling this example with rustc 1.38.0. I fixed them as per the error messages. Not sure if these make sense on earlier versions of rust, but here's a quick PR in case this is helpful.
+fst has all the necessary infrastructure for `FromIterator` to work; please consider implementing it, so that `collect` works, and in particular to make it easy to collect into `Result<Fst, ...>` or `Result<Set, ...>`.
+
+Thank you!
+For some uses, it would make sense to statefully walk through the FST, stepping forward with input bytes, but also popping off the last input and returning to the previous state.
+
+I'd love to have something with roughly the following interface:
+
+```rust
+impl FstWalker {
+    fn new(fst: &Fst) -> FstWalker;
+    fn push(&mut self, input: u8) -> bool; // false if no transition
+    fn node(&self) -> Node;
+    fn pop(&mut self);
+    fn value(&self) -> &[u8];
+}
+```
+
+The `FstWalker` would internally maintain the byte-string pushed so far, which it may want to reserve_exact on based on the longest key in the `Fst` to avoid needing to grow it. `value()` would return the current byte-string.
+
+The `node()` function would allow calling `is_final()` and/or `final_output()`.
+
+I can build this easily enough based on the interfaces already provided by `raw::Fst`, but I'm wondering if this looks like something useful enough to provide in the `fst` crate itself. If I wrote a patch for this, would you be interested?
+
+(I also don't know if this would beat the performance of just recursing on the `fst`, but I plan to test that.)
+For some uses of an FST, before applying a large number of queries to the fst, the caller may be able to prune out states and transitions from the FST based on knowledge of valid keys. For instance, if using an FST to store a dictionary, and performing lookups in that dictionary for a game, the caller may know that only a subset of letters are available, and could start by pre-processing the FST to prune any states or transitions that use unavailable letters.
+
+Please consider providing ways to efficiently process an FST and prune out states and transitions based on inputs. The simplest could be a filter on valid u8 inputs for transitions.
+Hello
+
+The fst can be queried with a specific key or with an automaton. The key is optimized by just „going forward“, while the automaton is „offered“ one byte at a time to modify the state.
+
+Now, I have a sparse automaton ‒ one that doesn't describe one specific key only, but it has only few branching points and is just single possible next byte in most of the states.
+
+I wonder if it's possible to somehow make the querying faster, given the above. Instead of offering it all the bytes that won't match for sure, just going forward on the straight parts. I could write a code specific to my use case, but is there something that could be done in general?
+
+Maybe extending the automaton with a `fn hint(&self) -> Option<&[u8]>` (default to None) that would not store the intermediate visited states and just go forward? Would it make it faster? Would it make sense to have something like that as part fst itself? Or, is there a better way? If so, I might try to implement it, but I want to ask first before I invest the time.
+
+Thank you
+The commandline
+
+> fst map two.csv two.fst
+
+does work, but the following command:
+
+> fst range -o two.fst
+
+prints only one single line and the command
+
+>  fst dot two.fst | dot -Tpng > two.png
+
+produces a graph with three nodes - ok. But only a single final node, a wrong output on label 'a' (1) and no output on label 'b'.
+ 
+I am currently working on an improvement of the `fst` library and I am facing a problem, I read the [Streamer Trait explanation](https://docs.rs/fst/0.3.0/fst/trait.Streamer.html) and the whole [lifetime nomicon explanations](https://doc.rust-lang.org/nomicon/hrtb.html) to try to fix this lifetime problem.
+
+```rust
+struct StreamWithStateOutput<S>(S);
+
+impl<'a, S, T> Streamer<'a> for StreamWithStateOutput<S>
+where
+    S: Streamer<'a, Item=(&'a [u8], u64, T)>,
+{
+    type Item = (&'a [u8], raw::Output, T);
+
+    fn next(&'a mut self) -> Option<Self::Item> {
+        self.0.next().map(|(k, v, s)| (k, raw::Output::new(v), s))
+    }
+}
+```
+
+This is the current mapping struct that I produced to map a `Streamer` into another `Streamer` but that produce `raw::Output`s rather than `u64` (like the [`StreamOutput` struct you already define](https://github.com/Kerollmops/fst/blob/8ae8cf89fd8ca1fba7631437c6eaa418be4319bd/src/map.rs#L1087)) but I'm facing a problem of lifetime (like the one you talk about in the `Streamer` Trait documentation I suppose).
+
+If I follow the help message that `rustc` outputs, I add a lifetime constraint `T: 'a` to the `StreamWithStateOutput` `Streamer` implementation and the problem comes after: the [`OpWithStateBuilder`](https://github.com/Kerollmops/fst/blob/8ae8cf89fd8ca1fba7631437c6eaa418be4319bd/src/map.rs#L1100) need a `T: 'static` constraint.
+
+So I didn't add this constraint because it blocks everything above, the code is less fexible.
+I just want to understand the problem here, it's hard to work with lifetimes 😢.
+
+I also think of using `IntoStreamer` to construct a `StreamWithStateOutput`, like you said in the `Streamer` explanations but it's not possible I fear.
+
+Note that I successfully [defined a `raw::OpWithStateBuilder` without forcing a `'static` bound on `T`](https://github.com/Kerollmops/fst/blob/op-builder-with-state/src/raw/ops.rs#L455) by using [the same constraints on the `push` method](https://github.com/Kerollmops/fst/blob/8ae8cf89fd8ca1fba7631437c6eaa418be4319bd/src/raw/ops.rs#L469-L475) than [the ones on `OpWithStateBuilder` (not `raw`)](https://github.com/Kerollmops/fst/blob/8ae8cf89fd8ca1fba7631437c6eaa418be4319bd/src/map.rs#L1114-L1120), the only thing that is different is [the `StreamWithStateOutput` mapping struct](https://github.com/Kerollmops/fst/blob/8ae8cf89fd8ca1fba7631437c6eaa418be4319bd/src/map.rs#L1140-L1151) (used to pass from a `u64` to an `Output`).
+In some cases it can be useful to know the automaton state as well, when intersecting the fst with an automaton using `.search(...)`.
+
+For instance, levenshtein's automaton's state hold the actual levenshtein distance of the current `key`. It is a very valuable information that could be used for ranking the results for instance.
+

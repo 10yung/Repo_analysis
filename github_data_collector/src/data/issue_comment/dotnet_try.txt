@@ -1,0 +1,608 @@
+
+Are we enabled to run C# codes with an optimized way in jupyter notebook? There is a property named "Optimize Code" in Visual Studio to let the compiler knows whether the code will be optimized or not. Something like this do you provide us?
+
+I'm asking this feature because there is x10 (for loop only small benchmarking) performance gap between Try .Net and .Net Core (Optimize Code is enabled), and x2 performance gap when Optimize Code is disabled.
+
+I also develop a deep learning library in .NET Core. I have to know and care about performance issues. 
+This handles the 3 basic messages:
+* HandleSubmitCode
+* HandleRequestCompletion
+* HandleCancelCurrentCommand (but is just a no-op at the moment)
+
+Things pending in this PR:
+* Order matters - right now the output stream is shown at the end, but it should be shown in the middle
+* Handling cancel
+* tests 😃 
+
+Example [PowerShell notebook](https://gist.github.com/TylerLeonhardt/ff9a20fb53313bf31e6c0107b0fec4e3) that came from this very change.
+E.g.
+
+````
+#r "nuget:Microsoft.ML,1.4.0"
+#r "nuget:Microsoft.ML.OnnxTransformer,1.4.0"
+var x = hello, world;
+````
+reports:
+````
+(1,1): error CS0819: Implicitly-typed variables cannot have multiple declarators
+(1,9): error CS0103: The name 'hello' does not exist in the current context
+````
+Error should occur on line 3 not line 1.
+This is a proposal for #729 (#214).
+
+Usage would be:
+`publish "..\Samples" --format Markdown --target-directory "..\Samples\published"`
+
+Supported formats are Markdown and HTML
+
+Root directory can be identical to target-directory. In that case with Markdown formatting selected, source files will replaced with the ones that contain the updated source blocks from the sample solutions.
+
+I was insecure about file access. Read access to directories is done via IDirectoryAccessor but write access is not abstracted, that seems incorrect. So any suggestions welcome.
+
+
+**Problem**
+I want to use .net interactive documentation to write my documentation but markdown doc files should still display my code samples when viewed in an environment without try .net hosting (git hub README or simple markdown viewer). Right now I have to copy the sample regions manually  from the C# projects to markdcown code blocks to make sure the samples are visible without try .net, which is error-prone and inconvenient.
+
+**Suggestion**
+I would like to use the global dotnet try tool to keep my markdown in sync with the sample code. It would be great to have a *sync* command that just copies the referenced regions into the markdown code blocks. Usage would be similar to the existing verify command:
+
+dotnet try sync <RootDirectory>
+
+Even if the docs are never used as interactive docs one gets the great advantage of writing sample code with compiler support. So no more broken code samples in the documentation.
+
+**Basic implementation**
+I created a basic implementation with the current try dotnet version. It is working for me and perhaps it is useful to start with (unfortunately pull requests are not possible at the moment):
+
+``` csharp
+
+using System.CommandLine;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using Markdig;
+using Markdig.Renderers.Normalize;
+using Markdig.Syntax;
+using Microsoft.DotNet.Try.Markdown;
+using MLS.Agent.Markdown;
+using MLS.Agent.Tools;
+using WorkspaceServer;
+
+namespace MLS.Agent.CommandLine
+{
+    public static class SyncCommand
+    {
+        public static async Task<int> Do(
+            SyncOptions syncOptions,
+            IConsole console,
+            StartupOptions startupOptions = null
+        )
+        {
+            var directoryAccessor = syncOptions.RootDirectory;
+            var packageRegistry = PackageRegistry.CreateForTryMode(directoryAccessor);
+            var markdownProject = new MarkdownProject(
+                directoryAccessor,
+                packageRegistry,
+                startupOptions);
+
+            var markdownFiles = markdownProject.GetAllMarkdownFiles().ToArray();
+            if (markdownFiles.Length == 0)
+            {
+                console.Error.WriteLine($"No markdown files found under {directoryAccessor.GetFullyQualifiedRoot()}");
+                return -1;
+            }
+
+            foreach (var markdownFile in markdownFiles)
+            {
+                var document = ParseMarkdownDocument(markdownFile);
+
+                var pipeline = new MarkdownPipelineBuilder().UseNormalizeCodeBlockAnnotations().Build();
+                var writer = new StringWriter();
+                var renderer = new NormalizeRenderer(writer);
+                renderer.Options.ExpandAutoLinks = true;
+                pipeline.Setup(renderer);
+
+                var blocks = document
+                    .OfType<AnnotatedCodeBlock>()
+                    .OrderBy(c => c.Order)
+                    .ToList();
+
+                if (!blocks.Any())
+                    continue;
+
+                await Task.WhenAll(blocks.Select(b => b.InitializeAsync()));
+
+                renderer.Render(document);
+                writer.Flush();
+
+                var updated = writer.ToString();
+
+                var fullName = directoryAccessor.GetFullyQualifiedPath(markdownFile.Path).FullName;
+                File.WriteAllText(fullName, updated);
+
+                console.Out.WriteLine($"Updated code sections in file {fullName}");
+            }
+
+            return 0;
+        }
+
+        private static MarkdownDocument ParseMarkdownDocument(MarkdownFile markdownFile)
+        {
+            var pipeline = markdownFile.Project.GetMarkdownPipelineFor(markdownFile.Path);
+
+            var document = Markdig.Markdown.Parse(
+                markdownFile.ReadAllText(),
+                pipeline);
+            return document;
+        }
+    }
+}
+
+using Markdig;
+using Markdig.Renderers;
+using Markdig.Renderers.Normalize;
+using Markdig.Syntax;
+
+namespace Microsoft.DotNet.Try.Markdown
+{
+    public static class MarkdownNormalizePipelineBuilderExtensions
+    {
+        public static MarkdownPipelineBuilder UseNormalizeCodeBlockAnnotations(
+            this MarkdownPipelineBuilder pipeline)
+        {
+            var extensions = pipeline.Extensions;
+
+            if (!extensions.Contains<NormalizeBlockAnnotationExtension>())
+            {
+                extensions.Add(new NormalizeBlockAnnotationExtension());
+            }
+
+            if (!extensions.Contains<SkipEmptyLinkReferencesExtension>())
+            {
+                extensions.Add(new SkipEmptyLinkReferencesExtension());
+            }
+
+            return pipeline;
+        }
+    }
+
+    public class NormalizeBlockAnnotationExtension : IMarkdownExtension        
+    {
+        public void Setup(MarkdownPipelineBuilder pipeline)
+        {
+        }
+
+        public void Setup(MarkdownPipeline pipeline, IMarkdownRenderer renderer)
+        {
+            var normalizeRenderer = renderer as NormalizeRenderer;
+            var renderers = normalizeRenderer?.ObjectRenderers;
+            if (renderers != null && !renderers.Contains<NormalizeAnnotatedCodeBlockRenderer>())
+            {
+                var codeLinkBlockRenderer = new NormalizeAnnotatedCodeBlockRenderer();
+                renderers.Insert(0, codeLinkBlockRenderer);
+            }   
+        }
+
+        public class NormalizeAnnotatedCodeBlockRenderer : CodeBlockRenderer
+        {
+            protected override void Write(
+                NormalizeRenderer renderer,
+                CodeBlock codeBlock)
+            {
+                if (codeBlock is AnnotatedCodeBlock codeLinkBlock)
+                {
+                    codeLinkBlock.Arguments = $"{codeLinkBlock.Annotations.Language} {codeLinkBlock.Annotations.RunArgs}";
+                    base.Write(renderer, codeBlock);
+                }
+                else
+                {
+                    base.Write(renderer, codeBlock);
+                }
+            }
+        }
+    }
+
+    public class SkipEmptyLinkReferencesExtension : IMarkdownExtension        
+    {
+        public void Setup(MarkdownPipelineBuilder pipeline)
+        {
+        }
+
+        public void Setup(MarkdownPipeline pipeline, IMarkdownRenderer renderer)
+        {
+            var normalizeRenderer = renderer as NormalizeRenderer;
+            var renderers = normalizeRenderer?.ObjectRenderers;
+            if (renderers != null)
+            {
+                renderers.RemoveAll(r => r is LinkReferenceDefinitionRenderer);
+                var linkRefRenderer = new SkipEmptyLinkReferencesRender();
+                renderers.Insert(0, linkRefRenderer);
+            }   
+        }
+
+        public class SkipEmptyLinkReferencesRender : LinkReferenceDefinitionRenderer
+        {
+            protected override void Write(NormalizeRenderer renderer, LinkReferenceDefinition linkDef)
+            {
+                if (linkDef.Label == null && linkDef.Url == null)
+                    return;
+
+                base.Write(renderer, linkDef);
+            }
+        }
+    }
+}
+
+```
+
+
+
+#### Describe the bug
+IntelliSense suggestions for extension methods have property icon (🔧-like), instead of a method-like (box thing).
+
+#### Did this error occur while using `dotnet try` or online?
+- [ ] `dotnet-try`
+- [ ] .NET Jupyter Notebook 
+- [x] online (https://docs.microsoft.com/en-us/dotnet/csharp/tutorials/intro-to-csharp/hello-world?tutorial-step=3)
+
+#### What kind of error was it?
+- [x] User Interface (UI):  IntelliSense icon is incorrect, using property one for extension methods like LINQ's Any, All, Aggregate, etc.
+- [ ] Service Error
+- [ ] Other:
+
+#### Screenshots
+Edge:
+![image](https://user-images.githubusercontent.com/2671396/71890990-d7212700-3145-11ea-85ac-defb0c8e8203.png)
+Chrome:
+![image](https://user-images.githubusercontent.com/2671396/71891017-e7390680-3145-11ea-8582-cf48f3392cb4.png)
+
+
+#### Please complete the following:
+ - OS
+    - [ ] Windows 10
+    - [ ] macOS
+    - [ ] Linux (Please specify distro)
+    - [ ] iOS
+    - [ ] Android
+ - Browser 
+    - [x] Chrome
+    - [x] Edge
+    - [ ] Safari
+
+ML.NET version: 1.4
+
+I'm working to port [this sample](https://github.com/dotnet/machinelearning-samples/tree/master/samples/csharp/getting-started/DeepLearning_ImageClassification_Training) to ML.NET 1.4 and being able to use it in Jupyter Notebooks. Even though it works smoothly as VS solution, when trying to run it on a Jupyter I get the following error:
+
+`System.InvalidOperationException: Splitter/consolidator worker encountered exception while consuming source data`
+
+To do this, I've splitted the Program.cs file into different cells. In order to more easily handle the different dependencies (and to avoid filling the notebook with other declarations), I've also referenced the .dll created at /bin/Debug when running it on VS.
+
+#### This is the code and the outputs of the notebook cells:
+```
+// ML.NET Nuget packages installation
+#r "nuget:Microsoft.ML,1.4"
+#r "nuget:Microsoft.ML.ImageAnalytics"
+#r "nuget:Microsoft.ML.Vision"
+#r "nuget:SciSharp.Tensorflow.Redist"
+#r "nuget:SharpZipLib"
+    
+#r "C:\Users\******\Desktop\DeepLearning_ImageClassification_Training\v_jupyter\ImageClassification.Train\bin\Debug\netcoreapp2.1\ImageClassification.Shared.dll"
+#r "C:\Users\******\Desktop\DeepLearning_ImageClassification_Training\v_jupyter\ImageClassification.Train\bin\Debug\netcoreapp2.1\ImageClassification.Train.dll"
+```
+Installing package SharpZipLib....
+Installing package Microsoft.ML.ImageAnalytics....
+Installing package Microsoft.ML.Vision....
+Installing package Microsoft.ML, version 1.4....
+Installing package SciSharp.Tensorflow.Redist....
+
+(by the way, in this one i've found no way to do the #r without the absolute path, despite what it's said in #698 and the inner issue suggestions)
+
+```
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using Common;
+using ImageClassification;
+using ImageClassification.DataModels;
+using ImageClassification.Train;
+using Microsoft.ML;
+using Microsoft.ML.Transforms;
+using Microsoft.ML.Vision;
+using static Microsoft.ML.Transforms.ValueToKeyMappingEstimator;
+```
+
+```
+private static void EvaluateModel(MLContext mlContext, IDataView testDataset, ITransformer trainedModel)
+{
+    Console.WriteLine("Making predictions in bulk for evaluating model's quality...");
+
+    // Measuring time
+    var watch = Stopwatch.StartNew();
+
+    var predictionsDataView = trainedModel.Transform(testDataset);
+
+    var metrics = mlContext.MulticlassClassification.Evaluate(predictionsDataView, labelColumnName:"LabelAsKey", predictedLabelColumnName: "PredictedLabel");
+    ConsoleHelper.PrintMultiClassClassificationMetrics("TensorFlow DNN Transfer Learning", metrics);
+
+    watch.Stop();
+    var elapsed2Ms = watch.ElapsedMilliseconds;
+
+    Console.WriteLine($"Predicting and Evaluation took: {elapsed2Ms / 1000} seconds");
+}
+
+private static void TrySinglePrediction(string imagesFolderPathForPredictions, MLContext mlContext, ITransformer trainedModel)
+{
+    // Create prediction function to try one prediction
+    var predictionEngine = mlContext.Model
+        .CreatePredictionEngine<InMemoryImageData, ImagePrediction>(trainedModel);
+
+    var testImages = FileUtils.LoadInMemoryImagesFromDirectory(
+        imagesFolderPathForPredictions, false);
+
+    var imageToPredict = testImages.First();
+
+    var prediction = predictionEngine.Predict(imageToPredict);
+
+    Console.WriteLine(
+        $"Image Filename : [{imageToPredict.ImageFileName}], " +
+        $"Scores : [{string.Join(",", prediction.Score)}], " +
+        $"Predicted Label : {prediction.PredictedLabel}");
+}
+
+
+public static IEnumerable<ImageData> LoadImagesFromDirectory(
+    string folder,
+    bool useFolderNameAsLabel = true)
+    => FileUtils.LoadImagesFromDirectory(folder, useFolderNameAsLabel)
+        .Select(x => new ImageData(x.imagePath, x.label));
+
+public static string DownloadImageSet(string imagesDownloadFolder)
+{
+    // get a set of images to teach the network about the new classes
+
+    //SINGLE SMALL FLOWERS IMAGESET (200 files)
+    const string fileName = "flower_photos_small_set.zip";
+    var url = $"https://mlnetfilestorage.file.core.windows.net/imagesets/flower_images/flower_photos_small_set.zip?st=2019-08-07T21%3A27%3A44Z&se=2030-08-08T21%3A27%3A00Z&sp=rl&sv=2018-03-28&sr=f&sig=SZ0UBX47pXD0F1rmrOM%2BfcwbPVob8hlgFtIlN89micM%3D";
+    Web.Download(url, imagesDownloadFolder, fileName);
+    Compress.UnZip(Path.Join(imagesDownloadFolder, fileName), imagesDownloadFolder);
+
+    //SINGLE FULL FLOWERS IMAGESET (3,600 files)
+    //string fileName = "flower_photos.tgz";
+    //string url = $"http://download.tensorflow.org/example_images/{fileName}";
+    //Web.Download(url, imagesDownloadFolder, fileName);
+    //Compress.ExtractTGZ(Path.Join(imagesDownloadFolder, fileName), imagesDownloadFolder);
+
+    return Path.GetFileNameWithoutExtension(fileName);
+}
+
+public static void ConsoleWriteImagePrediction(string ImagePath, string Label, string PredictedLabel, float Probability)
+{
+    var defaultForeground = Console.ForegroundColor;
+    var labelColor = ConsoleColor.Magenta;
+    var probColor = ConsoleColor.Blue;
+
+    Console.Write("Image File: ");
+    Console.ForegroundColor = labelColor;
+    Console.Write($"{Path.GetFileName(ImagePath)}");
+    Console.ForegroundColor = defaultForeground;
+    Console.Write(" original labeled as ");
+    Console.ForegroundColor = labelColor;
+    Console.Write(Label);
+    Console.ForegroundColor = defaultForeground;
+    Console.Write(" predicted as ");
+    Console.ForegroundColor = labelColor;
+    Console.Write(PredictedLabel);
+    Console.ForegroundColor = defaultForeground;
+    Console.Write(" with score ");
+    Console.ForegroundColor = probColor;
+    Console.Write(Probability);
+    Console.ForegroundColor = defaultForeground;
+    Console.WriteLine("");
+}
+
+private static void FilterMLContextLog(object sender, LoggingEventArgs e)
+{
+    if (e.Message.StartsWith("[Source=ImageClassificationTrainer;"))
+    {
+        Console.WriteLine(e.Message);
+    }
+}
+```
+
+```
+string outputMlNetModelFilePath = "ImageClassification.Train/assets/outputs/imageClassifer.zip";
+string imagesFolderPathForPredictions = "ImageClassification.Train/assets/inputs/images/images-for-prediction/FlowersPredictions";
+
+string imagesDownloadFolderPath = "ImageClassification.Train/assets/inputs/images/";
+```
+```
+// 1. Download the image set and unzip
+string finalImagesFolderName = DownloadImageSet(imagesDownloadFolderPath);
+string fullImagesetFolderPath = Path.Combine(imagesDownloadFolderPath, finalImagesFolderName);
+
+var mlContext = new MLContext(seed: 1);
+
+// Specify MLContext Filter to only show feedback log/traces about ImageClassification
+// This is not needed for feedback output if using the explicit MetricsCallback parameter
+mlContext.Log += FilterMLContextLog;    
+```
+ImageClassification.Train/assets/inputs/images/flower_photos_small_set.zip already exists.
+
+```
+// 2. Load the initial full image-set into an IDataView and shuffle so it'll be better balanced
+IEnumerable<ImageData> images = LoadImagesFromDirectory(folder: fullImagesetFolderPath, useFolderNameAsLabel: true);
+IDataView fullImagesDataset = mlContext.Data.LoadFromEnumerable(images);
+IDataView shuffledFullImageFilePathsDataset = mlContext.Data.ShuffleRows(fullImagesDataset);
+```
+
+```
+// 3. Load Images with in-memory type within the IDataView and Transform Labels to Keys (Categorical)
+IDataView shuffledFullImagesDataset = mlContext.Transforms.Conversion.
+        MapValueToKey(outputColumnName: "LabelAsKey", inputColumnName: "Label", keyOrdinality: KeyOrdinality.ByValue)
+    .Append(mlContext.Transforms.LoadRawImageBytes(
+                                    outputColumnName: "Image",
+                                    imageFolder: fullImagesetFolderPath,
+                                    inputColumnName: "ImagePath"))
+    .Fit(shuffledFullImageFilePathsDataset)
+    .Transform(shuffledFullImageFilePathsDataset);
+```
+
+```
+// 4. Split the data 80:20 into train and test sets, train and evaluate.
+var trainTestData = mlContext.Data.TrainTestSplit(shuffledFullImagesDataset, testFraction: 0.2);
+IDataView trainDataView = trainTestData.TrainSet;
+IDataView testDataView = trainTestData.TestSet;
+```
+
+```
+// 5. Define the model's training pipeline using DNN default values
+//
+var pipeline = mlContext.MulticlassClassification.Trainers
+        .ImageClassification(featureColumnName: "Image",
+                             labelColumnName: "LabelAsKey",
+                             validationSet: testDataView)
+    .Append(mlContext.Transforms.Conversion.MapKeyToValue(outputColumnName: "PredictedLabel",
+                                                          inputColumnName: "PredictedLabel"));
+```
+[Source=ImageClassificationTrainer; ImageClassificationTrainer, Kind=Trace] Channel started
+
+```
+// 5.1 (OPTIONAL) Define the model's training pipeline by using explicit hyper-parameters
+//
+//var options = new ImageClassificationTrainer.Options()
+//{
+//    FeatureColumnName = "Image",
+//    LabelColumnName = "LabelAsKey",
+//    // Just by changing/selecting InceptionV3/MobilenetV2/ResnetV250  
+//    // you can try a different DNN architecture (TensorFlow pre-trained model). 
+//    Arch = ImageClassificationTrainer.Architecture.MobilenetV2,
+//    Epoch = 50,       //100
+//    BatchSize = 10,
+//    LearningRate = 0.01f,
+//    MetricsCallback = (metrics) => Console.WriteLine(metrics),
+//    ValidationSet = testDataView
+//};
+
+//var pipeline = mlContext.MulticlassClassification.Trainers.ImageClassification(options)
+//        .Append(mlContext.Transforms.Conversion.MapKeyToValue(
+//            outputColumnName: "PredictedLabel",
+//            inputColumnName: "PredictedLabel"));
+```
+
+```
+// 6. Train/create the ML model
+Console.WriteLine("*** Training the image classification model with DNN Transfer Learning on top of the selected pre-trained model/architecture ***");
+
+// Measuring training time
+var watch = Stopwatch.StartNew();
+
+//Train
+ITransformer trainedModel = pipeline.Fit(trainDataView);
+
+watch.Stop();
+var elapsedMs = watch.ElapsedMilliseconds;
+
+Console.WriteLine($"Training with transfer learning took: {elapsedMs / 1000} seconds");
+```
+
+
+*** Training the image classification model with DNN Transfer Learning on top of the selected pre-trained model/architecture ***
+[Source=ImageClassificationTrainer; Ensuring meta files are present., Kind=Trace] Channel started
+[Source=ImageClassificationTrainer; Ensuring meta files are present., Kind=Trace] Channel finished. Elapsed 00:00:00.0028785.
+[Source=ImageClassificationTrainer; Ensuring meta files are present., Kind=Trace] Channel disposed
+Saver not created because there are no variables in the graph to restore
+
+System.InvalidOperationException: Splitter/consolidator worker encountered exception while consuming source data
+   at Microsoft.ML.Data.DataViewUtils.Splitter.Batch.SetAll(OutPipe[] pipes)
+   at Microsoft.ML.Data.DataViewUtils.Splitter.<>c__DisplayClass5_0.<ConsolidateCore>b__1()
+   at Microsoft.ML.Data.DataViewUtils.Splitter.Cursor.Dispose(Boolean disposing)
+   at Microsoft.ML.DataViewRow.Dispose()
+   at Microsoft.ML.Data.SynchronizedCursorBase.Dispose(Boolean disposing)
+   at Microsoft.ML.DataViewRow.Dispose()
+   at Microsoft.ML.Data.LinkedRootCursorBase.Dispose(Boolean disposing)
+   at Microsoft.ML.DataViewRow.Dispose()
+   at Microsoft.ML.Vision.ImageClassificationTrainer.CacheFeaturizedImagesToDisk(IDataView input, String labelColumnName, String imageColumnName, ImageProcessor imageProcessor, String inputTensorName, String outputTensorName, String cacheFilePath, Dataset dataset, Action`1 metricsCallback)
+   at Microsoft.ML.Vision.ImageClassificationTrainer.TrainModelCore(TrainContext trainContext)
+   at Microsoft.ML.Trainers.TrainerEstimatorBase`2.TrainTransformer(IDataView trainSet, IDataView validationSet, IPredictor initPredictor)
+   at Microsoft.ML.Trainers.TrainerEstimatorBase`2.Fit(IDataView input)
+   at Microsoft.ML.Data.EstimatorChain`1.Fit(IDataView input)
+   at Submission#13.<<Initialize>>d__0.MoveNext()
+--- End of stack trace from previous location where exception was thrown ---
+   at Microsoft.CodeAnalysis.Scripting.ScriptExecutionState.RunSubmissionsAsync[TResult](ImmutableArray`1 precedingExecutors, Func`2 currentExecutor, StrongBox`1 exceptionHolderOpt, Func`2 catchExceptionOpt, CancellationToken cancellationToken)
+I am unable to utilize the benefits of static typing due to the lack of autocomplete and go-to definition functionality.
+
+Use Cases:
+![image](https://user-images.githubusercontent.com/11929724/71328292-f6337e00-24e2-11ea-8d30-a63b3c192262.png)
+When inside a function/class initializer, "shift + tab" should show what parameters/overloads the function/class accepts.
+![image](https://user-images.githubusercontent.com/11929724/71328320-575b5180-24e3-11ea-97f9-a30f68963131.png)
+An object's properties should have autocomplete as well when you call "." on them. Pressing "tab" inside a Jupyter notebook shows the objects available methods/properties.
+
+
+#### Describe the bug
+Using Microsoft.Azure.Cosmos and CosmosClient throws "Unhandled Exception Could not load file or assembly 'Microsoft.Azure.Cosmos.Direct, Version=3.4.2.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35'. The system cannot find the file specified."
+
+Code:
+
+```
+#r "nuget:Microsoft.Azure.Cosmos,3.5.1"
+
+using Microsoft.Azure.Cosmos;
+
+string uri = "https://myuri.documents.azure.com:443/";
+string key = "ThisIsMadeUpAndThankYouForLookingAtThisIssueAETGPCjrVXat5KlIOaf2SxAxTzsujT4XyfZuEw==";
+
+using (CosmosClient client = new CosmosClient(uri, key))
+{
+    
+}
+```
+
+Adding a reference to Cosoms.Direct,
+`#r "nuget:Microsoft.Azure.Cosmos.Direct,3.4.2"`
+
+created a new error:
+
+```
+Unhandled Exception
+Could not load file or assembly 'System.Configuration.ConfigurationManager, Version=4.0.1.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51'. Reference assemblies should not be loaded for execution.  They can only be loaded in the Reflection-only loader context. (0x80131058)
+   at Microsoft.Azure.Cosmos.DocumentClient.Initialize(Uri serviceEndpoint, ConnectionPolicy connectionPolicy, Nullable`1 desiredConsistencyLevel, HttpMessageHandler handler, ISessionContainer sessionContainer, Nullable`1 enableCpuMonitor, IStoreClientFactory storeClientFactory)
+   at Microsoft.Azure.Cosmos.DocumentClient..ctor(Uri serviceEndpoint, String authKeyOrResourceToken, EventHandler`1 sendingRequestEventArgs, ConnectionPolicy connectionPolicy, Nullable`1 desiredConsistencyLevel, JsonSerializerSettings serializerSettings, ApiType apitype, EventHandler`1 receivedResponseEventArgs, HttpMessageHandler handler, ISessionContainer sessionContainer, Nullable`1 enableCpuMonitor, Func`2 transportClientHandlerFactory, IStoreClientFactory storeClientFactory)
+   at Microsoft.Azure.Cosmos.CosmosClient..ctor(String accountEndpoint, String authKeyOrResourceToken, CosmosClientOptions clientOptions)
+   at Submission#18.<<Initialize>>d__0.MoveNext()
+--- End of stack trace from previous location where exception was thrown ---
+   at Microsoft.CodeAnalysis.Scripting.ScriptExecutionState.RunSubmissionsAsync[TResult](ImmutableArray`1 precedingExecutors, Func`2 currentExecutor, StrongBox`1 exceptionHolderOpt, Func`2 catchExceptionOpt, CancellationToken cancellationToken)
+```
+
+Seems related to: [https://github.com/dotnet/try/issues/498](https://github.com/dotnet/try/issues/498)
+
+I'm on dotnet-try --version: 1.0.19553.4+001b36724d769e844a53b22e3833a23caed3dc68
+
+![image](https://user-images.githubusercontent.com/12533203/71211968-2b329d00-2265-11ea-80a1-62262e762db3.png)
+
+Thanks
+
+#### Did this error occur while using `dotnet try` or online?
+- [ ] `dotnet-try`
+- [x] .NET Jupyter Notebook 
+- [ ] online
+
+#### What kind of error was it?
+- [ ] User Interface (UI):  For example the output never displayed 
+- [ ] Service Error: For example "The service is temporarily unavailable. We are working on it"
+- [x] Other: 
+
+#### Screenshots
+
+
+#### Please complete the following:
+ - OS
+    - [x] Windows 10
+    - [ ] macOS
+    - [ ] Linux (Please specify distro)
+    - [ ] iOS
+    - [ ] Android
+ - Browser 
+    - [ ] Chrome
+    - [x] Edge (new)
+    - [ ] Safari

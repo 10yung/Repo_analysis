@@ -1,0 +1,249 @@
+Found this on Linux / macOS, with Python3.5/ 3.7, and meinheld version 1.0.1.
+
+Way to reproduce this:
+
+```a.py
+import flask
+
+
+app = flask.Flask(__name__)
+
+
+@app.route('/')
+def x():
+    return 'x'
+```
+
+Starting with:
+
+```
+$ gunicorn -b'[::]:1234' -kmeinheld.gmeinheld.MeinheldWorker a:app
+```
+
+And run wrk:
+
+```
+wrk http://localhost:1234 -c 1 -t 1
+```
+
+You can see meinheld worker is exit randomly with logs like this:
+
+```
+*** stack smashing detected ***: /data00/home/xxx/ooo/venv/bin/python3 terminated
+======= Backtrace: =========
+/lib/x86_64-linux-gnu/libc.so.6(+0x70bfb)[0x7fe35cbdabfb]
+/lib/x86_64-linux-gnu/libc.so.6(__fortify_fail+0x37)[0x7fe35cc63437]
+/lib/x86_64-linux-gnu/libc.so.6(__fortify_fail+0x0)[0x7fe35cc63400]
+/data00/home/xxx/ooo/venv/lib/python3.5/site-packages/meinheld/server.cpython-35m-x86_64-linux-gnu.so(+0xfe4f)[0x7fe35aaa9e4f]
+/data00/home/xxx/ooo/venv/lib/python3.5/site-packages/meinheld/server.cpython-35m-x86_64-linux-gnu.so(picoev_poll_once_internal+0x95)[0x7fe35aaae265]
+/data00/home/xxx/ooo/venv/lib/python3.5/site-packages/meinheld/server.cpython-35m-x86_64-linux-gnu.so(+0x10f0a)[0x7fe35aaaaf0a]
+/data00/home/xxx/ooo/venv/bin/python3(PyCFunction_Call+0x77)[0x55ffb5e20287]
+/data00/home/xxx/ooo/venv/bin/python3(PyEval_EvalFrameEx+0x48ef)[0x55ffb5dead0f]
+/data00/home/xxx/ooo/venv/bin/python3(PyEval_EvalFrameEx+0x4b64)[0x55ffb5deaf84]
+/data00/home/xxx/ooo/venv/bin/python3(+0x19002f)[0x55ffb5df002f]
+```
+
+This only happend with client wrk (a HTTP benchmark tool), but gunicorn with default worker `sync` or `gevent`, meinheld with chrome / curl have no issue.
+
+This error appears in the Docker with Django DRF application.
+
+```python
+Traceback (most recent call last):   File "/usr/local/lib/python3.7/site-packages/meinheld/mlogging.py", line 187, in _access     'h': environ.get('REMOTE_ADDR', '-'), SystemError: <method 'get' of 'dict' objects> returned a result with an error set
+```
+When loading the following [MDN page](https://developer.mozilla.org/en-US/docs/Web/API/XMLHttpRequestEventTarget/onprogress), got the headers that you can see on the attached image.
+Maybe you guys could cite MDN on your [Who uses Meinheld?](http://meinheld.org/).
+![screenshot](https://user-images.githubusercontent.com/18357691/41315032-c655c098-6e64-11e8-9e21-dccbdc596590.png)
+
+The Meinheld Gunicorn worker does not appear to call the `log.access()` method of the [Statsd logger](https://github.com/benoitc/gunicorn/blob/master/gunicorn/instrument/statsd.py) correctly when `--statsd-host` is enabled. This results in no request stats to be emitted.
+
+Currently, meinheld maintenance is inactive and maintenance cost is very high.
+
+Major maintenance cost comes from async features (e.g. spawn, msocket, patch)
+For example, Travis fails recently while test_logger.
+
+I think most meinheld users just want stable and high performance WSGI server.
+And there is asyncio and aiohttp for async requirements.
+
+How about remove all async features and keep meinheld simple and stable?
+* python 2.7.12
+* meinheld 0.6.1
+
+POC
+```python
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+from meinheld import patch
+patch.patch_all()
+from logging.handlers import SysLogHandler
+
+SysLogHandler({'address': ('127.0.0.1', 5140)})
+```
+
+Result
+```text
+Traceback (most recent call last):
+  File "test.py", line 8, in <module>
+    SysLogHandler({'address': ('127.0.0.1', 5140)})
+  File "/opt/python27/lib/python2.7/logging/handlers.py", line 766, in __init__
+    self.socket = socket.socket(socket.AF_INET, socktype)
+  File "/opt/python27/lib/python2.7/site-packages/meinheld/msocket.py", line 524, in __init__
+    self.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
+  File "<string>", line 1, in setsockopt
+socket.error: [Errno 92] Protocol not available
+```
+
+IPPROTO_TCP, TCP_NODELAY is not imported.
+My Python 3 app core dumped yesterday on a Raspberry Pi 2 running Arch Arm. Versions and coredump details are below.
+
+~~~~
+pi2:~ uname -a
+Linux pi2 4.9.43-1-ARCH #1 SMP Fri Aug 18 01:10:29 UTC 2017 armv7l GNU/Linux
+
+pi2:~ python --version
+Python 3.6.2
+
+pi2:~ ~/Data/src/pialarm/env/bin/pip list --format=legacy
+Beaker (1.9.0)
+bottle (0.12.13)
+bottle-cork (0.12.0)
+greenlet (0.4.12)
+meinheld (0.6.1)
+pifaceio (1.26)
+pip (9.0.1)
+pycrypto (2.6.1)
+ruamel.yaml (0.15.32)
+setuptools (28.8.0)
+
+pi2:~ coredumpctl gdb
+           PID: 266 (pialarm)
+           UID: 1000 (pi)
+           GID: 1000 (pi)
+        Signal: 11 (SEGV)
+     Timestamp: Fri 2017-08-25 07:56:07 AEST (24h ago)
+  Command Line: env/bin/python -u /home/pi/Data/src/pialarm/pialarm
+    Executable: /usr/bin/python3.6
+ Control Group: /system.slice/pialarm.service
+          Unit: pialarm.service
+         Slice: system.slice
+       Boot ID: c1da2280d845469d8f3d91fe7252c78d
+    Machine ID: d248d73f28ea419a864101496b8fce31
+      Hostname: pi2
+       Storage: /var/lib/systemd/coredump/core.pialarm.1000.c1da2280d845469d8f3d91fe7252c78d.266.1503611767000000.lz4
+       Message: Process 266 (pialarm) of user 1000 dumped core.
+                
+                Stack trace of thread 266:
+                #0  0x0000000074864d84 n/a (/home/pi/Data/src/pialarm/env/lib/python3.6/site-packages/meinheld/server.cpython-36m-arm-linux-gnueabihf.so)
+
+GNU gdb (GDB) 8.0
+Copyright (C) 2017 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.  Type "show copying"
+and "show warranty" for details.
+This GDB was configured as "armv7l-unknown-linux-gnueabihf".
+Type "show configuration" for configuration details.
+For bug reporting instructions, please see:
+<http://www.gnu.org/software/gdb/bugs/>.
+Find the GDB manual and other documentation resources online at:
+<http://www.gnu.org/software/gdb/documentation/>.
+For help, type "help".
+Type "apropos word" to search for commands related to "word"...
+Reading symbols from /usr/bin/python3.6...(no debugging symbols found)...done.
+
+warning: core file may not match specified executable file.
+[New LWP 266]
+[New LWP 350]
+[New LWP 352]
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/libthread_db.so.1".
+Core was generated by `env/bin/python -u /home/pi/Data/src/pialarm/pialarm'.
+Program terminated with signal SIGSEGV, Segmentation fault.
+#0  import_greenlet () at meinheld/server/greensupport.c:15
+15	meinheld/server/greensupport.c: No such file or directory.
+[Current thread is 1 (Thread 0x76f4d010 (LWP 266))]
+(gdb) where
+#0  import_greenlet () at meinheld/server/greensupport.c:15
+#1  greenlet_new (o=0x748d10d0, parent=0x0)
+    at meinheld/server/greensupport.c:31
+#2  0x7485875c in call_wsgi_handler (client=<optimized out>)
+    at meinheld/server/server.c:716
+#3  0x7485b61c in accept_callback (loop=0x181bf00, fd=4, 
+    events=<optimized out>, cb_arg=<optimized out>)
+    at meinheld/server/server.c:1272
+#4  0x74865b30 in picoev_poll_once_internal (_loop=_loop@entry=0x181bf00, 
+    max_wait=<optimized out>) at meinheld/server/picoev_epoll.c:174
+#5  0x7485c500 in picoev_loop_once (max_wait=<optimized out>, loop=0x181bf00)
+    at meinheld/server/picoev.h:390
+#6  meinheld_run_loop (self=<optimized out>, args=<optimized out>, 
+    kwds=<optimized out>) at meinheld/server/server.c:1853
+#7  0x76cbdb18 in _PyCFunction_FastCallDict ()
+   from /usr/lib/libpython3.6m.so.1.0
+#8  0x76d881e4 in ?? () from /usr/lib/libpython3.6m.so.1.0
+Backtrace stopped: previous frame identical to this frame (corrupt stack?)
+(gdb) 
+~~~~
+
+Occurred after updating system and rebooting but unfortunately I can not repeat the crash so seems just a one-off atm. I am raising this issue so it is known about. This app has been running for many years although I frequently update system and PyPI packages though.
+Hello,
+
+I have noticed an error when i use dnspython in django app, using meinheld backend of circus. My app use python 3.4.
+
+My django app is lauching DNS request to check some parameters provided by users, if DNS is not correctly configured, an error is shown to users.
+
+The following launch DNS request:
+
+```python
+        resolver = dns.resolver.Resolver()
+        resolver.nameservers = [self._get_dnshost()]
+        resolver.timeout = 3
+        resolver.lifetime = 3
+
+        try:
+            answers = resolver.query(self.sda.enum_format, 'NAPTR')
+        except dns.exception.Timeout as e:
+            raise PdnsDnsError(str(e))
+        except dns.resolver.NXDOMAIN as e:
+            raise PdnsDnsError(str(e))
+```
+
+Then,  i run my app using this command:
+```bash
+chaussette --backend meinheld voxisdas.wsgi.application --port 8000 --host 0.0.0.0
+```
+
+And a dns.exception.Timeout is raised.
+
+Do you have any clue about this error ? No DNS request is sent to my DNS server.
+If i run my app with waitress for example, no error is raised. All queries are OK.
+
+Thanks in advance.
+Hello,
+
+I have an application that I recently switched from gunicorn+gevent workers to gunicorn+meinheld and it is now having memory leak issues. The issues disappear when I switch back to gevent.
+
+I haven't done much investigation at the moment because I am busy with work, but I plan on doing it later this week. Is there anything in particular I should look for to see if this is really related to meinheld?
+
+I am using the following meinheld-related packages in the application:
+
+```
+greenlet==0.4.10
+gunicorn==19.6.0
+meinheld==0.5.9
+```
+
+and the following gunicorn config:
+
+```
+bind = '0.0.0.0:5000'
+workers = 1 if current_env == 'DEV' else multiprocessing.cpu_count() * 2 + 1
+worker_class = 'egg:meinheld#gunicorn_worker'
+proc_name = 'api'
+access_log_format = '%(h)s %(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s" "%({X-Real-IP}i)s" %(L)s'
+accesslog = '-'
+errorlog = '-'
+```
+
+The application is basically a more complex version of this: https://github.com/admiralobvious/falcon-boilerplate
+
+Thank you!

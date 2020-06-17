@@ -1,0 +1,176 @@
+When parsing a JSON file with BOM such as:
+
+https://github.com/dotnet/toolset/blob/40cc5860e2ef311b9aca733b1d2eccaa681bd422/TestAssets/InstallationScriptTests/InstallationScriptTests.json
+
+JSON.sh gives the following error:
+
+```sh
+EXPECTED EOF GOT {
+```
+
+Current workaround is to strip these characters using tool like awk: `awk 'NR==1{sub(/^\xef\xbb\xbf/,"")}1' "$json_file" | sh JSON.sh | ....`.
+
+It would be nice if parser skip these BOM characters and start parsing after the offset. It will save consumers from stripping these characters.
+Running on an embedded system with Busybox 1.11.2, any input fails:
+
+```
+$ echo {} | ./JSON.sh
+EXPECTED string GOT EOF
+
+$ egrep --version
+egrep: unrecognized option `--version'
+BusyBox v1.11.2 (2016-05-23 16:56:16 EEST) multi-call binary
+
+No help available.
+$ busybox --help
+BusyBox v1.11.2 (2016-05-23 16:56:16 EEST) multi-call binary
+Copyright (C) 1998-2008 Erik Andersen, Rob Landley, Denys Vlasenko
+and others. Licensed under GPLv2.
+See source distribution for full notice.
+
+Usage: busybox [function] [arguments]...
+   or: function [arguments]...
+
+	BusyBox is a multi-call binary that combines many common Unix
+	utilities into a single executable.  Most people will create a
+	link to busybox for each function they wish to use and BusyBox
+	will act like whatever it was invoked as!
+
+Currently defined functions:
+	[, [[, adjtimex, arping, ash, awk, basename, brctl, bunzip2, bzcat, cat, chgrp, chmod, chown, chroot, clear, cp, crond, crontab, cut, date, dd, df, diff, dirname,
+	dmesg, du, echo, egrep, env, expr, false, fgrep, find, free, garp, getty, grep, gunzip, gzip, halt, head, hexdump, hostid, hwclock, id, ifconfig, init, insmod,
+	kill, killall, killall5, klogd, length, less, ln, lock, logger, login, logread, ls, lsmod, md5sum, mesg, mkdir, mkfifo, mknod, mktemp, mount, mv, nc, netmsg,
+	netstat, nice, nslookup, passwd, pgrep, pidof, ping, ping6, pivot_root, pkill, poweroff, printf, ps, pwd, pwdog, rdate, realpath, reboot, reset, rm, rmdir,
+	rmmod, route, sed, seq, sh, sleep, sort, start-stop-daemon, strings, switch_root, sync, sysctl, syslogd, tail, tar, tee, telnet, telnetd, test, tftp, time,
+	top, touch, tr, traceroute, true, udhcpc, umount, uname, uniq, uptime, uudecode, uuencode, vconfig, vi, watchdog, wc, wget, which, xargs, yes, zcat, zcip
+```
+
+Then I looked at tokenization only. Sourcing `JSON.sh` doesn't work (still expecting input), so I changed the last lines like this:
+
+```sh
+#if ([ "$0" = "$BASH_SOURCE" ] || ! [ -n "$BASH_SOURCE" ]);
+#then
+#  parse_options "$@"
+#  tokenize | parse
+#fi
+parse_options "$@"
+tokenize
+```
+
+What then happens, is:
+
+```
+$ echo {} | shinc/JSON.sh
+{
+$ echo '{"foo": 1234, "bar":{"something": "hi there"}}' | shinc/JSON.sh
+{
+```
+
+Running all tests indeed [shows failures](https://github.com/dominictarr/JSON.sh/files/671597/test-output.txt).
+Fixes gh-46
+
+**Step to reproduce**
+
+```
+$ python -c "print('['*100000)" | ./JSON.sh 
+```
+
+**Expected behaviour**
+
+JSON.sh should either parse the string, or return an error.
+
+**Actual behaviour**
+
+```
+./JSON.sh: line 206: 40694 Done                    tokenize
+40695 Segmentation fault: 11  | parse
+```
+
+JSON.sh does crash because it lacks a nesting limit.
+
+**Step to reproduce**
+
+```
+$ echo $'["\x7F"]' | ./JSON.sh
+```
+
+**Expected behaviour**
+
+According to [RFC 7159](https://tools.ietf.org/html/rfc7159), character DEL 0x7F is perfectly valid unescaped.
+
+JSON.sh should parse the string and print:
+
+```
+[0] "\x7F"
+[]  ["\x7F"]
+```
+
+**Actual behaviour**
+
+JSON.sh cannot parse the string and prints an error:
+
+```
+EXPECTED value GOT "
+```
+
+The issue comes from the fact that JSON.sh uses `cntrl` to recognize control characters in regular expressions, and `cntrl` includes DEL 0x7F, while JSON control characters (the one that MUST be escaped) only go from U+0000 to U+001F and don't include U+007F.
+
+Any objection to converting all variables to being local? That would make sourcing the file a lot safer.
+
+At first glance, I think this would mostly amount to passing token to a bunch of functions as an argument, and having them echo it back, though maybe you know of a better way.
+
+I guess the other option is to just declare it as local in parse() and leave it to be set and read by everything else as done today...
+
+This is an attempt to make it easier to parse JSON.sh output from within bash.
+
+The first thing I looked at was supporting direct assignment to associative arrays (declare -A, not declare -a), since the native output format is very close to what you need for that. That change essentially amounts to piping the original output through `egrep -v '^\[]' | tr '\t' =`.
+
+Despite the usefulness of that, I'm not a fan of it because as far as I can tell the only way to actually interpret that in bash is by using an eval, which is dangerous. If someone finds a flaw in any of this they could potentially inject any arbitrary code, which would then get eval'd. I'll leave it to the reader to figure out what something like `eval rm -rf /`` would end up doing...
+
+The next thing I looked at was better support for `read -r key value`. Thanks to the tab delimiter, that was also pretty easy: I just stripped the `[]` surrounding the path. This seems pretty robust, so long as you change IFS to `$'\t'`. That works because tabs aren't valid in JSON, and the script seems to detect that pretty robustly (though I didn't exhaustively test that).
+
+The part I don't like about key-value mode is everything stays wrapped in double-quotes. Probably not a big deal for keys (I guess), but I'm worried it might cause problems for values. Especially values that have escapes in them. Maybe there's a clean way to deal with that.
+
+The remaining 3 modes are simple... key-only and value-only produce one key or value per line, as you'd expect. The default mode retains the same behavior as today.
+
+I also added a script of examples. It's a bit verbose and ugly, but at least it gives a good foundation on using the script. It does lean very heavily towards the function interface though, which is probably not a good thing to promote since JSON.sh makes heavy use of globals.
+
+i use JSON.sh as `curl 'http://conf.com/conf/config_20150920_test.json' | ./JSON.sh -l -p -b -s` and it work greet and it return result like
+
+``` bash
+["storage","mysql","u_db","database"]   "dev"
+["storage","mysql","u_db","username"]   "user"
+["storage","mysql","u_db","password"]   "123@1"
+["storage","mysql","u_db","internal_ip"]    "10.176.192.120"
+["storage","mysql","u_db","internal_port"]  3306
+["storage","mysql","a","database"]  "a"
+["storage","mysql","a","username"]  "user"
+["storage","mysql","a","password"]  "122a@1"
+```
+
+but what if add config param to determine how output look like and go with exporting this variables as env variables like
+
+``` bash
+storage_mysql_u_db_internal_port=3306
+storage_mysql_a_database=a
+storage_mysql_a_username=user
+storage_mysql_a_password=122a@1
+```
+
+which make it easy to be evaluated with `eval` as environment variable.
+
+The option -s does not work :
+
+```
+ echo '{"str_1":"\"ab\"" , "str_2" : "\\b" }' | ./lib/JSON.sh -s
+```
+
+still see the `\"`   and `\\`
+
+I'm using JSON.sh in a Cygwin environment and I'm getting an error when trying to use it for any kind of JSON:
+
+> EXPECTED value GOT EOF
+- Tried with your example: `curl registry.npmjs.org/express | ./JSON.sh | egrep '\["versions","[^"]*"\]'`
+- Also tried with: `echo "{\"foo\":\"bar\"}" | ./JSON.sh`
+
+Maybe related to #26? Or maybe related to CRLF vs. LF on Windows vs. Linux (note I'm using Cygwin on Windows)?

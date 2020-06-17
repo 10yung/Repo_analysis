@@ -1,0 +1,119 @@
+Getting a crash scenario from a 301 without a `Location` header. What appears to happen is that `HttpConnection#redirect` gets called with `nil` as a location which creates an empty hostname. Stack trace looks like this:
+
+```
+        7: from /var/lib/gems/2.5.0/gems/eventmachine-1.2.7/lib/eventmachine.rb:195:in `run'
+        6: from /var/lib/gems/2.5.0/gems/eventmachine-1.2.7/lib/eventmachine.rb:195:in `run_machine'
+        5: from /var/lib/gems/2.5.0/gems/eventmachine-1.2.7/lib/eventmachine.rb:1482:in `event_callback'
+        4: from /home/dorian/clients/people/dorian-taylor/rb-em-http-request/lib/em-http/http_connection.rb:33:in `unbind'
+        3: from /home/dorian/clients/people/dorian-taylor/rb-em-http-request/lib/em-http/http_connection.rb:231:in `unbind'
+        2: from /var/lib/gems/2.5.0/gems/eventmachine-1.2.7/lib/em/connection.rb:686:in `reconnect'
+        1: from /var/lib/gems/2.5.0/gems/eventmachine-1.2.7/lib/eventmachine.rb:795:in `reconnect'
+/var/lib/gems/2.5.0/gems/eventmachine-1.2.7/lib/eventmachine.rb:795:in `connect_server': no implicit conversion of nil into String (TypeError)
+```
+• [No checking for `Location` header in the client](https://github.com/igrigorik/em-http-request/blob/master/lib/em-http/client.rb#L104)
+• [No subsequent checking in the connection](https://github.com/igrigorik/em-http-request/blob/master/lib/em-http/http_connection.rb#L185)
+
+The result is that an instance like this is created: `#<Addressable::URI:0x2aaf7488f7a4 URI:/>`, which makes `@host` be `nil` and thus crash with the type error cited above.
+
+This should be easy enough to patch, the only question is what precisely—policywise—to patch it with.
+Try different scheme instead of `http` and you still receive same response.
+
+200 http://example.com/
+
+`<!doctype html>\n<html>\n<head>\n    <title>Example Domain</title>\n\n    <meta charset=\"utf-8\" />\n    <m`
+
+--------------------
+200 httpzzz://example.com/
+
+`<!doctype html>\n<html>\n<head>\n    <title>Example Domain</title>\n\n    <meta charset=\"utf-8\" />\n    <m`
+
+--------------------
+200 attp3://example.com/
+
+`<!doctype html>\n<html>\n<head>\n    <title>Example Domain</title>\n\n    <meta charset=\"utf-8\" />\n    <m
+`
+This addresses #304 . I used @foca's patch and wrote a basic test.
+(Mongrel is no longer supported with by Rack v2+)
+
+Remaining test failures: 
+```
+  1) EventMachine::HttpRequest should set content-length to 0 on posts with empty bodies
+     Failure/Error: http.response.strip.split(':')[1].should == '0'
+       expected: "0"
+            got: nil (using ==)
+    
+  2) EventMachine::HttpRequest should report error if connection was closed by server on client keepalive requests
+     Failure/Error: req.callback { fail }
+     RuntimeError:
+
+  3) EventMachine::HttpRequest should fail gracefully on an invalid host in Location header
+     Failure/Error: http.error.should match(/unable to resolve (server |)address/)
+     
+       expected "connection closed by server" to match /unable to resolve (server |)address/
+
+  4) EventMachine::HttpRequest should keep default http port in redirect url that include it
+     Failure/Error: http.last_effective_url.to_s.should == 'http://host:80/'
+     
+       expected: "http://host:80/"
+            got: "http://host/" (using ==)
+
+  5) EventMachine::HttpRequest should keep default https port in redirect url that include it
+     Failure/Error: http.last_effective_url.to_s.should == 'https://host:443/'
+
+       expected: "https://host:443/"
+            got: "https://host/" (using ==)
+```
+The test suite is currently failing because Mongrel support has officially been removed from Rack. Furthermore, Mongrel is unmaintained. We should migrate away from it and to something maintained, e.g. WEBrick. I'd be happy to pick this up.
+
+This relates to #318.
+
+Hello,
+
+as reported in the Debian BTS <https://bugs.debian.org/881627>, em-http-request started to fail the test suite after http-parser was upgraded from 2.1 to 2.7.1, the problem still exists with the most recent version 2.8.1.
+
+The most important error lines are:
+```
+     NoMethodError:
+       undefined method `continue?' for nil:NilClass
+     # ./lib/em-http/http_connection.rb:134:in `block in post_init'
+```
+
+After staring at the code for a long time and using Ruby's "Tracer" it seems http-parser calls message_complete more often than in earlier times but your library cannot deal with this. I might be completely wrong here, especially since I couldn't find any releated change in http-parser. Before starting a fairly annoying `git bisect` session, I'm asking you to take a look - my Ruby knowledge is basically "guessing from looking at the code".
+
+This HTTP client does **not** seem to perform _any_ validation on the certificate (and chain) presented by the peer, which is bad. It means it does not provide any guarantees with respect to authenticity and confidentiality of TLS connections.
+
+After reading the EventMachine [documentation](https://github.com/eventmachine/eventmachine/blob/debad3c6a3d623ae2fe5e2495ce6a5e18e6ba1e8/lib/em/connection.rb#L133-L136), I understand the problem is that EventMachine leaves the actual validation of certificates up to the client. Which means that this client should have implemented the `ssl_verify_peer` method.
+
+> It is up to user defined code to perform a check on the certificates. The return value from this callback is used to accept or deny the peer. A return value that is not nil or false triggers acceptance. If the peer is not accepted, the connection will be subsequently closed.
+
+I don't know too much about the implementation of either EventMachine or this client, but I don't think the implementation of certificate validation is something that should be left up to the client. This is something that should, in my opinion, be implemented in EventMachine.
+
+That said, developers and maintainers do have a responsibility of warning developers that, at this time, using this client (in production) is dangerous. Developers rightfully and reasonably expect HTTP clients that advertise HTTPS support to properly verify certificates.
+
+I was thinking about:
+
+* At the very least the documentation and README should reflect that this client does not perform any validation of the certificate.
+* Possibly release a new version in which HTTPS support is disabled, and the change log explains that validation is absent. For the time being, allow developers to continue using this client with HTTPS support using some 'not secure' flag.
+* Reach out to the community, and update vulnerability databases (which means we need to request an identifier). Especially considering [how many projects/libraries](https://github.com/igrigorik/em-http-request/network/dependents?dependent_type=PACKAGE) (still) depend on 'em-http-request'.
+broken with v1.1.4
+
+HttpConnectionOptions Class
+http_connection_options:23
+
+# Change in 1.1.4 forces the sni_hostname, EVEN if already provided
+@tls[:sni_hostname] = uri.host
+
+# Simple FIX (to retain the sni_hostname IF already provided
+@tls[:sni_hostname] ||= uri.host
+Zlib provides automatic gzip detection for you so you don't need to skip over it by hand. From `inflateInit2` in the zlib manual (also reflected in the [Zlib::Inflate.new documentation](https://docs.ruby-lang.org/en/2.4.0/Zlib/Inflate.html#method-c-new)):
+
+> Add 32 to windowBits to enable zlib and gzip decoding with automatic header detection, or add 16 to decode only the gzip format.
+
+So you can replace [L228 of EventMachine::HttpDecoders::Gzip](https://github.com/igrigorik/em-http-request/blob/6061430336bd1421b25c2244d5b85e4cdfcfb3f7/lib/em-http/decoders.rb#L228) with:
+
+```
+# zlib with automatic gzip detection
+@zstream ||= Zlib::Inflate.new(32 + Zlib::MAX_WBITS)
+```
+
+And delete the code in GzipHeader to prevent bugs like #284/#301

@@ -1,0 +1,154 @@
+Hello,
+
+I had previously been able to link applications against jemalloc on Aarch64.
+However, starting glibc 2.29 I was unable to do so. Here is a minimal error:
+
+### Minimal error
+
+```bash
+[eochoa@osprey1 temp]$ cat a.c
+#include <stdlib.h>
+
+int main( int argc, char **argv )
+{
+  malloc(0);
+}
+[eochoa@osprey1 temp]$ gcc -O0 -g a.c -ljemalloc -lpthread -static
+[eochoa@osprey1 temp]$ ./a.out
+Bus error (core dumped)
+```
+
+Please make sure that either glibc 2.29 is installed and you are running on an aarch64 machine or that you specifically link against glibc 2.29 like so:
+
+```
+[eochoa@osprey1 temp]$ gcc -O0 -g a.c -ljemalloc -lpthread -static /path/to/libc.a
+```
+
+### Stack trace
+
+Using gdb, I found the stack trace when SIGBUS was sent. Two interesting things to note is that the error is triggered when `__clock_gettime` is called and very early during the program, during `__libc_init_first` . 
+
+```
+#0  0x5efaf6adad3c47c6 in ?? ()
+#1  0x00000000004cb914 in __clock_gettime (clock_id=6, tp=0xffffffffc400) at ../sysdeps/unix/sysv/linux/clock_gettime.c:33
+#2  0x0000000000470b6c in nstime_get (time=0xffff80006b80) at src/nstime.c:119
+#3  0x0000000000470bb8 in nstime_update_impl (time=0xffff80006b80) at src/nstime.c:160
+#4  0x000000000042238c in arena_decay_reinit (decay=0xffff80006ab8, decay_ms=10000) at src/arena.c:672
+#5  0x00000000004224b0 in arena_decay_init (decay=0xffff80006ab8, decay_ms=10000, stats=0xffff80000df0) at src/arena.c:693
+#6  0x0000000000426298 in je_arena_new (tsdn=0x0, ind=0, extent_hooks=0x508200 <je_extent_hooks_default>) at src/arena.c:2043
+#7  0x0000000000409fec in arena_init_locked (tsdn=0x0, ind=0, extent_hooks=0x508200 <je_extent_hooks_default>) at src/jemalloc.c:340      #8  0x000000000040a0b0 in je_arena_init (tsdn=0x0, ind=0, extent_hooks=0x508200 <je_extent_hooks_default>) at src/jemalloc.c:368
+#9  0x000000000040f3a8 in malloc_init_hard_a0_locked () at src/jemalloc.c:1553
+#10 0x000000000040fb04 in malloc_init_hard () at src/jemalloc.c:1750
+#11 0x0000000000409b90 in malloc_init () at src/jemalloc.c:223
+#12 0x0000000000410a88 in imalloc_init_check (sopts=0xffffffffe128, dopts=0xffffffffe0f0) at src/jemalloc.c:2229
+#13 0x0000000000410bf4 in imalloc (sopts=0xffffffffe128, dopts=0xffffffffe0f0) at src/jemalloc.c:2260
+#14 0x0000000000410d58 in je_malloc_default (size=19) at src/jemalloc.c:2289
+#15 0x0000000000410ff8 in malloc (size=19) at src/jemalloc.c:2332
+#16 0x00000000004f221c in _dl_get_origin () at ../sysdeps/unix/sysv/linux/generic/dl-origin.c:51
+#17 0x00000000004ce6a4 in _dl_non_dynamic_init () at dl-support.c:308
+#18 0x00000000004cf528 in __libc_init_first (argc=argc@entry=2, argv=argv@entry=0xfffffffff438, envp=0xfffffffff450)
+    at ../csu/init-first.c:74
+#19 0x00000000004b03ac in __libc_start_main (main=0x4006c4 <main>, argc=2, argv=0xfffffffff438, init=0x4b0840 <__libc_csu_init>,
+    fini=0x4b0920 <__libc_csu_fini>, rtld_fini=0x0, stack_end=<optimized out>) at ../csu/libc-start.c:244
+#20 0x000000000040058c in _start () at ../sysdeps/aarch64/start.S:92
+```
+
+### Bisecting glibc
+
+I did a git bisect from glibc 2.28 to glibc 2.29 and found [the offending commit](https://sourceware.org/git/?p=glibc.git;a=commitdiff;h=979cfed05d0ee5a9d81d310ea1eb2d590739e36b;hp=ce035c6e909ad20ef2fe13c92eab4e69f6495b61) which enables VDSO for static linking. Since `clock_gettime` is part of VDSO this means that `clock_gettime` should be able to link statically as well.
+
+### The problem
+
+However, [`_dl_non_dynamic_init`](https://code.woboq.org/userspace/glibc/csu/init-first.c.html#74) which has a run time path to malloc is called before [VDSO](https://code.woboq.org/userspace/glibc/csu/init-first.c.html#78) has been setup.
+Because malloc is now jemalloc, it will attempt to use `clock_gettime` which has not been setup properly and thus access invalid memory.
+
+### The possible solution
+
+I'm also [filing a bug in glibc tracker](https://sourceware.org/bugzilla/show_bug.cgi?id=25413) to apply this patch. This makes the sample program run, however there is another [`setup_vdso`](https://code.woboq.org/userspace/glibc/elf/setup-vdso.h.html#20) function which (without the patch applied) is called before `VDSO_SETUP` and I am unsure about the interactions between them.
+
+```
+diff --git a/csu/init-first.c b/csu/init-first.c
+index 289373f9d8..330cc7d36c 100644
+--- a/csu/init-first.c
++++ b/csu/init-first.c
+@@ -68,16 +68,16 @@ _init (int argc, char **argv, char **envp)
+   __libc_argv = argv;
+   __environ = envp;
+
++#ifdef VDSO_SETUP
++  VDSO_SETUP ();
++#endif
++
+ #ifndef SHARED
+   /* First the initialization which normally would be done by the
+      dynamic linker.  */
+   _dl_non_dynamic_init ();
+ #endif
+
+-#ifdef VDSO_SETUP
+-  VDSO_SETUP ();
+-#endif
+-
+   __init_misc (argc, argv, envp);
+
+   /* Initialize ctype data.  */
+```
+
+It will happen je-malloc error when we do reboot test.
+In the android/external/jemalloc_new/include/jemalloc/internal/bitmap.h
+>>bitmap_sfu() -> bitmap_set()
+>>227             gp = &bitmap[binfo->levels[i].group_offset + goff];
+>>228             g = *gp;           // error in this
+
+-------------------------------------------------------------------------------------------------------------
+
+DEBUG: pid: 1529, tid: 1529, name: Binder:1529_2 >>> /system/bin/vold <<<
+DEBUG: uid: 0
+DEBUG: signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0xa307adc
+DEBUG: r0 ea307ac0 r1 ea54505c r2 0a307ab8 r3 07fffffe
+DEBUG: r4 80000000 r5 ffffffdf r6 ea301f70 r7 ea203008
+DEBUG: r8 00000003 r9 ffbbd8b4 r10 ea300380 r11 ea203008
+DEBUG: ip ea545068 sp ffbbd7a8 lr 0000001f pc ea558ddc
+DEBUG:
+DEBUG: backtrace:
+DEBUG: #00 pc 00035ddc /apex/com.android.runtime/lib/bionic/libc.so (arena_slab_reg_alloc+104) (BuildId: 382e04da0c4d6d7d06edbd53601a5dd4)
+DEBUG: #01 pc 00036437 /apex/com.android.runtime/lib/bionic/libc.so (je_arena_malloc_hard+338) (BuildId: 382e04da0c4d6d7d06edbd53601a5dd4)
+DEBUG: #02 pc 0002cb73 /apex/com.android.runtime/lib/bionic/libc.so (je_malloc+2110) (BuildId: 382e04da0c4d6d7d06edbd53601a5dd4)
+DEBUG: #03 pc 00029253 /apex/com.android.runtime/lib/bionic/libc.so (malloc+18) (BuildId: 382e04da0c4d6d7d06edbd53601a5dd4)
+DEBUG: #04 pc 00046c99 /system/lib/libc++.so (operator new(unsigned int)+16) (BuildId: 9226c827ffca67777f8715fae621c553)
+DEBUG: #05 pc 00033361 /system/bin/vold (std::1::basic_stringbuf<char, std::1::char_traits, std::1::allocator>::str() const+200) (BuildId: 06d7e5ca8c56d4f697b46cf1506f8ac2)
+DEBUG: #06 pc 00008441 /system/lib/libbase.so (android::base::LogMessage::~LogMessage()+96) (BuildId: 7a6528cfcb4efe233fdbfb73b5095897)
+DEBUG: #07 pc 00026e4b /system/bin/vold (prepare_dir(std::1::basic_string, std::1::allocator> const&, unsigned short, unsigned int, unsigned int)+250) (BuildId: 06d7e5ca8c56d4f697b46cf1506f8ac2)
+DEBUG: #08 pc 0002740f /system/bin/vold (fscrypt_prepare_user_storage(std::1::basic_string, std::1::allocator> const&, unsigned int, int, int)+326) (BuildId: 06d7e5ca8c56d4f697b46cf1506f8ac2)
+DEBUG: #09 pc 00026c41 /system/bin/vold (fscrypt_init_user0()+1704) (BuildId: 06d7e5ca8c56d4f697b46cf1506f8ac2)
+DEBUG: #10 pc 000243cd /system/bin/vold (android::vold::VoldNativeService::initUser0()+72) (BuildId: 06d7e5ca8c56d4f697b46cf1506f8ac2)
+DEBUG: #11 pc 00094d8f /system/bin/vold (android::os::BnVold::onTransact(unsigned int, android::Parcel const&, android::Parcel*, unsigned int)+4322) (BuildId: 06d7e5ca8c56d4f697b46cf1506f8ac2)
+DEBUG: #12 pc 00032ee3 /system/lib/libbinder.so (android::BBinder::transact(unsigned int, android::Parcel const&, android::Parcel*, unsigned int)+70) (BuildId: 65d96df6a24b6ab26474fae604a4cba7)
+DEBUG: #13 pc 0003b1a5 /system/lib/libbinder.so (android::IPCThreadState::executeCommand(int)+768) (BuildId: 65d96df6a24b6ab26474fae604a4cba7)
+DEBUG: #14 pc 0003addf /system/lib/libbinder.so (android::IPCThreadState::getAndExecuteCommand()+98) (BuildId: 65d96df6a24b6ab26474fae604a4cba7)
+DEBUG: #15 pc 0003b37b /system/lib/libbinder.so (android::IPCThreadState::joinThreadPool(bool)+38) (BuildId: 65d96df6a24b6ab26474fae604a4cba7)
+DEBUG: #16 pc 0001b7e9 /system/bin/vold (main+1952) (BuildId: 06d7e5ca8c56d4f697b46cf1506f8ac2)
+DEBUG: #17 pc 00059267 /apex/com.android.runtime/lib/bionic/libc.so (libc_init+66) (BuildId: 382e04da0c4d6d7d06edbd53601a5dd4)
+DEBUG: #18 pc 0001b033 /system/bin/vold (_start_main+42) (BuildId: 06d7e5ca8c56d4f697b46cf1506f8ac2)/n
+DEBUG: #19 pc 00004456 anonymous:eb64e000
+
+-------------------------------------------------------------------------------------------------------------
+Reentrancy is already set for other non-nominal tsd states (reincarnated and
+minimal_initialized).  Add purgatory to be safe and consistent.
+The `decrement_recent_count()` call is made to be async, and there's no concurrent lock holdings at any time.
+
+The issue was detected in a stress test I was writing. I'm also appending the stress test to this PR.
+Resolves #1397
+
+Also added stronger assertions in the buffered writer initializer.
+This can help triage issues, e.g. inefficiency caused by frequent thread creation / termination.
+Dumping process mapping in a native manner.
+superseeds #1439
+A few remarks:
+- I'm chopping last-N dumping into batches, each under the `prof_recent_alloc_mtx`, so that sampled `malloc` and `free` can proceed between the batches, rather than being blocked until the entire dumping process finishes.
+- I'm using the existing `prof_dump_mtx` to cover the entire dumping process, during which I first change the limit to unlimited (so that existing records can stay), then perform the dumping batches, and finally revert the limit back (and shorten the record list). `prof_dump_mtx` serves to only permit one thread at a time to dump, either the last-N records or the original stacktrace-based profiling information. An alternative approach is to use a separate mutex for the last-N records, so that the two types of dumping can take place concurrently. Thoughts?
+- I'm additionally changing the `mallctl` logic for reading and writing the limit: they now need the `prof_dump_mtx`. For reading, this ensures that what's being read is always the real limit. For writing, this ensures that the application cannot change the limit during dumping. The downside is that the `mallctl` calls are blocked until the entire dumping process finishes, but I think it's fine, because the `mallctl` calls are very rare and only initiated by the application.
+- I'm increasing the buffer size to be the same as the size used by stats printing and the original profiling dumping. I think I could even consolidate the last-N buffer with the original profiling buffer, especially since I'm already using `prof_dump_mtx`. Thoughts? I could have a separate commit for that, since that'd also need some refactoring of the original profiling dumping logic.
+- The batch size is chosen to be 64. I figured making such a choice is quite tricky and here's how I get it -
+  - The goal I'm pursuing is to find a batch size so that each batch can trigger at most one I/O procedural call: the worst case blocking time is always at least one I/O, so a smaller batch size cannot reduce the worst case blocking time, while a larger batch size can multiply the worst case blocking time.
+  - The amount of output per record depends primarily on (a) the length of the stack trace and (b) whether the record has been released (two stack traces if released; one if not). I examined last-N dumps from production, 4 per service, and found that one of the services happened to have both the longest stack traces and the highest proportion of released records, and the average length per record for that service is in the order of 800-900 characters (in compact JSON format). So, if I set the batch size to be 64 records, each batch will at most output less than but close to 64K characters, which is the size of the buffer.

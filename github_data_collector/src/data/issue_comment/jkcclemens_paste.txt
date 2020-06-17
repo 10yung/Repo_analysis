@@ -1,0 +1,114 @@
+As per issue #101.
+There are plenty of errors/notices in the webserver that are not localised. I believe all the admin errors and notices are localised, as well as the anti-CSRF error.
+
+These should all be localised at least in English so that they can be translated whenever and Just Work(tm).
+When using paste.gg with Javascript disabled, the experience is considerably less nice.
+
+I've recently updated some buttons to work better without JS, but there are still some pain points.
+
+With JS disabled:
+
+- [x] Anonymous pastes cannot be deleted (button shows modal and does nothing without JS)
+  - Solution: make button a link to a page that has an input for the deletion key. Show the modal if JS is enabled.
+- [ ] More than one file cannot be added to a paste
+- [ ] Pastes cannot be edited outside of metadata
+- [x] Destructive actions have no warning
+- [ ] Rendered content cannot be switched to the source tab
+- [ ] No highlighting
+  - Solution: use server-side highlighting. This is solved in the SSH branch, but that branch is not ready for production (and it will be a miracle when it is).
+
+If anyone has additional issues when JS is disabled, please add them.
+
+Aside from anonymous pastes, I'm not sure about the best way to handle non-JS.
+
+Destructive actions could get individual pages that prompt for a confirmation, but that seems a lot of work and very clunky. Any other way to display a warning to non-JS users before a destructive action?
+Diesel supports embedding migrations into the binary so they can be called and applied from the binary itself. paste could just run the migrations every time it's started instead of having to compile `diesel_cli` in the docker image and run them that way.
+This is an issue for the `feat/server-highlighting` branch. In this branch, paste's docker-compose starts a microservice that handles highlighting for the backend in order to produce pre-highlighted code that doesn't require any JS when viewing pastes.
+
+I would like to use the same microservice for highlighting the code editor, which will eventually be [csp_editor](https://gitlab.com/jkcclemens/csp_editor). csp_editor allows using a callback to produce the highlighted code. If we use nginx to [reverse proxy](http://nginx.org/en/docs/http/websocket.html) the microservice (internal-only at the moment) and update the microservice to use websockets, we can write a throttled callback to highlight the code.
+
+@lol768, I am worried about abuse of the reverse-proxied websocket. How can we limit abuse so that, ideally, only people actually editing a paste can use it to produce highlighted code?
+
+---
+
+`highlight.rb`
+```ruby
+#!/usr/bin/env ruby
+
+require 'rack'
+require 'rouge'
+require 'faye/websocket'
+
+Faye::WebSocket.load_adapter('thin')
+
+class Highlight
+  @html = nil
+  @lexer = nil
+
+  def initialize(kind, name)
+    if kind == 'file'
+      lexers = Rouge::Guesser.guess([Rouge::Guessers::Filename.new(name)], Rouge::Lexer.all)
+      @lexer = lexers[0] || Rouge::Lexers::PlainText
+    elsif kind == 'snippet'
+      @lexer = Rouge::Lexer.find(name) || Rouge::Lexers::PlainText
+    else
+      raise ArgumentError, 'kind must be "file" or "snippet"'
+    end
+
+    @html = Rouge::Formatters::HTML.new
+  end
+
+  def highlight(code)
+    @html.format(@lexer.lex(code))
+  end
+end
+
+class Server
+  KEEPALIVE_TIME = 15
+
+  def call(env)
+    if Faye::WebSocket.websocket?(env)
+      ws = Faye::WebSocket.new(env, nil, {ping: KEEPALIVE_TIME})
+
+      ws.on :message do |event|
+        lang, type, source = event.data.split("\n", 3)
+        begin
+          hl = Highlight.new(type, lang)
+        rescue ArgumentError
+          # send nothing
+        else
+          ws.send(hl.highlight(source))
+        end
+      end
+
+      ws.on :close do |event|
+        ws = nil
+      end
+
+      return ws.rack_response
+    else
+      ['400', {}, []]
+    end
+  end
+end
+
+Rack::Handler::Thin.run Server.new
+```
+I like to put my files in a logical order for sharing, but paste.gg reorders them alphabetically which makes it confusing for the reader. 
+The hunk subtitles on the revisions page are quite a bit bigger compared to the actual content - could use with a bit of shrinking.
+It is currently hard to tell where one revision starts and ends, as the horizontal rule is not easy to see and is also quite small.
+
+A title (such as `revision #1`, `revision #2`, etc) might work?
+See title.
+So, I did a search for `paste.gg`..
+
+![image](https://user-images.githubusercontent.com/2552726/47883718-09d6dd80-de26-11e8-876a-d4eb9043ca20.png)
+
+I don't like the term "SEO". It feels somewhat dirty after continued use by so-called "SEO consultants" who mainly peddle snakeoil. *However*, we could definitely make some simple improvements in my opinion:
+
+* We could do with a meta description explaining wtf paste.gg is - this will then potentially be used as the snippet. Google's current snippet is made up of random form labels/buttons which isn't ideal.
+* More fundamentally we could do with some text on the main page pointing out it's a "minimalistic pastebin" or some other slogan. I'll let someone marketing-inclined think about possibilities :laughing: 
+* We could also do with a `<title>` a la what you get on `https://github.com` as a logged-out user.
+* `<!--googleoff: index-->` in footer, maybe. Not much point indexing commit hashes.
+
+Thoughts?

@@ -1,0 +1,102 @@
+I'm running into all kinds of corner cases with one of my projects, this being another one. It is even more tricky because tables are not part of CommonMark so it is less clear what the right behavior is. The problem this PR solves is that a table that has a paragraph right before it will not be parsed:
+
+```
+Hello
+| abc | def |
+| --- | --- |
+| bar | baz |
+```
+
+Becomes a long paragraph the table syntax as part of the paragraph.
+
+This PR fixes that and inserts a `Hello` paragraph before the table in the parsed markdown. In my project, I kind of rely on the possibility of having a paragraph before an element which is how I ran into this issue. I did some research to see how other projects, notably GitHub render the example above.
+Interestingly, GitHub exhibits the same issue in their markdown parsing, while [this online editor](https://jbt.github.io/markdown-editor/) supports it just fine.
+
+However, other examples, such as
+
+```
+# Hello
+| abc | def |
+| --- | --- |
+| bar | baz |
+```
+
+render correctly on GitHub. It is only paragraphs, that are not supported right before a table. Therefore, at least to me, this feels more like an accidental bug than correct behavior.
+
+Personally, for me, it would be great if this would be merged, as I'd need to continue using a fork otherwise. Another, maybe, viable option might be to have this behavior be optional via a feature flag (although I can see that this is a road that, once taken, can lead to madness if more and more of the non-standardized idiosyncratic markdown _features_ end up as feature flags).
+
+This PR also contains tests, and I'd be more than happy to improve the code if it is not up to the quality standards of pulldown-cmark.
+
+
+This should make it easier to see what tests are related to base commonmark or extensions. Reviewing tests when a spec changes should be easier this way.
+
+cc https://github.com/raphlinus/pulldown-cmark/pull/414#discussion_r347148031
+See https://github.com/raphlinus/pulldown-cmark/issues/119#issuecomment-552158266
+
+In addition, this PR also implements LUT switching so that the performance of plain CommonMark is not affected by adding extensions. The full commit message explains the performance impact of that change.
+
+Here's the overall effect:
+
+```
+⌁  g/pulldown-cmark ╍ (static-scanner-lut) cargo bench --bench html_rendering -- --baseline baseline crdt_parse
+    Finished bench [optimized] target(s) in 0.16s
+     Running target/release/deps/html_rendering-09cbd52ae1f5c0d2
+crdt_parse              time:   [337.56 us 338.25 us 338.96 us]
+                        change: [-2.0951% -1.8117% -1.5011%] (p = 0.00 < 0.05)
+                        Performance has improved.
+
+```
+
+(I would also note these benchmarks were running on a pretty noisy machine, and the baseline fluctuated quite a lot later (still centred on where it was). You can at the very least say that plain-spec perf is no longer dependent on the number of extensions & extra special chars that need to be scanned to support them.)
+Since Markdown doesn't have any specific tag to specify the direction of [a given block of] a text, and since there are many cases in which the text body is mixed with RTL and LTR text, there is a need to detect the direction of the text automatically based on the context.
+
+This feature is extremely need to be implemented in whatever possible way but the most feasible solution (as per my understanding) is to apply bidirection (bidi) to the render engine so it pass the responsibility of dealing with direction to the browser.
+When I use this library with wasm_bindgen, E0277 was occurred.
+
+```
+error[E0277]: the trait bound `pulldown_cmark::parse::Event<'_>: std::borrow::Borrow<pulldown_cmark::parse::Event<'_>>` is not satisfied
+  --> src\lib.rs:73:1
+   |
+73 | #[wasm_bindgen]
+   | ^^^^^^^^^^^^^^^ the trait `std::borrow::Borrow<pulldown_cmark::parse::Event<'_>>` is not implemented for `pulldown_cmark::parse::Event<'_>`
+   |
+   = note: required by `pulldown_cmark_to_cmark::fmt::cmark`
+
+error: aborting due to previous error
+
+For more information about this error, try `rustc --explain E0277`.
+``` 
+
+ref:
+- https://github.com/yumetodo/markdown_img_url_editor_rust/commit/a582d3e05911bd75eddadbc074e24005838a0ccc
+- https://circleci.com/gh/yumetodo/markdown_img_url_editor_rust/3
+The parse module has gotten fairly large at 3k lines of code. It contains both the first and second pass of parsing, which don't have much code in common. Creating separate modules for the passes and moving shared data structures to the root module may improve maintainability and more clearly signal to new contributors the structure of the parser.
+In pulldown_cmark, the main data structure is a vector backed tree. The final tree which is traversed to generate events in two passes. Roughly speaking, the tree structure is constructed in the first pass (blocks) and the leaf nodes are finalized in the second pass. Especially in this second pass, many tree mutations are done which correspond to indexed vector accesses. These operations incur the cost of bound checking in Rust, which could possibly be avoided by replacing the vector by an efficient arena. One such candidate could be [id_arena]. This would a great display of getting maximal performance while still enjoying Rust's safety guarantees.
+
+There may be a tricky bit in the emphasis handling part of the second pass, where we currently construct some vector indices with arithmetic, which will not work with arena ids. One way to get around this may be to ask the arena to "upgrade" a numeric value to a valid arena id. This would do a one-time bounds check, after which we could use the id for access without checks after. It may also be possible to simply reuse arena ids that are already in the tree.
+
+Another place where vector backed stores without deletion are used is the `Allocations` struct. It contains details of links, images, owned strings and table alignments. Tree nodes may store keep indexes to the `Allocations` struct, which are much smaller than the details themselves. These vector backed datastructures are also prime candidates for arena replacement. We don't do any index arithmetic for those.
+
+[id_arena]: https://docs.rs/id-arena/2.2.1/id_arena/
+The following markdown:
+
+```
+> Note: Though you should not rely on this, all pointers to <abbr
+> title="Dynamically Sized Types">DSTs</abbr> are currently twice the size of
+> the size of `usize` and have the same alignment.
+```
+
+causes the `<abbr>` tag to close at the newline.  That is, it becomes:
+
+```
+<blockquote>
+<p>Note: Though you should not rely on this, all pointers to <abbr
+>title=&quot;Dynamically Sized Types&quot;&gt;DSTs</abbr> are currently twice the size of
+the size of <code>usize</code> and have the same alignment.</p>
+</blockquote>
+```
+
+I would expect the blockquote to be mostly transparent and allow the tag to continue.  commonmark.js dingus seems to handle it correctly.  GitHub handles it too (though it strips out `<abbr>` tags).
+
+It would be helpful to know what kind of link failed in the broken link callback to improve diagnostics in rustdoc for intra-doc links.
+Currently the fuzzer spawns a number of threads, which can be rescheduled at any time to any core. We might be able to improve performance by pinning each thread to a core.

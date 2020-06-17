@@ -1,0 +1,147 @@
+It is not used in Python core, should not be used in user code, and will be removed in Python 3.9. `METH_NOARGS` functions should have type `PyCFunction` instead of `PyNoArgsFunction` and take `NULL` as the second argument.
+This PR implements the append method for the PyList class because using the insert method is twice lower.
+
+I also added test for this.
+The first form macro is called by `py_fn!`, and calls `py_method_def!`
+again with a default value for the docstring.
+
+But it didn't bear the `local_inner_macros` modifier so that fails.
+Adding that modifier forces us to rewrap `concat!` as done before
+with `stringify!`.
+
+Reference: https://doc.rust-lang.org/edition-guide/rust-2018/macros/macro-changes.html#macros-using-local_inner_macros
+As part of developing PyOxidizer, I needed to force python3-sys to
+statically link against a Python library on Windows in a downstream
+crate of python3-sys. This requires the unstable `static-nobundle`
+link type so Cargo leaves symbols as unresolved when python3-sys
+is built. (Currently, the `static` linkage type verifies referenced
+symbols are present at crate build time.) See
+https://github.com/rust-lang/rust/issues/37403 for more. Look for
+comments by me (@indygreg) to describe the issue in more detail.
+
+This commit teaches python3-sys a pair of new build features which
+enable more explicit control over the linker directives emitted by
+its build script. If no directive is specified, `link-mode-default`
+is used and the existing logic for linker directive emission is
+used. If `link-mode-unresolved-static` is used and we're on Windows,
+we emit a `static-nobundle=pythonXY` linker directive and
+omit the location of the library. This effectively says "I depend
+on a static `pythonXY` library but don't resolve the symbols
+when you build me and require someone else to specify the location
+to that library." What PyOxidizer does is emit its own linker
+directive that defines the location of a static `pythonXY` library,
+satisfying the linker constraint and enabling the build to work.
+If a downstream create doesn't do this, the build should fail due
+to a missing library or symbols.
+
+I have purposefully designed the crate features to be extensible.
+If we want to add additional, mutually exclusive features in the
+future, we could do that. e.g. we could add a `link-mode-static`
+that force emits a `rustc-link-lib=static=pythonXY` directive
+to force static linking, even if a shared library is detected.
+But I have no need for this today and don't want to complicate
+the code, so I haven't added it.
+
+To round out the new feature, features have been added to the
+cpython crate to toggle the new features.
+
+Because Python 2.7 is end of life in a few weeks, I have not
+implemented the new feature for Python 2.7. I suspect very
+few people will use this feature anyway and I'm pretty confident
+that nobody will request this feature on Python 2.7.
+
+I concede that adding this feature to the crate to support
+PyOxidizer's esoteric use case is a bit unfortunate. I really wish
+Cargo allowed a crate to wholesale replace the build script output
+of a dependency, as PyOxidizer could statically resolve the
+Python settings for python3-sys since it brings its own Python
+library. But Cargo doesn't have this feature. So I'm stuck
+having to land this feature in the upstream crate to avoid having
+to maintain a permanent fork of `rust-cpython`. Sorry :/
+The struct and function are documented at
+https://docs.python.org/3/c-api/import.html#c._inittab
+and defined in source code (in CPython master) at
+https://github.com/python/cpython/blob/51edf8aaa2e17626f9690ed29d25945fc03016b9/Include/cpython/import.h#L30.
+
+It is unclear whether PyImport_Inittab is part of the official
+API, as it isn't clearly documented. But the static has been
+shipping for years and is still in CPython master. I need to
+use this variable in PyOxidizer in order to modify the set
+of extensions at run-time. Putting it behind Py_LIMITED_API
+should be safe.
+
+So I've had experience before creating python bindings with the C++ library [pybind11](https://github.com/pybind/pybind11) where I'm able to return python buffers but I can't figure out how to do the same with rust-cpython
+This was originally developed for the Mercurial's Rust extension. It allows
+us to implement a Python iterator over a Rust iterator _relatively_ safely.
+
+The problem is that a Rust iterator typically has a reference to the
+collection behind, and thus cannot be a data member of a Python object.
+We get around this problem by casting &'a to &'static and add runtime
+validation instead. The basic idea is described in the following blog post.
+
+https://raphaelgomes.dev/blog/articles/2019-07-01-sharing-references-between-python-and-rust.html
+
+In order to make the reference-sharing business safe, we have the following
+structs:
+
+ - PySharedRefCell defines a storage holding a value to be shared
+ - PySharedRef is a lifetime-bound reference to the value above, which provides
+   a safe interface on top of the PySharedRefCell and its owner PyObject
+ - UnsafePyLeaked is the reference not bound to the real lifetime, and its
+   validity is checked at runtime
+ - PyLeakedRef/PyLeakedRefMut are borrowed references from UnsafePyLeaked
+
+In order to create PySharedRef in safe manner, we plan to add py_class!()
+macro like this:
+
+    py_class!(class List |py|
+        shared_data vec: Vec<i32>;
+        // the storage type is PySharedRefCell<Vec<i32>>, but its accessor
+        // returns PySharedRef<'a, Vec<i32>>. It makes sure that the right
+        // owner PyObject and its data member are paired.
+    });
+
+The macro extension is not included in this PR since we'll probably need
+some bikeshedding.
+
+There are a couple of unsafe business in this module, and some public
+functions are unfortunately unsafe. Please refer to the inline comments
+why some of them can be safe and some can't.
+
+Thanks to @gracinet for the basic ideas and experiments,
+          @Alphare for the core implementation,
+          @markbt for the generation-counter idea,
+          and Mercurial developers for reviewing the original patches.
+Is there any chance we can build python3-sys or rust-cpython with target = wasm32-unknown-unknown ?
+
+I have a webapp built in Rust/wasm32, and I would like to be able to use Python3.7 as the scripting language for the Rust webapp.
+
+I am getting error:
+
+```
+error: failed to run custom build command for `python3-sys v0.2.1`
+
+--- stderr
+thread 'main' panicked at 'called `Result::unwrap()` on an `Err` value: "failed to run python interpreter `\"python\" \"-c\" \"import sys; import sysconfig; print(sys.executable); print(sys.version_info[0:2]); print(sysconfig.get_config_var(\\\'LIBDIR\\\')); print(sysconfig.get_config_var(\\\'Py_ENABLE_SHARED\\\')); print(sysconfig.get_config_var(\\\'LDVERSION\\\') or \\\'%s%s\\\' % (sysconfig.get_config_var(\\\'py_version_short\\\'), sysconfig.get_config_var(\\\'DEBUG_EXT\\\') or \\\'\\\')); print(sys.exec_prefix);\"`: No such file or directory (os error 2)"', src/libcore/result.rs:1051:5
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace.
+```
+
+Thanks for the great project!
+
+Without this patch, the example were not working on my computer with Python 3. I hope it's OK!
+Is it possible to specify the interpreter to use, i.e., its path, at runtime?
+
+Something like:
+```
+use std::env;
+use cpython::...
+
+fn main() {
+    let path = env::current_exe().unwrap();
+    let interpreter = path.with_file_name(r"python\pythonw.exe");
+    Python::set_interpreter(interpreter).unwrap();
+    // use cpython as normal
+}
+```
+
+The reason for this is if I'm distributing a rust & python app I want to include a python subdir and have rust use that python (with all the extra dependencies I need) rather than any that might happen to be on the system. And, of course, this means that my users don't _need_ to have their own python (e.g., on windows).

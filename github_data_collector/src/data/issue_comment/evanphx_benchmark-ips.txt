@@ -1,0 +1,309 @@
+* That way, warmup is more similar to actual measurements and not wildly
+  different due to the overhead of going through #call_times in and out
+  on every cycle.
+* This also communicates to the JIT that cycles is not always 1, which
+  means the method compiled during warmup is more likely to be re-used.
+  Before, the compiled method could deoptimize because `run_warmup` always
+  calls `call_times` with cycles=1 and the JIT might speculate on that
+  to remove the loop, but then `run_benchmark` suddenly calls `call_times`
+  with cycles > 1, which needs the loop and therefore causes deoptimization
+  and later recompilation, during the actual measurements.
+
+This PR addresses the second issue of the benchmark shown in #95.
+I believe it also addresses #94, cc @ioquatix
+```ruby
+# frozen_string_literal: true
+require 'benchmark/ips'
+
+module ActiveSupport
+  class StringInquirer < String
+    def method_missing(method_name, *arguments)
+      if method_name[-1] == "?"
+        self == method_name[0..-2]
+      else
+        super
+      end
+    end
+  end
+end
+
+def env
+  @_env ||= ActiveSupport::StringInquirer.new("development")
+end
+
+Benchmark.ips do |x|
+  x.iterations = 2
+
+  x.report("env.development?") do
+    env.development?
+  end
+
+  x.report("env == 'development'") do
+    env == 'development'
+  end
+end
+```
+When running this benchmark on MRI with current master, I see:
+```
+$ ruby -I/home/eregon/code/benchmark-ips/lib bench_dev.rb
+Warming up --------------------------------------
+    env.development?   200.814k i/100ms
+env == 'development'   423.283k i/100ms
+    env.development?   201.198k i/100ms
+env == 'development'   426.050k i/100ms
+Calculating -------------------------------------
+    env.development?      2.783M (± 1.9%) i/s -     14.084M in   5.062861s
+env == 'development'     10.756M (± 1.3%) i/s -     54.108M in   5.031362s
+    env.development?      2.782M (± 1.2%) i/s -     14.084M in   5.062568s
+env == 'development'     10.818M (± 1.0%) i/s -     54.108M in   5.002086s
+```
+
+I noticed the warming times, which are per 100ms are not really close to a 10th of the measurement times, which are in 1000ms (1 second). This sounds surprising, as on MRI for this benchmark I would expect no difference between warmup and actual measurement.
+Yet, we see `env == 'development'` is 426k i/100ms (= 4.26M i/s) during warmup and then it's 10.818M i/s during measurements. Did MRI get magically more than twice faster when it realized we are actually benchmarking and not just warming up? I would not think so.
+
+The reason is the warmup phase uses `call_times(cycles=1)` while the measurement phase uses `call_times(cycles)` with `cycles` typically far great than 1 (in this case, around 200 000).
+Using `call_times(1)` has a significant overhead as shown here, because every time we need to go in call_times:
+https://github.com/evanphx/benchmark-ips/blob/0bb23ea1f5d8f65416629505889f6dfc550fa4a6/lib/benchmark/ips/job/entry.rb#L46-L56
+Read a few instance variables, go in the loop for just one call, exit the loop and return from `call_times`.
+
+So instead, if we adapt the warmup to call `call_times` with enough cycles to take at least 1ms, we will reduce the overhead significantly, as this PR does:
+```
+$ ruby -I/home/eregon/code/benchmark-ips/lib bench_dev.rb
+Warming up --------------------------------------
+    env.development?   274.007k i/100ms
+env == 'development'     1.049M i/100ms
+    env.development?   274.043k i/100ms
+env == 'development'     1.035M i/100ms
+Calculating -------------------------------------
+    env.development?      2.787M (± 6.0%) i/s -     13.976M in   5.041526s
+env == 'development'     10.717M (± 0.8%) i/s -     53.813M in   5.021777s
+    env.development?      2.820M (± 0.8%) i/s -     14.250M in   5.053428s
+env == 'development'     10.621M (± 0.6%) i/s -     53.813M in   5.067114s
+```
+Now warmup and measurement timings are consistent and make sense.
+
+Of course, nobody should use only warmup times for interpreting results, but nevertheless I believe it's good for warmup and measurements times to match, as it can be an indication of whether enough warmup happened and how stable is the code being benchmarked.
+
+The same issue also happens on TruffleRuby (because the warmup loop cannot be compiled efficiently with the previous code, only with OSR after many many iterations). Without this PR:
+```
+Warming up --------------------------------------
+    env.development?   737.218k i/100ms
+env == 'development'     1.900M i/100ms
+    env.development?   945.329k i/100ms
+env == 'development'     2.203M i/100ms
+Calculating -------------------------------------
+    env.development?     14.695M (±23.7%) i/s -     68.064M in   5.049277s
+env == 'development'      1.219B (± 5.9%) i/s -      6.007B in   4.995364s
+    env.development?     14.532M (±25.5%) i/s -     66.173M in   5.010910s
+env == 'development'      1.243B (± 2.9%) i/s -      6.206B in   4.997811s
+```
+With this PR:
+```
+Warming up --------------------------------------
+    env.development?     1.218M i/100ms
+env == 'development'   107.143M i/100ms
+    env.development?     1.518M i/100ms
+env == 'development'   121.856M i/100ms
+Calculating -------------------------------------
+    env.development?     14.787M (±16.5%) i/s -     72.850M in   5.070296s
+env == 'development'      1.244B (± 0.8%) i/s -      6.336B in   5.092835s
+    env.development?     14.425M (±17.4%) i/s -     69.814M in   5.000543s
+env == 'development'      1.233B (± 2.2%) i/s -      6.215B in   5.044568s
+```
+And warmup is then consistent with measurements (instead of being apparently much slower).
+
+cc @chrisseaton 
+* That way, there is no polymorphism for `@action.call` inside `#call_times`
+  and the inline cache for `@action.call` remains monomorphic and well
+  optimized, independent of the job order.
+
+While running this fairly simple benchmark on MRI and TruffleRuby I noticed 2 issues.
+```ruby
+# frozen_string_literal: true
+require 'benchmark/ips'
+
+module ActiveSupport
+  class StringInquirer < String
+    def method_missing(method_name, *arguments)
+      if method_name[-1] == "?"
+        self == method_name[0..-2]
+      else
+        super
+      end
+    end
+  end
+end
+
+def env
+  @_env ||= ActiveSupport::StringInquirer.new("development")
+end
+
+Benchmark.ips do |x|
+  x.iterations = 2
+
+  x.report("env.development?") do
+    env.development?
+  end
+
+  x.report("env == 'development'") do
+    env == 'development'
+  end
+end
+```
+
+This PR addresses the first issue. The second is #96. The first issue, which applies more to Ruby implementations able to inline Ruby methods like TruffleRuby and JRuby, is that the call to `@action.call` inside `call_times` (the innermost loop of benchmark-ips) becomes polymorphic:
+https://github.com/evanphx/benchmark-ips/blob/0bb23ea1f5d8f65416629505889f6dfc550fa4a6/lib/benchmark/ips/job/entry.rb#L49-L55
+
+It is important for performance to compile that loop and let the JIT know exactly which Proc will be called inside the loop.
+However, with the current code, all Procs given to `Benchmark::IPS::Job#report` will be observed for that `act.call` call site during warmup. And then for `run_benchmark` the inline cache will have as many entries as blocks given to `report`, which results in something like this:
+```ruby
+          i = 0
+          while i < times
+            # act.call is compiled to something like
+           if act.equal? FIRST_PROC
+             FIRST_PROC.call
+           elsif act.equal? SECOND_PROC
+             SECOND_PROC.call
+           ...
+             ...
+           end
+            i += 1
+          end
+```
+
+This is not good for performance, because those checks for the Proc make the loop body much larger, and the JIT will be less happy to inline any of these `Proc#call` since it's not just one but a lot of them and it's unclear which one is to prioritize (and might cause unfair inlining for the different blocks).
+
+What we want instead is a copy of the loop for each block to measure, which we can easily achieve by defining a method on the singleton class of each Job::Entry, which was already done for `report(String)` but not other cases. That way we end up with:
+```ruby
+          i = 0
+          while i < times
+           if act.equal? PROC_OF_THAT_ENTRY
+             PROC_OF_THAT_ENTRY.call # very likely to be inlined,
+             # which is critical for performance to avoid a non-inlined call
+             # in the innermost loop and optimize the loop together with the Proc
+           else
+             # deoptimize
+           end
+            i += 1
+          end
+```
+
+So in practice, it means running this benchmark on TruffleRuby 19.3.0 without this change gives:
+```
+$ ruby -v                                                
+truffleruby 19.3.0, like ruby 2.6.2, GraalVM CE Native [x86_64-linux]
+$ ruby -I/home/eregon/code/benchmark-ips/lib bench_dev.rb
+Warming up --------------------------------------
+    env.development?   739.502k i/100ms
+env == 'development'     1.756M i/100ms
+    env.development?   814.826k i/100ms
+env == 'development'     2.161M i/100ms
+Calculating -------------------------------------
+    env.development?     13.419M (±25.2%) i/s -     61.927M in   5.036341s
+env == 'development'     74.301M (± 5.5%) i/s -    371.632M in   5.016977s
+    env.development?     14.518M (±24.0%) i/s -     67.631M in   5.025972s
+env == 'development'     76.262M (± 4.0%) i/s -    382.435M in   5.022961s
+```
+And with this change:
+```
+Warming up --------------------------------------
+    env.development?   737.218k i/100ms
+env == 'development'     1.900M i/100ms
+    env.development?   945.329k i/100ms
+env == 'development'     2.203M i/100ms
+Calculating -------------------------------------
+    env.development?     14.695M (±23.7%) i/s -     68.064M in   5.049277s
+env == 'development'      1.219B (± 5.9%) i/s -      6.007B in   4.995364s
+    env.development?     14.532M (±25.5%) i/s -     66.173M in   5.010910s
+env == 'development'      1.243B (± 2.9%) i/s -      6.206B in   4.997811s
+```
+
+We see the reported performance of `env == 'development'` radically changes with this PR.
+In fact, `env == 'development'` is well optimized, as it should and is in real code, and the PR lets it do that, while before benchmark-ips itself would prevent running it a full speed due to internal polymorphism.
+
+cc @chrisseaton 
+https://github.com/evanphx/benchmark-ips/blob/0bb23ea1f5d8f65416629505889f6dfc550fa4a6/lib/benchmark/ips/job.rb#L256
+
+Do you think it's possible to add a offset and/or factor to control the times parameter?
+
+It would be nice if we could tell it to run at least 10 iterations minimum, for example.
+FWIW I believe Ruby < 2.3 support can be dropped, as 2.3 is EOL and 2.4
+will be EOL soon.
+Showerthought.
+
+The reason why benchmark/ips is so great is it helps us to set and decide on what would otherwise be pretty arbitrary parameters for benchmarks - particularly of course number of iterations.
+
+I think we could go further.
+
+* A benchmark is "warmed up" when iterations of the benchmark don't get significantly faster. 
+* Rather than just running for 5 seconds, a benchmark iteration can run until significance is achieved or a timeout is reached.
+* Once a result is achieved, it can be immediately replicated by iterating the benchmark again. If the result is replicated, stop. If it isn't replicated, try again, and if it doesn't replicate after X attempts, error out.
+
+Just some ideas. I think I just want to get rid of the three remaining "config points" in benchmark/ips: warmup time, iteration runtime, and number of iterations.
+I'm interested in comparing two (or more) implementations of the same thing.
+
+There is some "one off" setup cost - establishing the connection, and then the repeated `times` cost, i.e. what I'm interested in.
+
+For one benchmark, the setup cost might be N and for the other, 2N. The iteration cost is largely the same. However, what ends up happening is that for the benchmark with N setup overhead, the `times` repeats is much larger than the benchmark with 2N overhead. This causes the effect of the setup to be even more pronounced, because `benchmark-ips` will set `times` to, say, 80, for the case of 2N setup cost, and 500 for the case of N setup cost, so you end up with:
+
+- (2N + 80) * number of repeats until 5 seconds is elapsed, vs
+- (N + 500) * number of repeats until 5 seconds is elapsed.
+
+Ultimately, it makes the 2nd case look much better even though the different is mostly in the setup overhead.
+
+Is there some way to take this bias into account? My initial thoughts were to use the upper bound for `times` (or perhaps the average) so that each benchmark would be largely running with the same number, proportionally, of setup overhead to number of `times`.
+This unifies the double `@stdout` and `@suite` calls. It also allows a user to choose a different output.
+
+Addresses #81 for `warmup` and `benchmark` but not `compare!`
+
+Outstanding:
+
+Changing `compare` is not as easy, the output needs to be passed in:
+1. Pass in the stream from one of the `@outs`
+2. Pass in a stream to `config` and use that throughout
+3. Enhance `StdoutReport` and change `compare` to use the `@outs`.
+
+Let me know which you approach you prefer. I can fixup this PR or just make another.
+
+### Sample Code
+
+```ruby
+require "benchmark/ips"
+
+my_stream = StringIO.new
+Benchmark.ips do |x|
+  x.config(:quiet => true, :suite => ::Benchmark::IPS::Job::StdoutReport.new(my_stream))
+
+  x.report("mul") { 2 * 2 * 2 * 2 * 2 * 2 * 2 * 2 }
+  x.report("pow") { 2 ** 8 }
+
+  # x.compare!
+end
+
+puts "results: #{my_stream.string}"
+```
+
+It would be nice, to have a way to capture the output to a String in order to print it or send it to an external service, like Bugsnag. Also in a PASS like heroku it's hard to get the reports because the logs are combined from logger, stdout and stderr.
+
+By output I mean the full report:
+
+```
+Calculating -------------------------------------
+            addition    71.254k i/100ms
+           addition2    68.658k i/100ms
+           addition3    83.079k i/100ms
+addition-test-long-label
+                        70.129k i/100ms
+-------------------------------------------------
+            addition     4.955M (± 8.7%) i/s -     24.155M
+           addition2    24.011M (± 9.5%) i/s -    114.246M
+           addition3    23.958M (±10.1%) i/s -    115.064M
+addition-test-long-label
+                         5.014M (± 9.1%) i/s -     24.545M
+
+Comparison:
+           addition2: 24011974.8 i/s
+           addition3: 23958619.8 i/s - 1.00x slower
+addition-test-long-label:  5014756.0 i/s - 4.79x slower
+            addition:  4955278.9 i/s - 4.85x slower
+```

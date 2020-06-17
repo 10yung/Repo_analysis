@@ -1,0 +1,432 @@
+I'm trying to serialize an object to JSON using scala-pickling 0.10.1 and Scala 2.11, but am having a very strange issue. I've replicated a minimal example below:
+
+```scala
+import org.apache.hadoop.io.compress.CompressionCodecFactory
+import scala.pickling.Defaults._
+import scala.pickling.json._
+    
+trait foo {
+  var compressionCodecFactory1: CompressionCodecFactory = _
+  val compressionCodecFactory2: CompressionCodecFactory = null
+}
+    
+class blah extends foo
+ 
+object FooFoo {
+  def main(args: Array[String]) = {
+        
+  val k = new blah
+  val pkl = k.pickle // compilation fails with error "Cannot generate a pickler for blah"
+  }
+}
+```
+
+However, if I remove or comment out `var compressionCodecFactory1: CompressionCodecFactory = _` within the trait `foo`, it compiles and pickles perfectly. I've also tried adding the `@transient` notation to this var, but it fails with the same error.
+
+Why could this possibly be happening? 
+
+Have this trait:
+```
+trait TestTrait1 {
+  val createdAt = System.currentTimeMillis
+  var finishedAt:Long = 0
+
+  def setAsFinished():Unit = finishedAt = System.currentTimeMillis
+
+  override def toString = s"TestTrait[createdAt=$createdAt, finishedAt=$finishedAt]"
+}
+```
+and this case class:
+```
+case class TestCaseClass(int:Int, dbl:Double, str:String, millis:Long = System.currentTimeMillis) extends TestTrait1 
+```
+instantiating the case class by:
+
+`
+   TestCaseClass(1, 2.0, "String3")
+`
+
+and pickling gives this JSON:
+
+```
+{
+  "$type": "pickletests.TestCaseClass",
+  "int": 1,
+  "dbl": 2.0,
+  "str": "String3",
+  "millis": "1497970617809",
+  "finishedAt": "1497970618823"
+}
+```
+
+The **createdAt** field does not appear in the JSON, and hence upon unpickling is set to a new (different) value.  By contrast, the **millis** field is represented and hence retains the originally assigned value. If **createdAt** is defined as a **var** instead of a **val** then it will appear in the JSON and the correct value is preserved.
+
+Is this a bug or a feature? (In our actual application, **createdAt** is really an internal **uniqueID** field, so really do want it declared as a **val** so that it can never be accidentally modified.)
+
+This was run using 0.11.0-M2, Scala 2.11.8, java 1.8.0_121, the IDE is IntelliJ
+
+The complete test routine and console output is pasted below. 
+
+BTW: 0.10.0 throws an exception trying to unpickle, claiming that the **var finishedAt** is not represented as a Java variable in the class file. Have the same problem in 0.11.0-M2 in our full application, but have not been able to reproduce within an isolated test file.
+
+-------------------------------------------------------------------------------------------
+```
+package pickletests
+
+import scala.pickling._
+import scala.pickling.Defaults._
+import scala.pickling.json._
+
+/**
+  * Created by JCrowley on 6/19/2017.
+  */
+
+trait TestTrait1 {
+  val createdAt = System.currentTimeMillis
+  var finishedAt:Long = 0
+
+  def setAsFinished():Unit = finishedAt = System.currentTimeMillis
+
+  override def toString = s"TestTrait[createdAt=$createdAt, finishedAt=$finishedAt]"
+}
+
+case class TestCaseClass(int:Int, dbl:Double, str:String, millis:Long = System.currentTimeMillis) extends TestTrait1 {
+  override def toString = s"TestCaseClass[int=$int, dbl=$dbl, str='$str', millis=$millis ${super.toString}]"
+}
+
+object PickleVarInTraitTests extends App {
+
+  val test = TestCaseClass(1, 2.0, "String3")
+
+  Thread.sleep(1000)
+
+  test.setAsFinished()
+
+  Console.println(s"\nEnvironment - Scala: ${scala.util.Properties.versionString}  Java: ${System.getProperty("java.version")}\n")
+
+  Console.println("\nOriginal TestCaseClass: " + test.toString + "\n")
+
+  val testPickled = test.pickle
+  val testPickledJSON = testPickled.value
+
+  Console.println("JSON pickled: " + testPickledJSON + "\n")
+
+  val testUnpickle = testPickledJSON.unpickle[TestCaseClass]
+
+  Console.println("Success for [TestCaseClass] = " + testUnpickle + "\n")
+
+  val testUnpickle2 = testPickledJSON.unpickle[AnyRef]
+
+  Console.println("Unpickle1 == Unpickle2: " + (testUnpickle == testUnpickle2))
+}
+```
+----------------------------------- Console Output -------------------------------------
+```
+Environment - Scala: version 2.11.8  Java: 1.8.0_121
+
+
+Original TestCaseClass: TestCaseClass[int=1, dbl=2.0, str='String3', millis=1497970617809 TestTrait[createdAt=1497970617809, finishedAt=1497970618823]]
+
+JSON pickled: {
+  "$type": "pickletests.TestCaseClass",
+  "int": 1,
+  "dbl": 2.0,
+  "str": "String3",
+  "millis": "1497970617809",
+  "finishedAt": "1497970618823"
+}
+
+Success for [TestCaseClass] = TestCaseClass[int=1, dbl=2.0, str='String3', millis=1497970617809 TestTrait[createdAt=1497970619494, finishedAt=1497970618823]]
+
+Unpickle1 == Unpickle2: true
+
+Process finished with exit code 0
+
+```
+Apologies if this is a duplicate, but several searches did not turn up this problem. [Using JSON format]
+
+With this definition:
+      case class PickleNone(test:Option[String])
+
+this sequence works OK: 
+  val test = PickleNone(None)
+  val roundTrip = test.pickle.value.unpickle[PickleNone]
+
+gives **test == roundTrip**
+
+but this sequence:
+  val test = PickleNone(None)
+  val roundTrip = test.pickle.value.unpickle[AnyRef]
+  
+results in **test != roundTrip**
+
+It appears in the second case that the unpickle step sees the scala.None.type and instantiates a new instance for None. Unfortunately, Scala expects None to be a singleton, and any None == None test is reduced to object identity, which now fails.
+
+Scala 2.11.8  Pickling 0.10.1
+
+Full test case follows
+=============
+package pickletests
+
+import scala.pickling._
+import scala.pickling.Defaults._
+import scala.pickling.json._
+
+case class PickleNone(testOption:Option[String])
+
+object PickleNoneTest extends App {
+  val test = PickleNone(None)
+  val testPickled = test.pickle.value
+  val testUnpickled = testPickled.unpickle[PickleNone]
+  val testAnyRef = testPickled.unpickle[AnyRef]
+  val testAnyRefAsPickleNone = testPickled.unpickle[AnyRef].asInstanceOf[PickleNone]
+
+  Console.println("test == testUnpickled is: " + (test == testUnpickled))
+  Console.println("   test == testAnyRef is: " + (test == testAnyRef))
+  Console.println(" test == asInstanceOf is: " + (test == testAnyRefAsPickleNone))
+
+  Console.println("")
+  Console.println("")
+  Console.println("                  test.testOption is: " + test.testOption.toString + " @%8X".format(System.identityHashCode(test.testOption)))
+  Console.println("         testUnpickled.testOption is: " + testUnpickled.testOption.toString + " @%8X".format(System.identityHashCode(testUnpickled.testOption)))
+  Console.println("            testAnyRef.testOption is: " + testAnyRef.asInstanceOf[PickleNone].testOption.toString + " @%8X".format(System.identityHashCode(testAnyRef.asInstanceOf[PickleNone].testOption)))
+  Console.println("testAnyRefAsPickleNone.testOption is: " + testAnyRefAsPickleNone.testOption.toString + " @%8X".format(System.identityHashCode(testAnyRefAsPickleNone.testOption)))
+}
+
+
+Are new maintainers sought?
+
+Regardless of what the situation is, it would be good if the README were frank about it.
+- removed all the straight deprecations
+- added access to sun.misc.Unsafe in Util - removed in 2.12
+- might be useful if anyone wants to update the library for 2.12
+- there are many other macro code deprecations that would take time to remove
+
+Compiles except for benchmark and tests. If the build (`project/Util.scala`) is changed to 2.11.8 only, everything compiles and the tests run so clearly there are some differences when using 2.12.1 that don't work. I suspect that there is still a reference to `scala.concurrent.util.Unsafe.instance`. This would work in 2.11 but not 2.12.
+
+Note: I used whitebox macros.
+Is it possible to unpickle a pickled object without specifying the type?
+
+Example:
+
+```
+import scala.pickling.Defaults._
+import scala.pickling.binary._
+
+object TestPickling extends App {
+
+  case class Person(name: String, age: Int)
+
+  val obj = Person("John", 65)
+  
+  val b = obj.pickle.value
+
+  val objAgain = b.unpickle
+
+}
+```
+
+The example doesn't work:
+
+```
+error: ambiguous implicit values:
+ both value datePickler in trait DatePicklers of type => scala.pickling.Pickler[java.util.Date] with scala.pickling.Unpickler[java.util.Date]
+ and value javaBigDecimalPickler in trait JavaBigDecimalPicklers of type => scala.pickling.Pickler[java.math.BigDecimal] with scala.pickling.Unpickler[java.math.BigDecimal]
+ match expected type scala.pickling.Unpickler[T]
+       b.unpickle
+```
+
+Am I missing something, or is this just not possible?
+
+Usecase: serializing a set of objects of which the types are not known at compile time
+Hello, could you explain me why `pickling` is able to deserialize in incorrect type, without any errors/warning? Or I'm doing something wrong? 
+```
+"org.scala-lang.modules" %% "scala-pickling" % "0.10.1",
+scalaVersion := "2.11.8"
+```
+
+```SCALA
+import scala.pickling.Defaults._
+import scala.pickling.binary._
+
+object TestApp extends App {
+
+  final case class SimpleType(str: String)
+  final case class MoreComplex(str: String, xs: Seq[Int], st: SimpleType)
+  final case class LessComplex(str: String, d: Double)
+
+  val simple = SimpleType("simple type")
+  val mcomplex = MoreComplex("more complex", Seq(1, 2, 3), simple)
+  val lcomplex = LessComplex("less complex", 1994.23)
+
+  println("\nMust be OK:")
+
+  test(simple.pickle.value)("simple") // SimpleType:  SimpleType(simple type)
+  test(mcomplex.pickle.value)("more") // MoreComplex: MoreComplex(more complex,List(1, 2, 3),SimpleType(simple type))
+  test(lcomplex.pickle.value)("less") // LessComplex: LessComplex(less complex,1994.23)
+
+  println("\nMust fail:")
+
+  test(mcomplex.pickle.value)("less")   // LessComplex: LessComplex(more complex,6.6738327668E-313)
+  test(mcomplex.pickle.value)("simple") // SimpleType:  SimpleType(more complex)
+  test(lcomplex.pickle.value)("simple") // SimpleType:  SimpleType(less complex)
+  // test(simple.pickle.value)("less") - java.lang.ArrayIndexOutOfBoundsException: 37
+
+  class T1(str: String) {
+    override def toString: String = s"T1($str)"
+  }
+
+  class T2(str: String, i: Int) {
+    override def toString: String = s"T2($str,$i)"
+  }
+
+  val t1 = new T1("Hey")
+  val t2 = new T2("Hello",3)
+
+  println("\nNot a case class:")
+
+  test(t1.pickle.value)("T1") // T1: T1(Hey)
+  test(t1.pickle.value)("T2") // T2: T1(Hey)
+  test(t2.pickle.value)("T1") // T1: T2(Hello,3)
+  test(t2.pickle.value)("T2") // T2: T2(Hello,3)
+
+  def test(ab: Array[Byte])(name: String): Unit = name match {
+    case "simple" =>  println("SimpleType:  " + ab.unpickle[SimpleType])
+    case "more"   =>  println("MoreComplex: " + ab.unpickle[MoreComplex])
+    case "less"   =>  println("LessComplex: " + ab.unpickle[LessComplex])
+    case "T1"     =>  println("T1: " + ab.unpickle[T1])
+    case "T2"     =>  println("T2: " + ab.unpickle[T2])
+  }
+}
+```
+
+Output:
+```
+Must be OK:
+SimpleType:  SimpleType(simple type)
+MoreComplex: MoreComplex(more complex,List(1, 2, 3),SimpleType(simple type))
+LessComplex: LessComplex(less complex,1994.23)
+
+Must fail:
+LessComplex: LessComplex(more complex,6.6738327668E-313)
+SimpleType:  SimpleType(more complex)
+SimpleType:  SimpleType(less complex)
+
+Not a case class:
+T1: T1(Hey)
+T2: T1(Hey)
+T1: T2(Hello,3)
+T2: T2(Hello,3)
+```
+
+So as you can see it is possible to deserialize `MoreComplex` or `LessComplex` into `SimpleType` but not other way around. So how can I be sure that I `unpickle` it in a proper type? 
+
+Thanks!
+
+
+Is it possible to serialize the `PicklerUnpickler` generated by `PicklerUnpickler.generate[T]`? A marco of `PicklerUnpickler` is not serializable by Java. Is this going to be supported, or even possible?
+The following code:
+
+```
+import scala.pickling.{FastTypeTag, Pickler, Unpickler}
+import scala.pickling.binary._
+import scala.pickling.Defaults._
+
+class Serializer[T : Pickler : FastTypeTag] {
+  def serialize(data: T): Array[Byte] = {
+    Foo.bar(data)
+  }
+}
+
+object Foo {
+  def bar[T: Pickler: FastTypeTag](t: T): Array[Byte] = t.pickle.value
+  def unbar[T: Unpickler: FastTypeTag](bytes: Array[Byte]): T = bytes.unpickle[T]
+}
+
+class Message(message: String)
+
+implicit object messageSerializer extends Serializer[Message]
+
+def test[A: Pickler: FastTypeTag: Serializer](message: A): Array[Byte] = {
+  implicitly[Serializer[A]].serialize(message)
+}
+
+val message = new Message("message")
+
+test(message)
+```
+
+Evaluates to:
+```
+
+
+import scala.pickling.{FastTypeTag, Pickler, Unpickler}
+import scala.pickling.binary._
+import scala.pickling.Defaults._
+
+defined class Serializer
+
+
+
+
+
+defined module Foo
+
+
+
+
+defined class Message
+
+defined module messageSerializer
+
+test: test[A](val message: A)(implicit <synthetic> val evidence$10: scala.pickling.Pickler[A],implicit <synthetic> val evidence$11: pickling.FastTypeTag[A],implicit <synthetic> val evidence$12: Serializer[A]) => Array[Byte]
+
+
+
+message: Message = com.impresign.hub.core.A$A12$A$A12$Message@6c7df044
+
+java.lang.VerifyError: Bad type on operand stack
+Exception Details:
+  Location:
+    com/impresign/hub/core/A$A12$A$A12$messageSerializer$.<init>(Lcom/impresign/hub/core/A$A12$A$A12;)V @212: invokespecial
+  Reason:
+    Type uninitializedThis (current frame, stack[3]) is not assignable to 'com/impresign/hub/core/A$A12$A$A12$messageSerializer$'
+  Current Frame:
+    bci: @212
+    flags: { flagThisUninit }
+    locals: { uninitializedThis, 'com/impresign/hub/core/A$A12$A$A12', 'scala/runtime/VolatileObjectRef', 'scala/Tuple2' }
+    stack: { uninitializedThis, 'com/impresign/hub/core/A$A12$A$A12', 'scala/Predef$', uninitializedThis, 'scala/runtime/VolatileObjectRef', 'com/impresign/hub/core/A$A12$A$A12' }
+  Bytecode:
+    0x0000000: 2a2b b200 2db8 0031 4db2 0036 b600 3ab9
+    0x0000010: 0040 0100 b900 4601 0099 00c5 bb00 4859
+    0x0000020: b200 36b6 003a b900 4001 00b2 004d 124f
+    0x0000030: b200 54b6 0058 b900 5e01 00b9 0062 0200
+    0x0000040: b200 36b6 003a b900 4001 00b2 004d 124f
+    0x0000050: b200 54b6 0058 b900 5e01 00b9 0065 0200
+    0x0000060: b700 684e 2dc6 006c 2db6 006c c000 6e3a
+    0x0000070: 042d b600 71c0 006e 3a05 1904 c100 7399
+    0x0000080: 0052 1904 c000 733a 0619 06b6 0076 c000
+    0x0000090: 783a 0719 05c1 0073 9900 3919 05c0 0073
+    0x00000a0: 3a08 1908 b600 76c0 007a 3a09 1907 1909
+    0x00000b0: 3a0a 59c7 000c 5719 0ac6 000e a700 1519
+    0x00000c0: 0ab6 0080 9900 0d19 07c0 0082 3a0b a700
+    0x00000d0: 0b2a 2c2b b700 843a 0b19 0ba7 0009 2a2c
+    0x00000e0: 2bb7 0084 b600 88c0 0078 b200 4d12 4fb2
+    0x00000f0: 0054 b600 58b7 008b b1                 
+  Stackmap Table:
+    full_frame(@191,{UninitializedThis,Object[#147],Object[#10],Object[#72],Object[#110],Object[#110],Object[#115],Object[#120],Object[#115],Object[#122],Object[#122]},{UninitializedThis,Object[#147],Object[#41],Object[#120]})
+    full_frame(@199,{UninitializedThis,Object[#147],Object[#10],Object[#72],Object[#110],Object[#110],Object[#115],Object[#120],Object[#115],Object[#122],Object[#122]},{UninitializedThis,Object[#147],Object[#41]})
+    full_frame(@209,{UninitializedThis,Object[#147],Object[#10],Object[#72]},{UninitializedThis,Object[#147],Object[#41]})
+    full_frame(@217,{UninitializedThis,Object[#147],Object[#10],Object[#72],Top,Top,Top,Top,Top,Top,Top,Object[#130]},{UninitializedThis,Object[#147],Object[#41]})
+    full_frame(@222,{UninitializedThis,Object[#147],Object[#10]},{UninitializedThis,Object[#147],Object[#41]})
+    full_frame(@228,{UninitializedThis,Object[#147],Object[#10]},{UninitializedThis,Object[#147],Object[#41],Object[#130]})
+Output exceeds cutoff limit.
+```
+
+When the `Serializer` is changed to accept a pre-generated `Pickler` of a concreted type through the constructor, the same problem is encountered. For example:
+
+`object messageSerializer extends Serializer[Message](PicklerUnpickler.generate[Message])`
+
+But if the `Serializer` is abstract and has an abstract `implicit val pickler: AbstractPicklerUnpickler` that the `messageSerializer` defined upon extending, to `PicklerUnpickler.generate[Message]`, it works.
+
+Is this an issue related to Scala Pickling, or a compiler bug?

@@ -1,0 +1,219 @@
+https://stu.dev/how-to-target-net4x-on-macos/
+
+```
+brew tap isen-ng/dotnet-sdk-versions
+brew cask install dotnet-sdk-2.1.500
+brew cask install mono-mdk
+```
+I suggest adding a [.editorconfig](https://docs.microsoft.com/en-us/visualstudio/ide/create-portable-custom-editor-options?view=vs-2019) file to the project to unify the coding style. A good baseline would be to simply copy the [.editorconfig](https://github.com/dotnet/runtime/blob/master/.editorconfig) that is used by Microsoft for .NET Core development, to keep things similar.
+
+Fixes #646
+## Proposed Changes
+
+This PR fixes some Threading/Async issues by utilizing Tasks and the ThreadPool instead of dedicated threads. This should result in better better core utilization and gets rid of the overhead of creating separate threads. It also replaces AutoResetEvent and TaskCompletionSource objects with SemaphoreSlim to fix a possible race-condition that could trigger a deadlock.
+
+These changes work with the 6.x branch but should ideally also be pushed out to 5.x as well to fix the race condition/deadlock issue.
+
+## Types of Changes
+
+- [X] Bug fix (non-breaking change which fixes a possible deadlock issue)
+
+## Checklist
+
+- [X] I have read the `CONTRIBUTING.md` document
+- [X] I have signed the CA (see https://cla.pivotal.io/sign/rabbitmq)
+- [X] All tests pass locally with my changes
+- [X] I have added tests that prove my fix is effective or that my feature works
+- [ ] I have added necessary documentation (if appropriate)
+- [ ] Any dependent changes have been merged and published in related repositories
+
+## Further Comments
+
+Have run all tests locally, and below is a program that triggers said deadlock in the current version (5.1.2) of the client.
+
+### Important
+Moving background work to Tasks + ThreadPool might impact those that create a lot more connections than their have core-count on their machines (not recommended b.t.w). In those cases the ThreadPool slowly increments the minimum number of Threads that can run at a time from the ThreadPool (affects one of the tests that creates hundreds of connections). In those cases, customers might want to call [System.Threading.ThreadPool.SetMinThreads](https://docs.microsoft.com/en-us/dotnet/api/system.threading.threadpool.setminthreads) if they want all those connections to become immediately active, otherwise they slowly ramp up as the ThreadPool sees more work to do. This is well documented here: https://docs.microsoft.com/en-us/dotnet/api/system.threading.threadpool.setminthreads
+
+**Code to reproduce deadlock:**
+```csharp
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace DeadlockRabbitMQ
+{
+    class Program
+    {
+        private static int messagesSent = 0;
+        private static int messagesReceived = 0;
+        private static int batchesToSend = 1000;
+        private static int itemsPerBatch = 500;
+        static async Task Main(string[] args)
+        {
+            //ThreadPool.SetMinThreads(16 * Environment.ProcessorCount, 16 * Environment.ProcessorCount);
+            var connectionString = new Uri("amqp://guest:guest@localhost/");
+
+            var connectionFactory = new ConnectionFactory() { DispatchConsumersAsync = true, Uri = connectionString };
+            var connection = connectionFactory.CreateConnection();
+            var connection2 = connectionFactory.CreateConnection();
+            var publisher = connection.CreateModel();
+            var subscriber = connection2.CreateModel();
+            publisher.ConfirmSelect();
+            subscriber.ConfirmSelect();
+
+            publisher.ExchangeDeclare("test", ExchangeType.Topic, true);
+
+            subscriber.QueueDeclare("testqueue", true, false, true);
+            var asyncListener = new AsyncEventingBasicConsumer(subscriber) { ConsumerTag = "testconsumer" };
+            asyncListener.Received += AsyncListener_Received;
+            subscriber.QueueBind("testqueue", "test", "myawesome.routing.key");
+            subscriber.BasicConsume("testqueue", false, asyncListener.ConsumerTag, asyncListener);
+
+            var batchPublish = Task.Run(() =>
+            {
+                while (messagesSent < batchesToSend * itemsPerBatch)
+                {
+                    var batch = publisher.CreateBasicPublishBatch();
+                    for (int i = 0; i < itemsPerBatch; i++)
+                    {
+                        var properties = publisher.CreateBasicProperties();
+                        properties.AppId = "testapp";
+                        properties.CorrelationId = Guid.NewGuid().ToString();
+                        batch.Add("test", "myawesome.routing.key", true, properties, BitConverter.GetBytes(i + messagesSent));
+                    }
+                    batch.Publish();
+                    publisher.WaitForConfirmsOrDie();
+                    messagesSent += itemsPerBatch;
+                }
+            });
+
+            while (messagesReceived < batchesToSend * itemsPerBatch)
+            {
+                Console.WriteLine($"Messages received: {messagesReceived}");
+
+                await Task.Delay(500);
+            }
+
+            await batchPublish;
+
+            Console.WriteLine("Done receiving all messages.");
+            Console.ReadLine();
+            subscriber.Dispose();
+            publisher.Dispose();
+            connection.Dispose();
+            connection2.Dispose();
+        }
+
+        private static async Task AsyncListener_Received(object sender, BasicDeliverEventArgs @event)
+        {
+            // Doing things in parallel here is what will eventually trigger the deadlock,
+            // probably due to a race condition in AsyncConsumerWorkService.Loop, although
+            // I've had trouble pinpointing it exactly, but due to how the code in there uses
+            // a TaskCompletionSource, and elsewhere overrides it, it might cause Enqueue and Loop
+            // to eventually be working with different references, or that's at least the current theory.
+            // Moving to better synchronization constructs solves the issue, and using the ThreadPool
+            // is standard practice as well to maximize core utilization and reduce overhead of Thread creation
+            await Task.WhenAll(IncrementCounter().AsTask(), WriteToConsole(@event.BasicProperties.CorrelationId, @event.Body).AsTask());
+            (sender as AsyncEventingBasicConsumer).Model.BasicAck(@event.DeliveryTag, false);
+        }
+
+        private static ValueTask IncrementCounter()
+        {
+            Interlocked.Increment(ref messagesReceived);
+            return new ValueTask();
+        }
+
+        private static ValueTask WriteToConsole(string correlationId, byte[] body)
+        {
+            Console.WriteLine($"Received event {correlationId} with value: {BitConverter.ToInt32(body, 0)}");
+            return new ValueTask();
+        }
+    }
+}
+```
+
+https://docs.microsoft.com/en-us/dotnet/standard/net-standard
+
+[@bording approved](https://github.com/rabbitmq/rabbitmq-dotnet-client/issues/684#issuecomment-574233312) 😄 
+We recently ran into an issue where part of our solution crashed after "An unhandled exception terminated the CLR". 
+
+This was due to us trying to Serialize the `AlreadyClosedException`.
+
+We generally treat all Exceptions as Serializable since the [Exception](https://docs.microsoft.com/en-us/dotnet/api/system.exception?view=netframework-4.8) type implements ISerializable. and the [CA1032](https://docs.microsoft.com/en-us/visualstudio/code-quality/ca1032?view=vs-2019) code analysis recommends all custom Exceptions implement 3 constructors (the last of which is a Serialization constructor). 
+Feature request:
+Support connection.update-secret in RabbitMQ.Client. 
+
+Background:
+The AMQP 0-9-1 reference guide at https://www.rabbitmq.com/amqp-0-9-1-reference.html defines a method connection.update-secret. This method is intended to be used with authorization plugins like rabbitmq_auth_backend_oauth2. This plugin allows establishing a connection with a token rather than a password. Such tokens usually have an expiry timestamp and connections become unusable after this point. Using the method connection.update-secret, it is possible to supply a new token that has not yet expired without having to re-establish the connection. It would also allow updating permissions at this point. The plugin ships with RabbitMQ 3.8 and therefore it makes sense to support it within RabbitMQ.Client. Without this feature, we can not make use of this plug-in. 
+## Proposed Changes
+
+As requested in #664 this test demonstrates the issue where the consumer tag in the `ConsumerCancelled` event is not as expected
+
+## Types of Changes
+
+- [ ] Bug fix (non-breaking change which fixes issue #NNNN)
+- [ ] New feature (non-breaking change which adds functionality)
+- [ ] Breaking change (fix or feature that would cause an observable behavior change in existing systems)
+- [ ] Documentation improvements (corrections, new content, etc)
+- [ ] Cosmetic change (whitespace, formatting, etc)
+
+## Checklist
+
+- [x] I have read the `CONTRIBUTING.md` document
+- [ ] I have signed the CA (see https://cla.pivotal.io/sign/rabbitmq)
+- [x] All tests pass locally with my changes
+- [x] I have added tests that prove my fix is effective or that my feature works
+- [x] I have added necessary documentation (if appropriate)
+- [x] Any dependent changes have been merged and published in related repositories
+I've run into an issue where an exception happens after recovery which causes the connection to be closed and no attempt to recover.
+
+As far as I can tell from logs this is what's happening
+
+- `RecoverySucceeded` event raised
+- `ModelShutdown` event raised with close reason 530 NOT_ALLOWED
+- Connection is closed but `ConnectionShutdown` event is not raised
+
+From a quick look over the code it seems like the problem is here:
+
+https://github.com/rabbitmq/rabbitmq-dotnet-client/blob/015c51761deabfebe03e3bff2c4eb4e2ab53a072/projects/client/RabbitMQ.Client/src/client/impl/Connection.cs#L575-L586
+
+There is already a close reason set but there is another exception happening
+
+Here is the full exception taken from `m_shutdownReport`
+
+```
+Unable to read data from the transport connection: An existing connection was forcibly closed by the remote host.
+   at RabbitMQ.Client.Impl.InboundFrame.ReadFrom(NetworkBinaryReader reader)
+   at RabbitMQ.Client.Framing.Impl.Connection.MainLoopIteration()
+   at RabbitMQ.Client.Framing.Impl.Connection.ClosingLoop()
+```
+### Problem
+Creating a new channel in an asynchronous consumer creates new channel on server, but throws timeout exception on client
+
+### Details
+I tried to make a pipeline from multiple queues and ran into a problem that a basic consumer is working, but an asynchronous one is constantly falling with a timeout. It turned out to understand that the problem is in creating a new channel using same connection inside async consumer callback, it hangs when creating. But if you create a channel before the start consuming and pass inside consumer using closure, it works
+
+### How to reproduce
+Send some message to `queue1`, when in `queue1` async consumer try to create new channel (or try lazy initialization/lazy cache - need `connection.CreateModel()` call) and when send using created channel to somewhere else
+
+Example: https://github.com/phema-team/Phema.RabbitMQ/tree/master/examples/Phema.RabbitMQ.RawClient
+
+Client version 6.0.0-pre3, 5.1.0
+Server version 3.7.17
+Exception stack trace
+```csharp
+System.TimeoutException: The operation has timed out.
+   at RabbitMQ.Util.BlockingCell`1.WaitForValue(TimeSpan timeout)
+   at RabbitMQ.Client.Impl.SimpleBlockingRpcContinuation.GetReply(TimeSpan timeout)
+   at RabbitMQ.Client.Impl.ModelBase.ModelRpc(MethodBase method, ContentHeaderBase header, Byte[] body)
+   at RabbitMQ.Client.Framing.Impl.Model._Private_ChannelOpen(String outOfBand)
+   at RabbitMQ.Client.Framing.Impl.AutorecoveringConnection.CreateNonRecoveringModel()
+   at RabbitMQ.Client.Framing.Impl.AutorecoveringConnection.CreateModel()
+   at Phema.RabbitMQ.RawClient.Program.<>c__DisplayClass0_0.<<Main>b__0>d.MoveNext() in C:\Users\Sergey\GitHub\Phema\Phema.RabbitMQ\examples\Phema.RabbitMQ.RawClie
+nt\Program.cs:line 34
+```
+
+###

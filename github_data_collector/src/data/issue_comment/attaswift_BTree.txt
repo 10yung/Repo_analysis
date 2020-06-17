@@ -1,0 +1,125 @@
+
+Thanks for publishing this library.
+
+I have been looking for something like this, including "Relaxed Radix Balanced Trees" (RRB trees), trying to determine precisely how to guarantee O(log n) time for arbitrary sequences of operations that include concatenating two B-trees used to represent integer-indexed arrays.  The challenge seems to be to guarantee that the height/depth of the tree does not exceed O(log n) for an arbitrary sequence of concatenate, split, append, prepend, etc. operations.
+
+Does this library, and/or your book "Optimizing Collections", contain any kind of proof or argument that this is the case?
+
+For example, do you have any kind of invariants on the "shape" of the BTree data structure that is always true, regardless of the sequence of operations that produced them, that guarantee the depth remains at most O(log n)?
+
+Right now half open ranges and closed ranges are supported, but there is no support for getting a fully open range:
+
+(start, end)
+
+or a half open range where the half-open boundary is on the lower end:
+
+(start, end]
+
+I suggest to add methods.
+
+suffix(after: ...)
+
+to BTree (and SortedSet where I need it).
+
+I can help with a MR if wanted.
+This fix suspends BridgedList's countByEnumerating func on Linux.
+Swift's `Collection` protocol has a number of nontrivial semantic constraints that are rather under-documented; one of these is that a collection's `SubSequence` must be a collection that shares indices with the original instance. (The type system is currently not even able to enforce the requirement about `SubSequence` being a collection, or that its index type must be the same as the top-level collection. Presumably, these are going to be fixed, but the requirement about sharing index *values* is unlikely to be ever enforced by the type system.)
+
+Slices of valid collections should have their start index the same as the index of their starting element in the original collection. `BTree` gets this wrong:
+
+```
+let list = List(0 ..< 10)
+print(list[3 ..< 10].startIndex) // ==> 0
+let array = Array(0 ..< 10)
+print(array[3 ..< 10].startIndex) // ==> 3
+```
+
+This means `BTree`'s collection types aren't really collections.
+
+The way to fix this is to replace the custom `SubSequence` typealiases with one of the default Slice types in each. This is a source-breaking change, so it requires a major version bump.
+
+The original BTree slicing behavior (i.e., extracting a separate sub-collection of the same type) will be moved to a family of functions (`list.extract(3..<10)` or `list.sublist(3..<10)` or somesuch).
+
+Now that [SE-0065] moved index manipulation methods into collections, it would be possible to switch to `unowned(unsafe)` references inside `BTreeWeakPath`, probably speeding up indexing considerably. Perhaps even making indexing competitive with iteration.
+
+This requires much more careful index invalidation, so #7 is likely a prerequisite.
+
+[SE-0065]: https://github.com/apple/swift-evolution/blob/master/proposals/0065-collections-move-indices.md
+
+`BTree` implements _order-statistic_ trees, i.e., trees where each node maintains a count of all elements in the subtree under it. This allows offset-based access in logarithmic time, which is highly useful; e.g., we can't have a useful `List` without integer indices, and offset-based access also greatly enhances the usefulness of `SortedSet` and `Map`.
+
+However, maintaining these element counts doesn't come free; they clearly have a performance cost. It would be nice if we had a BTree variant that wasn't augmented, if only to measure how much performance the augmentation costs. If this cost is too large, it might be worthwhile to provide an unaugmented BTree variant.
+
+Furthermore, while counting is probably the most frequently useful tree augmentation, sometimes other statistics are needed. The code that implements the counting augmentation can be generalized to provide quick (log(n)) access to the result of any monoid operation over a sequence of tree elements. Some examples:
+- Counting: this is what we already have. Augmenting the tree with counts allows for efficient retrieval of elements at any offset, enables fast navigation inside the tree, etc.
+  
+  ```
+  count([]) = 0
+  count([_]) = 1
+  count(a + b) = count(a) + count(b)
+  ```
+- Weight: The weight is a variant of counting where each element may have a different weight in the sum. For example, let's say the elements of the tree are themselves collections, and the tree is used to represent a concatenation of its elements. Augmenting the tree using a weight calculated from the sizes of each element enables efficient offset-based access to any element in the concatenated list.
+  
+  ```
+  weight([]) = 0, 
+  weight([e]) = e.weight, 
+  weight(a + b) = weight(a) + weight(b)
+  ```
+- Maximum (or minimum) over some secondary key extracted from the elements. Beyond getting easy access to the element that has the largest/smallest such key, this also gives us an easy way to get the largest/smallest element to the left or right to any other element; this has interesting applications.
+  
+  ```
+  max([]) =  -infinity
+  max([e]) = key(e)
+  max(a + b) = max(max(a), max(b))
+  ```
+- Any combinations of the above and more. We could support interval trees, well-separated point pair decompositions, etc.
+
+Generalizing the existing `BTreeNode` to implement any such monoid-cached tree would be straightforward, but it would probably slow things down even more. So it'd probably be better to do support this in a separate implementation.
+
+You mention that `forEach` is more efficient than a regular `for` loop for `BTree`s, which isn't really ideal. It's true that it's a lot easier to write an efficient `forEach` implementation than to write an efficient iterator, but it's possible to write an efficient iterator! As a proof of concept, here's an improved `BTreeIterator`:
+
+```
+public class BTreeIterator<Key: Comparable, Value>: IteratorProtocol {
+    public typealias Element = (Key, Value)
+    typealias Node = BTreeNode<Key, Value>
+
+    let node: Node
+
+    var iterator: BTreeIterator?
+    var index = -1
+
+    init(root: Node) {
+        node = root
+        incrementChildIterator()
+    }
+
+    private func incrementChildIterator() {
+        index += 1
+        if !node.isLeaf && index < node.children.count {
+            iterator = node.children[index].makeIterator()
+        }
+    }
+
+    public func next() -> Element? {
+        if let childIterator = iterator {
+            if let nextElement = childIterator.next() {
+                return nextElement
+            }
+            else {
+                iterator = nil
+                return next()
+            }
+        }
+        else {
+            guard index < node.elements.count else { return nil }
+
+            defer { incrementChildIterator() }
+            return node.elements[index]
+        }
+    }
+}
+```
+
+My benchmarks show no significant performance difference between `for-in` and `forEach`, now. Let me know what you think!
+
+It would be nice if a native English speaker reviewed the documentation and fixed my bad grammar. Also, I'd love to have a list of places where the existing text does a bad job of explaining the API.

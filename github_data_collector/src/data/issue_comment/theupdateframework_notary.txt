@@ -1,0 +1,124 @@
+I'm working on the notary package for debian:
+
+https://salsa.debian.org/go-team/packages/notary
+
+In Debian unstable lately, we updated the `prometheus/client_golang` package to `v1.x`. This new version removes all deprecated APIs, hence brings several breaking changes, as mentioned in the release note: https://github.com/prometheus/client_golang/releases/tag/v1.0.0
+
+In Debian, we don't build go packages with the vendor tree, instead we use the go libraries as packaged in Debian. In short, it means that for Debian, every packages that depend on `prometheus/client_golang` must now be built against the `v1.x` series.
+
+Right now, building Notary against `prometheus/client_golang` `v1.x` fails as such:
+
+```
+# github.com/theupdateframework/notary/server
+src/github.com/theupdateframework/notary/server/server.go:127:9: undefined: prometheus.InstrumentHandlerWithOpts
+src/github.com/theupdateframework/notary/server/server.go:235:44: undefined: prometheus.Handler
+```
+
+The second failure is actually easy to fix, as far as I can tell. See https://salsa.debian.org/go-team/packages/notary/blob/master/debian/patches/0001-Update-for-latest-prometheus-golang_client.patch.
+
+The first failure, however, seems to require more work. I have too little knowledge of notary or prometheus to fix that myself, so I open an issue here asking for help, if ever anyone has time/interest looking into this issue.
+
+Thanks!
+
+@NightTsarina @onlyjob
+ use go modules to makes dependency version information explicit and easier to manage 
+For private registries, one must be able to provide basic auth creds, via `NOTARY_AUTH` env var or interactively. However, the code assumes that all `readOnly` operations [can be anonymous,](https://github.com/theupdateframework/notary/blob/5b8946ccb2fe7bd7b5a1c893ceb3191d09bf2fad/cmd/notary/tuf.go#L952) which in turn [suppresses sending the auth header.](https://github.com/theupdateframework/notary/blob/5b8946ccb2fe7bd7b5a1c893ceb3191d09bf2fad/cmd/notary/tuf.go#L784-L786)
+
+We discovered this problem because https://github.com/theupdateframework/notary/pull/1315 made lookup a `readOnly` operation, so now `notary lookup` cannot be used with private registries even if `NOTARY_AUTH` is set.
+
+Reverting https://github.com/theupdateframework/notary/commit/ad8b0a720f01574ec7a50cf15032ac24a694e902 fixes the problem for us, though I believe the *real* issue is that `readOnly` is synonymous with "anonymous".
+It would be great if the notary client could be integrated with Hashicorp vault as a storage location for the keys.
+
+Use case:
+
+CI and CD to release docker images runs in different servers and locations. For each repository we need to be able to create the target keys and authorize developers / ci to sign the docker images. As we don't want these root and target keys to live on a developers machine we would like to integrate with Hashicorp Vault so keys can be managed centrally and backups can also be managed in a centralized location.
+I managed to upgrade the codebase to use Go Modules.
+
+In this PR I kept the Go version at 1.12 to not interfere with other PRs I created and to limit the risk of breaking things.
+Folllowing PR should make the image for the cross.Dockerfile available
+
+Running the ./build-image.sh from that PR should create it locally on your machine for testing purposes.
+
+https://github.com/docker/golang-cross/pull/49
+
+Depending on the other PR we might also take out that change for the cross.Dockerfile so this PR doesn't remain open for ages.
+I've had a bit of a nightmare trying to get notary running with certificates on OpenShift.
+
+I tried to use ecdsa keys because that's what's documented in the server-config.json
+```json
+"trust_service": {
+	"type": "remote",
+	"hostname": "notarysigner",
+	"port": "7899",
+	"tls_ca_file": "./root-ca.crt",
+	"key_algorithm": "ecdsa",
+	"tls_client_cert": "./notary-server.crt",
+	"tls_client_key": "./notary-server.key"
+}
+```
+No matter what I did I just got tls: bad certificate logged by the server. I was able to make a connection to the signer using 
+`openssl s_client -connect notary-signer:7899 -CAfile /certs/server/root-ca.crt -cert /certs/server/notary-server.crt -key /certs/server/notary-server.key`
+which showed a successful TLS connection then an error logged by the signer that I hadn't sent a valid http2 preface, which is fair enough!
+
+I suspect this is an issue with the Go TLS library rather than Notary, but it would be really helpful if the example config file used the same key algorithm as the test certificates you generate.
+
+I'm happy to submit a PR for this if somebody can confirm my thinking is correct. I think it'll help people in the future.
+
+There's also the issue that the field is then probably ignored by Notary? It's also not possible to set this field in the signer which doesn't then seem like you can generate ecdsa keys for the signer?
+Running notary on a GUN that contains a port number (e.g. the 443 in docker.io:443/library/ubuntu) on Windows fails because the colon is an invalid character in a directory name:
+
+```
+notary -v -D -s https://notary.docker.io lookup docker.io:443/library/ubuntu 18.04
+[37mDEBU[0m[0000] Configuration file not found, using defaults
+[37mDEBU[0m[0000] Using the following trust directory: C:\Users\d041725\.notary
+
+* fatal: mkdir C:\Users\cfiderer\.notary\tuf\docker.io:443: The directory name is invalid.
+```
+
+This makes it impossible to run the notary client with private registries that use non-standard ports.
+Hello there!
+
+My notary cli version on MacOS 10.14.6 installed via brew:
+
+```
+notary
+ Version:    0.6.1
+ Git commit: d6e1431f
+```
+
+notary-server and notary-signer latest version deployed using the Helm Chart: 
+
+```
+{"level":"info","msg":"Version: 0.6.1, Git commit: d6e1431","time":"2019-12-09T15:36:19Z"}
+{"level":"info","msg":"Using local signing service, which requires ED25519. Ignoring all other trust_service parameters, including keyAlgorithm","time":"2019-12-09T15:36:19Z"}
+{"level":"info","msg":"Using memory backend","time":"2019-12-09T15:36:19Z"}
+{"level":"info","msg":"Starting Server","time":"2019-12-09T15:36:19Z"}
+{"level":"info","msg":"Enabling TLS","time":"2019-12-09T15:36:19Z"}
+{"level":"info","msg":"Starting on :4443","time":"2019-12-09T15:36:19Z"}
+```
+
+While trying to run a `notary init` command with the following flags:
+
+```
+notary -D -p -v -s https://notary-server:4443/ -d ~/.docker/trust --tlscacert root-ca.crt init registry.test/test/alpine
+```
+
+ I've encountered the following error:
+
+```
+* fatal: unable to reach trust server at this time: 301.
+```
+
+Eventhough I could see in the notary-server logs that the request arrived and that the server answered a 200 code:
+
+```json
+{"go.version":"go1.12.8","http.request.contenttype":"multipart/form-data; boundary=baad9b540d8e6c58d34cec3943a601253176422dc145ee7b33e3a617f970","http.request.host":"notary-server:4443","http.request.id":"721e5e16-fc45-44a6-a05e-8c074f003849","http.request.method":"POST","http.request.remoteaddr":"127.0.0.1:54798","http.request.uri":"/v2/registry.test/test/alpine/_trust/tuf/","http.request.useragent":"Go-http-client/1.1","http.response.duration":"78.957661ms","http.response.status":0,"http.response.written":0,"level":"info","msg":"response completed","time":"2019-12-09T15:37:31Z"}
+```
+
+After a day and a half of debugging and redoing everything from scratch several times I've figured out that the problem was **the trailing slash in the notary server url**.
+
+I think that the error message could be improved, i.e. it doesn't say that 301 is an HTTP error code, or even better follow the redirect. Adding (or not) the final slash is an easy error to do and easy to fix code-side.
+
+Could you please consider "sanitizing" the server url? As you know, Notary is a complex beast I the last thing I thought to be doing wrong was that slash, I've even copied and pasted the server URL into a curl command to check and it succeded, of course.
+
+Thanks!

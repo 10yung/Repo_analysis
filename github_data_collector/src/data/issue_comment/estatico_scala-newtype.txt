@@ -1,0 +1,151 @@
+I often wrap newtypes in newtypes and then I want to access the basetype. Example:
+
+```scala
+@newtype case class Secret(value: String)
+@newtype case class Password(value: Secret)
+@newtype case class AdminPassword(value: Password)
+
+val adminPassword: AdminPassword = ???
+
+// Access the basetype
+println(adminPassword.value.value.value)
+```
+
+Something like `adminPassword.coerce[String]` would be nice, or maybe even `adminPassword.underlying`. As `Coercible` is a typeclass, I think with the correct derivation it should be possible to get something like it.
+
+Opinions?
+On Scala 2.13 with `-Xsource:2.14` compiler option, newtype macro gives the following warning 
+```
+Auto-application to `()` is deprecated. Supply the empty argument list `()` explicitly to invoke method hashCode, 
+or remove the empty argument list from its definition (Java-defined methods are exempt).
+In Scala 3, an unapplied method like this will be eta-expanded into a function.
+```
+It makes newtypes unusable with both this option and `-Xfatal-warnings` enabled
+Initial attempt at implementation of #46 - I have checked and this seems to work as it should, but sadly usage of another value class to introduce allocation-less name-based extractor introduces an usage limitation for macro annotations - it's impossible to declare a value class inside of another class and sadly, test suite classes are one of potential use cases like that. Frankly, I have no idea how and if this can be circumvented but maybe some other soul can find a way to solve this riddle.
+
+Tests fail, obviously, as macro annotations now won't compile with `unapply = true` when declared inside of a class.
+There's a little less known pattern allowing for high-performance no-allocation `unapply` method construction. It's described in [this blogpost by Heiko Seeberger](https://hseeberger.wordpress.com/2013/10/04/name-based-extractors-in-scala-2-11/). 
+
+Do you think it would be possible to actually generate sensible name-based extractors in your macros?
+The README.md compares this library to Haskell's `newtype` and to Tagged types. However, more crucially, it doesn't mention how this is any different/better than simply using `case class Thing(value: String) extends AnyVal`.
+
+From my understand this is an alternative to `extends AnyVal`, hence this info is crucial.
+There are use cases when the generation of the `Coercible` instances is not required. One example might be when using `@newtype` annotation in the internal implementation of a library without bringing a runtime dependency on the `Coercible` type to the users of the latter. A possible way could be to add another flag like the ones in [here](https://github.com/estatico/scala-newtype/blob/master/shared/src/main/scala/io/estatico/newtype/macros/newtype.scala#L5) to drive select this behaviour. Something like `coercible: Boolean = true`. Thanks.
+
+version 0.4.2.
+
+```scala
+object Test {
+  @newsubtype case class VectorPointer(addr: Long)
+ }
+
+scala> new Array[Test.VectorPointer](10)
+<console>:12: error: cannot find class tag for element type Test.VectorPointer
+       new Array[Test.VectorPointer](10)
+```
+
+
+The current encoding allows for some unsafe type ascriptions. While this would basically never happen in a real world scenario, we should still look into improving the encoding.
+
+Here's an example of the problem. I've abridged the debug output for simplicity.
+
+```scala
+scala> @newtype(debug = true) case class Foo(x: String)
+Expanded @newtype Foo:
+{
+  type Foo = Foo.Type;
+  abstract trait Foo$Types extends scala.AnyRef {
+    type Repr = String;
+    type Base = _root_.scala.Any { type Foo$newtype };
+    abstract trait Tag extends _root_.scala.Any;
+    type Type <: Base with Tag
+  };
+  object Foo extends scala.AnyRef with Foo$Types { .. }
+}
+defined type alias Foo
+defined trait Foo$Types
+defined object Foo
+
+scala> Foo("a"): Foo.Tag
+java.lang.ClassCastException: java.lang.String cannot be cast to Foo$Types$Tag
+```
+
+The main reason for the `Tag` trait is to anchor the companion so it's in the implicit search path. I've been experimenting with refinements to see if that could help but so far I've been unable to get implicit resolution working without it.
+Currently, for newtypes we generate a `Coercible[O, N]` instance where `O` is the original type and `N` is the newtype. While this is perfectly fine, we go a step further and generate a `Coercible[F[O], F[N]]` instance for _any_ `F[_]`. This is where we get into trouble. There are cases where this shouldn't be permitted due to the nature of the data structure we're dealing with. For example, let's look at how this would work with [dogs.Set](https://github.com/stew/dogs/blob/5f4f178e55d0920d0be3c8a13956aff2ef8c02fe/core/src/main/scala/dogs/Set.scala) which relies on an implicit `Order` instance for its operations - 
+
+```scala
+import cats.instances.int._
+import cats.Order
+import io.estatico.newtype.ops._
+import io.estatico.newtype.macros.newtype
+
+// Like Int except ordered in reverse.
+@newtype case class RevInt(value: Int)
+object RevInt {
+  implicit val order: Order[RevInt] =
+    Order.from((x, y) => -Order[Int].compare(x.value, y.value))
+}
+
+// Build a dogs.Set[Int]
+println(dogs.Set(1, 2, 3))
+// Set(1,2,3)
+
+// Build a dogs.Set[RevInt]
+println(dogs.Set(RevInt(1), RevInt(2), RevInt(3)))
+// Set(3,2,1)
+
+// Build a dogs.Set[Int], coerce it to dogs.Set[RevInt], and add an element
+println(dogs.Set(1, 2).coerce[dogs.Set[RevInt]] + RevInt(3))
+// Set(3,1,2)
+```
+
+One quick and dirty way to deal with this would be to introduce type roles via a type class.
+
+```scala
+trait TypeRole[A] {
+  type Role
+}
+
+object TypeRole {
+
+  def mk[A, R]: TypeRole[A] { type Role = R } =
+    _instance.asInstanceOf[TypeRole[A] { type Role = R }]
+
+  private val _instance = new TypeRole[Nothing] {}
+
+  type Nominal[A] = TypeRole[A] { type Role = types.Nominal }
+  type Representational[A] = TypeRole[A] { type Role = types.Representational }
+
+  object types {
+    sealed trait Representational
+    sealed trait Nominal
+  }
+}
+```
+
+Then we'd define this Coercible instance based on the type role -
+
+```scala
+implicit def reprF[F[_], A, B](
+  implicit ev: TypeRole.Representational[F[A]]
+): Coercible[F[A], F[B]] = Coercible.unsafe
+```
+
+We then need to define type role instances -
+
+```scala
+implicit def typeRoleScalaSet[A]: TypeRole.Representational[Set[A]] = TypeRole.mk
+
+implicit def typeRoleDogSet[A]: TypeRole.Nominal[Set[A]] = TypeRole.mk
+
+// Compiles
+println(Set(1, 2, 3).coerce[Set[RevInt]])
+// Set(1, 2, 3)
+
+// Does not compile now
+println(dogs.Set(1, 2, 3).coerce[dogs.Set[RevInt]])
+```
+
+See -
+* https://ghc.haskell.org/trac/ghc/wiki/Roles
+* https://stackoverflow.com/questions/49209788/simplest-examples-demonstrating-the-need-for-nominal-type-role-in-haskell

@@ -1,0 +1,329 @@
+**API Platform version(s) affected**: 2.5.4
+
+**Description**  
+Following the docs on how to implement [cursor based pagination](https://api-platform.com/docs/core/pagination/#cursor-based-pagination) throws
+`Warning: Illegal string offset 'direction'`
+
+**How to reproduce**  Add the following annotations to an entity:
+`
+/**
+ * @ApiResource(attributes={
+ *   "pagination_partial"=true,
+ *   "pagination_via_cursor"={"field"="id", "direction"="DESC"}
+ * )
+ * @ApiFilter(RangeFilter::class, properties={"id"})
+ * @ApiFilter(OrderFilter::class, properties={"id"="DESC"})
+ */
+`
+
+**Possible Solution**  
+I think this bug comes from [PartialCollectionViewNormalizer](https://github.com/api-platform/core/blob/e8effc74ec97261545bfca145f837607e1898134/src/Hydra/Serializer/PartialCollectionViewNormalizer.php#L150) (line 155, 160 & 161). Instead of `$field['direction']` and `$field['field']` it should be `$fields['...']`
+
+| Q             | A
+| ------------- | ---
+| Bug fix?      | no
+| New feature?  | yes
+| BC breaks?    | no
+| Deprecations? | no
+| Tickets       | -
+| License       | MIT
+| Doc PR        | -
+
+When having many validation groups generators for resources, you need to make every generator as a public service, and this doesn't work with `_instanceof` configuration where you could add a custom marker and make those services public, because symfony doesn't detect that those services are used and removes from container.
+
+This adds `ApiPlatform\Core\Validator\ValidationGroupsGeneratorInterface` so apps can leverage the autoconfiguration + autowiring of those generators. Generators are collected and registered in a custom service locator, but consumers won't need anymore any configuration for them if will implement the interface. For not breaking backwards compatibility left the full service container as a fallback.
+
+TODO:
+- [ ] Add more tests if needed?
+- [ ] Make docs PR
+
+**API Platform version(s) affected: 2.5.4**
+
+I have the given resource entities "Account", "Group" and "AccountGroup".
+AccountGroup contains a referenceId so an account can be part of a group with a specific reference.
+
+Account has a 
+
+```php
+    /**
+     * @var Collection<AccountGroup> List of account group connections
+     *
+     * @ORM\OneToMany(targetEntity="App\Entity\AccountGroup", mappedBy="account", cascade={"persist", "remove"})
+     *
+     * @Groups({"account:output", "item_query", "elastica"})
+     * @ApiSubresource()
+     *
+     */
+    protected $groups;
+```
+
+For various reasons i also have an assignGroups property that is not an ORM field, but a logic field i validate inside the persister to check permissions and add the groups one by one
+
+```php
+    /**
+     * @var Collection<AccountGroup> List of new account groups to set
+     *
+     * @Groups({"assign-groups:input"})
+     *
+     * @Audit\Ignore
+     */
+    protected $assignGroups;
+```
+
+As you can see they both have different @Groups annotations, so i was not really worried.
+
+Everything works fine, except when i enable the `mercure=true` flag on Account, i now get this issue:
+
+```php
+1) App\Tests\Api\Rest\Account\AccountItemTest::testUpdateAccountSuccess
+ApiPlatform\Core\Exception\InvalidArgumentException: Unable to generate an IRI for "App\Entity\AccountGroup".
+
+/var/www/html/vendor/api-platform/core/src/Bridge/Symfony/Routing/IriConverter.php:155
+/var/www/html/vendor/api-platform/core/src/Bridge/Symfony/Routing/IriConverter.php:128
+/var/www/html/vendor/api-platform/core/src/Serializer/AbstractItemNormalizer.php:609
+/var/www/html/vendor/api-platform/core/src/Serializer/AbstractItemNormalizer.php:578
+/var/www/html/vendor/api-platform/core/src/Serializer/AbstractItemNormalizer.php:534
+/var/www/html/vendor/symfony/serializer/Normalizer/AbstractObjectNormalizer.php:183
+/var/www/html/vendor/api-platform/core/src/Serializer/AbstractItemNormalizer.php:151
+/var/www/html/vendor/api-platform/core/src/JsonLd/Serializer/ItemNormalizer.php:80
+/var/www/html/vendor/symfony/serializer/Serializer.php:152
+/var/www/html/vendor/symfony/serializer/Serializer.php:125
+/var/www/html/vendor/api-platform/core/src/Bridge/Doctrine/EventListener/PublishMercureUpdatesListener.php:180
+/var/www/html/vendor/api-platform/core/src/Bridge/Doctrine/EventListener/PublishMercureUpdatesListener.php:103
+/var/www/html/vendor/symfony/doctrine-bridge/ContainerAwareEventManager.php:58
+/var/www/html/vendor/doctrine/orm/lib/Doctrine/ORM/UnitOfWork.php:3412
+/var/www/html/vendor/doctrine/orm/lib/Doctrine/ORM/UnitOfWork.php:444
+/var/www/html/vendor/doctrine/orm/lib/Doctrine/ORM/EntityManager.php:368
+/var/www/html/src/DataPersister/BaseDataPersister.php:59
+/var/www/html/src/Service/BaseService.php:37
+/var/www/html/tests/AppApiTestCase.php:201
+/var/www/html/tests/AppApiTestCase.php:104
+/var/www/html/tests/Api/Rest/Account/AccountItemTest.php:28
+
+Caused by
+Symfony\Component\Routing\Exception\InvalidParameterException: Parameter "id" for route "api_account_groups_get_item" must match "[^/\.]++" ("" given) to generate a corresponding URL.
+```
+
+The reason for this is that the `$accountGroups` contains a list of entities that is not persisted, and also should not be persisted at all, but it seems like the Mercure Publisher does not care about the serialization groups at for the given context?
+
+I solved it easily by setting `$account->setAssignGroups(new ArrayCollection());` before `$entityManager->persist()`.
+
+Because of this "simple" solution, that took me some hours to figure out, i am not really sure if this is a design issue with Mercure Publisher, API Platform persisting logic or my code in general.
+
+My main question is, as `assignGroups` was not designed for output at all, why is it being triggered by Mercure Publisher? I would assume that the Mercure Publisher would only care about the query item get normalization context when serializing and not all fields?
+
+Here is my normalization context just in case
+
+```php
+ *     itemOperations={
+ *         "get"={
+ *              "security"="is_granted('VIEW', object)",
+ *              "normalization_context"=Account::API_READ
+ *          },
+
+...
+
+    // Normalization groups
+    const API_READ = [
+        'groups' => ['lifecycle', 'account:output']
+    ];
+```
+**API Platform version(s) affected**: 2.5.4 (2.5.3 is not affected)
+
+**Description** / **How to reproduce**  
+When using this property in an ApiResource
+
+```php
+    /**
+     * @var self
+     */
+    public $foo;
+```
+
+.. I get the error "Class elf does not exist" on api docs.
+
+**Additional Context**  
+
+<img width="803" alt="Screenshot 2020-01-15 14 52 23" src="https://user-images.githubusercontent.com/330436/72439144-a6c13480-37a6-11ea-9b19-7eca9e4f4ad9.png">
+
+**API Platform version(s) affected**: 2.5.4
+
+**Description**  
+When I upgrade api-platform/core 2.5.3 to 2.5.4 I have the following problem on api docs: "There is no PropertyInfo extractor supporting the class "DateInterval"."
+
+**How to reproduce**  
+I think we just have to put a property with a DateInterval in an exposed entity and it will reproduce the problem. 
+
+**Possible Solution**  
+No idea
+
+**Additional Context**  
+
+```
+ApiPlatform\Core\Exception\RuntimeException:
+There is no PropertyInfo extractor supporting the class "DateInterval".
+
+  at vendor/api-platform/core/src/Bridge/Symfony/PropertyInfo/Metadata/Property/PropertyInfoPropertyNameCollectionFactory.php:46
+  at ApiPlatform\Core\Bridge\Symfony\PropertyInfo\Metadata\Property\PropertyInfoPropertyNameCollectionFactory->create('DateInterval', array())
+     (vendor/api-platform/core/src/Metadata/Property/Factory/InheritedPropertyNameCollectionFactory.php:44)
+  at ApiPlatform\Core\Metadata\Property\Factory\InheritedPropertyNameCollectionFactory->create('DateInterval', array())
+     (vendor/api-platform/core/src/Metadata/Property/Factory/ExtractorPropertyNameCollectionFactory.php:50)
+  at ApiPlatform\Core\Metadata\Property\Factory\ExtractorPropertyNameCollectionFactory->create('DateInterval', array())
+     (vendor/api-platform/core/src/Metadata/Property/Factory/ExtractorPropertyNameCollectionFactory.php:50)
+  at ApiPlatform\Core\Metadata\Property\Factory\ExtractorPropertyNameCollectionFactory->create('DateInterval', array())
+     (vendor/api-platform/core/src/Metadata/Property/Factory/CachedPropertyNameCollectionFactory.php:47)
+  at ApiPlatform\Core\Metadata\Property\Factory\CachedPropertyNameCollectionFactory->ApiPlatform\Core\Metadata\Property\Factory\{closure}()
+     (vendor/api-platform/core/src/Cache/CachedTrait.php:44)
+  at ApiPlatform\Core\Metadata\Property\Factory\CachedPropertyNameCollectionFactory->getCached('property_name_collection_3bf8de46e9d114c9746a5da4376c201b', object(Closure))
+     (vendor/api-platform/core/src/Metadata/Property/Factory/CachedPropertyNameCollectionFactory.php:48)
+  at ApiPlatform\Core\Metadata\Property\Factory\CachedPropertyNameCollectionFactory->create('DateInterval', array())
+     (vendor/api-platform/core/src/JsonSchema/SchemaFactory.php:135)
+  at ApiPlatform\Core\JsonSchema\SchemaFactory->buildSchema('DateInterval', 'json', 'output', null, null, object(Schema), array(), false)
+     (vendor/api-platform/core/src/Hydra/JsonSchema/SchemaFactory.php:52)
+  at ApiPlatform\Core\Hydra\JsonSchema\SchemaFactory->buildSchema('DateInterval', 'json', 'output', null, null, object(Schema), array())
+     (vendor/api-platform/core/src/JsonSchema/TypeFactory.php:118)
+  at ApiPlatform\Core\JsonSchema\TypeFactory->getClassType('DateInterval', 'json', null, array(), object(Schema))
+     (vendor/api-platform/core/src/JsonSchema/TypeFactory.php:69)
+  at ApiPlatform\Core\JsonSchema\TypeFactory->getType(object(Type), 'json', null, array(), object(Schema))
+     (vendor/api-platform/core/src/JsonSchema/SchemaFactory.php:199)
+  at ApiPlatform\Core\JsonSchema\SchemaFactory->buildPropertySchema(object(Schema), 'Warehouse', 'operationTime', object(PropertyMetadata), array(), 'json')
+     (vendor/api-platform/core/src/JsonSchema/SchemaFactory.php:146)
+  at ApiPlatform\Core\JsonSchema\SchemaFactory->buildSchema('App\\Domain\\TourBuilding\\Model\\Entity\\Warehouse\\Warehouse', 'json', 'output', 'item', 'get', object(Schema), array(), false)
+     (vendor/api-platform/core/src/Hydra/JsonSchema/SchemaFactory.php:52)
+  at ApiPlatform\Core\Hydra\JsonSchema\SchemaFactory->buildSchema('App\\Domain\\TourBuilding\\Model\\Entity\\Warehouse\\Warehouse', 'json', 'output', 'item', 'get', object(Schema), null, false)
+     (vendor/api-platform/core/src/Swagger/Serializer/DocumentationNormalizer.php:597)
+  at ApiPlatform\Core\Swagger\Serializer\DocumentationNormalizer->getJsonSchema(false, object(ArrayObject), 'App\\Domain\\TourBuilding\\Model\\Entity\\Warehouse\\Warehouse', 'output', 'item', 'get', 'json', null, false)
+     (vendor/api-platform/core/src/Swagger/Serializer/DocumentationNormalizer.php:294)
+  at ApiPlatform\Core\Swagger\Serializer\DocumentationNormalizer->addSchemas(false, array('description' => 'Warehouse resource response'), object(ArrayObject), 'App\\Domain\\TourBuilding\\Model\\Entity\\Warehouse\\Warehouse', 'item', 'get', array('application/ld+json' => 'jsonld', 'application/json' => 'json', 'text/html' => 'html'))
+     (vendor/api-platform/core/src/Swagger/Serializer/DocumentationNormalizer.php:343)
+  at ApiPlatform\Core\Swagger\Serializer\DocumentationNormalizer->updateGetOperation(false, object(ArrayObject), array('application/ld+json' => 'jsonld', 'application/json' => 'json', 'text/html' => 'html'), 'item', object(ResourceMetadata), 'App\\Domain\\TourBuilding\\Model\\Entity\\Warehouse\\Warehouse', 'Warehouse', 'get', object(ArrayObject))
+     (vendor/api-platform/core/src/Swagger/Serializer/DocumentationNormalizer.php:273)
+  at ApiPlatform\Core\Swagger\Serializer\DocumentationNormalizer->getPathOperation(false, 'get', array('method' => 'GET', 'input_formats' => array('jsonld' => array('application/ld+json'), 'json' => array('application/json'), 'html' => array('text/html')), 'output_formats' => array('jsonld' => array('application/ld+json'), 'json' => array('application/json'), 'html' => array('text/html'))), 'GET', 'item', 'App\\Domain\\TourBuilding\\Model\\Entity\\Warehouse\\Warehouse', object(ResourceMetadata), object(ArrayObject), object(ArrayObject))
+     (vendor/api-platform/core/src/Swagger/Serializer/DocumentationNormalizer.php:222)
+  at ApiPlatform\Core\Swagger\Serializer\DocumentationNormalizer->addPaths(false, object(ArrayObject), object(ArrayObject), 'App\\Domain\\TourBuilding\\Model\\Entity\\Warehouse\\Warehouse', 'Warehouse', object(ResourceMetadata), 'item', object(ArrayObject))
+     (vendor/api-platform/core/src/Swagger/Serializer/DocumentationNormalizer.php:187)
+  at ApiPlatform\Core\Swagger\Serializer\DocumentationNormalizer->normalize(object(Documentation), 'json', array('spec_version' => 2))
+     (vendor/api-platform/core/src/Swagger/Serializer/ApiGatewayNormalizer.php:51)
+  at ApiPlatform\Core\Swagger\Serializer\ApiGatewayNormalizer->normalize(object(Documentation), 'json', array('spec_version' => 2))
+     (vendor/symfony/serializer/Serializer.php:152)
+  at Symfony\Component\Serializer\Serializer->normalize(object(Documentation), 'json', array('spec_version' => 2))
+     (vendor/api-platform/core/src/Bridge/Symfony/Bundle/Action/SwaggerUiAction.php:142)
+  at ApiPlatform\Core\Bridge\Symfony\Bundle\Action\SwaggerUiAction->getContext(object(Request), object(Documentation))
+     (vendor/api-platform/core/src/Bridge/Symfony/Bundle/Action/SwaggerUiAction.php:116)
+  at ApiPlatform\Core\Bridge\Symfony\Bundle\Action\SwaggerUiAction->__invoke(object(Request))
+     (vendor/symfony/http-kernel/HttpKernel.php:146)
+  at Symfony\Component\HttpKernel\HttpKernel->handleRaw(object(Request), 1)
+     (vendor/symfony/http-kernel/HttpKernel.php:68)
+  at Symfony\Component\HttpKernel\HttpKernel->handle(object(Request), 1, true)
+     (vendor/symfony/http-kernel/Kernel.php:201)
+  at Symfony\Component\HttpKernel\Kernel->handle(object(Request))
+     (public/index.php:27)
+```
+<!-- Please update this template with something that matches your PR -->
+| Q             | A
+| ------------- | ---
+| Bug fix?      | no (performance)
+| New feature?  | hmm (performance)
+| BC breaks?    | no
+| Deprecations? | no
+| Tickets       | fixes #3316 
+| License       | MIT
+| Doc PR        | 
+
+The code of getAllowedAttributes is quite heavy and relate on a lot of micro cache, despite being a medium hot path.
+
+Just add a local cache on it, but this is a draft. The cache key only relates on `$options` that I don't think is enough. Relates on `$context` isn't possible because of `$context['cache_Key']`. Should I just remove it and pass ĉontext ?
+
+![image](https://user-images.githubusercontent.com/84887/72207881-05cc3400-349d-11ea-97e0-d6fc18dabd3a.png)
+
+Hi,
+
+I use api-platform with pomm and I upgrade package : https://github.com/pomm-project/pomm-api-platform/pull/9.
+
+I'm writing a persister but I have a problem. In fact, the function ```getResourceClass``` of ```ResourceClassResolver``` exclude values ```\Traversable```. 
+
+Why?
+
+The pomm object implements this interface.
+
+
+
+ 
+**Description**  
+When  `accept: application/json` why we can't have simple id ? Iri should be used only on application/ld+json ?
+
+In AbstractItemNormalizer::normalizeRelation we could return identifier(s) instead of iri on `'json' === $format` ?
+
+**Example**  
+JSON (now)
+```json
+[
+  {
+    "id": "Pair-1",
+    "driver": "/api/drivers/Driver-1",
+    "vehicle": "/api/vehicles/Vehicle-1"
+  },
+ ...
+]
+```
+JSON (proposition)
+```json
+[
+  {
+    "id": "Pair-1",
+    "driver": "Driver-1",
+    "vehicle": "Vehicle-1"
+  },
+ ...
+]
+```
+JSONLD
+```json
+{
+  "@context": "/api/contexts/Pair",
+  "@id": "/api/pairs",
+  "@type": "hydra:Collection",
+  "hydra:member": [
+    {
+      "@id": "/api/pairs/Pair-1",
+      "@type": "Pair",
+      "id": "Pair-1",
+      "driver": "/api/drivers/Driver-1",
+      "vehicle": "/api/vehicles/Vehicle-1"
+    },
+    ...
+  ],
+  ...
+}
+```
+
+The service definition in https://github.com/api-platform/core/blob/master/src/Bridge/Symfony/Bundle/Resources/config/swagger.xml differs from constructor, so the YAML exporter is not recognizing the swaggerVersions at the moment. And only if defaultContext is the last one we can change it. Please change the file. Thanks
+
+| Q             | A
+| ------------- | ---
+| Bug fix?      | yes
+| New feature?  | no
+| BC breaks?    | no
+| Deprecations? | no
+| Tickets       | no
+| License       | MIT
+| Doc PR        | api-platform/docs#...
+
+The service definition in https://github.com/api-platform/core/blob/master/src/Bridge/Symfony/Bundle/Resources/config/swagger.xml differs from constructor, so the YAML exporter is not recognizing the swaggerVersions at the moment. And only if defaultContext is the last one we can change it.
+Given
+
+```
+api_platform:
+    formats:
+        json:
+            - application/json
+```
+
+and a request with `Accept: application/json;key=value`, i get
+
+```
+Requested format "application/json;key=val" is not supported.
+Supported MIME types are "application/json".
+```
+
+It feels like a bug, as it forces me to configure each possible mimetype variant, whereas all are `application/json` really.

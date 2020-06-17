@@ -1,0 +1,222 @@
+Currently in `ReactComponent` we have override methods  for `componentWillUpdate`,`shouldComponentUpdate` `componentDidUpdate`, `componentWillReceiveProps`  just to  get `scala props/state` from wrapper `JSProps/JSState`
+
+```scala
+ class ReactComponent extends .. {
+   @JSName("sComponentWillUpdate")
+  def componentWillUpdate(nextProps: P, nextState: S): Unit = ()
+
+  @JSName("componentWillUpdate")
+  override def jsComponentWillUpdate(nextProps: Props,
+                                     nextState: State): Unit = {
+    componentWillUpdate(nextProps.sprops, nextState.sstate)
+  }
+
+  @JSName("sShouldComponentUpdate")
+  def shouldComponentUpdate(nextProps: P, nextState: S): Boolean = true
+
+  @JSName("shouldComponentUpdate")
+  override def jsShouldComponentUpdate(nextProps: Props,
+                                       nextState: State): Boolean = {
+    shouldComponentUpdate(nextProps.sprops, nextState.sstate)
+  }
+
+  @JSName("sComponentDidUpdate")
+  def componentDidUpdate(prevProps: P, prevState: S): Unit = ()
+
+  @JSName("componentDidUpdate")
+  override def jsComponentDidUpdate(prevProps: Props, prevState: State): Unit = {
+    componentDidUpdate(prevProps.sprops, prevState.sstate)
+  }
+
+  @JSName("sComponentWillReceiveProps")
+  def componentWillReceiveProps(nextProps: P): Unit = ()
+
+  @JSName("componentWillReceiveProps")
+  override def jsComponentWillReceiveProps(nextProps: Props): Unit = {
+    componentWillReceiveProps(nextProps.sprops)
+  }
+
+}
+```
+
+When ever a component updated via `setState` they will be called. even though implementation is just unit `()` we still paying method call! and user component should annotate method with `  @JSName("sShouldComponentUpdate"), etc`  how about removing this overrides ? 
+
+***Current*** User Component with overrides of `sComponetX`
+
+```scala
+
+class HeaderComponent extends ReactComponent {
+
+    @JSName("sShouldComponentUpdate")
+  override def shouldComponentUpdate(nextProps: P,
+                                       nextState: S): Boolean = {
+   (nexProps ne props) && (nextState ne state)
+  }
+
+}
+```
+
+***New*** after removing overrides from ReactComponent 
+
+```scala
+
+class HeaderComponent extends ReactComponent {
+
+  override def shouldComponentUpdate(nextJSProps: JSProps[P],
+                                       nextJSState: JSState[S]): Boolean = {
+ (nextJSProps.sprops ne props) && (nextJSState.sstate ne state)
+  }
+
+```
+
+this way we can eliminate extra method calls , and no `JSName` annotations required,  but user  should call `.sprops/.sstate` when they need scala props/state.
+***Current Approach*** 
+
+```scala
+case class WebStyle(name: String) {
+  def :=(v: String | Double) = new WebStylePair(name, v)
+}
+
+class WebStylePair(val name: String, val value: Any)
+
+trait WebStyleAttrs {
+  final val/lazy val opacity = new WebStyle("opacity")
+  object flexDirection extends WebStyle("flexDirection") {
+    @inline final def column = this := "column"
+    @inline final def columnReverse = this := "column-reverse"
+    @inline final def row = this := "row"
+    @inline final def rowReverse = this := "row-reverse"
+  }
+ ...  more
+}
+
+trait WebStyleSheet extends WebStyleAttrs {
+
+
+  /** if duplicate attrs found then last one wins */
+  @inline def styleE(maps: js.Dictionary[Any]*)(v: WebStylePair*) = {
+    maps.fold(js.Dictionary.empty[Any])((d1, d2) => d1.++(d2).toJSDictionary)
+      .++(style(v: _*))
+      .toJSDictionary
+  }
+
+  @inline def style(v: WebStylePair*): js.Dictionary[Any] = {
+    val p = js.Dictionary.empty[Any]
+    v.foreach(t => p.update(t.name, t.value))
+    p
+  }
+
+}
+
+```
+
+***New Proposal:*** 
+
+```scala
+@ScalaJSDefined
+ trait WebStyles  extends js.Object { 
+  var opracity: js.UndefOr[String | Int] = js.undefined
+  var flexDirection : js.UndefOr[String] = js.undefined
+  ....
+ 
+}
+
+trait WebStyleSheet extends WebStyleAttrs {
+  /** if duplicate attrs found then last one wins */
+  @inline def styleE(maps: js.Dictionary[Any]*) = {
+    maps.fold(js.Dictionary.empty[Any])((d1, d2) => d1.++(d2).toJSDictionary)
+      .toJSDictionary
+  }
+}
+```
+
+***Pros*** : 
+1)no runtime overhead 
+2)easy to define and maintain 
+
+***Cons*** : 
+1)we loose little convenience in defining enum attributes for example in previous system `flexDirection.column` now `flexDirection = "column"`
+
+currently its 60k LOC(inline +noinline) (generated) , each tag defined like .. 
+
+```scala
+     
+ @inline
+ def caption(
+  tabIndex: U[Int] = undefined,
+is: U[String] = undefined,
+classID: U[String] = undefined,
+contentEditable: U[String] = undefined,
+role: U[String] = undefined,
+style: U[js.Any] = undefined,
+hidden: U[Boolean] = undefined,
+ref: U[(_ <: dom.html.Element) => _] = undefined,
+key: U[String | Int] = undefined,
+dir: U[String] = undefined,
+id: U[String] = undefined,
+.. many more
+  @exclude extraAttributes: U[js.Object] = undefined)(children: ReactNode*) : ReactElement  = {
+      val props = FunctionMacro()
+    if(extraAttributes.isDefined && extraAttributes != null) addJsObjects(props,extraAttributes.get)
+    if (developmentMode) React.createElement("caption",props,children :_*)
+    else inlineReactElement("caption",props,children :_*)
+ }
+```
+In above code we used macro to create js.Object from method params which expands to bunch of updateDynamic calls and we have `extrraAttributes` for unknown props at compile time which will add extra execution time while combing objects ,i think with new `@ScalaJSDefined trait` changes came in scala.js 0.6.14 we can make it better! 
+
+***New Proposal :*** 
+
+lets have a global trait with all dom attributes 
+
+```scala
+@ScalaJSDefined
+trait DOMProps extends js.Object {
+var  tabIndex: U[Int] = undefined,
+ var is: U[String] = undefined,
+var classID: U[String] = undefined,
+var contentEditable: U[String] = undefined,
+var role: U[String] = undefined,
+var style: U[js.Any] = undefined,
+......
+}
+
+def caption(props:DOMProps)(children:ReactNode*) = React.createElement("caption",props,children:_*)
+
+//call site 
+caption(new DOMProps { id = "hello" ; tabIndex = 2})(children)
+```
+
+***Pros*** : 
+1)we can have type safe DOM tags under 500LOC instead of 30K LOC before
+2)no need of macros 
+3)no extra run time cost
+
+***Cons*** : 
+1)we need some extra typing `new DOM Props{` at call site , but i think its not a big deal 
+
+Hi,
+      Till now sri is under single owner,its definitely not scalable option in long run , lets distribute owner ship(maintenance & publishing).  from now onwards all future work will be done under https://github.com/scalajs-react-interface. as we're moving to more stable place lets make architecture changes and breaking changes now!.
+
+### Separate Project for each module : 
+
+***Core*** : react core types and component/element construction helpers/factories.
+
+***Universal*** : Components and API's that will work across multiple platform (web,ios,android,macos,windows)  
+
+***Relay*** : react-relay
+
+***Web***:  ReactDOM and html tags,svg tags etc
+
+***Mobile*** : react-native
+
+***Other Platforms***..
+
+by having separate project we can iterate rapidly, for example if @dispalt  want some change in relay and @nafg want some change in web, they can make their changes in isolation and publish it without worrying about other projects ..
+
+Is there any way to debug the Scala.js code in Chrome when running in the react-native in the iOS Simulator (or anyhow else), I'm only able to debug using the generated index.ios.js :-(?
+
+I see that the project is depending heavily on npm packages and dependencies as well as sbt. It would be easier to use if only sbt was required to build and use the library.
+
+Do you think that is possible? All dependencies from npm/bower is possible to find/import to webjars.org and get from sbt.
+
+[ScalaJS-React](https://github.com/japgolly/scalajs-react) is already pretty complete, and I think it'd be great if there weren't yet another way to write Scala.js + React. Is it possible to use ScalaJS-React instead of rolling your own facade?

@@ -1,0 +1,51 @@
+This PR is a follow-up of #174 and it solves issue with anonymous class string. It doesn't avoid calling `to_s` completely, but only calls `to_s` when `allowed_classes` contains a string like `#<Class:0xXXXXXX>`.
+Hi - I'm developing an events API for my Rails app and I'm conflicted between these three choices. I've read their READMEs but I don't know what's the right choice for me. Any suggestions?
+Sorry for the confusion; I'm switching branches on this PR with this new approach, so I'm closing my old PR and opening this one.
+
+This approach still fails in one case - when you call `to_s` on an anonymous class, you get a name like `<Class:xxxxxx>`. I'm not aware of a safe / sane way to reify an object from that string. The API currently supports passing in those strings in the publisher, but this breaks that ability.
+
+Any ideas?
+Recently while chasing down some database performance bottlenecks in my application, I noticed a fairly significant amount of time being spent broadcasting events created by wisper-activerecord. It turns out that the underlying issue concerns wisper itself...
+
+My application involves subscribing to a number of classes, each along the lines of 
+
+```ruby
+MyPublisher.subscribe(my_listener)
+```
+
+where the publisher is an activerecord model. Wisper handles these cases by instantiating an `ObjectRegistration` for each listener and adding each one to a set of `global_registrations` that are stored in the `GlobalListener` class and accessible by all publishers.
+
+When `broadcast` is called on an activerecord instance, e.g. in one of the AR callbacks defined by wisper-activerecord, a method of the same name is called on all registrations accessible by the model, which in my case are all `global_registrations` (I have no instance-level `local_registrations` or `temporary_registrations`). That method involves first testing those registrations to see whether the specified event should be broadcast:
+```ruby
+def broadcast(event, publisher, *args)
+  method_to_call = map_event_to_method(event)
+  if should_broadcast?(event) && listener.respond_to?(method_to_call) && publisher_in_scope?(publisher)
+    broadcaster.broadcast(listener, publisher, method_to_call, args)
+  end
+end
+```
+Even though the callback is triggered by a CRUD event on a single AR record of known class, this test is performed for every global_registration created for every AR publisher class. In my case I have around 20 publisher classes and each one has multiple listeners, so the total number of `global_registrations` to be tested each time is potentially of the order of 100.
+
+The computational cost of this process is dominated by the method `publisher_in_scope?` :
+```ruby
+def publisher_in_scope?(publisher)
+  allowed_classes.empty? || publisher.class.ancestors.any? { |ancestor| allowed_classes.include?(ancestor.to_s) }
+end
+```
+When used in the context of wisper-activerecord, `publisher.class.ancestors` includes all of the modules included in ActiveRecord::Base and its parent classes. In my case that amounts to 80+ items.
+
+Because of a particular pressing need I had to eliminate unnecessary computation, the approach I took to address this situation involved:
+1. creating a new set of class-specific registrations represented by the class instance variable `@class_registrations` and overriding the class-level `subscribe` method to add registrations to this new set rather than to `global_registrations`. This significantly reduces the number of registrations that need to be tested each time an event is broadcast. The new definitions are wrapped in a `Publisher` module that I include into my AR models instead of `Wisper.model`.
+2. overriding `Wisper::ObjectRegistration#publisher_in_scope?` to eliminate the testing of ancestor modules. To ensure that we're able to pick up registrations defined on any parent classes, a new class method `registrations` recursively retrieves registrations from any of the publisher's superclasses.
+
+The approach is illustrated in the following gist - https://gist.github.com/MarkMT/a983fd7c23414fb28de3e883c24af309
+
+Obviously this isn't a general solution since it doesn't touch the gem directly, but it should serve to highlight the issue I'm raising and to indicate broadly one way of addressing it should someone wish to do so. Note that the gist includes the definition of `Wisper::ObjectRegistration#broadcast` only for the sake of clarity (for me) to provide context and to add some comments. The method itself is unchanged.
+
+
+Fixes #156.
+I work on a project that uses the `values` gem for immutable (hence frozen) value objects in several places. We add behavior to the objects that doesn't mutate their data. Sometimes we generate events of interest that we'd like to publish with Wisper. But due to [the lazy-loading of `@local_registrations`](https://github.com/krisleech/wisper/blob/master/lib/wisper/publisher.rb#L66) we can't unless we override `initialize` to set `@local_registrations = Set.new` and then call `super` (which is where `#freeze` gets called).
+
+Just this one niggling line of code keeping Wisper from working smoothly for a frozen object.
+
+I'd be happy to put together a pull request—can you tell me what you would or would not want to see in a fix for this issue?

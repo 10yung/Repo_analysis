@@ -1,0 +1,155 @@
+Working with several biological collaborators using iSEE, a few things came up as must-haves to make iSEE a part of their regular routine. Amongst them, one feature that would be a gamechanger  would be the ability to generate high quality PNGs/PDFs directly from the interface itself.
+Dear all, 
+First of all, thank you very much for this great app. 
+I am trying to save my iSEE session using bookmarking in shiny. Although some plots are recovered correctly, (redim plot and column plot) the heatmap is not. The values of .heatMapColData, and .heatMapCenterScale are correctly recovered but not so for the .heatMapFeatName. I was debugging the observeEvent (see below) and the issue is that when I restore the session my state$input$heatMapPlot1_FeatName has the right values (the ones I saved before), but in the observeEvent the input[[heatMapPlot1_FeatName]] has the value the app had at startup and not the saved value. However, it is even weirder that for .heatMapColData, and .heatMapCenterScale, I do get the saved values. Do you know why this could happen? Is there anything special with the heatMapPlot1_FeatName widget? 
+
+# Saving list-based values.
+        for (field in c(.heatMapColData, .heatMapFeatName, .heatMapCenterScale)) {
+            local({
+                id0 <- id
+                mode0 <- "heatMapPlot"
+                field0 <- field
+                plot_name <- paste0(mode0, id0)
+                cur_field <- paste0(plot_name, "_", field0)
+
+                observeEvent(input[[cur_field]], {
+                    existing <- pObjects$memory[[mode0]][,field0][[id0]]
+                    incoming <- as(input[[cur_field]], typeof(existing))
+                    if (identical(incoming, existing)) {
+                        return(NULL)
+                    }
+
+                    pObjects$memory[[mode0]] <- .update_list_element(pObjects$memory[[mode0]], id0, field0, incoming)
+                    rObjects[[plot_name]] <- .increment_counter(isolate(rObjects[[plot_name]]))
+                }, ignoreInit=TRUE, ignoreNULL=(field0==.heatMapFeatName))
+
+                # ignoreNULL necessary for FeatName where updateSelectize generates a temporary NULL;
+                # this would trigger re-rendering of the plot upon re-rendering of the UI.
+            })
+        }
+
+These are the onBookmark and the onRestore functions I use in the server: 
+```
+ onBookmark(function(state) {
+        state$values$se <-se
+ })
+```
+
+#when I restore my session all the input values for the widgets are automatically recovered. If I print the values of the widget heatMapPlot1_FeatName it also has the values I saved. 
+```
+onRestore(function(state) {
+      print(state$input$heatMapPlot1_FeatName)  
+  })
+```
+This is a major refactor whereby we will use S4 classes and methods to define observers and UI elements for each panel type. This has a number of obvious benefits:
+
+- Improved re-use of shared methods via inheritance, e.g., reduced dimension plots, feature assay plots and column data plots can be implemented as subclasses of "column dot plots".
+- Exploit S4 dispatch to provide panel-type-specific behavior while simplifying the code in `iSEE()`; this moves simplifies the main app and improves the linking of the logic with the panel type.
+- Enable easy extensions to new panel types, by subclassing an existing panel type and modifying one or more methods as desired. This includes support for custom UI elements, a la #308.
+
+Careful implementation can resolve a host of issues:
+
+- #314, where the state is fully captured by a list of `Panel` objects.
+- #208, where the construction of a `Panel` object does its own validity checks.
+- #281, if we have a more systematic naming convention based on the class names.
+
+This PR will be considered complete when:
+
+- All panels are represented by S4 classes.
+- Initial state and memory are represented as a list of instances of those classes.
+- There is a well-defined API for extension with a new panel type.
+Description: Hinton plots for one category alone are not brushable
+
+Reproducing this: with `allen`
+
+```
+library(iSEE)
+example(iSEE, ask = FALSE)
+```
+
+Select any categorical variable (e.g. `Core.Type`)
+
+with shiny 1.3.2:
+
+<img width="545" alt="image" src="https://user-images.githubusercontent.com/7447478/68953540-694e2400-07c2-11ea-81e2-530efdd9aed4.png">
+
+with shiny 1.4.0:
+
+<img width="1680" alt="image" src="https://user-images.githubusercontent.com/7447478/68954260-f47be980-07c3-11ea-9a52-465757bdf207.png">
+
+See how "brushing" does nothing but drag the image.
+
+Now, trying to hunt down what it could be due to...
+
+- https://cran.r-project.org/web/packages/shiny/news/news.html
+- in a related issue, https://github.com/rstudio/shiny/issues/1433, at the end, it is mentioned a json-related issue. Would somewhat fit with the message showing up in the console:
+
+```
+Input to asJSON(keep_vec_names=TRUE) is a named vector. In a future version of jsonlite, this option will not be supported, and named vectors will be translated into arrays instead of objects. If you want JSON object output, please use a named list instead. See ?toJSON.
+```
+
+Shall we ping one of the main persons in the Shiny team (Joe/Carson)?
+How about wrapping all the settings DataFrame's into a single object of class e.g. `iSEEParam`?
+
+Some pros and cons:
+1. (+) the call to `iSEE()` could be more compact if we separate the configuration of individual panels from more general app arguments
+2. (+) we could give users getters and setters more convenient than the current `$` and nested `list` tricks to set values. Setters would also allow us to enforce validity checks to further help users avoid invalid values.
+3. (-) Maintenance? I would really like to avoid the need for `updateObject` or users saving the configuration object as RDS. We need to make sure users are encouraged to continue saving their configuration as R scripts.
+
+Concept code:
+
+* Separate definition of iSEE parameters:
+
+```
+isp <- iSEEParams(
+  redDimArgs = NULL, colDataArgs = NULL, featAssayArgs = NULL,
+  rowStatArgs = NULL, rowDataArgs = NULL, sampAssayArgs = NULL,
+  colStatArgs = NULL, customDataArgs = NULL, customStatArgs = NULL, heatMapArgs = NULL,
+  redDimMax = 5, colDataMax = 5,
+  featAssayMax = 5, rowStatMax = 5, rowDataMax = 5,
+  sampAssayMax = 5, colStatMax = 5, customDataMax = 5,
+  customStatMax = 5, heatMapMax = 5,
+  initialPanels=NULL)
+```
+
+which - in our current examples - would generally be as short as
+
+```
+isp <- iSEEParams(redDimArgs = redDimArgs, initialPanels = initialPanels)
+```
+
+* Shorter call to `iSEE()`
+
+```
+iSEE <- function(se,
+    ISEEParam = isp,
+    annotFun=NULL, customDataFun=NULL, customStatFun=NULL, customSendAll=FALSE,
+    colormap=ExperimentColorMap(), tour=NULL, appTitle=NULL, runLocal=TRUE,
+    voice=FALSE)
+```
+
+* Getters / setters
+
+```
+redDimPlotArgs(isp) <- DataFrame(...)
+redDimPlotArg(isp, index=1, field="XAxis") <- 3L
+colDataPlotArg(isp, index=2, field="ColorBy") <- "Column data"
+```
+Hi, 
+
+Is there a way to make a custom function that does not use an interactive selection, but instead uses the row names or column names to select from?
+
+The `DataFrame`s generated by the panel status drop-down are named like `redDimPlotArgs`, which is all well and good, but the `iSEE` arguments are named `redDimArgs`. We should probably keep consistency with one or the other. I would favor `redDimPlotArgs` in all cases, as this is more explicit, but it would break existing code that used `redDimArgs`.
+A question from a presentation I gave.
+
+Things that immediately pop in mind to be careful about:
+- do point selections behave well in the transformed space? 
+- such checkboxes should be disabled/hidden in the presence of negative values on that axis
+For every parameter, we define a triple of `(parameter_name, default_value, validity_function)`. We then go through this definition to recreate the various `*Defaults()` functions, as well as some new `*IsValid()` functions. This means we have to define this triplet **exactly once** every time we add a new argument, avoiding scenarios where we add a new argument but forget to define its validity method.
+Will this run from a remote cluster? 
+
+Two use cases: 
+(1) I have a very large dataset and can't/don't want to analyse it on my local laptop/desktop. Will I be able to access the shiny app locally through ssh port forwarding or similar? (the rmote pkg by Ryan Hafen is a good example/motivation there) 
+(2) I produce a dataset for my biological collaborator on my institute's cluster. The dataset is too        big to transfer/they don't have the setup to run iSEE locally on this big dataset. Can I make the app available for them to access through a browser?
+
+Could we do the above but from a cloud environment (AWS/GCP etc)? This  would be great for exploring HCA data which will end up on all of those platforms.

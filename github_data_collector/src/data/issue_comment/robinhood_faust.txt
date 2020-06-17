@@ -1,0 +1,698 @@
+## Steps to reproduce
+
+When using a `take` on a stream with `enable_ack = False` (`by using stream.noack()`), the messages are still automatically acknowledged.
+
+## Actual behavior
+
+As take only returns a list of values (not the events themselves, which are necessary to acknowledge) the behavior (while unexpected) might be unavoidable.
+
+## Expected behavior
+
+I would propose to add another stream method (e.g. `noack_take`), which does not acknowledge messages and actually returns events instead of values.
+If the returned items would not be different I would suggest to just add a configuration parameter to the method, but since the signature is different a new method (while logically mostly identical), might be adequate.
+
+Maybe we could also add a warning when using take with `enable_ack = False`. 
+
+@ask What do you think? Is this a bug or totally intended? Would a PR in order to introduce such a `noack_take` be welcome?
+Hello!
+## Checklist
+
+- [* ] I have included information about relevant versions
+- [* ] I have verified that the issue persists when using the `master` branch of Faust.
+
+## Steps to reproduce
+**App worker**
+app.py
+```python
+import faust
+from faust import current_event
+from mode.utils.aiter import aiter
+
+app = faust.App('app16',
+                broker='kafka://localhost:9092',
+                store='memory://',
+                consumer_auto_offset_reset='earliest',
+                stream_wait_empty=False,
+                autodiscover=False)
+class CommandSubscribe(faust.Record):
+    topic: str
+command_topic = app.topic('command_topic',  value_type=CommandSubscribe)
+
+@app.agent(command_topic, concurrency=2)
+async def command_consumer(stream):
+    async for record in stream:
+        event = current_event()
+        print(f'Got {record}')
+        topic = app.topic(record.topic, value_type=bytes, value_serializer='raw')
+        topic_iterator = aiter(topic)
+        app.topics.add(topic)
+        new_stream = faust.Stream(topic_iterator, app=app)
+        event.ack()
+        await data_consumer(new_stream)
+        print('awaited')
+
+async def data_consumer(stream):
+    print('consumer called')
+    counter = 0
+    async for record in stream:
+        event = current_event()
+        if counter == 30:
+            print('exiting')
+            break
+        print(f'Consumed {record}')
+        counter += 1
+        event.ack()
+    print('exited')
+
+if __name__ == '__main__':
+    app.main()
+```
+
+**Data producer worker**
+data_producer.py
+```python
+import faust
+import asyncio
+
+app = faust.App('app17',
+                broker='kafka://localhost:9092',
+                store='memory://',
+                web_port=6067,
+                autodiscover=False)
+class CommandSubscribe(faust.Record):
+    topic: str
+
+command_topic = app.topic('command_topic', value_type=CommandSubscribe)
+
+@app.task()
+async def task():
+    print('sending command')
+    data_topic_name = 'data_topic'
+    data_topic = app.topic(data_topic_name)
+    await command_topic.send(value=CommandSubscribe(topic=data_topic_name))
+
+    for idx in range(20):
+        print('task sending data..')
+        idx1=idx+5000
+        await data_topic.send(value=f'message {idx1}_1')
+        await data_topic.send(value=f'message {idx1}_2')
+        await data_topic.send(value=f'message {idx1}_3')
+        await data_topic.send(value=f'message {idx1}_4')
+        await asyncio.sleep(4)
+
+@app.task()
+async def task1():
+    print('sending command')
+    data_topic_name1 = 'data_topic1'
+    data_topic1 = app.topic(data_topic_name1)
+    await command_topic.send(value=CommandSubscribe(topic=data_topic_name1))
+
+    for idx in range(20):
+        print('task1 sending data..')
+        idx1=idx+4000
+        await data_topic1.send(value=f'message {idx1}_1')
+        await data_topic1.send(value=f'message {idx1}_2')
+        await data_topic1.send(value=f'message {idx1}_3')
+        await data_topic1.send(value=f'message {idx1}_4')
+        await asyncio.sleep(4)
+
+if __name__ == '__main__':
+    app.main()
+```
+
+## Expected behavior
+When creating stream dynamically 
+1) it starts to consume in a reasonable time
+2) it starts to consume from the earliest offset (consumer_auto_offset_reset='earliest')
+
+## Actual behavior
+
+When creating the stream dynamically on runtime there are occurring two unexpected behaviours
+1) After the creation of a new stream, it takes approx 45 seconds until it starts to consume from the stream.
+2) It ignores configuration  
+
+> consumer_auto_offset_reset='earliest'
+
+and starts to consume only from that time coming messages
+
+Question:
+I wonder if this is the right way to create the topic dynamically or if there is a better approach.
+
+## Full traceback
+
+app.py
+```pytb
+┌ƒaµS† v1.10.0┬─────────────────────────────────────────────┐
+│ id          │ app16                                       │
+│ transport   │ [URL('kafka://localhost:9092')]             │
+│ store       │ memory:                                     │
+│ web         │ http://localhost:6066/                      │
+│ log         │ -stderr- (info)                             │
+│ pid         │ 21034                                       │
+│ hostname    │ localhost.localdomain                       │
+│ platform    │ CPython 3.7.3 (Linux x86_64)                │
+│ drivers     │                                             │
+│   transport │ aiokafka=1.1.3                              │
+│   web       │ aiohttp=3.6.2                               │
+│ datadir     │ /home/matt/PycharmProjects/kx/app16-data    │
+│ appdir      │ /home/matt/PycharmProjects/kx/app16-data/v1 │
+└─────────────┴─────────────────────────────────────────────┘
+[2020-01-17 10:27:22,479] [21034] [INFO] [^Worker]: Starting... 
+[2020-01-17 10:27:22,512] [21034] [INFO] [^-App]: Starting... 
+[2020-01-17 10:27:22,513] [21034] [INFO] [^--Monitor]: Starting... 
+[2020-01-17 10:27:22,514] [21034] [INFO] [^--Producer]: Starting... 
+[2020-01-17 10:27:22,515] [21034] [INFO] [^---ProducerBuffer]: Starting... 
+[2020-01-17 10:27:22,558] [21034] [INFO] [^--CacheBackend]: Starting... 
+[2020-01-17 10:27:22,558] [21034] [INFO] [^--Web]: Starting... 
+[2020-01-17 10:27:22,559] [21034] [INFO] [^---Server]: Starting... 
+[2020-01-17 10:27:22,560] [21034] [INFO] [^--Consumer]: Starting... 
+[2020-01-17 10:27:22,561] [21034] [INFO] [^---AIOKafkaConsumerThread]: Starting... 
+[2020-01-17 10:27:22,608] [21034] [INFO] [^--LeaderAssignor]: Starting... 
+[2020-01-17 10:27:22,609] [21034] [INFO] [^--Producer]: Creating topic 'app16-__assignor-__leader' 
+[2020-01-17 10:27:22,722] [21034] [INFO] [^--Producer]: Topic 'app16-__assignor-__leader' created. 
+[2020-01-17 10:27:22,736] [21034] [INFO] [^--ReplyConsumer]: Starting... 
+[2020-01-17 10:27:22,738] [21034] [INFO] [^--AgentManager]: Starting... 
+[2020-01-17 10:27:22,739] [21034] [INFO] [^---Agent: __main__.command_consumer]: Starting... 
+[2020-01-17 10:27:22,746] [21034] [INFO] [^----OneForOneSupervisor: (2@0x7f4b6ee5dd30)]: Starting... 
+[2020-01-17 10:27:22,748] [21034] [INFO] [^---Conductor]: Starting... 
+[2020-01-17 10:27:22,748] [21034] [INFO] [^--TableManager]: Starting... 
+[2020-01-17 10:27:22,750] [21034] [INFO] [^---Conductor]: Waiting for agents to start... 
+[2020-01-17 10:27:22,752] [21034] [INFO] [^---Conductor]: Waiting for tables to be registered... 
+[2020-01-17 10:27:23,752] [21034] [INFO] [^---Recovery]: Starting... 
+[2020-01-17 10:27:23,756] [21034] [INFO] [^--Producer]: Creating topic 'app16-__assignor-__leader' 
+[2020-01-17 10:27:24,611] [21034] [INFO] Updating subscribed topics to: frozenset({'command_topic', 'app16-__assignor-__leader'}) 
+[2020-01-17 10:27:24,614] [21034] [INFO] Subscribed to topic(s): {'command_topic', 'app16-__assignor-__leader'} 
+[2020-01-17 10:27:24,659] [21034] [INFO] Discovered coordinator 1 for group app16 
+[2020-01-17 10:27:24,669] [21034] [INFO] Revoking previously assigned partitions set() for group app16 
+[2020-01-17 10:27:24,692] [21034] [WARNING] Topic command_topic is not available during auto-create initialization 
+[2020-01-17 10:27:25,612] [21034] [INFO] (Re-)joining group app16 
+[2020-01-17 10:27:25,638] [21034] [INFO] Joined group 'app16' (generation 1) with member_id faust-1.10.0-c100be8c-252b-46c9-8b09-e17bd787cc0f 
+[2020-01-17 10:27:25,639] [21034] [INFO] Elected group leader -- performing partition assignments using faust 
+[2020-01-17 10:27:25,643] [21034] [WARNING] Ignoring missing topic: 'command_topic' 
+[2020-01-17 10:27:25,668] [21034] [INFO] Successfully synced group app16 with generation 1 
+[2020-01-17 10:27:25,670] [21034] [ERROR] Rejoining group -- Need to rejoin! -- Topics not yet created: {'command_topic'} 
+[2020-01-17 10:27:25,686] [21034] [INFO] (Re-)joining group app16 
+[2020-01-17 10:27:25,717] [21034] [INFO] Joined group 'app16' (generation 2) with member_id faust-1.10.0-c100be8c-252b-46c9-8b09-e17bd787cc0f 
+[2020-01-17 10:27:25,718] [21034] [INFO] Elected group leader -- performing partition assignments using faust 
+[2020-01-17 10:27:25,734] [21034] [INFO] Successfully synced group app16 with generation 2 
+[2020-01-17 10:27:25,735] [21034] [INFO] Setting newly assigned partitions {TopicPartition(topic='app16-__assignor-__leader', partition=0), TopicPartition(topic='command_topic', partition=0)} for group app16 
+[2020-01-17 10:27:26,532] [21034] [INFO] [^---Recovery]: Resuming flow... 
+[2020-01-17 10:27:26,533] [21034] [INFO] [^---Recovery]: Seek stream partitions to committed offsets. 
+[2020-01-17 10:27:27,526] [21034] [INFO] [^---Fetcher]: Starting... 
+[2020-01-17 10:27:27,528] [21034] [INFO] [^---Recovery]: Worker ready 
+[2020-01-17 10:27:27,530] [21034] [INFO] [^Worker]: Ready 
+[2020-01-17 10:27:37,535] [21034] [WARNING] Got <CommandSubscribe: topic='data_topic1'> 
+[2020-01-17 10:27:37,536] [21034] [WARNING] consumer called 
+[2020-01-17 10:27:37,536] [21034] [WARNING] Got <CommandSubscribe: topic='data_topic'> 
+[2020-01-17 10:27:37,539] [21034] [WARNING] consumer called 
+[2020-01-17 10:28:22,544] [21034] [INFO] [^--Producer]: Creating topic 'app16-__assignor-__leader' 
+[2020-01-17 10:28:22,566] [21034] [INFO] Updating subscribed topics to: frozenset({'data_topic', 'command_topic', 'data_topic1', 'app16-__assignor-__leader'}) 
+[2020-01-17 10:28:22,568] [21034] [INFO] Subscribed to topic(s): {'data_topic', 'command_topic', 'data_topic1', 'app16-__assignor-__leader'} 
+[2020-01-17 10:28:22,572] [21034] [INFO] Revoking previously assigned partitions frozenset({TopicPartition(topic='app16-__assignor-__leader', partition=0), TopicPartition(topic='command_topic', partition=0)}) for group app16 
+[2020-01-17 10:28:22,659] [21034] [INFO] (Re-)joining group app16 
+[2020-01-17 10:28:22,666] [21034] [INFO] Joined group 'app16' (generation 3) with member_id faust-1.10.0-c100be8c-252b-46c9-8b09-e17bd787cc0f 
+[2020-01-17 10:28:22,666] [21034] [INFO] Elected group leader -- performing partition assignments using faust 
+[2020-01-17 10:28:22,674] [21034] [INFO] Successfully synced group app16 with generation 3 
+[2020-01-17 10:28:22,675] [21034] [INFO] Setting newly assigned partitions {TopicPartition(topic='app16-__assignor-__leader', partition=0), TopicPartition(topic='data_topic', partition=0), TopicPartition(topic='command_topic', partition=0), TopicPartition(topic='data_topic1', partition=0)} for group app16 
+[2020-01-17 10:28:22,758] [21034] [INFO] [^---Recovery]: Resuming flow... 
+[2020-01-17 10:28:22,758] [21034] [INFO] [^---Recovery]: Seek stream partitions to committed offsets. 
+[2020-01-17 10:28:23,593] [21034] [INFO] [^---Recovery]: Worker ready 
+[2020-01-17 10:28:26,597] [21034] [WARNING] Consumed b'"message 4012_1"' 
+[2020-01-17 10:28:27,163] [21034] [WARNING] Consumed b'"message 4012_2"' 
+[2020-01-17 10:28:27,165] [21034] [WARNING] Consumed b'"message 5012_1"' 
+[2020-01-17 10:28:27,166] [21034] [WARNING] Consumed b'"message 4012_3"' 
+[2020-01-17 10:28:27,167] [21034] [WARNING] Consumed b'"message 5012_2"' 
+[2020-01-17 10:28:27,169] [21034] [WARNING] Consumed b'"message 4012_4"' 
+[2020-01-17 10:28:27,170] [21034] [WARNING] Consumed b'"message 5012_3"' 
+[2020-01-17 10:28:27,171] [21034] [WARNING] Consumed b'"message 5012_4"' 
+[2020-01-17 10:28:30,343] [21034] [WARNING] Consumed b'"message 4013_1"' 
+[2020-01-17 10:28:30,606] [21034] [WARNING] Consumed b'"message 4013_2"' 
+....
+....
+```
+
+
+
+# Versions
+
+* Python version 
+Python 3.7.3
+
+* Faust version
+1.9
+
+* Operating system
+NAME=Fedora
+VERSION="28 (Twenty Eight)"
+ID=fedora
+VERSION_ID=28
+VERSION_CODENAME=""
+PLATFORM_ID="platform:f28"
+PRETTY_NAME="Fedora 28 (Twenty Eight)"
+
+* Kafka version
+docker image
+confluentinc/cp-enterprise-kafka:5.3.1
+confluentinc/cp-schema-registry:5.3.1
+confluentinc/cp-zookeeper:5.3.1
+
+
+Many thanks for any insides!
+In my _faust_ app I have a blocking background task (in my case a _dash_ app) that I run in a separate process using `multiprocessing`
+
+```python
+@app.task()
+async def start_dashboard():
+    global dash_process
+    dash_process = multiprocessing.Process(target=dash_app.run_server)
+    dash.process.start()
+``` 
+
+How do I ensure that proper cleanup happens when my faust app exits, for instance when I hit 
+<nobr><kbd>Ctrl</kbd> + <kbd>C</kbd></nobr> on the console running my app? 
+
+I image application signals are what I am looking for, however the [user guide](https://faust.readthedocs.io/en/latest/userguide/applicotion.html#application-signals) does not go into much detail there. In the repo I found `on_before_shutdown` which sounds like a correct signal name but seems not to be exposed on the `faust.App` class. I imagined this to look something like 
+
+```python
+@app.on_before_shutdown.connect()
+async def clean_up(*args, **kwargs):
+    dash_process.terminate()
+```
+
+
+
+## Checklist
+
+- [ x] I have included information about relevant versions
+- [ x] I have verified that the issue persists when using the `master` branch of Faust.
+
+## Steps to reproduce
+
+As soon as I edit the provided window example (https://github.com/robinhood/faust/blob/master/examples/windowed_aggregation.py) to use rocksdb the behavior suddenly changes. The value-function does always return an empty list.
+
+(The code is more or less the same as. I just shortened the example for brevity)
+
+```pytb
+from datetime import datetime, timedelta
+from time import time
+import random
+import faust
+
+
+class RawModel(faust.Record):
+    date: datetime
+    value: float
+
+
+TOPIC = 'raw-event'
+TABLE = 'tumbling_table'
+KAFKA = 'kafka://localhost:9092'
+CLEANUP_INTERVAL = 1.0
+WINDOW = 10
+WINDOW_EXPIRES = 10
+PARTITIONS = 1
+
+app = faust.App('windowed-agg', broker=KAFKA, version=1, topic_partitions=1,
+                store='rocksdb://')
+
+app.conf.table_cleanup_interval = CLEANUP_INTERVAL
+source = app.topic(TOPIC, value_type=RawModel)
+
+
+def window_processor(key, events):
+    print(f'window_processor - events: {len(events)}')
+
+
+tumbling_table = (
+    app.Table(
+        TABLE,
+        default=list,
+        partitions=PARTITIONS,
+        on_window_close=window_processor,
+    )
+    .tumbling(WINDOW, expires=timedelta(seconds=WINDOW_EXPIRES))
+    .relative_to_field(RawModel.date)
+)
+
+
+@app.agent(source)
+async def print_windowed_events(stream):
+    async for event in stream:
+        value_list = tumbling_table['events'].value()
+        print(f'print_windowed_events before: {value_list}')
+        print(event)
+        value_list.append(event)
+        tumbling_table['events'] = value_list
+        value_list = tumbling_table['events'].value()
+        print(f'print_windowed_events after: {value_list}')
+
+
+@app.timer(0.1)
+async def produce():
+    await source.send(value=RawModel(value=random.random(), date=int(time())))
+
+if __name__ == '__main__':
+    app.main()
+```
+
+## Expected behavior
+
+I would expect the output like when using the in memory store:
+
+[2020-01-10 14:52:49,442] [10873] [WARNING] print_windowed_events before: [] 
+[2020-01-10 14:52:49,442] [10873] [WARNING] <RawModel: date=1578664368, value=0.3634263945834183> 
+[2020-01-10 14:52:49,443] [10873] [WARNING] print_windowed_events after: [<RawModel: date=1578664368, value=0.3634263945834183>] 
+[2020-01-10 14:52:49,943] [10873] [WARNING] print_windowed_events before: [<RawModel: date=1578664368, value=0.3634263945834183>] 
+[2020-01-10 14:52:49,943] [10873] [WARNING] <RawModel: date=1578664369, value=0.4364065026849575> 
+[2020-01-10 14:52:49,943] [10873] [WARNING] print_windowed_events after: [<RawModel: date=1578664368, value=0.3634263945834183>, <RawModel: date=1578664369, value=0.4364065026849575>] 
+
+
+## Actual behavior
+
+The value method does always return an empty list even when I just added an element. Therefore the window_processor always gets only one event instead of all events in the window.
+
+```pytb
+[2020-01-10 14:51:52,332] [10833] [WARNING] print_windowed_events before: [] 
+[2020-01-10 14:51:52,333] [10833] [WARNING] <RawModel: date=1578664311, value=0.1627785852779441> 
+[2020-01-10 14:51:52,333] [10833] [WARNING] print_windowed_events after: [] 
+[2020-01-10 14:51:52,849] [10833] [WARNING] print_windowed_events before: [] 
+[2020-01-10 14:51:52,849] [10833] [WARNING] <RawModel: date=1578664312, value=0.5614135995691765> 
+[2020-01-10 14:51:52,850] [10833] [WARNING] print_windowed_events after: [] 
+```
+Let me know if I miss something. I also checked python-rocksdb separately and it seems to work.
+
+# Versions
+
+* Python version: 3.7.4
+* Faust version: 1.9.0
+* Operating system: macOS Catalina (10.15.2)
+* Kafka version Confluent 5.3.0-ccs (Commit:a8eb7a79910d0f1a)
+* RocksDB version (if applicable):  python-rocksdb (0.7.0)
+
+# Comment
+
+Thanks a lot for any suggestions on this!
+## Checklist
+
+- [x] I have included information about relevant versions
+- [x] I have verified that the issue persists when using the `master` branch of Faust.
+
+## Steps to reproduce
+
+Create simple app with GlobalTable, like so:
+
+```python
+app = faust.App('test')
+table = app.GlobalTable('test')
+
+def main():
+    app.main()
+```
+
+and run it using Faust from master branch.
+
+## Expected behavior
+
+App should start.
+
+## Actual behavior
+
+App bootstrap hangs on:
+```
+[2020-01-10 14:56:32,824] [3385] [INFO] Elected group leader -- performing partition assignments using faust
+```
+
+During our investigation we found that the problem is in `def _global_table_standby_assignments` method in `assignor/partition_assignor.py` file. `num_partitions` variable is `None` during app bootstrap.
+
+Single GlobalTable works fine on Faust 1.9.0.
+
+## Full traceback
+
+```pytb
+┌ƒaµS† v1.9.0─┬──────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ id          │ test                                                                                                 │
+│ transport   │ [URL('kafka://192.168.1.1:9092'), URL('kafka://192.168.1.2:9093'), URL('kafka://192.168.1.3:9094')]  │
+│ store       │ memory:                                                                                              │
+│ web         │ http://localhost:6066/                                                                               │
+│ log         │ -stderr- (info)                                                                                      │
+│ pid         │ 3385                                                                                                 │
+│ hostname    │ makz0rd                                                                                              │
+│ platform    │ CPython 3.6.5 (Darwin x86_64)                                                                        │
+│ drivers     │                                                                                                      │
+│   transport │ aiokafka=1.1.3                                                                                       │
+│   web       │ aiohttp=3.6.2                                                                                        │
+│ datadir     │ (cut)/test-data                                     │
+│ appdir      │ (cut)/test-data/v1                                  │
+└─────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────┘
+[2020-01-10 14:56:29,747] [3385] [INFO] [^Worker]: Starting...
+[2020-01-10 14:56:29,759] [3385] [INFO] [^-App]: Starting...
+[2020-01-10 14:56:29,759] [3385] [INFO] [^--Monitor]: Starting...
+[2020-01-10 14:56:29,759] [3385] [INFO] [^--Producer]: Starting...
+[2020-01-10 14:56:29,759] [3385] [INFO] [^---ProducerBuffer]: Starting...
+[2020-01-10 14:56:29,787] [3385] [INFO] [^--CacheBackend]: Starting...
+[2020-01-10 14:56:29,787] [3385] [INFO] [^--Web]: Starting...
+[2020-01-10 14:56:29,788] [3385] [INFO] [^---Server]: Starting...
+[2020-01-10 14:56:29,789] [3385] [INFO] [^--Consumer]: Starting...
+[2020-01-10 14:56:29,790] [3385] [INFO] [^---AIOKafkaConsumerThread]: Starting...
+[2020-01-10 14:56:29,811] [3385] [INFO] [^--LeaderAssignor]: Starting...
+[2020-01-10 14:56:29,812] [3385] [INFO] [^--Producer]: Creating topic 'test-__assignor-__leader'
+[2020-01-10 14:56:29,825] [3385] [INFO] [^--ReplyConsumer]: Starting...
+[2020-01-10 14:56:29,826] [3385] [INFO] [^--AgentManager]: Starting...
+[2020-01-10 14:56:29,826] [3385] [INFO] [^--Conductor]: Starting...
+[2020-01-10 14:56:29,826] [3385] [INFO] [^--TableManager]: Starting...
+[2020-01-10 14:56:29,826] [3385] [INFO] [^--Conductor]: Waiting for agents to start...
+[2020-01-10 14:56:29,827] [3385] [INFO] [^--Conductor]: Waiting for tables to be registered...
+[2020-01-10 14:56:30,831] [3385] [INFO] [^--GlobalTable: test]: Starting...
+[2020-01-10 14:56:30,835] [3385] [INFO] [^---Store: test]: Starting...
+[2020-01-10 14:56:30,836] [3385] [INFO] [^--Producer]: Creating topic 'test-test-changelog'
+[2020-01-10 14:56:30,843] [3385] [INFO] [^---Recovery]: Starting...
+[2020-01-10 14:56:30,844] [3385] [INFO] [^--Producer]: Creating topic 'test-test-changelog'
+[2020-01-10 14:56:30,860] [3385] [INFO] [^--Producer]: Creating topic 'test-__assignor-__leader'
+[2020-01-10 14:56:31,815] [3385] [INFO] Updating subscribed topics to: frozenset({'test-test-changelog', 'test-__assignor-__leader'})
+[2020-01-10 14:56:31,818] [3385] [INFO] Subscribed to topic(s): {'test-test-changelog', 'test-__assignor-__leader'}
+[2020-01-10 14:56:31,849] [3385] [INFO] Discovered coordinator 3 for group test
+[2020-01-10 14:56:31,851] [3385] [INFO] Revoking previously assigned partitions set() for group test
+[2020-01-10 14:56:32,815] [3385] [INFO] (Re-)joining group test
+[2020-01-10 14:56:32,823] [3385] [INFO] Joined group 'test' (generation 3) with member_id faust-1.9.0-8f6c71c3-5caf-4428-b22c-504fe1915783
+[2020-01-10 14:56:32,824] [3385] [INFO] Elected group leader -- performing partition assignments using faust
+```
+
+# Versions
+
+* Python version: 3.6.5
+* Faust version: master (rev 37fb187120c64bc94b0ed88f5ba38e6b9cd32e8b)
+* Operating system: macOS
+* Kafka version: 2.4.0
+* RocksDB version (if applicable)
+
+
+## Checklist
+
+- [X] I have included information about relevant versions
+- [X] I have verified that the issue persists when using the `master` branch of Faust.
+
+## Steps to reproduce
+
+This is my first time using faust and I wanted to create a small example application with multiple agents. My expectation is that each agent would run concurrently and that I would see the print lines from each agent interspersed in some random ordering. 
+
+```sh
+@app.agent(job_location_topic)
+async def job_locations(job_location):
+    async for job_loc_batch in job_location.take(1, within=30):
+        for job_loc in job_loc_batch:
+            print("JOB LOC")
+            await asyncio.sleep(10.0)
+            print("not sleeping")
+
+@app.agent(job_topic)
+async def test_jobs(jobs):
+    async for job_batch in jobs.take(1, within=30):
+        for job in job_batch:
+            print("job")
+```
+
+However, when I observe the output it appears that only one agent can run at any given time. This is even true if I use an `await asyncio.sleep(10.0)`, which I thought might let other agents process events from the event loop.
+
+I have a feeling I'm just misunderstanding how agents are executed and managed via the agent_supervisor.
+
+Would really appreciate it if I could get some insight into what I might be doing/misunderstanding. Thank you!
+
+## Expected behavior
+
+```sh
+not sleeping
+JOB LOC
+job
+not sleeping
+JOB LOC
+job
+job
+job
+job
+not sleeping
+JOB LOC
+```
+
+Something of this variation.
+
+## Actual behavior
+
+```sh
+not sleeping
+JOB LOC
+not sleeping
+JOB LOC
+not sleeping
+JOB LOC
+not sleeping
+JOB LOC
+not sleeping
+JOB LOC
+not sleeping
+JOB LOC
+```
+
+# Versions
+* Python version 3.7.5 (docker slim-buster)
+* Faust version 1.9.0
+* Kafka version  1.1.1
+
+Is there a standard way to listen to the changelog of a table? Seems silly to have a secondary topic just to notify an agent of table changes
+
+Thanks
+We try to connect to a kerberized Kafka Cluster.
+
+In Java we use a keytab to achieve that, the JAAS File looks like this, we use SASL_SSL and GSSAPI:
+
+KafkaClient {
+   com.sun.security.auth.module.Krb5LoginModule required
+  useKeyTab=true
+  keyTab="/etc/schema-registry/username.keytab"
+  debug=true
+  serviceName="kafka"
+  doNotPrompt=true
+  principal="username@MYDOMAIN.COM";
+};
+
+
+## Steps to reproduce
+
+Tell us what you did to cause something to happen.
+
+## Expected behavior
+
+Is it possible to do that with faust too?
+
+We try something like this:
+import ssl
+ssl_context = ssl.create_default_context(
+purpose=ssl.Purpose.SERVER_AUTH, cafile='ca.pem')
+  ssl_context.load_cert_chain('client.cert', keyfile='client.key')
+
+app = faust.App(
+  broker_credentials=faust.GSSAPICredentials(
+    kerberos_service_name='faust',
+    kerberos_domain_name='example.com',
+    ssl_context=ssl_context,
+  ),
+)
+
+We get an Kerberos error, that the "server is not in the list". We wonder, how to supply the kerberos principal in this case. Should this work?
+
+
+# Versions
+* Python version 3.6.8
+* Faust version : 1.9.0
+* Operating system  CentOS 7
+* Kafka version  2.2
+* RocksDB version (if applicable)
+
+
+Adds the option to yield Events from Stream.take with a yield_events parameter. 
+## Checklist
+
+- [x] I have included information about relevant versions
+- [x] I have verified that the issue persists when using the `master` branch of Faust.
+
+## Steps to reproduce
+
+I use confluent kafka (only use confluent Connectors),  streaming mysql `user` table data to kafka  topic `user`.  then an agent consumer it, save it in rocks db.
+
+but sometime user data is stream  in topic, and consumer successed. print info. but the offset not update.
+
+
+single node Kafka,  topic_partitions is 1.
+run app in docker.
+Faust 1.9.0
+Confluent 5.3.1-ce (Commit:deddb2f3457cd178)
+Docker version 18.06.1-ce, build e68fc7a
+
+```
+app = faust.App('transporter',
+                enable_web=True,
+                web_port=6066,
+                stream_wait_empty=False,
+                autodiscover=True,
+                origin='transporter',
+                consumer_auto_offset_reset='earliest')
+
+user_topic = app.topic("user", value_type=User)
+
+def modify_sink(_):
+    m_time = int(time.time())
+    app_runtime_table[APP_RUNTIME_BASE_DATA_MODIFY_TIME] = m_time
+
+
+@app.agent(user_topic, sink=[modify_sink])
+async def user_stream(users):
+    async for user in users:
+        user_table[user.id] = user.dumps()
+        print(f'save user, id: {user.id}')
+        yield user
+```
+
+current info:
+```
+[1] [WARNING] [^--Consumer]: Possible livelock: COMMIT OFFSET NOT ADVANCING FOR TopicPartition(topic='user', partition=0)
+```
+
+`kafka-consumer-groups --bootstrap-server localhost:9092 --group transporter --describe`
+
+| GROUP | TOPIC | PARTITION | CURRENT-OFFSET | LOG-END-OFFSET | LAG  | CONSUMER-ID |
+| ----- | ----- | --------- | -------------- | -------------- | ---- | ----------- |
+|transporter|user|0|33350|33369|19|faust-1.9.0-d576f6c6-3a7f-44f8-91d4-9dab19ba727f|
+|transporter| transporter-user-changelog|0|-|34601|-|faust-1.9.0-d576f6c6-3a7f-44f8-91d4-9dab19ba727f|
+
+
+
+change db data, will get new date. and log print it.  and rocksdb store it.
+```
+[1] [WARNING] save user, id: 14
+```
+
+but, the offset not update. consumer groups info:
+
+| GROUP | TOPIC | PARTITION | CURRENT-OFFSET | LOG-END-OFFSET | LAG  | CONSUMER-ID |
+| ----- | ----- | --------- | -------------- | -------------- | ---- | ----------- |
+|transporter|user|0|33350|33370|20|faust-1.9.0-d576f6c6-3a7f-44f8-91d4-9dab19ba727f|
+|transporter| transporter-user-changelog|0|-|34602|-|faust-1.9.0-d576f6c6-3a7f-44f8-91d4-9dab19ba727f|
+
+when I restart the app, it will consume 20 user again, then LAG = 1.  and hang again.
+
+## Expected behavior
+
+not hang.  offset updated.
+
+## Actual behavior
+
+agents hangs,  consumer  success but offset not update.
+
+
+# Versions
+
+* Python 3.6.8
+* Faust 1.9.0
+* Operating system docker 18.06.1-ce, build e68fc7a
+* Kafka version Confluent 5.3.1-ce (Commit:deddb2f3457cd178)
+* RocksDB version 6.1.2
+

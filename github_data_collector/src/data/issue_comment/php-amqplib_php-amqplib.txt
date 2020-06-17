@@ -1,0 +1,135 @@
+* add missing and fix conflicting doc block definitions
+* simplified if statements
+* remove deprecated and unused method
+* improve scrutinizer rating
+Currently the integration test suite does not use TLS. We could use the same technique used in Pika to run the test suite once without TLS, then enable TLS.
+
+Configuring RabbitMQ to use TLS:
+
+https://github.com/pika/pika/blob/master/.travis.yml#L44
+
+Running tests on Travis:
+
+https://github.com/pika/pika/blob/master/.travis.yml#L54-L60
+There is a lot of supported AMQP features but documentation is missing. People keep asking how to use this library using github issues but this way is no go.
+
+Would be nice to have a brief summary about all main features and use cases in some "Read the docs" style documentation.
+
+Here are things I would like to have documented:
+
+### Exchange types and how to declare them:
+* simple direct
+* fanout `demo/amqp_consumer_fanout_1.php`
+* topic
+* headers #554 `demo/amqp_message_headers_recv.php`
+
+### Queue parameters and what they mean.
+#731 #741
+* exclusive queue `demo/amqp_consumer_exclusive.php`
+
+### Consumer features
+* consumer cancel #704
+* publish confirm `demo/amqp_publisher_with_confirms.php`
+* handling POSIX signals `demo/amqp_consumer_signals.php`
+* non blockig consume `demo/amqp_consumer_non_blocking.php`
+
+### Additional features:
+* delayed messages `demo/delayed_message.php`
+* dead lettering `demo/delayed_message.php`
+* exchange to exchange binding `demo/e2e_bindings.php`
+
+### Connection parameters:
+* how to set connection name #728
+* heartbeats #699 #703 #725
+For instance, socket read timeout should be greater than 2x the heartbeat timeout. See #713 and other issues related to timeouts.
+Feel free to comment and suggest what can be changed/refactored to make things more fluent and consistent in next major version.
+
+- [ ] Use one immutable object for all connection options and reuse it in all connection types
+- [ ] Merge StreamIO and SocketIO into corresponding connection class
+- [ ] Connection class should not extend channel class therefore no calls to protected methods
+- [ ] Split AMQPChannel->wait() into to separate blocking and non-blocking methods, separate method for internal use
+- [ ] Refactor existing TODO
+- [ ] Deprecate AMQPSSLConnection, activate SSL context whenever protocol is secure
+- [x] Deprecate public properties in connection and channel classes #673 
+- [ ] Deprecate global constants #732
+- [ ] PSR-12 code style
+- [ ] Changelog standard https://keepachangelog.com/en/1.0.0/
+- [x] Remove bcmath dependency #573 #694 #695 #737 #754 
+- [ ] PHP > 7.0, typehints for most public methods
+- [ ] Use https://github.com/reactphp/socket or https://github.com/amphp/socket for low level non-blocking IO operations
+Consider the following example:
+
+```
+$connection = new AMQPStreamConnection('localhost', 5672, 'user', 'password');
+$channel = $connection->channel();
+
+$channel->basic_publish(new AMQPMessage('message 1'), 'undefined_exchange', 'routing_key'); // here the exception is reported to the channel and channel is closed on RabbitMQ side
+$channel->basic_publish(new AMQPMessage('message 2'), 'defined_exchange', 'routing_key'); // this message, even though valid, will never reach its destination
+```
+
+The `defined_exchange` already exists and the `undefined_exchange` does not.
+First call to `basic_publish` will result in channel exception being reported to the channel by RabbitMQ and channel being closed. The issue I see here is that in userland we have no clue that this has happened and keep on sending new messages. But they will never arrive to the server because channel has already been closed.
+
+
+The same will happen when you have a consumer defined with prefetch grater than 1. Take a look at the following example:
+
+```
+$connection = new AMQPStreamConnection('localhost', 5672, 'user', 'password');
+$channel = $connection->channel();
+$channel->basic_qos(null, 2, null);
+
+$message = $channel->basic_get('my_queue');
+$channel->basic_ack('invalid_tag'); // here the exception is reported to the channel and channel is closed on RabbitMQ side
+
+$message = $channel->basic_get('my_queue'); // we still get this message because it is already in buffer
+$channel->basic_ack($message->delivery_info['delivery_tag']); // This message will not actually be acknowledged
+```
+
+First message is processed and `ack`-ed with an invalid `delivery_tag`. This results in exception being reported to the channel and channel being closed (on the server side). Due to QOS settings there are already other messages in the stream buffer so the library will simply grab the next available message without realizing there was an exception on the channel. The library will eventually figure it out but only after all messages have been already read from the buffer and the next frame that is there, is the exception itself.
+
+Both of the behaviors can be dangerous.
+First one because your well defined messages will never reach their destination without any apparent reason.
+Second one (even though very unlikely) can lead to processing some messages twice when we definitely need to process them only once.
+
+This behavior also presents itself when people are complaining that there is an exception being raised when they already try to close the connection. This is exactly the same problem. We send close message to the server but instead of getting the response we get previously buffered exception from already closed channel.
+
+As a solution would be to throw an exception as soon as it is possible to detect there is an exception waiting in a buffer. I do understand that this may impact performance to some extend but it would provide a "logical" behavior.
+
+Tested on `php-amqplib/php-amqplib v2.6.3`.
+See the discussion in https://github.com/php-amqplib/php-amqplib/pull/491.
+
+It would be nice if both had identical defaults. It remains to be decided what the default should be and how can we cause as little breakage as possible to existing codebases.
+See https://wiki.php.net/rfc/async_signals
+
+Basically, in 7.1+, the `pcntl_signal_dispatch()` call in the loop is no longer necessary.
+I am use
+define('AMQP_WITHOUT_SIGNALS', true);
+And i am use custom sighandler with flag to exit
+
+If i send kill 15 - 
+PHP Fatal error:  Uncaught PhpAmqpLib\Exception\AMQPIOWaitException: A network error occured while awaiting for incoming data in /usr/share/nginx/html/pushall/vendor/PhpAmqpLib/Wire/AMQPReader.php:128
+Stack trace:
+#0 /usr/share/nginx/html/pushall/vendor/PhpAmqpLib/Wire/AMQPReader.php(148): PhpAmqpLib\Wire\AMQPReader->wait()
+#1 /usr/share/nginx/html/pushall/vendor/PhpAmqpLib/Wire/AMQPReader.php(106): PhpAmqpLib\Wire\AMQPReader->rawread(7)
+#2 /usr/share/nginx/html/pushall/vendor/PhpAmqpLib/Connection/AbstractConnection.php(508): PhpAmqpLib\Wire\AMQPReader->read(7)
+#3 /usr/share/nginx/html/pushall/vendor/PhpAmqpLib/Connection/AbstractConnection.php(555): PhpAmqpLib\Connection\AbstractConnection->wait_frame(5)
+#4 /usr/share/nginx/html/pushall/vendor/PhpAmqpLib/Channel/AbstractChannel.php(217): PhpAmqpLib\Connection\AbstractConnection->wait_channel(1, 5)
+#5 /usr/share/nginx/html/pushall/vendor/PhpAmqpLib/Channel/AbstractChannel.php(328): PhpAmqpLib\Channel\AbstractChannel->next_frame(5)
+#6 /usr/share/nginx/html/pushall/connect_rabb in /usr/share/nginx/html/pushall/vendor/PhpAmqpLib/Wire/AMQPReader.php on line 128
+
+global $needDie;
+        $channel = $this->getChannel($queue_name);
+        $channel->basic_consume($queue_name, '', false, false, false, false, $callback);
+        while(count($channel->callbacks)) {
+            try {
+                $channel->wait(null, false, $timeout);
+            }catch (PhpAmqpLib\Exception\AMQPTimeoutException $e){
+                pcntl_signal_dispatch();  //обработаем внешние сообщения
+            if($needDie) {
+                $this->log('WORKER die');
+                $rabbit->getChannel('pushall-allpushes')->close();
+                $rabbit->connection->close();
+                //exit;
+            }
+            }
+        }

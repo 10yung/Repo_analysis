@@ -1,0 +1,136 @@
+Add `POSTGRES_HOST_AUTH_METHOD` to bring back old behavior and be similar to `MYSQL_ALLOW_EMPTY_PASSWORD`, but add warning when "trust" is used since it disables all passwords
+
+
+Fixes #580.
+
+In our CI pipeline, we run some sql scripts on initialization of the postgres container. This works well most of the time.
+When there is heavy load on our CI cluster, we are noticing that the initialization scripts executes all of our sql but doesn't restart postgres. 
+
+**Successful**
+```
+2019-12-19 22:55:54.524 UTC [114] STATEMENT:  INSERT INTO tag (account_id, created_at)
+	SELECT NULL, NOW();
+INSERT 0 0
+waiting for server to shut down....2019-12-19 22:55:54.559 UTC [34] LOG:  received fast shutdown request
+2019-12-19 22:55:54.571 UTC [34] LOG:  aborting any active transactions
+2019-12-19 22:55:54.572 UTC [34] LOG:  worker process: logical replication launcher (PID 41) exited with exit code 1
+2019-12-19 22:55:54.572 UTC [36] LOG:  shutting down
+2019-12-19 22:55:54.970 UTC [34] LOG:  database system is shut down
+ done
+server stopped
+
+PostgreSQL init process complete; ready for start up.
+```
+
+**Unsuccessful ( postgres doesn't restart and is killed after a timeout. Notice diff in timestamps)**
+```
+2019-12-19 22:55:54.524 UTC [114] STATEMENT:  NSERT INTO tag (account_id, created_at)
+	SELECT NULL, NOW();
+INSERT 0 0
+
+waiting for server to shut down....2019-12-19 23:03:37.362 UTC [34] LOG:  received fast shutdown request
+2019-12-19 23:03:37.364 UTC [34] LOG:  aborting any active transactions
+2019-12-19 23:03:37.365 UTC [34] LOG:  worker process: logical replication launcher (PID 41) exited with exit code 1
+2019-12-19 23:03:37.366 UTC [36] LOG:  shutting down
+```
+
+Is it possible `pg_ctl` in `docker_temp_server_stop` does not return ?  
+
+**Dockerfile**
+```
+FROM postgres:10.10-alpine
+ENV DIR=/docker-entrypoint-initdb.d/ SEED_DIR=/etc/postgresql/seed/ SCRIPTS_DIR=/etc/postgresql/scripts/
+RUN mkdir -p ${DIR} && mkdir -p ${SEED_DIR}
+
+COPY postgresql.conf ${SCRIPTS_DIR}/postgresql.conf
+COPY scripts/ ${SCRIPTS_DIR}
+COPY seed/*.sql ${SEED_DIR}
+COPY initialize.sh ${DIR}/
+
+RUN chown -R postgres: ${SCRIPTS_DIR} && chown -R postgres: ${SEED_DIR} && chown postgres: ${DIR}/initialize.sh
+
+ARG COMMIT
+ENV COMMIT $COMMIT
+```
+I have been working with the Alpine build for a bit. I am not sure how to communicate with the devs here or in forum when/if I find findings in Twistlock. Who should I email or how do I communicate here to make suggestions in the Alpine build.
+
+Thanks
+Hi!
+
+I'm trying to run the PostgreSQL docker image with the minimum set of Linux capabilities. This set seems to [work well so far](https://github.com/hartwork/jawanndenn/commit/593a85c914aff4d18af4bcc95293dc43e75354cb), superficially:
+
+```
+version: "3"
+
+services:
+  postgres:
+    image: postgres:11.6
+[..]
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_READ_SEARCH
+      - FOWNER
+      - SETGID
+      - SETUID
+```
+
+Am I missing some capabilities that the service will not use in the first few minutes of operation but later in its lifetime? Does it need any where I am not likely to see errors in standard error/output?
+
+Thanks and best, Sebastian
+This change adds support to choose which auth method to use on newly-created database (md5 vs scram-sha-256 (... vs future ones))
+See https://lists.debian.org/debian-glibc/2019/03/msg00030.html, https://bugs.debian.org/926627, and https://salsa.debian.org/ddp-team/release-notes/commit/ad75c4b for some context.
+
+> When upgrading from stretch to buster, the glibc locale data is upgraded.
+> Specifically, this changes how PostgreSQL sorts data in text indexes.
+> To avoid corruption, such indexes need to be `REINDEX`ed
+> immediately after upgrading the `locales` or
+> `locales-all` packages, before putting back the database
+> into production.
+>
+> Suggested command: `sudo -u postgres reindexdb --all`
+
+I'm not entirely sure how we're going to handle this, but it does mean it won't be reasonable for us to simply upgrade the images from Stretch to Buster once Buster is released. :confused: :disappointed:
+This container is rather handy but I've found it more difficult than I expected to apply a non-default configuration. Specifically I needed to install SSL certificates and keys, apply some `postgresql.conf` entries and modify `pg_hba.conf`.
+
+To do so I had to create a setup script in `/docker-entrypoint-initdb.d/` to overwrite `pg_hba.conf`, append to `postgresql.conf` and copy the SSL certs in from a bind mounted volume. Originally I actually went further and made a derived container that copied these things in before I realised I could just bind mount.
+
+I suggest:
+
+* document that bind-mounting `/docker-entrypoint-initdb.d/` is a good way to run scripts and load configuration;
+* Special case a `/docker-entrypoint-initdb.d/copy-files.d/` directory. When present, copy everything in `copy-files.d` to the new datadir (recursively, preserving mode and changing ownership to container user). So you can add an include_dir etc.
+* Special case a `/docker-entrypoint-initdb.d/append-files.d/` directory. When present, *append* everything in `append-files.d` to the new datadir with the same filename, creating it if it doesn't exist.
+* Auto-append `include_dir 'postgresql.conf.d'` to the generated `postgresql.conf`. Document that any config file snippet placed in `/docker-entrypoint-initdb.d/copy-files.d/postgresql.conf.d/` will be copied to the datadir and loaded as part of PostgreSQL's configuration. Or alternately just special case `postgresql.conf.d` in the `docker-entrypoint-initdb.d` and auto-enable `include_dir` if it's present.
+* Make it more obvious in the docs that scripts in `/docker-entrypoint-initdb.d/` run as the postgres user.
+I believe that current authentication configuration in `docker-entrypoint.sh` is less secure than it should be.  I have a problem with `$POSTGRES_PASSWORD` changing the authentication settings and not adequately warning user about it.
+
+Currently if the password is not supplied `host all all all trust` is added to `pg_hba.conf` , disabling the password checks for all users. I think this goes way too far:
+
+1) I honestly believe that there should be no way for the line `host all all all trust` to appear in configuration unless user explicitly sets `ACCEPT_ANY_PASSWORD_FOR_ANY_USER=true`
+2) Currently any mistake in configuration (for example misspelling  `POSTGRES_PASSWORD`) results in disabled authentication
+3) Disabled authentication is completely silent. User could believe that password authentication is working, since the DB accepts the password. 
+4) Warning displayed if `POSTGRES_PASSWORD` wasn't set does not convey that password checks were disabled altogether. 
+> No password has been set for the database. This will allow anyone with access to the Postgres port to access your database.
+
+Sounds like you can fix it by setting the password, but the password would be just ignored.
+
+I had an unpleasant experience of discovering my development DB for a personal project consuming 100% of server's CPU because someone was mining some kind of crypto coin on it.
+Initially I was using `POSTGRES_PASSWORD`, but later I decided to move password configuration for "postgres" user together with creating additional, less privileged users into an init SQL file in `/docker-entrypoint-initdb.d/` (amazing feature, btw). As you might imagine, I did not believe that this would disable all password checks altogether, and since my server continued to grant access with my password I had no idea that I was completely insecure.
+
+I did not expect (and didn't need) high security from DB with an exposed port and without SSL, but having literally no security is a really strange decision.
+
+I've read issues about security of this image (#3 #29 #31), and it seems like "security is annoying and not our problem" argument is winning. I'd much rather have official images be more secure by default, but I feel like this fight is futile. So here are my suggestions, from less bothersome to more secure:
+
+1) Change the warning to clearly state "all authentication is disabled, any password is valid for any user, change pg_hba.conf or set $POSTGRES_PASSWORD if this behavior is undesirable" or something like that. Add this warning to readme.
+2) If `POSTGRES_PASSWORD` is not set (better yet, if `ALLOW_EMPTY_PASSWORD` is set), then set it to an empty string and keep the `md5` authentication always enabled. That way developers can still easily connect to a DB with empty password, but changing the password would never be silently ignored, like it was in my case.
+3) If `POSTGRES_PASSWORD` is not set (better yet, if `GENERATE_RANDOM_PASSWORD` is set), then set password to a random string and print it on initial launch.
+
+Official MySQL image allows to get second or third behavior by setting `MYSQL_ALLOW_EMPTY_PASSWORD` or `MYSQL_RANDOM_ROOT_PASSWORD` environment variables. Alternatively, you can set `MYSQL_ROOT_PASSWORD` directly. One of the three variables must be set explicitly, or MySQL container fails to launch.
+
+For backwards compatibility `ACCEPT_ANY_PASSWORD_FOR_ANY_USER` or similarly explicitly named environment variable could be added. If it is set to true then `host all all all trust` is added to the config.
+
+I'm willing to write the necessary code, but I'd like to know beforehand which approach would be accepted. IMHO MySQL's approach is the correct one, it is both flexible and explicit, but it's up to the maintainers.
+During the research for [that problem](https://stackoverflow.com/questions/56046010) I came to the finding that if any files mounted to `docker-entrypoint-initdb.d` are unreadable to `postgres` user (e.g. have wrong permissions),  `docker-entrypoint.sh` just goes ahead and [ignores them](https://github.com/docker-library/postgres/blob/master/11/docker-entrypoint.sh#L160). 
+
+IMHO the entrypoint script should be more verbose in terms of complaining about files being there but having wrong permissions, instead of just passing by and starting up the server.

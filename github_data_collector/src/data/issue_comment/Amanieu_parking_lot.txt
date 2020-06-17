@@ -1,0 +1,212 @@
+On macOS and iOS, as of last year or so, many kernel synchronization mechanisms support priority inheritance out of the box.  (For a list of things that support it, see [this header](https://opensource.apple.com/source/xnu/xnu-4903.241.1/osfmk/kern/turnstile.h.auto.html) and scroll down a bit.)  When using one of those mechanisms, a waiting thread knows which thread it's waiting *for*, and if the waiter has higher priority than the waitee, the kernel temporarily boosts the waitee's priority to match.
+
+Priority inheritance is clearly useful across processes.  One might think that it's not very useful within a single process, since it's rare for threads in the same process to be set at different priorities.  But even if they're set at the same priority, they can have different *effective* priorities if one of them has been boosted by priority inheritance from another process.  If that thread then tries to lock a mutex held by another thread, it should be able to pass on its boost to the latter thread.  For this reason, the list of mechanisms supporting priority inheritance includes pthread mutexes (as well as ulocks, another kind of userland mutex).
+
+As far as I can tell, `parking_lot` currently doesn't support priority inheritance on any platform; `park` has no way of notifying the kernel which thread it's waiting for.  It would be good to fix this, though it might require substantial API changes.
+Currently the `Fairness` section of the `parking_lot::Mutex` documentation has this text:
+
+> A typical unfair lock can often end up in a situation where a single thread quickly acquires and releases the same mutex in succession, which can starve other threads waiting to acquire the mutex. While this improves performance because it doesn't force a context switch when a thread tries to re-acquire a mutex it has just released, this can starve other threads.
+>
+> This mutex uses eventual fairness to ensure that the lock will be fair on average without sacrificing performance. This is done by forcing a fair unlock on average every 0.5ms, which will force the lock to go to the next thread waiting for the mutex.
+>
+> Additionally, any critical section longer than 1ms will always use a fair unlock, which has a negligible performance impact compared to the length of the critical section.
+>
+> You can also force a fair unlock by calling MutexGuard::unlock_fair when unlocking a mutex instead of simply dropping the MutexGuard.
+
+I feel like this could be improved by replacing mentions of “performance” with “throughput” and perhaps establishing that thread starvation has implications on “latency”. This comes up as depending on the audience “performance” can mean either throughput or latency and explicitly calling out these two kinds of performances makes for less thinking time :)
+This blog post [Mutexes Are Faster Than Spinlocks](https://matklad.github.io/2020/01/04/mutexes-are-faster-than-spinlocks.html) generated a reddit discussion about lock implementatons. This made some users benchmark `parking_lot` on windows and some results shown are very problematic, others could just be better (since parking_lot is always faster than spin on linux and mac, but not on windows for some reason).
+
+I did not run this benchmark since I don't currently have windows installed, but since the user hadn't filed an issue I decided to post it here, their comment was: https://www.reddit.com/r/rust/comments/ejx7y8/blog_post_mutexes_are_faster_than_spinlocks/fd31um3/
+
+The results:
+
+Benchmark code: https://github.com/matklad/lock-bench
+Windows 10 Pro
+Intel Core i7-5930k @ 3.5 GHz
+stable-x86_64-pc-windows-msvc (default)
+rustc 1.40.0 (73528e339 2019-12-16)
+
+*extreme contention*
+```
+cargo run --release 32 2 10000 100
+    Finished release [optimized] target(s) in 0.03s
+     Running `target\release\lock-bench.exe 32 2 10000 100`
+Options {
+    n_threads: 32,
+    n_locks: 2,
+    n_ops: 10000,
+    n_rounds: 100,
+}
+
+std::sync::Mutex     avg 32.452982ms  min 20.4146ms    max 45.2767ms
+parking_lot::Mutex   avg 154.509064ms min 111.2522ms   max 180.4367ms
+spin::Mutex          avg 46.3496ms    min 33.5478ms    max 56.1689ms
+AmdSpinlock          avg 45.725299ms  min 32.1936ms    max 54.4236ms
+
+std::sync::Mutex     avg 33.383154ms  min 18.2827ms    max 46.0634ms
+parking_lot::Mutex   avg 134.983307ms min 95.5948ms    max 176.1896ms
+spin::Mutex          avg 43.402769ms  min 31.9209ms    max 55.0075ms
+AmdSpinlock          avg 39.572361ms  min 28.1705ms    max 50.2935ms
+```
+
+**heavy contention**
+```
+cargo run --release 32 64 10000 100
+    Finished release [optimized] target(s) in 0.03s
+     Running `target\release\lock-bench.exe 32 64 10000 100`
+Options {
+    n_threads: 32,
+    n_locks: 64,
+    n_ops: 10000,
+    n_rounds: 100,
+}
+
+std::sync::Mutex     avg 12.8268ms    min 6.4807ms     max 14.174ms
+parking_lot::Mutex   avg 8.470518ms   min 3.6558ms     max 10.0896ms
+spin::Mutex          avg 6.356252ms   min 4.6299ms     max 8.1838ms
+AmdSpinlock          avg 7.147972ms   min 5.7731ms     max 9.2027ms
+
+std::sync::Mutex     avg 12.790879ms  min 3.7349ms     max 14.4933ms
+parking_lot::Mutex   avg 8.526535ms   min 6.7143ms     max 10.0845ms
+spin::Mutex          avg 5.730139ms   min 2.8063ms     max 7.6221ms
+AmdSpinlock          avg 7.082415ms   min 5.2678ms     max 8.2064ms
+```
+
+light contention
+```
+cargo run --release 32 1000 10000 100
+    Finished release [optimized] target(s) in 0.05s
+     Running `target\release\lock-bench.exe 32 1000 10000 100`
+Options {
+    n_threads: 32,
+    n_locks: 1000,
+    n_ops: 10000,
+    n_rounds: 100,
+}
+
+std::sync::Mutex     avg 7.736325ms   min 4.3287ms     max 9.194ms
+parking_lot::Mutex   avg 4.912407ms   min 4.1386ms     max 5.9617ms
+spin::Mutex          avg 3.787679ms   min 3.2468ms     max 4.8136ms
+AmdSpinlock          avg 4.229783ms   min 1.0404ms     max 5.2414ms
+
+std::sync::Mutex     avg 7.791248ms   min 6.2809ms     max 8.9858ms
+parking_lot::Mutex   avg 4.933393ms   min 4.3319ms     max 6.1515ms
+spin::Mutex          avg 3.782046ms   min 3.3339ms     max 5.4954ms
+AmdSpinlock          avg 4.22442ms    min 3.1285ms     max 5.3338ms
+```
+
+no contention
+```
+cargo run --release 32 1000000 10000 100
+    Finished release [optimized] target(s) in 0.03s
+     Running `target\release\lock-bench.exe 32 1000000 10000 100`
+Options {
+    n_threads: 32,
+    n_locks: 1000000,
+    n_ops: 10000,
+    n_rounds: 100,
+}
+
+std::sync::Mutex     avg 12.465917ms  min 8.8088ms     max 13.6216ms
+parking_lot::Mutex   avg 5.164135ms   min 4.2478ms     max 6.1451ms
+spin::Mutex          avg 4.112927ms   min 3.1624ms     max 5.599ms
+AmdSpinlock          avg 4.302528ms   min 4.0533ms     max 5.4168ms
+
+std::sync::Mutex     avg 11.765036ms  min 3.3567ms     max 13.5108ms
+parking_lot::Mutex   avg 3.992219ms   min 2.4974ms     max 5.5604ms
+spin::Mutex          avg 3.425334ms   min 2.0133ms     max 4.7788ms
+AmdSpinlock          avg 3.813034ms   min 2.2009ms     max 5.0947ms
+```
+I was trying to put my finger on what exactly it was that made `RefMut::downgrade` unsound in https://github.com/rust-lang/rust/pull/57401, and wrote it down as [part of a blog post](https://pitdicker.github.io/Creative-methods-on-interior-mutability-types/#downgrading-a-mutable-smart-pointer).
+
+To quote from there (sorry to quote myself):
+>`RwLockWriteGuard` in `parking_lot` has a [`downgrade`](https://docs.rs/lock_api/0.3/lock_api/struct.RwLockWriteGuard.html#method.downgrade) method which turns it into a `RwLockReadGuard`. It is instructive to explore why `RefCell`s `RefMut` can't provide a similar method to turn it into a `Ref`.
+>
+>The signature of the closure used in `RefMut::map` is `FnOnce(&mut T) -> &mut U`. This gives it an interesting property: it allows you to bypass conventions of wrapped interior mutability types because you have exclusive access (with `as_mut`).
+>
+>Because `RefMut::map` made the promise to wrapped types that its reference is unique, the returned `RefMut` has to remain unique. It can't be turned into a `Ref`, of which multiple can exist. Example of how it can go wrong:
+>```rust
+>let refcell = RefCell::new(Cell::new(10u32));
+>let ref_mut = refcell.borrow_mut();
+>RefMut::map(ref_mut, |x| x.get_mut());
+>let ref1 = RefMut::downgrade(ref_mut);
+>let cell_ref = &*ref1;
+>let ref2 = refcell.borrow();
+>// We can now mutate the `Cell` through `ref2` while there also exists a
+>// reference to its interior.
+>```
+>
+>For `RwLockWriteGuard` however `downgrade` is sound, because it's `map` method returns another type. But that returned type, `MappedRwLockWriteGuard`, now has to remain unique, so [`MappedRwLockWriteGuard::downgrade`](https://docs.rs/lock_api/0.3/lock_api/struct.MappedRwLockWriteGuard.html#method.downgrade) is unsound.
+> The deadlock detection code (which can be enabled through a feature) will break if a mutex can be unlocked in a different thread than the one that locked it. It was decided that disabling `MutexGuard: Send` if that feature is enabled would be unacceptable since it might break code that relies on `MutexGuard: Send`.
+
+_Originally posted by @Amanieu in https://github.com/Amanieu/parking_lot/issues/139#issuecomment-490236259_
+
+While I understand the reasoning in the quote above, it's not ideal. This a bit weird for me to say, considering I proposed and implemented the PR that introduced the deadlock detection :rofl: 
+
+Parkinglot is the **only** crate that _can/could_ do Sendable guard AFAIK. So maybe should try to  preserve it somehow?
+
+Sendable guards may come in handy, as it just did for me, and you'd have to use an unsafe impl to work around it and hope that nobody enables deadlock detection.
+
+Some ideas, each with its own {up/down}sides
+1 - Reintroduce Sendable guards which is implicitly a `!deadlock` feature.
+2 - Create a Sendable{Mutex,RwLock} or something like that that don't participate in the deadlock detection.
+3 - Same as above, but in another crate.
+4 - ..
+This is very rough, but it was borne out of necessity. Essentially, parking is not something you can do in wasm, so I was encountering flurries of parking_lot panics, and not just from #166.
+
+So, this reimplements RawMutex and RawRwLock in the same way std has vastly simplified implementations for wasm. There's a bit of cruft, and I can't claim to understand the meaning of the translated `cmpxchg` in RwLock but it seems to work, and doesn't panic all the time. Clearly it needs more eyes on it though.
+
+Questions
+
+* Does it actually need the deadlock calls? I think the deadlock system might be using Instant::now.
+What is the best practice to profile the RwLock or Mutex in parking_lot, including:
+1. Acquire locks TPS;
+2. Histogram for lock wait time, including min, avg, p90, p99 and max;
+
+I know some tools like 'perf lock' on Linux, but it does not work well enough for me. I really prefer to the "Deadlock Detection" feature that integrated within the parking_lot, so any tool to achieve my goal?
+I have a very weird situation where compiling a library on the machine my program is running will cause the mutex to get stuck locking. But _only_ when called from specific places. There are a lot of moving parts to my project, so I honestly doubt much can be fixed from it. All I know is that using the mutex from `parking_lot` causes it to get stuck locking, while using the `std::sync` mutex works fine. 
+
+Below I've included a detailed description of my situation. But as I said, I honestly don't expect anything helpful to come from this due to the complexity of the whole thing.
+
+If there's any other information I can give to help with the issue, let me know.
+
+---
+
+My project is a discord bot using the [Serenity](https://crates.io/crates/serenity) crate. I'm implementing a fancy system to dynamically reload commands from a rust `dylib`, helped by the [libloading](https://crates.io/crates/libloading) crate. To keep things threadsafe, I have a mutex around the inner framework of the bot, which is modified whenever something is reloaded. I noticed I got segfaults and other weird problems all of a sudden and it was quite confusing. After some debugging, I found out that some calls to lock the inner framework never completed, leaving things in a weird broken state.
+
+Specifically, if I'm recompiling the program and I issue a command that locks the inner framework, the locking process will get stuck. Notably, this seems to _only_ happen when the lock request is coming from some of the dynamically loaded code, since the main core of the bot can still lock the framework no problem. Whether it's coincidental that it's the dynamically loaded code that is able to cause it problem is unknown. I've not been able to make a minimally reproducible version of the error outside of my specific situation. Though it is consistently reproducible within what I have.
+
+I've tried using the fair unlocking, thinking there was locking contention, but that had no effect. Using `try_lock_until` failed after the timeout, proving to me that it's not in fact crashed the thread, just stuck locking forever. As I said, switching to the `std::sync` mutex is the only thing that seems to fix the problem.
+
+Here's a link to the repo of my project: https://github.com/Jerald/fracking-toaster
+The code there's not entirely up to date, but the part that causes is the issue is still present.
+The underlying sys_call is not implemented for `Instant::now()` for the `wasm32-unknown-unknown` target (unless recompiling rust with `xargo` and enabling `wasm_syscall`):
+
+```
+panicked at 'Time system call is not implemented by WebAssembly host', src/libstd/sys/wasm/mod.rs:302:13
+
+Stack:
+
+Error
+    at Module.__wbg_new_59cb74e423758ede (webpack:///../pkg/spawn_chain.js?:181:26)
+    at __wbg_new_59cb74e423758ede (http://localhost:8080/bootstrap.js:65:102)
+    at console_error_panic_hook::hook::h8df71f3722ab18fc (wasm-function[194]:292)
+    at core::ops::function::Fn::call::h42e98a3c026ddf0b (wasm-function[776]:3)
+    at std::panicking::rust_panic_with_hook::h3f94f83752aaaaa5 (wasm-function[314]:265)
+    at std::panicking::begin_panic::h6beec07bc67d7532 (wasm-function[613]:40)
+    at std::sys::wasm::TimeSysCall::perform::h27f1627f17fac1d9 (wasm-function[721]:13)
+    at std::sys::wasm::time::Instant::now::h34de02a8c4aa47a2 (wasm-function[770]:3)
+    at std::time::Instant::now::h70048c3feeca6e27 (wasm-function[791]:1)
+    at parking_lot_core::parking_lot::HashTable::new::h1383e3e985aa35d8 (wasm-function[208]:53)
+```
+
+Finding a way to substitute the use of `Instant` in configuration or using a hooks system would be helpful to make this work for `wasm32-unknown-unknown` to allow plugging in a time source that works for Web vs WASI, etc.
+Hello,
+I really like your job, I use this crate really a lot, and I found the lack of a Future integration quite sad, because I often write future-based software and using locks inside them isn't a good choice.
+
+So I spent a bit of my free time and I came up with this really simple (and quite incomplete) implementation: [https://github.com/nappa85/future-rwlock/](https://github.com/nappa85/future-rwlock/)
+
+I don't know if you had other plans about this topic, maybe you'll find my work horrible, but I wanted to share my two cents.
+
+
+Best regards

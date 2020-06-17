@@ -1,0 +1,67 @@
+I have a Visitor that prevents further writes after a single value (e.g. okay: `["1", 2]`, but not okay: `"1" [2]`). In this case, writing the "1" to the root visitor instead of the array visitor prematurely triggers a close() on the underlying resource. The encoding for `Left(2)` is `["1" , 2]` regardless, since the `ctx.visitValue()` call is correct, but the EitherWriter was sending the `.visitFloat64StringParts("1")` to the wrong place which causes problems if visiting the root prevents further calls.
+
+Found during https://github.com/rallyhealth/weePickle/pull/52.
+I found a corner-case correctness issue when feeding [mutable](https://github.com/rallyhealth/weePickle/blob/b088175f380bd47e830376b909e064052c85cdfc/weejson/jackson/src/com/rallyhealth/weejson/v0/jackson/VisitorJsonGenerator.scala#L66-L71) `CharSequence`s into the generated macros.
+
+Input of `"""{"s1":"a","s2":"b", "$type": "upickle.Hierarchy.C"}"""` fails in this scenario. Macro ends up with values of `Str("upickle.Hierarchy.C")` for "s1" and "s2".
+
+Freezing `Str` to `CharSequence.toString` resolves the issue. We'd also need `StringVisitor` to freeze to a `String` since it's used by the macro for parsing the value of `"$type"`.
+
+AFAIK, the ujson parsers only emit `java.lang.String` anyway, so I expect the cost should be negligible. As long as that's true, it's only an issue for extensibility outside the library.
+This is not exactly a bug, it is kind of a feature request.
+
+If I create an "alias" of a type and proceed to create a ReadWriter to the alias, the program compiles but fails on with scala.MatchError on runtime while serializing an object of the aliased type.
+
+In my use case it, the problematic type was used in a case class with an default value, so it would only fail in the rare cases where the default value was not used.
+
+Bellow is the simplest reproduction of the problem I could manage to create.
+
+```
+import upickle.default.{ReadWriter, Writer, macroRW, write}
+import scala.util.Try
+
+object Example {
+  type Problem = List[Int]
+  final case class A(x: Problem = List()) extends AnyVal
+  implicit val ARw: ReadWriter[A] = macroRW
+  implicit val XRw: ReadWriter[Problem] = macroRW // Not needed, and if commented out solves the MatchError.
+
+  def main(args: Array[String]) {
+
+    def serialize[T](data: T)(implicit writer: Writer[T]): String = {
+      write(data)
+    }
+
+    println(A()) // OK
+    println(A(List())) // OK
+    println(Try(serialize(A(List(0, 1))))) // scala.MatchError
+    println(Try(serialize(List(0, 1).asInstanceOf[Problem]))) // scala.MatchError
+  }
+}
+```
+Using `"com.lihaoyi" %% "ujson" % "0.6.6"`
+
+```
+val json = ujson.read("{'foo': 28291041994989161181883157038606177750}")
+```
+
+yields:
+
+```
+28291041994989161181883157038606177750
+java.lang.NumberFormatException: 28291041994989161181883157038606177750
+	at ujson.util.Util$.parseLong(Util.scala:57)
+	at ujson.util.Util$.parseIntegralNum(Util.scala:23)
+	at ujson.Js$.visitNum(Js.scala:181)
+	at ujson.Js$.visitNum(Js.scala:77)
+	at ujson.Parser.parseNum(Parser.scala:171)
+	at ujson.Parser.rparse(Parser.scala:404)
+	at ujson.Parser.parse(Parser.scala:330)
+	at ujson.Parser.parse(Parser.scala:325)
+	at ujson.SyncParser.parse(SyncParser.scala:23)
+	at ujson.StringParser$.transform(StringParser.scala:28)
+	at ujson.StringParser$.transform(StringParser.scala:27)
+	at ujson.Transformable$fromTransformer.transform(Transformable.scala:13)
+	at ujson.package$.transform(package.scala:2)
+	at ujson.package$.read(package.scala:4)
+```

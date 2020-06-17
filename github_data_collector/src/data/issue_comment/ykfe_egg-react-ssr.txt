@@ -1,0 +1,116 @@
+
+# 现 renderToStream 方法只能针对一个 server.js 处理，若多个 server.js 文件会出现 server.js 调用错误问题
+
+原因：
+1. `global.serverStream = typeof serverJs === 'string' ? require(serverJs).default : serverJs`
+2. 当同一个 worker 同一个时刻需要渲染不用 server.js 的时候，可能会出现 `global.serverStream` 读取错误 server.js 情况
+比如：
+1. 同一时刻单worker，请求 Index 和 News 页面渲染。
+2. Index 页面执行到 `global.serverStream = typeof serverJs === 'string' ? require(serverJs).default : serverJs` 但未执行到 `const serverRes = await global.serverStream(ctx)`，此时 `global.serverStream` 为 Index.server.js 文件。
+3. News 页面执行完 `global.serverStream = typeof serverJs === 'string' ? require(serverJs).default : serverJs` 后，此时  `global.serverStream` 为 News.server.js 文件，Index 页面开始执行 `const serverRes = await global.serverStream(ctx)`
+4. 结果 Index 和 News 均采用了 News.server.js 进行渲染
+
+## 建议
+
+```Typescript
+import { Context }from 'midway'
+import { useCdn } from './useCdn'
+import { Config }from './interface/config'
+import { Global }from './interface/global'
+
+declare const global: Global
+
+const renderToStream = async (ctx: Context, config: Config) => {
+  const baseDir = config.baseDir || process.cwd()
+  const isLocal = process.env.NODE_ENV === 'development' || config.env === 'local' // 标志非正式环境
+  const useCDN = config.useCDN
+  global.isLocal = isLocal
+  let serverJs = config.serverJs
+  
+  if (useCDN) {
+    serverJs = await useCdn(serverJs as string)
+  }
+
+  if (isLocal && typeof serverJs === 'string') {
+    // 本地开发环境下每次刷新的时候清空require服务端文件的缓存，保证服务端与客户端渲染结果一致
+    !useCDN && delete require.cache[serverJs]
+  }
+
+  let csr
+  if (ctx.request && ctx.request.query) {
+    // 兼容express和koa的query获取
+    csr = ctx.request.query.csr
+  }
+  if (config.type !== 'ssr' || csr) {
+    const renderLayout = require('yk-cli/lib/renderLayout').default
+    const str = await renderLayout(ctx)
+    return str
+  }
+
+  if (!global.renderToNodeStream) {
+    // for this issue https://github.com/ykfe/egg-react-ssr/issues/4
+    global.renderToNodeStream = require(baseDir + '/node_modules/react-dom/server').renderToNodeStream
+  }
+
+  if (!global.serverStream) {
+    global.serverStream = {};
+  }
+
+  if (!global.serverStream || isLocal) {
+    global.serverStream[serverJs] = typeof serverJs === 'string' ? require(serverJs).default : serverJs
+  }
+
+  const serverRes = await global.serverStream[serverJs](ctx)
+  const stream = global. renderToNodeStream(serverRes)
+  return stream
+}
+
+export default renderToStream
+```
+1\ boilerplate  vs skeleton ?
+
+`
+Boilerplate code
+From Wikipedia, the free encyclopedia
+In computer programming, boilerplate code or boilerplate is the sections of code that have to be included in many places with little or no alteration. It is often used when referring to languages that are considered verbose, i.e. the programmer must write a lot of code to do minimal jobs. The need for boilerplate can be reduced through high-level mechanisms such as metaprogramming (which has the computer automatically write the needed boilerplate text), convention over configuration (which provides good default values, reducing the need to specify program details in every project) and model-driven engineering (which uses models and model-to-code generators, eliminating the need for boilerplate manual code).
+`
+
+bolierplate描述项目的结构的，而skeleton描述实际应用的
+
+
+我感觉bolierplate可能会更合适一点
+
+收到反馈只装生产环境依赖切换成csr运行会报错
+
+原因：csr的页面模版是你请求来的时候会用webpack去编译你的layout组件来生成模版，所以运行环境也需要webpack等模块。
+
+临时解决方案: 不使用npm i --production,需要将devdependencies一并安装
+
+计划解决方案：3.0版本会改成本地构建layout组件然后上传的做法，这样可以少安装一些模块。现在2.0版本暂时改不了，否则以前的应用会不兼容
+- add packages/middleware，package name：`ssr-middleware`
+- add koa/koa middlwares
+
+example
+
+```
+const conf = require('./config/config.ssr')
+const ssr = require('egg-react-ssr').koa(conf);
+
+const Koa = require('koa');
+const app = new Koa();
+
+//  mount routes from config
+app.use(ssr)
+
+// ctx.ssrRender()
+app.use(async ctx => {
+  ctx.ssrRender(...);
+});
+
+app.listen(3000);
+```
+
+
+
+能否补充一下PWA的example
+https://zeit.co/now

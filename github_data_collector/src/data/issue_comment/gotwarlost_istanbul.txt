@@ -1,0 +1,160 @@
+When handlebars.js version is above 4.6.0, the coverage report will be blank，
+
+![image](https://user-images.githubusercontent.com/18001899/72232015-8e5fe700-35f9-11ea-8c9a-6584282ef254.png)
+
+
+
+
+I have made a pull request just for an update to handlebars which causes multiple run time vulnerabilities in istanbul. I am wondering if we can just get this remedial update through.
+
+I am trying to solve multiple vulnerabilities in karma packages karma-typescript and karma-coverage and this update to instanbul will solve all of these minus one.
+
+Details :-
+https://github.com/karma-runner/karma/issues/2474#issuecomment-572173673
+Closes #781 
+
+This is my first contribution here. I'm not sure using this.currentState for this is the best way to do it but I'm open to suggestions :)
+## Context
+At Tanda, we run tests on CircleCI as part of our deployment process. Recently when running with `--coverage` flag, our tests are only failing on CircleCI, not locally. @builtbyproxy and I spent a whole day walking through the process to identify what may throw the error mentioned below. These are our findings.
+
+## Prerequisites
+package.json versions
+```
+jest 24.8.0
+react-native 0.59.9
+babel-jest 24.8.0
+react: 16.8.3
+```
+
+We touch:
+- `istanbul-lib-instrument`
+- `babel-plugin-istanbul`
+- `babel-jest`
+- `istanbul-reports`
+
+## Description
+When running tests in our local env, everything passes as intended. However, when deployed to CircleCI, we get an error in the form of `ReferenceError: cov_14jyvcatev is not defined`. The id that comes after the `cov_` changes depending on which file it is referring to. The file referred to by the `cov_${id}` has (so far) never been the file that is being tested.
+
+This only happens on CircleCI, and when the jest `--coverage` flag is on.
+
+This also only happens to one test per test run. It's always the same test, and the cov_id is always the same (but does not refer to the test or the tested component that fails). For example, we test component B, and component J's cov_id will be the cause. We have had cases where the two components are completely unrelated.
+
+![image](https://user-images.githubusercontent.com/5846629/67167947-7c6dff80-f38e-11e9-9391-27c4c5b14a7e.png)
+
+## Generating the cov_id
+This `cov_${id}` is generated in `istanbul-lib-instrument/dist/visitor.js` using the function `genVar`. `genVar` is called in the constructor for the VisitState class, and is assigned to `this.varName`. A VisitState object is created in the function `programVisitor` and used in the `enter` and `exit` functions, which is the default export for `istanbul-lib-instrument/dist/visitor.js`
+
+## The cov_id's journey
+
+With our programVisitor default export we found it is imported in `istanbul-lib-instrument/dist/index.js` and exported again as `programVisitor`.
+
+Then it is imported by `babel-plugin-istanbul/lib/index.js` and is given types, realPath, and other options. With the result being assigned to `this.__dv__`:
+![image](https://user-images.githubusercontent.com/5846629/67168106-2a2dde00-f390-11e9-83b8-83945c199486.png)
+
+Then it gets imported and exported by `babel-jest/build/index.js` and exports it as a part of the transformer (it's the `babelIstanbulPlugin` part)
+![image](https://user-images.githubusercontent.com/5846629/67168124-66613e80-f390-11e9-9e5b-2d517fd59336.png)
+
+We logged `transformResult` and got a big string with two consistent values of `code` and `map`. `code` looked something like this:
+```
+code: 'var cov_14jyvcatev = function () {\n  var path = "/usr/local/repo/src/components/Cards/ShiftAcceptance.js",\n...
+// a LOT more lines
+```
+This gave us our first reference to the `cov_${id}` that was being used as a value, thus pointing to a potential `ReferenceError: cov_id is not defined`.
+
+We searched our entire repo for instances of `code` being used and found the file `istanbul-reports/lib/html/annotator.js` running a map on the `code` variable after it's been split on newlines to generate an array of code lines. The istanbul-reports code looks like this:
+![image](https://user-images.githubusercontent.com/5846629/67168216-85140500-f391-11e9-8eda-75ad42522e5f.png)
+
+When running the same split on the same `code` string from `transformResult` (as mentioned above), we got an array looking like this:
+![image](https://user-images.githubusercontent.com/5846629/67168234-ae349580-f391-11e9-9e8c-ac59ed82fc65.png)
+
+Furthermore, when scrolling through we noticed instances of cov_id value being specifically mutated. This is the only place we can find reason for a `ReferenceError: cov_id is not defined`. (Pictured is the babel-plugin-graphql-tag import example, however the cov_id increments are inserted throughout our code as well.)
+![image](https://user-images.githubusercontent.com/5846629/67168250-ea67f600-f391-11e9-8401-a847284dbf34.png)
+
+`istanbul-report` generates an interactive directory of coverage reports. In these reports, there is a counter beside each code line which indicates how often it's called in tests. The GUI for this looks like this:
+![image](https://user-images.githubusercontent.com/5846629/67168275-50ed1400-f392-11e9-8f8b-072001e3e207.png)
+
+We believe that there is a race condition assigning the `cov_${id}` which isn't finishing before babel(or istanbul-reports or something?) tries to increment it.
+
+
+Before
+```
+found 66 vulnerabilities (21 low, 17 moderate, 27 high, 1 critical) in 1057 scanned packages
+  run `npm audit fix` to fix 57 of them.
+  1 vulnerability requires semver-major dependency updates.
+  8 vulnerabilities require manual review. See the full report for details.
+```
+After 
+```
+                       === npm audit security report ===
+
+found 0 vulnerabilities
+ in 767 scanned packages
+```
+Please see https://www.npmjs.com/advisories/1164
+In this sample code I use ``/* istanbul ignore if */``, which works fine I get to 100% coverage, it's OK. But I'd like to have a way to list all ignored lines, so that later (for example when I have the resources to clear some of those ignored cases) I can identify the "false 100%" and act on them. Today only a global search on ``/* istanbul`` can help me and it's not really visual ;)
+
+```js
+const LoginForm = ({ logIn, loggedIn, i18n }) => {
+  /* istanbul ignore if */
+  if (i18n === null) {
+    throw new Error('oh no!');
+  }
+  …
+```
+
+No indication in the file HTML report:
+
+![image](https://user-images.githubusercontent.com/214067/64868194-21cede80-d63f-11e9-8200-4b475f6f5a19.png)
+
+And obviously nothing in the listing either, where it would be cool to have a way to add a mention like "100%, 13% ignored":
+
+![image](https://user-images.githubusercontent.com/214067/64868223-2c897380-d63f-11e9-8dd5-06b5bd8ecfa5.png)
+
+Is there any way to achieve this goal?
+
+I am doing code coverage of an app running live and need to ignore some guard conditions that never are covered when app is running live. I tried all options below and still have red flag near my if statement:
+
+1: Ignore if and else in one tag
+
+```
+/* istanbul ignore if|else */
+if (A) {
+      throw new Error("..null or undefined.");
+}
+```
+2: Ignore if and else in two tags
+
+```
+/* istanbul ignore if */
+/* istanbul ignore else */
+if (A) {
+      throw new Error("..null or undefined.");
+}
+```
+3: Ignore else, then ignore code inside if with 'next':
+
+```
+/* istanbul ignore else */
+if (A) {
+      /* istanbul ignore next */
+      throw new Error("..null or undefined.");
+}
+```
+4: Ignore if:
+
+```
+/* istanbul ignore if */
+if (A) {
+      throw new Error("..null or undefined.");
+}
+```
+5: Ignore with multiple next's:
+
+```
+/* istanbul ignore next */
+if (A) {
+      /* istanbul ignore next */
+      throw new Error("..null or undefined.");
+}
+```
+It would be nice if import statements could be ignored as well so that the coverage is actually only taken from the file I want to test and not parts I may or may not mock.

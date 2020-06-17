@@ -1,0 +1,213 @@
+Hello,
+
+Please add another function to ServeFiles with BasicAuth
+
+```go
+router.ServeFiles("/static/*filepath", http.FileSystem(http.Dir(staticFolder)))
+```
+compatible with this:
+```go
+router.GET("/", BasicAuth(Index, user, pass))
+```
+
+to avoid two different middleware.
+### Why
+Because I want to use middleware in the way which is similar to net/http.
+
+### How to fix
+I added method of ServeHTTP to httprouter.Handle.
+Then, you can use middleware like this.
+```
+func myHandler(w http.ResponseWriter, r *http.Request, ps Params) {
+    ...
+    
+    fmt.Println("some process")
+
+    ...
+}
+
+func middleware(h httprouter.Handle) httprouter.Handle {
+    return func(w http.ResponseWriter, r *http.Request, ps Params) {
+        ...
+        
+        fmt.Println("some process")
+
+        ...
+
+        h.ServeHTTP(w, r, ps)
+    }
+}
+
+func main() {
+    r := httprouter.New()
+    r.GET("/route", middleware(myHandler))
+
+    ...
+}
+```
+
+### Additional
+Created test.
+
+At the moment, `"/param1a%2fparam1b/tail"` matches route `"head/:param1/:param2/tail"` instead of `":param1/tail"`. There's no way we can have a `'/'` in a URL param.
+Being able to serve static files at the root ("/index.html") while still allowing other routes is not covered by the readme. None of the issues I've read cover this either. I'm posting a working solution here for those looking. Perhaps this can be added to the readme.
+
+```go
+router := httprouter.New()
+router.GET("/", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	http.FileServer(http.Dir(("./templates"))).ServeHTTP(w, r)
+})
+router.GET("/api/", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	...
+})
+http.ListenAndServe(":3000", router)
+```
+
+This solves the `panic: '/api/' in new path '/api/' conflicts with existing wildcard '/*filepath' in existing prefix '/*filepath'` error when using the recommended `router.ServeFiles("/*filepath", http.Dir("./templates"))` function.
+I've built some extras around httprouter which would work much nicer if `Lookup(method, path)` would include the `.HandleOPTIONS` functionality that `ServeHTTP` has. 
+
+### Use Case
+I have user permission based routing. When an options request comes in, it doesn't work the way I'd like it to. Here's an example.
+
+```
+appUsers := httprouter.New()
+appUsers.GET("/api/user", someHandler)
+
+adminUsers := httprouter.New()
+adminUsers.GET("/api/user", someHandler)
+adminUsers.DELETE("/api/user", someHandler) // admin only handler
+
+muxer := Mux({
+    appRouter: appUsers,
+    adminRouter: adminUsers,
+}) 
+
+func (m *Mux) ServeHTTP() {
+     if user.IsAppUser && user.IsAdminUser {
+              handler, params, _ := m.appRouter.Lookup(r.Method, r.Path)
+              if handler != nil {
+                     handler.ServeHTTP(w, r, params)
+                     return
+             }
+
+             m.adminRouter.ServeHTTP(w, r)
+            return
+     }
+
+     if user.IsAppUser {
+          m.appRouter.ServeHTTP(w, r)
+          return
+     }
+
+     if user.IsAdminUser {
+          m.appRouter.ServeHTTP(w, r)
+          return
+     }
+
+     http.NotFound(w, r)
+}
+```
+For some reason the request's response object is nil, even when using defer.
+
+How do I log the status code the endpoint resulted with?
+
+
+```
+func LogHandler(h httprouter.Handle) httprouter.Handle {
+	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+
+		lc := ToContext(r.Context(), SetupLogrus())
+
+		requestID := r.Header.Get(REQUEST_ID)
+
+		if requestID == "" {
+			requestID = string(composeRequestID())
+			r.Header.Set(REQUEST_ID, string(requestID))
+		}
+		f := setupRequestFields(r.Context(), w, r)
+		delete(f, "status")
+
+		AddFields(lc, f)
+		req := r.WithContext(lc)
+		h(w, req, ps)
+		defer func() {
+			l := Extract(lc)
+			l.WithField("status", req.Response.StatusCode).Infof("%s %s", string(r.Method), r.URL)
+		}()
+
+	}
+}
+```
+
+Hi I met a issue to use this router. 
+
+I'm trying to add a prometheus midware into our endpoint implementation. But our endpoint are using httprouter. Then when I tried to add this midware into existing code base, I cannot find a good way to integrate both together.
+
+```golang
+
+router := httprouter.New()
+router.GET("/hello", r.Hello)
+
+func (r configuration) Hello(w http.ResponseWriter, req *http.Request, ps httprouter.Params)
+
+func InstrumentHandlerFunc(name string, handler http.HandlerFunc) http.HandlerFunc {
+    counter := prometheus.NewCounterVec(
+		do something...
+	)
+
+	duration := prometheus.NewHistogramVec(
+		do something...
+	)
+	return promhttp.InstrumentHandlerDuration(duration,
+		promhttp.InstrumentHandlerCounter(counter, handler))
+}
+
+```
+
+What I need is I need pass a httprouter.Handle endpoint fucntion pointer into a midware function and generate a new httprouter.Handle. Then I can use this httprouter.Handle to register it into the router. When the requests comes it will call that midware first then call the real endpoint.
+
+
+```golang
+Below is what I want to do
+
+func InstrumentHandlerFunc(name string, handler httprouter.Handle) httprouter.Handel {
+
+}
+
+router.Get("/hello", InstrumentHandlerFunc("/hello", r.Hello))
+```
+
+
+I was able to serve a react app which I created with "create-react-app", but how I serve an app which is created with "create-react-app" and has react router? Is this possible?
+I am using httprouter in a project and I now need to make it work with the go http server to serve image files from a few different directories, for example:
+
+images in path1: `/root/path1/to/images_part1`
+images in path2: `/root/path2/to/images_part2`
+...
+images in path_n_: `/root/pathn/to/images_partn`
+
+In my code, I have the following working in supporting what I wanted to do, but I was wondering if there is any negative impact on my http server using httprouter:
+```go
+
+r := httprouter.New()
+imagePaths := []string{"/root/path1/to/images_part1/cool_me.jpeg", "/root/path2/to/images_part2/128.png", 
+"/root/path3/to/images_part3/imagen.jpeg"}
+
+// get the code executive path:
+ex, err := os.Executable()
+if err != nil {
+  panic(err)
+}
+
+for idx, imgPath := range imagePaths {
+	if rel, err := filepath.Rel(ex, imgPath); err != nil {
+		logrus.Errorf("err in getting relative path: %v\n", err)
+	} else {
+		logrus.Infof("for image: %s, rel dir is %s\n", imgPath, filepath.Dir(rel))
+		r.ServeFiles(fmt.Sprintf("/static%d/*filepath", idx), rice.MustFindBox(filepath.Dir(rel)).HTTPBox()) // here, create many different static paths to httprouter
+    }
+}
+
+http.ListenAndServe(":8888", r)
+
+```

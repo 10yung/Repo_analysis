@@ -1,0 +1,222 @@
+This addresses https://github.com/xi-editor/druid/issues/430
+
+This requires https://github.com/linebender/piet/pull/117 to have access to `current_transform()` which is necessary to keep track of applied transformations.
+
+One thing that is missing here (also because I'm not 100% sure) is keeping track of clipping. Right now previous clipping is not applied to z-order painting. It would be a bit trickier since `PaintCtx` would need to keep track of clipping.
+
+One other thing that I was thinking about was thinking about is whether it would make sense to allow negative `z_index`es to allow painting below content?
+I'm running code which in simplified version looks like this
+```rust
+use std::{thread, time};
+use druid::widget::{Button, Flex};
+use druid::{AppLauncher, Widget, WindowDesc};
+
+// Clicking a button should close the window
+
+//// The close button close the window
+//fn main () {
+//    let window = WindowDesc::new(build_widget);
+//    AppLauncher::with_window(window)
+//        .use_simple_logger()
+//        .launch(0_u32)
+//        .expect("launch failed");
+//
+//    dbg!("GUI killed");
+//}
+
+// The close button makes the window hang
+fn main () {
+    dbg!("LAUNCH_GUI");
+
+    let mut should_gui = true;
+    loop {
+        dbg!("LOOP ITERATION");
+        if should_gui == true {
+            dbg!("SHOW GUI");
+            should_gui = false;
+
+            let window = WindowDesc::new(build_widget);
+            AppLauncher::with_window(window)
+                .use_simple_logger()
+                .launch(0_u32)
+                .expect("launch failed");
+
+            dbg!("GUI KILLED");
+        }
+        let sleep_time = time::Duration::from_millis(100);
+        thread::sleep(sleep_time);
+    }
+}
+
+fn build_widget() -> impl Widget<u32> {
+    Flex::column()
+        .with_child(
+            Button::sized(
+                "Close",
+                |evt_ctx , data: _, _env| {
+                    dbg!(&data);
+                    //evt_ctx.window().close();
+                    evt_ctx.submit_command(druid::commands::CLOSE_WINDOW, None);
+                },
+                80.0,
+                20.0,
+            ),
+            0.0,
+        )
+}
+```
+
+I'm expecting the window is closed properly and the program keeps looping without GUI.
+
+Instead, I'm getting a hanging window which can't be closed, see
+![druid-close-broken2](https://user-images.githubusercontent.com/298994/72505676-b9884780-3840-11ea-8777-ef54862a17c9.gif)
+
+
+Also discussed here: https://xi.zulipchat.com/#narrow/stream/147926-druid/topic/evt_ctx.2Ewindow().2Eclose().20not.20working.3F
+
+# Software versions
+gtk3-devel.x86_64                                  3.24.13-1.fc31                       
+glib2-devel.x86_64                                 2.62.3-1.fc31                       
+Hi -
+
+Cool project...
+I'm a 12 year UI dev and would like to contribute. Here are a few items I feel this project could benefit from and would love your feedback. I'm a relative newcomer to Rust and Druid but UI has been my focus for some time and the patterns used in Druid are very familiar to me.
+
+## This PR is a WIP and contains: 
+1. Virtual List widget - Tested using 1 million rows with no performance cost. It can take many, many more rows with zero performance impact. Works with both Vertical and Horizontal axis.
+2. A Decoupled `Scrollbar` widget - Basically a slider that interpolates between a given Range instead of a viewport boundary. This decoupling allows the most flexible usage for views that virtualize layouts.
+3. `Event::Size` propagates to children - this was necessary to adjust the scroll position bindings and to calculate a new `max_scroll_position` value. 
+
+## To Test
+run the `virtual_list.rs` in `examples/`
+
+## TODO
+### VirtualList
+- [ ] Keyboard navigation / accessibility
+- [x] Determine if reusing popped widgets provides advantages and implement if yes. (tabled for later)
+- [ ] Variable size rows/cols - Potentially impactful with performance since all items would need to be measured in order to calculate the `max_scroll_position`.
+- [ ] Smooth scroll - A fairly straightforward implementation since the VirtualList design keeps this in mind. 
+- [ ] Test thoroughly 
+### Scrollbar
+- [x] Apply animation to scrollbar - this will likely be a copy/paste from the original `Scroll` widget
+- [x] Page the scroll position up or down depending on where a mouse event occurs in relation to the scroll thumb along the scroll track.
+- [ ] Wire in whatever solution is found for #457 
+- [ ] Test thoroughly
+
+I have a few questions also: 
+
+1. The `update` flow seems to aggressively clone the entire data structure even when a single field is all that has changed. This still seems to happen when manually implementing the `Data` trait also. Is there a way to avoid this? If no, are there plans to address this? e.g. Observables 
+2. I found the `Data` requirement to be cumbersome. Why was this chosen over just `PartialEq`? I see they are somewhat synonymous `#[druid(same_fn = "PartialEq::eq")]`
+3. `Event::MouseMoved` requires a delta to be calculated manually. Are there plans to include the delta similar the `Event::Scroll`?
+
+I hope you find these widgets useful. I certainly had fun creating them. 
+
+Thank you for your time and feedback!
+
+Justin
+
+This is branched from #450, but has come up repeatedly, so I felt it needed its own issue.
+
+Mouse move and up events are dropped when the mouse is clicked in window then dragged outside. This causes all kinds of problems, as widgets (reasonably) expect an eventual mouse up after a mouse down.
+
+I think it needs to be solved at the druid-shell level. On Windows, we should be calling [SetCapture](https://docs.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setcapture) (and ReleaseCapture). I'm not sure what the counterparts are on other systems; on macOS I think this may be handled by the platform.
+
+When should the app grab mouse capture? One possibility is to *always* do this on mouse click. Another is to have it plumbed down from set_active (and there is a [TODO](https://github.com/xi-editor/druid/blob/master/druid/src/core.rs#L617) in the source for this). If the behavior on macOS is to always capture, then I think the former route is more developer-friendly, as there's less risk of strange behavior when set_active is not called, and of course less platform variation.
+breaking out of #448. There's currently an issue where commands issued during or after `update` won't be handled until after the next normal event arrives. We shouldn't have to wait; if there are commands to handle, we should immediately schedule a new update, and handle them.
+
+@edwin0cheng you're welcome to take this if you're interested!
+
+> The best way to handle this right now would be to schedule an idle call with the runloop if there are commands to process after painting is finished, that would trigger a new event/update pass.
+> 
+> This is something we will need to do anyway, because `lifecycle` will work like `update` and you will be able to submit commands there, but we won't run them until after this paint cycle.
+> 
+> If you're interested in implementing this, you would be welcome to; it would work like `timer` does, where you request a callback from the `WindowHandle` or `WinCtx`, and then I would probably add a `fn idle(&mut self)` method to `druid-shell::WinHandler`, with an implementation in `druid::win_handler` that just processes commands?
+> 
+> Also the mechanism for scheduling idle tasks exists, but is a bit confusing: basically you call `WindowHandle::get_idle_handle()`, which returns an `Option<IdleHandle>`; then you call `add_idle` on that, passing a closure that will be called with an `&dyn Any` that is actually your `WindowHandler` type; you can downcast that to the correct concrete type and do stuff with it.
+> 
+> I'm not totally sure what the rationale for this approach is; the basic idea is that you can do arbitrary things with your `WindowHandler` in that closure, like create and dispatch events, but it's definitely an awkward API.
+> 
+
+_Originally posted by @cmyr in https://github.com/xi-editor/druid/pull/448#issuecomment-573147934_
+I am running textbox example from main branch on windows compiled with:
+stable-x86_64-pc-windows-msvc
+rustc 1.40.0 (73528e339 2019-12-16)
+
+steps to reproduce:
+- run textbox example
+- select all text in top textbox
+- move the cursor out of the window before releasing the mouse button
+- type something
+- move cursor back into textbox after typing
+
+Textbox needs to handle key press event so It doesn't keep selecting after user types something. I want to open a pull request for this if this is a bug
+I found out when modifying `data` in  `AnimFrame`, the `Widget::update` will not run. 
+
+For example, I have a widget which use `AnimFrame` event to poll some thread results, and then it will change a boolean flag in my data which is controlling a `Either` widget. But it do not work as expect and my `Either` widget do not switch.
+
+I think the reason of that is :
+
+https://github.com/xi-editor/druid/blob/cbc31d86fe0548be507116f543b0f2efa700bdf8/druid/src/win_handler.rs#L144-L165
+
+If I understand correctly, It should call update **after** `AnimFrame` event but current implementation did not.
+
+
+
+
+We've been talking about this for a while in zulip, though I'm just now realizing there's no issue for it. This is a first step toward doing some fancy buttons like a control strip and the "button" aspect of a drop-down menu, but also as-is it should be helpful for many scenarios where something needs to be "clickable".
+
+Two issues with my implementation:
+1. to recreate the existing styling, I made a ButtonBackground widget, but for some reason that widget doesn't get `is_active` updates from its parent, only `is_hot`, so I have to do extra event handling. (It's very possible I'm doing a very dumb error but I couldn't find it).
+2. to make lifetimes work with WidgetExt I had to make WidgetExt ``T: Data + `static`` which I'm guessing is not ideal? It's unclear to me what I'm doing weird here, because WidgetExt is working with other widgetpod-as-child widgets as-is.
+
+Also all the names for things are up for debate, but I'm pretty happy with it right now. I guess there's a larger question if this is appropriate for WidgetExt, but it felt right to me.
+Follow-up from #440.
+
+The Github workflow should be updated to check against feature flags, so that any future API-breaking change doesn't also silently break the flagged feature.
+I have some code that creates a split layout:
+
+```
+fn ui_builder() -> impl Widget<i32> {
+    Split::horizontal(
+        Flex::column().with_child(Label::new("Sidebar goes here").center(), 1.),
+        Flex::column().with_child(Label::new("Task goes here").center(), 1.),
+    )
+    .draggable(true)
+}
+```
+
+If I drag the split handle so that the left side of the `Split` is smaller than the width of the `Label` it contains, the label text overflows its container and into the right side of the split. This is what it looks like:
+
+<img width="612" alt="Screen Shot 2020-01-02 at 5 53 57 PM" src="https://user-images.githubusercontent.com/120190/71667001-40411d00-2d89-11ea-8c16-577d306ecbf2.png">
+
+I can reproduce the same issue by manually setting the size of the `Split`:
+
+```
+fn ui_builder() -> impl Widget<i32> {
+    Split::horizontal(
+        Flex::column().with_child(Label::new("Sidebar goes here").center(), 1.),
+        Flex::column().with_child(Label::new("Task goes here").center(), 1.),
+    )
+    .draggable(true)
+    .split_point(0.2)
+}
+```
+
+If I use a `Button` instead of a `Label` as a child, the button resizes itself to fit inside the `Split` as expect. But the text inside the button overflows the `Split` container as well as the button. Here's the code to reproduce the issue:
+
+```
+fn ui_builder() -> impl Widget<i32> {
+    Split::horizontal(
+        Flex::column().with_child(Button::new("Button goes here", Button::noop).center(), 1.),
+        Flex::column().with_child(Label::new("Task goes here").center(), 1.),
+    )
+    .draggable(true)
+    .split_point(0.2)
+}
+```
+
+Here's is what it produces:
+
+<img width="612" alt="Screen Shot 2020-01-02 at 6 00 57 PM" src="https://user-images.githubusercontent.com/120190/71667161-dc6b2400-2d89-11ea-80bb-58b3f0aafc1a.png">
+
+The issue occurs on the current `master` branch. I haven't had a chance to test it on `0.4`.

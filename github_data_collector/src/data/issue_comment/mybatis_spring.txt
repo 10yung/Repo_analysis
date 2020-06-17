@@ -1,0 +1,220 @@
+# Version Info
+mybatis-spring：2.0.3
+
+# Problem
+I wanna register a "DefaultEnumTypeHandler" when creating bean "sqlSessionFactory". but if "configLocation" and "configuration" are both null, the "sqlSessionFacotry" will rebuild and my settings are invalid.
+
+#### Bean register code：
+```
+    @Bean
+    public SqlSessionFactoryBean sqlSessionFactory(@Qualifier("blogDataSource") DataSource dataSource) throws Exception {
+        SqlSessionFactoryBean factoryBean = new SqlSessionFactoryBean();
+        factoryBean.setDataSource(dataSource);
+        // if there is no "configLocation" or "configuration"
+        // factoryBean.setConfiguration(new org.apache.ibatis.session.Configuration());
+
+        SqlSessionFactory factory = factoryBean.getObject();
+        if (null == factory) {
+            throw new Exception("No sql session factory found!");
+        }
+        factory.getConfiguration().getTypeHandlerRegistry().setDefaultEnumTypeHandler(AutoEnumTypeHandler.class);
+        return factoryBean;
+    }
+```
+
+#### Source code：
+Method "afterPropertiesSet" will be called when getting the bean instance. Then it will try to build a "sqlSessionFactory".
+
+```
+@Override
+  public void afterPropertiesSet() throws Exception {
+    notNull(dataSource, "Property 'dataSource' is required");
+    notNull(sqlSessionFactoryBuilder, "Property 'sqlSessionFactoryBuilder' is required");
+    state((configuration == null && configLocation == null) || !(configuration != null && configLocation != null),
+        "Property 'configuration' and 'configLocation' can not specified with together");
+
+    this.sqlSessionFactory = buildSqlSessionFactory();
+  }
+```
+
+Here is the root cause, "targetConfiguration" will be a new instance of "Configuration" when "configLocation" and "configuration" are both null. Then the "DefaultEnumTypeHandler" will initialize and my settings turn invalid.
+
+```
+protected SqlSessionFactory buildSqlSessionFactory() throws Exception {
+
+    final Configuration targetConfiguration;
+
+    XMLConfigBuilder xmlConfigBuilder = null;
+    if (this.configuration != null) {
+      targetConfiguration = this.configuration;
+      if (targetConfiguration.getVariables() == null) {
+        targetConfiguration.setVariables(this.configurationProperties);
+      } else if (this.configurationProperties != null) {
+        targetConfiguration.getVariables().putAll(this.configurationProperties);
+      }
+    } else if (this.configLocation != null) {
+      xmlConfigBuilder = new XMLConfigBuilder(this.configLocation.getInputStream(), null, this.configurationProperties);
+      targetConfiguration = xmlConfigBuilder.getConfiguration();
+    } else {
+      LOGGER.debug(
+          () -> "Property 'configuration' or 'configLocation' not specified, using default MyBatis Configuration");
+      // 【Here】
+      targetConfiguration = new Configuration();
+      Optional.ofNullable(this.configurationProperties).ifPresent(targetConfiguration::setVariables);
+    }
+```
+
+<!--
+Dear contributors,
+
+Please consider providing an executable test case or an example project.
+As Spring has many ways to setup, it is really difficult for us to reproduce the problem just from some snippets.
+
+Thank you very much for your contribution!
+-->
+
+I recently tried to update spring from 5.1.9.RELEASE to 5.2.0.RELEASE and got this error:
+
+`WARN - main : No MyBatis mapper was found in '[com.vividseats.skybox.mappers]' package. Please check your configuration.`
+
+I have this in the configuration:
+```
+<bean class="org.mybatis.spring.mapper.MapperScannerConfigurer">
+        <property name="basePackage" value="com.vividseats.skybox.mappers"/>
+        <property name="sqlSessionTemplateBeanName" value="masterSqlSessionTemplate"/>
+    </bean>
+```
+
+Using mybatis-spring version 2.0.3
+I was using SpringManagedTransactionFactory with Oracle to execute stored procedures successfully. When I moved from Oracle to postgresql (converted the oracle procedures to functions in postgresql) its throwing "unnamed portal [9]" error when I execute a function.
+I extended the SpringManagedTransactionFactory to set autoCommit to false which works on getting result sets but this is not committing  any data. Tried setting commit directly the procedure and tried with sqlSession commit. Both are not working.
+
+```
+<bean id="sqlSessionFactory" class="org.mybatis.spring.SqlSessionFactoryBean">
+		<property name="dataSource" ref="dataSource" />
+		<property name="mapperLocations" value="classpath:mappers/*.xml" />
+		<property name="transactionFactory">
+				<bean class="util.BesstManagedFactory" />
+<!-- 			<bean class="org.mybatis.spring.transaction.SpringManagedTransactionFactory" /> -->
+		</property>
+	</bean>
+```
+
+```
+public class BesstManagedTransaction extends SpringManagedTransaction {
+	@Override
+	public Connection getConnection() throws SQLException {
+		Connection connection = super.getConnection();
+		connection.setAutoCommit(false);
+		return connection;
+	}
+```
+This is a design issue, which is based on two considerations below.
+
+1. Instantiating SqlSessionFactoryBean in a spring context causes MyBatis logging system to be initialized before any other MyBatis code. This prevents MyBatis configuration setting to be applied at this time. Which prompts more general question, if invoking MyBatis logging system before any other MyBatis code was intended by design.
+
+2. Consideration #1 is actually a consequence of attempt to step out of implementation patterns for Spring framework extensions.  SqlSessionFactoryBean is an extension of Spring framework (and not MyBatis framework), thus usage of apache commons logging (with all its drawbacks) is prescribed.
+
+Suggestion: use Apache Commons Lgging in mybatis-spring components that extend Spring framework.
+**Secne**
+[![DB action sequence and My problems][1]][1]
+
+
+  [1]: https://i.stack.imgur.com/YCnGZ.png
+
+**Detail**
+
+I think after step 2, the datasource 2 SqlSession should not be stored in the thread. 
+
+**Code**
+
+SqlSessionUtils#registerSessionHolder
+
+
+      private static void registerSessionHolder(SqlSessionFactory sessionFactory, ExecutorType executorType,
+      PersistenceExceptionTranslator exceptionTranslator, SqlSession session) {
+    SqlSessionHolder holder;
+    if (TransactionSynchronizationManager.isSynchronizationActive()) {
+      Environment environment = sessionFactory.getConfiguration().getEnvironment();
+
+      if (environment.getTransactionFactory() instanceof SpringManagedTransactionFactory) {
+        if (LOGGER.isDebugEnabled()) {
+          LOGGER.debug("Registering transaction synchronization for SqlSession [" + session + "]");
+        }
+
+        holder = new SqlSessionHolder(session, executorType, exceptionTranslator);
+        // Key Point: If transaction synchronization is active for the current thread, sqlsession is binded to the thread. I think this logic is wrong.
+        TransactionSynchronizationManager.bindResource(sessionFactory, holder);
+        TransactionSynchronizationManager.registerSynchronization(new SqlSessionSynchronization(holder, sessionFactory));
+        holder.setSynchronizedWithTransaction(true);
+        holder.requested();
+      } else {
+
+As I mentioned in the code, I think this logic is wrong. Binding sqlsession to the thread should have the condition as:
+
+ - there is transaction ***that corresponds to the current sqlsession***
+   in this thread;
+
+**Version**
+
+Spring 4.3.5 & mybatis-spring 1.3.1
+
+
+----------
+
+So I think this is a bug in mybatis-spring and I don't know how to fix it.
+
+See https://github.com/mybatis/mybatis-3/issues/629#issuecomment-298385323.
+
+I've met a problem when I hope my service method shouldn't be wrapped by a transaction.Because there's several http requests and the method took a long time to finish itself and then, many threads hold the jdbc connections too long that my connection pool is empty and  many CannotGetJdbcConnectionException were be thrown. So I marked the method with @Transactional(propagation = Propagation.NOT_SUPPORTED), but it dosn't work.
+
+I checked the SqlSessionTemplate and found that it'll invoke SqlSessionUtils.registerSessionHolder method to bind the SqlSession to TransactionSynchronizationManager if the TransactionFactory is implemented by SpringManagedTransactionFactory. It only works well then my transaction propagation behavior is Propagation.REQUIRED I bet.
+
+So I think we should reimplement the SqlSessionTemplate and writer a MybatisTransactionManager to take the place of SqlSessionSynchronization.
+
+Or if there's a better choice for me?
+Hi, I've met an issue that the db record was updated but related cache still stale in some concurrent cases. I dig into the source code, find the implement of `beforeCommit` method in `SqlSessionUtils.java`:
+
+     public void beforeCommit(boolean readOnly) {
+        // Connection commit or rollback will be handled by ConnectionSynchronization or
+        // DataSourceTransactionManager.
+        // But, do cleanup the SqlSession / Executor, including flushing BATCH statements so
+        // they are actually executed.
+        // SpringManagedTransaction will no-op the commit over the jdbc connection
+        // TODO This updates 2nd level caches but the tx may be rolledback later on! 
+        if (TransactionSynchronizationManager.isActualTransactionActive()) {
+          try {
+            if (LOGGER.isDebugEnabled()) {
+              LOGGER.debug("Transaction synchronization committing SqlSession [" + this.holder.getSqlSession() + "]");
+            }
+            this.holder.getSqlSession().commit(); //This line will delete 2nd level cache.
+          } catch (PersistenceException p) {
+            if (this.holder.getPersistenceExceptionTranslator() != null) {
+              DataAccessException translated = this.holder
+                  .getPersistenceExceptionTranslator()
+                  .translateExceptionIfPossible(p);
+              if (translated != null) {
+                throw translated;
+              }
+            }
+            throw p;
+          }
+        }
+      }
+
+I guess `this.holder.getSqlSession().commit();` should not be to executed  in  `beforeCommit` since it would delete the cache before db commit. and it may cause the issue like I met. FaceBook wrote a paper to explain that **the right way should be delete the cache after commit** . (https://www.usenix.org/system/files/conference/nsdi13/nsdi13-final170_update.pdf)
+(https://www.quora.com/Why-does-Facebook-use-delete-to-remove-the-key-value-pair-in-Memcached-instead-of-updating-the-Memcached-during-write-request-to-the-backend)
+
+So I guess maybe we can move `this.holder.getSqlSession().commit();` into `afterCompletion` to solve this problem? 
+
+<!--
+Dear contributors,
+
+Please consider providing an executable test case or an example project.
+As Spring has many ways to setup, it is really difficult for us to reproduce the problem just from some snippets.
+
+Thank you very much for your contribution!
+-->
+
+The Mockito is very popular mock library. I will consider to use the Mockito instead of the Mockrunner.
+Note : The Mockito has been used already on some other projects(mybatis-3, typehandlers-jsr310) .

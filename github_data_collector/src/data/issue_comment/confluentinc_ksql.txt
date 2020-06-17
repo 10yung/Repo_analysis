@@ -1,0 +1,121 @@
+
+**Describe the bug**
+
+When inserting a record into a stream that's serialized with Avro, a poor error message is raised if ksqlDB can't connect to Schema Registry.
+
+**To Reproduce**
+
+With ksqlDB 0.6.0, where Schema Registry is not configured on the server:
+
+```sql
+CREATE STREAM s1 (c1 varchar) WITH (kafka_topic='t1', partitions=1, key='c1', value_format = 'avro');
+
+insert into s1 (c1) values ('a');
+```
+
+**Expected behavior**
+
+An error message indicating that ksqlDB couldn't connect to Schema Registry.
+
+**Actual behaviour**
+
+```
+Failed to insert values into 'S1'. Could not serialize row: [ 'a' ]
+```
+
+This error message is tough because in a more complex setting, it leads the user to believe that it's a problem with their data.
+
+`Kafka Topic` should be `KSQL object` (or similar) - it's definitely _not_ Kafka topic though. In this example here the topic is `BAR` but `SHOW QUERIES` says it's `FOO2` (which is the name of the stream)
+
+```
+ksql> CREATE STREAM FOO2 WITH (KAFKA_TOPIC='BAR') AS SELECT * FROM KSQL_PROCESSING_LOG;
+
+ Message
+------------------------------------------------------------------------------
+ Stream FOO2 created and running. Created by query with query ID: CSAS_FOO2_2
+------------------------------------------------------------------------------
+ksql> SHOW QUERIES;
+
+ Query ID    | Kafka Topic | Query String
+---------------------------------------------------------------------------------------------------------------
+ CSAS_FOO2_2 | FOO2        | CREATE STREAM FOO2 WITH (KAFKA_TOPIC='BAR', PARTITIONS=1, REPLICAS=1) AS SELECT *
+FROM KSQL_PROCESSING_LOG KSQL_PROCESSING_LOG
+EMIT CHANGES;
+---------------------------------------------------------------------------------------------------------------
+For detailed information on a Query run: EXPLAIN <Query ID>;
+ksql>
+```
+
+This may seem like a nit, but if you're using `SHOW QUERIES` and want to match a query with a stream, this mislabeling makes things more difficult. 
+This is to revert the #4339 - temporary disabling of deprecated API usage in KsLocator, once we land fix for #4086 
+BREAKING CHANGE: standalone literals that used to be doubles will now be
+interpreted as BigDecimal. In most scenarios, this won't affect any
+queries as the DECIMAL can auto-cast to DOUBLE; in the case were the
+literal standsalone, the output schema will be a DECIMAL instead of a
+DOUBLE. To specify a DOUBLE literal, use scientific notation (e.g.
+1.234E-5). 
+
+fixes #3593 
+
+### Description 
+
+The `DIGIT+ '.' DIGIT*    | '.' DIGIT+` pattern will now resolve to a Decimal while anything in scientific notation (`DIGIT+ ('.' DIGIT*)? EXPONENT  | '.' DIGIT+ EXPONENT`) will resolve to a floating point (double) value. This is in line with [SQL Server](https://docs.microsoft.com/en-us/sql/t-sql/data-types/constants-transact-sql?view=sql-server-ver15#decimal-constants), [IBM DB2](https://www.ibm.com/support/knowledgecenter/SSEPEK_11.0.0/sqlref/src/tpc/db2z_floatconstants.html) and is mostly consistent with [Postgres](https://www.postgresql.org/docs/8.4/sql-syntax-lexical.html#SQL-SYNTAX-CONSTANTS) which claims that "Constants that contain decimal points and/or exponents are always initially presumed to be type numeric" (numeric is the equivalent of our decimal type).
+
+### Testing done 
+
+Added new tests were applicable and updated all old tests that used double constants.
+
+### Reviewer checklist
+- [ ] Ensure docs are updated if necessary. (eg. if a user visible feature is being added or changed).
+- [ ] Ensure relevant issues are linked (description should include text like "Fixes #<issue number>")
+
+
+**Is your feature request related to a problem? Please describe.**
+Today we cant `INSERT VALUES` with an empty array even though we can infer the type from the schema because the code path doesn't have this information.
+
+**Describe the solution you'd like**
+Pass along the target schema when producing values to insert into.
+
+See https://github.com/confluentinc/ksql/pull/4232#discussion_r363688600 for more info
+Parent issue https://github.com/confluentinc/ksql/issues/4254
+
+... instead of JsonObject.
+
+Please see https://github.com/confluentinc/ksql/pull/4320#discussion_r367404186
+Parent issue https://github.com/confluentinc/ksql/issues/4254
+
+e.g. in ApiTest.
+
+Although IMHO the benefits are not clear and there is a significant learning curve and more complexity in constructing asserts.
+### Description 
+
+This patch removes the qualifier field from LogicalSchema and ColumnRef.
+
+We still need to support column reference expressions with qualifiers. These
+are now implemented using a new expression type called QualifiedColumnReferenceExp.
+QualifiedColumnReferenceExp contains a SourceName qualifier and a ColumnRef. The
+parser creates a QualifiedColumnReferenceExp for (sub-)expressions that have a
+source dereference.
+
+Most of the query execution utilities (codegen, expression analyzer) should only
+worry about schemas and expressions. Since schemas don't specify a source, these
+classes cannot handle qualified column references. Therefore these classes now
+throw when they see qualified column references. This also  means that LogicalPlanner
+has to resolve all qualified column refs to unqualified column refs in the final plan.
+
+Finally, without source qualifiers joins are problematic because the two sources
+may have clashing names. To solve this, LogicalPlanner first projects each source
+to a new schema that includes the source name as a prefix. It also rewrites all
+expressions in the query to use the prefixed column names.
+
+BREAKING CHANGE: the schema in repartition/changelog topics for joins now includes
+the source name as a prefix.
+
+How to review:
+- First look at the changes to `LogicalSchema` and `ColumnRef` to drop qualifiers
+- Then, look at the new `QualifiedColumnReference` expression type and see how its handled by the different expression visitors (`SqlToJavaVisitor`, `ExpressionTypeManager`, `ExpressionFormatter`).
+- Finally, review the changes to engine, particularly those to `LogicalPlanner` to build the logical plan with the right column references.
+
+Parent issue https://github.com/confluentinc/ksql/issues/4254
+
+Consider basing the new API server config on AbstractConfig.

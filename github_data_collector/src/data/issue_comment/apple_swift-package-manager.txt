@@ -1,0 +1,123 @@
+Refactor manifest validation diagnostics to emit all of them when parsing manifests from Workspace, instead of failing on the first one. Also took the opportunity to improve the wording of some of those diagnostics.
+
+For example, the following Package:
+
+```swift
+let package = Package(
+	name: "Foo",
+	products: [
+		.library(name: "Product", targets: []),
+		.library(name: "Product", targets: ["A", "C"]),
+	],
+	dependencies: [
+		.package(path: "../foo1"),
+		.package(url: "/foo1.git", from: "1.0.1"),
+		.package(url: "path/to/foo1", from: "3.0.0"),
+		.package(url: "/foo2.git", from: "1.0.1"),
+		.package(url: "/foo2.git", from: "1.1.1"),
+		.package(url: "/foo3.git", from: "1.0.1"),
+	],
+	targets: [
+		.target(name: "A"),
+		.target(name: "B"),
+		.target(name: "A"),
+		.target(name: "B"),
+	]
+)
+```
+
+will now emit the following diagnostics:
+
+```
+/path/to/Package: error: duplicate target named 'B'
+/path/to/Package: error: duplicate target named 'A'
+/path/to/Package: error: product 'Product' doesn't reference any targets
+/path/to/Package: error: target 'C' referenced in product 'Product' could not be found
+/path/to/Package: error: duplicate dependency 'foo2'
+/path/to/Package: error: duplicate dependency 'foo1'
+```
+
+### PS
+
+To achieve this while continue to have those diagnostics assigned the right `DiagnosticLocation`, I modified `DiagnosticsEngine` to have a configurable `defaultLocation` (not always `UnknownLocation` anymore), and created a helper function to generate a new `DiagnosticsEngine` with a specific default location that emits back to a parent `DiagnosticsEngine`. The allows to do the following in Workspace:
+
+```swift
+return diagnostics.with(location: PackageLocation.Local(packagePath: packagePath)) { diagnostics in
+     // Use the new "inner" diagnostics engine.
+}
+```
+
+Finally, to disambiguate this new functionality from the `wrap` function, which also used to provide a default location, but only for captured errors, I removed the optional location from `wrap`. Now, to both capture errors and provide a default location for them, we can simply surround them in both closures:
+
+```swift
+return diagnostics.with(location: PackageLocation.Local(packagePath: packagePath)) { diagnostics in
+    diagnostics.wrap {
+        try something()
+    }
+}
+```
+`show-dependencies` emits duplicate lines in dot format in some cases. This behavior, for example,  causes wasteful arrows when converted image is drawn.
+This PR will fix the issue.
+
+Resolves [SR-12016](https://bugs.swift.org/browse/SR-12016).
+I'm not extremely happy of this PR. This feature introduces a cyclic dependency in the SwiftPM types: to generate the host `Triple`, we now need the path to the Swift compiler, which is calculated and stored in a `Toolchain`. The `UserToolchain` used in SwiftPM itself requires the host `Destination`, which requires the host `Triple` :)
+
+I resolved this cyclic dependency by introducing a `getHostTriple(usingSwiftCompiler:)` static function on `Triple` and defining a cached `Triple.hostTriple` extension property in `Workspace` that uses the bare minimum information in the `UserToolchain` static functions to get the path to a Swift compiler.
+
+Please let me know if you think there is a better way.
+Notice that this change requires modifications to `bootstrap` and `ManifestLoader` to make sure the compiled manifest can find the dynamic `PackageDescription` runtime library.
+The process for linking against the XCFrameworks mimics how Xcode does it:
+
+* Copying the correct `.framework` in the build directory,
+* Adding a `-F` option to the compiler arguments pointing to the build directory,
+* Adding a `-F` option to the linker arguments pointing to the build directory.
+* Adding a `-framework` option to the linker arguments with the name of the framework.
+
+Based on https://github.com/apple/swift-package-manager/pull/2511
+
+####  Motivation
+
+https://bugs.swift.org/browse/SR-12008
+
+#### Modification
+
+- changed file generation for `TestDiscoveryCommand`
+- added a basic test and run `swift test --generate-linuxmain`
+
+#### Result
+
+`swift test -Xswiftc -warnings-as-errors --enable-test-discovery` would work without errors on Linux(any environment without Darwin's ObjC runtime?) with tests marked as `deprecated`.
+
+
+fixed issue: "error: cannot find -lClibgit"
+This improves performance by decreasing the number of spawned XCTest processes & makes the testing results output more convenient – `Executed 100 tests, with 0 failures` will be printed instead of `Executed 1 tests, with 0 failures` 100 times.
+
+This is the next step after https://github.com/apple/swift-corelibs-xctest/pull/268
+There are a few cases in which we are throwing `Diagnostics.fatalError` but aren't actually sure that there were previous diagnostics, so we could be failing silently. This is not only theoretical, I just ran into one such case.
+Hi!
+I added `isBelong(to: ArgumentParser)` method to `ArgumentParser.Result`.
+I think this method is needed to detect which subcommand is executed with optional PositionalArgument.
+
+Like this.
+
+```.swift
+let parser = ArgumentParser(...)
+let subParser1 = parser.add(subparser: "sub1")
+let optionalArgument1 = local.add(positional: "sub1_arg", kind: String.self, optional: true)
+let subParser2 = parser.add(subparser: "sub2")
+
+// which subparser is given?
+let result = try! parser.parse(Array(CommandLine.arguments.dropFirst()))
+```
+
+If `isBelong(to: ArgumentParser)` is implemented, We can detect that.
+
+```.swift
+let result = try! parser.parse(Array(CommandLine.arguments.dropFirst()))
+
+if result.isBelong(to: subParser1) {
+    // this command is executed by subParser`1`.
+}
+```
+
+Or If you have any idea to detect this without above method, Can you let me know?

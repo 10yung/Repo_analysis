@@ -1,0 +1,85 @@
+If I set a SOCKS proxy with config's `ProxyURL`, I consistently run in to this panic on torrent download. With no proxy the download completes fine.
+
+```
+panic: error writing chunk: open filename.txt: too many open files
+
+goroutine 223 [running]:
+github.com/anacrolix/torrent.(*connection).receiveChunk(0xc000526c00, 0xc001537b20, 0x5, 0x1)
+	/Users/tom/go/src/github.com/tab1293/torrent-test/vendor/github.com/anacrolix/torrent/connection.go:1349 +0x96a
+github.com/anacrolix/torrent.(*connection).mainReadLoop(0xc000526c00, 0x0, 0x0)
+	/Users/tom/go/src/github.com/tab1293/torrent-test/vendor/github.com/anacrolix/torrent/connection.go:1142 +0x49c
+github.com/anacrolix/torrent.(*Client).runHandshookConn(0xc000144000, 0xc000526c00, 0xc00035e000)
+	/Users/tom/go/src/github.com/tab1293/torrent-test/vendor/github.com/anacrolix/torrent/client.go:883 +0x569
+github.com/anacrolix/torrent.(*Client).outgoingConnection(0xc000144000, 0xc00035e000, 0xc0000b0aec, 0x4, 0x4, 0x4436f9a, 0x46f6ca7, 0x2, 0x0)
+	/Users/tom/go/src/github.com/tab1293/torrent-test/vendor/github.com/anacrolix/torrent/client.go:713 +0x392
+created by github.com/anacrolix/torrent.(*Torrent).initiateConn
+	/Users/tom/go/src/github.com/tab1293/torrent-test/vendor/github.com/anacrolix/torrent/torrent.go:1723 +0x277
+```
+
+I also see tons of these errors in the logs:
+`client.go:426: error accepting connection: tcp listener disabled due to proxy`
+`client.go:426: error accepting connection: utp listener disabled due to proxy`
+
+The torrent still seems to be downloading data but is interrupted by the panic before the download finishes. Are there too many failed connections being opened due to the proxy that are exhausting my system's file descriptors? The proxy works fine when directing HTTP browser traffic through it.
+
+
+FWIW I see the error messages I am seeing were added here: https://github.com/anacrolix/torrent/pull/360/files
+cc @sickyoon
+I think I want to remove `TorrentSpec`. I'm not sure how that should look yet. See https://github.com/anacrolix/torrent/issues/243 for some background.
+Per https://github.com/anacrolix/torrent/issues/243#issue-310328823:
+
+> remove torrent creation methods from the client. there are just want too many of them. poorly documented, and its unclear which one should be used and when.
+> ```
+> func (cl *Client) AddMagnet(uri string) (T *Torrent, err error) {}
+> func (cl *Client) AddTorrentFromFile(filename string) (T *Torrent, err error) {}
+> func (cl *Client) AddTorrent(mi *metainfo.MetaInfo) (T *Torrent, err error) {}
+> func (cl *Client) AddTorrentInfoHash(infoHash metainfo.Hash) (t *Torrent, new bool) {}
+> func (cl *Client) AddTorrentInfoHashWithStorage(infoHash metainfo.Hash, specStorage storage.ClientImpl) (t *Torrent, new bool) {}
+> func (cl *Client) AddTorrentSpec(spec *TorrentSpec) (t *Torrent, new bool, err error) {}
+> ```
+I'm using torrent.File.Reader to read a torrent's file as if it was a sequential byte stream. Works great.
+
+However, while monitoring the network, I've noticed that I'm downloading way more than the file mandates by itself; for example, an mkv video file with an average bitrate of ~2.44MB/s (112 minutes, 16GB file) will consume about 10-25MB/s from the torrent network while playing it back. Is that normal?
+
+I also tested this with torrentfs; exact same behaviour. Thanks!
+Addresses #356 
+
+During testing I found that passing in a unix domain socket doesn't work because there is an assumption that addresses have port numbers. So if that was fixed, one could use TmpDir for the test, and of course pass in domain sockets in real client code.
+
+My first approach was to try and make `NewClient` a wrapper around `NewClientWithSockets`, but the `listenAll` dependency on `cl.firewallFunction` meant that the client has to be instantiated before socket creation. That is why I split it out into `initClient` and `initSockets`. If, in a future API, Client was more like http.Server and separated construction from starting, then the client would be ready to go before we make the sockets.
+I have been testing this library using an in-memory lru cache with a small readahead time. One of the issues I have observed is that when chunks get evicted from the cache and the piece completion state changes, if I then seek back to try to re-download those chunks, in a lot of cases the peers end up getting banned, and the download seems to hang for a long time. I see a bunch of messages like this in the logs:
+
+```
+2020-01-06 00:50:54 client.go:1222: banning ip 5.39.78.105
+2020-01-06 00:51:07 client.go:1222: banning ip 5.39.78.105
+2020-01-06 00:51:10 client.go:1222: banning ip 5.39.78.105
+2020-01-06 00:51:12 client.go:1222: banning ip 5.39.78.105
+2020-01-06 00:51:18 client.go:1222: banning ip 5.39.78.105
+2020-01-06 00:51:19 client.go:1222: banning ip 5.39.78.105
+2020-01-06 00:51:20 client.go:1222: banning ip 5.39.78.105
+2020-01-06 00:51:21 client.go:1222: banning ip 5.39.78.105
+2020-01-06 00:51:22 client.go:1222: banning ip 5.39.78.105
+2020-01-06 00:51:24 client.go:1222: banning ip 5.39.78.105
+2020-01-06 00:51:26 client.go:1222: banning ip 99.242.55.224
+2020-01-06 00:51:28 client.go:1222: banning ip 185.149.90.102
+2020-01-06 00:51:48 client.go:1222: banning ip 195.154.176.126
+2020-01-06 00:52:25 client.go:1222: banning ip 84.94.62.90
+2020-01-06 00:52:27 client.go:1222: banning ip 185.149.90.32
+2020-01-06 00:53:47 client.go:1222: banning ip 2.44.118.238
+2020-01-06 00:54:09 client.go:1222: banning ip 216.244.83.187
+2020-01-06 00:54:41 client.go:1222: banning ip 195.154.225.54
+```
+
+I mentioned this to you over email and your reply you said:
+
+> My theory is that chunks arriving after piece is marked for hashing are added to the dirty list (after it's already cleared in preparation to be hashed). Later when the pieces are evicted from the cache, a piece check fails and those peers that sent late, overlapping chunks are being banned (despite being innocent). If your cache was small enough, and chunks were redundant, and hashes took a while, this would occur quite a lot. I think the solution is to disallow writing chunks while piece checks are pending or active.
+To maximize download speed, Is it possible (for slow devices) to limit the number of connections and drop low-speed peers?
+The RC4 cipher currently part of BitTorrent protocol encryption is considered insecure these days. In search for replacement, TLS appears the best candidate, comprising a modern, widely deployed suite of cryptographic protocols. Although there is no active or draft BEP specification on TLS, it would be a major step forward in the protocol development. The proposal  here is to  develop a not-yet-standard extension adding TLS support to BitTorrent protocol, with a perspective to have it thoroughly documented and put up as a BEP.
+
+Any constructive input is welcome.
+Context in issue #341. Work in progress – sharing for visibility and early feedback.
+
+I've been testing the new functionality in an isolated Docker-based environment with trackers and DHT functions disabled. The swarm consisted 1 rate-limited seeder and 7 downloaders whose peer lists were bootstrapped with the seeder's IP+port.  Even with a simple exchange of connected peers following the handshake, without the follow-up PEX updates, the swarm has grown visibility of each other and got fairly well cross-connected, with chunks download by one peer quickly propagating to the others.
+
+The existing protocol isn't much affected other than sending an extra message with an ID negotiated according to [BEP 10](http://bittorrent.org/beps/bep_0010.html). This may potentially result in interoperability issues; with that said, if encountered in field, the clients can work around by setting *DisablePEX* configuration option.
+

@@ -1,0 +1,75 @@
+I found that the HttpServer can not work when the ActorSystem name contains underscore. 
+And I debug it and find the ActorSystem name is treated as an URL host name and then parsed failed.
+But the program does not give me any hint for this limit.
+
+**Test Code:**
+sbt-version: 2.11.11
+colossus-version: 0.10.1
+```
+import scala.concurrent.duration._
+
+import akka.actor.ActorSystem
+import colossus.IOSystem
+import colossus.core.{NoRetry, ServerContext, ServerRef, ServerSettings}
+import colossus.parsing.DataSize
+import colossus.protocols.http.HttpMethod.{Get, Post}
+import colossus.protocols.http.{Http, HttpServer, Initializer, RequestHandler}
+import colossus.service.GenRequestHandler.PartialHandler
+import colossus.service.{Callback, ErrorConfig, ServiceConfig}
+
+class TestServer(name: String)(implicit val actorSystem: ActorSystem) {
+
+  class HttpRequestHandler(context: ServerContext, serviceConfig: ServiceConfig) extends RequestHandler(context, serviceConfig) {
+
+    import colossus.protocols.http.UrlParsing._
+
+    override def handle: PartialHandler[Http] = {
+      case req@Get on Root => {
+        Callback.successful(req.ok("ok"))
+      }
+      case req@Post on Root / "ack" => {
+        println("received ack")
+        Callback.successful(req.ok("ack"))
+      }
+    }
+  }
+
+  def start(port: Int): ServerRef = {
+    implicit val ioSystem: IOSystem = IOSystem(name)
+    val serviceConfig = ServiceConfig(
+      2.minutes,
+      4096,
+      logErrors = true,
+      requestMetrics = false,
+      DataSize("1024 MB"),
+      ErrorConfig(Set.empty, Set.empty)
+    )
+
+    HttpServer.start(name, ServerSettings.load(name).copy(port = port, bindingRetry = NoRetry)) { initContext =>
+      new Initializer(initContext) {
+        override def onConnect: ServerContext => RequestHandler =
+          serverContext => new HttpRequestHandler(serverContext, serviceConfig)
+      }
+    }
+  }
+
+}
+
+object TestServer {
+
+  def main(args: Array[String]): Unit = {
+    implicit val actorSystem: ActorSystem = ActorSystem("ab_cd")
+    val ts = new TestServer("testServer")
+    ts.start(9000)
+  }
+
+}
+```
+When I do post to `http://localhost:9000/ack`, I will get logs like below
+```
+[INFO] [09/04/2019 20:14:30.191] [ab_cd-akka.actor.default-dispatcher-11] [akka://ab_cd/deadLetters] Message [colossus.core.Worker$NewConnection] from Actor[akka://ab_cd/user/server-testServer#1510445994] to Actor[akka://ab_cd/deadLetters] was not delivered. [1] dead letters encountered. If this is not an expected behavior, then [Actor[akka://ab_cd/deadLetters]] may have terminated unexpectedly, This logging can be turned off or adjusted with configuration settings 'akka.log-dead-letters' and 'akka.log-dead-letters-during-shutdown'.
+[INFO] [09/04/2019 20:14:30.192] [ab_cd-akka.actor.default-dispatcher-3] [akka://ab_cd/deadLetters] Message [colossus.core.Worker$NewConnection] from Actor[akka://ab_cd/user/server-testServer#1510445994] to Actor[akka://ab_cd/deadLetters] was not delivered. [2] dead letters encountered. If this is not an expected behavior, then [Actor[akka://ab_cd/deadLetters]] may have terminated unexpectedly, This logging can be turned off or adjusted with configuration settings 'akka.log-dead-letters' and 'akka.log-dead-letters-during-shutdown'.
+```
+
+
+https://github.com/fthomas/scala-steward

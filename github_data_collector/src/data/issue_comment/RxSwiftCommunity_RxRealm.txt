@@ -1,0 +1,152 @@
+I'm getting a fatalError when deleting an object that's being observed. It seems reasonable to send an error event to the observable when its target disappears, bit this doesn't seem like a reason to terminate the app.
+
+The code that's deleting from the Realm is far away from the UI that's holding the subscriptions, so it's impractical to find them all and dispose of them.
+
+This must be a fairly common use case - Is there a way to safely delete an object that may be observed?
+
+When trying to install RxRealm using SPM it throws error cloning dependencies.
+
+`Failed to clone 'src/external/pegtl'`
+
+`Failed to clone 'Realm/ObjectStore'`
+
+Is there anything we can do, or we just have to wait for those dependencies to support SPM ?
+
+[error.txt](https://github.com/RxSwiftCommunity/RxRealm/files/3649156/error.txt)
+
+Updates the add() function to use Realm.UpdatePolicy instead of the deprecated Bool parameter
+Sorry for the previous issue without much info — here's a new ticket.
+
+When creating an Observable from a managed Realm object using `Observable.from(optional: managedRealmObj)`, the expected behavior is that — similar to using `Observable.from(object: managedRealmObj)` — a stream should be created that emits an initial value of the object, and then new values when the update is updated via a write to the Realm. If the value passed in is `nil`, it should emit `nil` and then complete and dispose.
+
+However, this is not the case. Instead, the stream is created with a non-`nil` item, an item is emitted (the initial value), and then the stream immediately completes and is then disposed.
+
+Here are some logs to demonstrate this:
+
+```
+2019-08-13 01:37:09.318: [Observable.from(optional: ...) is broken!] -> subscribed
+2019-08-13 01:37:09.319: [Observable.from(optional: ...) is broken!] -> Event next(User {
+2019-08-13 01:37:09.320: [Observable.from(optional: ...) is broken!] -> Event completed
+2019-08-13 01:37:09.320: [Observable.from(optional: ...) is broken!] -> isDisposed
+```
+
+`Observable.from(optional: ...)` is useful because I can have Observables with optional values, eg. say a logged in user that should be nil if there is no such user, and would return an Observable user from Realm if it was not nil. The other alternative right now would be to emit errors instead, but this is not ideal.
+Getting warnings for public func add<O: Object>(update: Bool = false,
+                               onError: ((O?, Error) -> Void)? = nil) -> AnyObserver<O>
+
+Warning:
+'add(_:update:)' is deprecated: Pass .error, .modified or .all rather than a boolean. .error is equivalent to false and .all is equivalent to true.
+Removed "public" sentence from functions in order to avoid Xcode Warnings. Keep things clean.
+After updating to XCode 10.2, I'm receiving the following error and I can't build.
+
+And I'm also receiving Could not build Object-C module 'RealmSwift'
+
+![Screen Shot 2019-03-30 at 11 26 45 PM](https://user-images.githubusercontent.com/1935246/55281300-5ece3f80-5343-11e9-8f32-41dd3bcc5856.png)
+
+Use case:
+
+I have a favorite button, when it's favorited I press it again it changes to unfavorite and removes the record. When I re-favorite it it should insert the object again but it accuses this error below
+
+Crash with error:
+```
+2019-02-20 09:58:44.348244-0300 Project[3851:768454] *** Terminating app due to uncaught exception 'RLMException', reason: 'Attempting to modify object outside of a write transaction - call beginWriteTransaction on an RLMRealm instance first.'
+*** First throw call stack:
+(0x1babecec4 0x1b9dbda40 0x101681788 0x101683208 0x100565728 0x1006aea94 0x1006aeae4 
+libc++abi.dylib: terminating with uncaught exception of type NSException
+```
+```swift
+struct FavoriteTool {
+    private let disposeBag = DisposeBag()
+    var didLoadFavorites: (([Tool]) -> Void)?
+private let disposeBag = DisposeBag()
+    var didLoadFavorites: (([Tool]) -> Void)?
+    func isFavorite(favoriteTool: FavoriteTool) -> Observable<Results<FavoriteTool>> {
+        return favorites(filter: "id == '\(favoriteTool.id)'")
+    }
+
+    func favorite(favoriteTool: FavoriteTool) {
+        if needSaveApi { saveApi(favoriteTool: favoriteTool) }
+        Observable.just(favoriteTool)
+            .subscribe(Realm.rx.add())
+            .disposed(by: disposeBag)
+    }
+
+    func unfavorite(favoriteTool: FavoriteTool) {
+        favorites(filter: "id == '\(favoriteTool.id)'")
+            .subscribe(Realm.rx.delete())
+            .dispose()
+    }
+
+    func favorites(filter predicateFormat: String? = nil) -> Observable<Results<FavoriteTool>> {
+        guard let realm = try? Realm() else {
+            return Observable.empty()
+        }
+        var results: Results<FavoriteTool> = realm.objects(FavoriteTool.self)
+        if let predicate = predicateFormat {
+            results = results.filter(predicate)
+        }
+
+        return Observable.collection(from: results)
+    }
+}
+```
+Let's take the sample code from the readme:
+
+```
+let realm = try! Realm()
+let laps = realm.objects(Lap.self)
+
+Observable.changeset(from: laps)
+  .subscribe(onNext: { results, changes in
+    if let changes = changes {
+      // it's an update
+      print(results)
+      print("deleted: \(changes.deleted)")
+      print("inserted: \(changes.inserted)")
+      print("updated: \(changes.updated)")
+    } else {
+      // it's the initial data
+      print(results)
+    }
+  })
+```
+
+The above code sets _synchronousStart_ to _true_ by default. 
+
+Here is the implementation of `Observable.changeset(from: synchronousStart)`:
+
+```
+public static func changeset(from collection: E, synchronousStart: Bool = true)
+        -> Observable<(AnyRealmCollection<E.ElementType>, RealmChangeset?)> {
+
+        return Observable.create { observer in
+            if synchronousStart {
+                observer.onNext((collection.toAnyCollection(), nil))
+            }
+
+            let token = collection.toAnyCollection().observe { changeset in
+
+                switch changeset {
+                    case .initial(let value):
+                        guard !synchronousStart else { return }
+                        observer.onNext((value, nil))
+                    case .update(let value, let deletes, let inserts, let updates):
+                        observer.onNext((value, RealmChangeset(deleted: deletes, inserted: inserts, updated: updates)))
+                    case .error(let error):
+                        observer.onError(error)
+                        return
+                }
+            }
+
+            return Disposables.create {
+                token.invalidate()
+            }
+        }
+    }
+```
+
+If the database is modified continuously from a background thread it can happen that the database changes in between invoking code `observer.onNext((collection.toAnyCollection(), nil))` and `guard !synchronousStart else { return }`. As a result one change is swallowed and the next change that is delivered by `observer.onNext((value, RealmChangeset(deleted: deletes, inserted: inserts, updated: updates)))` will be incompatible with the previously saved state of the collection in the view model.
+Because of the lost/swallowed change of the collection the incremental update of UITableView will crash the app if the change to be applied is not valid. (Invalid update, etc)
+The current workaround for me is to set  _ synchronousStart_ to _false_.
+
+So, basically synchronous start with the current implementation does not work in some situation.

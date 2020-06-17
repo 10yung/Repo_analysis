@@ -1,0 +1,149 @@
+fixes #116, #1097, #1249, #1275, #1366, #1723, #1670, #1875, #1938
+
+TODO:
+- [ ] write a PR message explaining myself
+- [ ] add docs
+- [ ] fix a circular import
+- [ ] consider adding a `custom_gradient` convenience wrapper
+Addresses #2006 . 
+
+Also attempting to replace `canonicalize_dtype ` with `coerce_to_array `. Edit: Removing `canonicalize_dtype ` inside `xla.py` introduces errors that i can't fix...giving that up for now. 
+cc @mattjj 
+
+TODO: Add tests to make sure error is properly caught. 
+```python
+import os
+os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=8'
+
+import jax
+from jax import lax
+import jax.numpy as np
+
+@jax.soft_pmap
+def fn1(x):
+  return x
+
+def fn2(c, _):
+  return fn1(c), ()
+
+print('N devices', jax.local_device_count())
+print(jax.__version__)
+
+lax.scan(fn2, np.zeros([2]), xs=np.zeros([5]))
+```
+
+Yields:
+```
+N devices 8
+0.1.57
+
+Traceback (most recent call last):
+  File "test.py", line 18, in <module>
+    lax.scan(fn2, np.zeros([2]), xs=np.zeros([5]))
+  File "/home/siege/.local/lib/python3.7/site-packages/jax/lax/lax_control_flow.py", line 553, in scan
+    linear=(False,) * (len(consts) + len(in_flat)))
+  File "/home/siege/.local/lib/python3.7/site-packages/jax/lax/lax_control_flow.py", line 919, in scan_bind
+    num_carry=num_carry, linear=linear)
+  File "/home/siege/.local/lib/python3.7/site-packages/jax/core.py", line 156, in bind
+    return self.impl(*args, **kwargs)
+  File "/home/siege/.local/lib/python3.7/site-packages/jax/lax/lax_control_flow.py", line 574, in _scan_impl
+    return fori_loop(lax._const(length, 0), length, body_fun, init + ys_init)
+  File "/home/siege/.local/lib/python3.7/site-packages/jax/lax/lax_control_flow.py", line 143, in fori_loop
+    (lower, upper, init_val))
+  File "/home/siege/.local/lib/python3.7/site-packages/jax/lax/lax_control_flow.py", line 210, in while_loop
+    body_nconsts=len(body_consts), body_jaxpr=body_jaxpr)
+  File "/home/siege/.local/lib/python3.7/site-packages/jax/core.py", line 156, in bind
+    return self.impl(*args, **kwargs)
+  File "/home/siege/.local/lib/python3.7/site-packages/jax/interpreters/xla.py", line 160, in apply_primitive
+    compiled_fun = xla_primitive_callable(prim, *map(arg_spec, args), **params)
+  File "/home/siege/.local/lib/python3.7/site-packages/jax/interpreters/xla.py", line 175, in xla_primitive_callable
+    built_c = primitive_computation(prim, backend, tuple_args, *avals, **params)
+  File "/home/siege/.local/lib/python3.7/site-packages/jax/interpreters/xla.py", line 217, in primitive_computation
+    rule(c, AxisEnv(), *xla_args, backend=backend, **params)  # side-effect on c
+  File "/home/siege/.local/lib/python3.7/site-packages/jax/lax/lax_control_flow.py", line 248, in _while_loop_translation_rule
+    _map(body_c.Constant, body_jaxpr.literals), (), *(y + z))
+  File "/home/siege/.local/lib/python3.7/site-packages/jax/interpreters/xla.py", line 326, in jaxpr_subcomp
+    backend=backend, **new_params)
+  File "/home/siege/.local/lib/python3.7/site-packages/jax/interpreters/pxla.py", line 639, in _pmap_translation_rule
+    outs = [_xla_unshard(c, new_env, shard) for shard in sharded_outs]
+  File "/home/siege/.local/lib/python3.7/site-packages/jax/interpreters/pxla.py", line 639, in <listcomp>
+    outs = [_xla_unshard(c, new_env, shard) for shard in sharded_outs]
+  File "/home/siege/.local/lib/python3.7/site-packages/jax/interpreters/pxla.py", line 670, in _xla_unshard
+    return c.CrossReplicaSum(padded, xla.axis_groups(axis_env, axis_env.names[-1]))
+  File "/home/siege/.local/lib/python3.7/site-packages/jax/interpreters/xla.py", line 371, in axis_groups
+    return _axis_groups(axis_env.nreps, axis_env.sizes, mesh_axes)
+  File "/home/siege/.local/lib/python3.7/site-packages/jax/interpreters/xla.py", line 375, in _axis_groups
+    assert not ragged
+```
+
+Works fine with `vmap`.
+Makes [shapecheck work on PixelCNN++](https://github.com/JuliusKunze/jaxnet/blob/shapecheck-pixelcnn/tests/test_examples.py#L245). Allows `shapecheck` of indexing, slicing, broadcast_to, reshape, random sampling, iota and simple cases of split. 
+
+For `np.split` and random sampling, I used special handling for polymorphic shapes. This could probably be changed with more effort. There is an issue making this hard:
+```python
+@shapecheck(['n'], 'n')
+  def neg_zeros_like(x):
+    return -np.zeros(x.shape)
+```
+breaks: `find_top_trace` in `full_p.bind` returns `None` here since all arguments are independent of any inputs. Therefore, the result of `zeros` is not wrapped in a trace, and the `np.negative` _implementation_ is called with a polymorphic shape instead of the shape rule, causing an error. This also breaks shape check of `-np.ones(x.shape)`, `-np.broadcast_to(0, x.shape)`, `-lax.iota` etc. @mattjj Any ideas how to fix this?
+The documentation suggests that fori_loop goes from lower to upper. Is there any reason why we couldn't go opposite direction as well. Akin to: for i in reversed(range()).
+
+
+In the autodiff cookbook,
+
+"To implement hessian, we could have used jacrev(jacrev(f)) or jacrev(jacfwd(f)) or any other composition of the two. But forward-over-reverse is typically the most efficient. That's because in the inner Jacobian computation we're often differentiating a function wide Jacobian (maybe like a loss function  𝑓:ℝ𝑛→ℝ ),"
+
+I believe this should be "jacfwd(jacrev(f)) or jacrev(jacfwd(f))".
+
+P.S. Thanks for the excellent work. Hessians are a breeze !
+`numpy.ndarray` instances currently return `True` if you run an `isinstance` check against `jax.numpy.ndarray`. I guess I see how this happens: I think Jax doesn't actually use that type, so it's maybe the actual one from numpy? It's a bit of a hassle when you're checking the array provenances though.
+
+```python
+def test_numpy_ndarray_is_not_instance_of_jax_numpy_ndarray():
+    assert not isinstance(numpy.zeros(1), jax.numpy.ndarray)
+```
+
+Btw, what's the preferred way to convert data from Jax to numpy? I've found `jax.device_get()` by poking around, but I don't think it's documented.
+
+Thanks for the great project! 
+Is it possible to run JAX on other GPU architectures other than NVIDIA (ex.: Intel, AMD)?
+I am trying to write a very simple code for a linear regression problem, However, I received 
+"NotImplementedError: Singular value decomposition JVP not implemented for full matrices" error 
+while trying to run grad on the mse loss. Can someone look into this issue for me? 
+
+```
+#preamble 
+import jax.numpy as np
+from jax import grad, random
+key = random.PRNGKey(1)
+
+#generate random data
+n, d = 20, 1 
+x = random.uniform(key, (n, d), dtype=np.float64,  minval = -5., maxval = 5.)    
+t = np.sin(np.pi*x) + 0.3*random.normal(key, (n, d))    
+
+#build mean squared error || y - t ||^2
+
+def make_mse_vector(x, t):  
+  def mse_vector(w):
+    return np.linalg.norm(np.dot(x, w) - t, ord = 2)
+  return mse_vector 
+
+w =  np.zeros(())
+
+epsilon = 0.1
+iter = 100
+
+#The following line throws me SVD error
+w_gradient = grad(make_mse_vector(x, t))(w) 
+
+#run gradient descent 
+for _ in range(iter):
+  w = w - epsilon * w_gradient
+  w_gradient = grad(make_mse_vector(x, t))(w)
+```
+Implements [`np.linalg.matrix_rank`](https://docs.scipy.org/doc/numpy/reference/generated/numpy.linalg.matrix_rank.html). 
+
+Honestly not sure what sorcery needs to be going on for someone to want to take the gradient through this operation, but here we are anyway.
+
+Related to #1999 

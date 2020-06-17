@@ -1,0 +1,344 @@
+First of all,
+I want to apology if this is not acceptable to open a ticket for asking for help and not for a bug.
+Also, I know there is others tickets about this subject but the API have change since, and reading them did not help me to understand the best way to generate the schema for my data structure.
+
+So here is my data-structure (simplified version):
+```scala
+sealed trait ExampleCriterion {
+  val kind: String
+}
+
+case class ExampleExist(fieldName: String) extends ExampleCriterion {
+  val kind = ExampleExist.kind
+}
+object ExampleExist {
+  val kind = "exist"
+}
+
+case class ExampleNot(inner: ExampleCriterion) extends ExampleCriterion {
+  val kind = ExampleNot.kind
+}
+
+object ExampleNot {
+  val kind = "not"
+}
+```
+
+Here is my naive tentative:
+```scala
+  implicit def schemasForExampleCriterion: Schema[ExampleCriterion] = Schema.oneOf[ExampleCriterion, String](_.kind, identity)(
+    ExampleNot.kind -> implicitly[Schema[ExampleNot]],
+    ExampleExist.kind -> implicitly[Schema[ExampleExist]],
+  )
+```
+Wish of course result in a stack-overflow. But the following answer https://github.com/softwaremill/tapir/issues/84#issuecomment-491734469, seems to say it should work.
+I guess I should handwrite the schema but I am a bit confuse with `SRef` and `SObjectInfo`.
+
+
+Version 0.12.13
+
+Running:
+```
+package example
+import sttp.tapir._
+import sttp.tapir.client.sttp._
+import sttp.client._
+
+object Main {
+
+  case class Foo(i: Int, d: Double)
+
+  def main(args: Array[String]): Unit = {
+    println("Hello com.example.Empty Project!")
+
+    val e = endpoint
+      .in("adf")
+      .in(path[String])
+      .in(path[Int])
+      .in(path[Double])
+      .mapIn({
+        case (s, i, d) => (s, Foo(i, d))
+      })({ case (s, foo) => (s, foo.i, foo.d) })
+
+    e.toSttpRequest(uri"http://host.com").apply(("adsf", Foo(1, 1.0)))
+  }
+
+}
+```
+
+Throws an exception at runtime:
+
+`java.lang.String cannot be cast to scala.Tuple2`
+
+Repro project: https://github.com/jatcwang/tapir_tuple_mapIn_bug_repro
+
+Given simple example:
+```
+sealed trait Entity {
+  def name: String
+}
+case class Person(name: String, age: Int) extends Entity
+case class Organization(name: String) extends Entity
+```
+Check if it is doable to create a validator for entity which will validate `name` and it will be also used against `Person` and `Organization`
+Ref: #370 
+As I understand, OpenAPI specification [permits](https://github.com/OAI/OpenAPI-Specification/blob/master/versions/3.0.0.md#operationObject) usage of security scopes for operations.
+But tapir openapi interpreter contains [next lines](https://github.com/softwaremill/tapir/blob/744bcbfd34be51c1b4ceefa8a640fe6e8487016f/docs/openapi-docs/src/main/scala/sttp/tapir/docs/openapi/EndpointToOpenApiPaths.scala#L50):
+```scala
+// for now, all auths have empty scope
+    val securityRequirement = authNames.map(_ -> Vector.empty).toListMap
+```
+
+Why scopes was removed from operation security object ? Is it a bug ?
+[Here](https://redocly.github.io/redoc/#section/Authentication) example of redoc with security scopes per operation
+
+There's not a clear way to return `(Something, Unit)` as an endpoint output.
+
+Constructing as 
+```
+Endpoint[..., ..., (H, Unit), Nothing]  = ...
+.out(headerFn)
+.out(emptyOutput).explicitly(tapir.typelevel.ParamConcat.concatSingleAndSingle)
+```
+
+ returns 
+
+```
+java.lang.IllegalStateException: Outputs and output values don't match in output:
+Multiple(Vector(Mapped(Multiple(Vector(Header(...))),
+sttp.tapir.EndpointOutput$$Lambda$1525/603127357@4ed041bb,
+sttp.tapir.EndpointOutput$$Lambda$1586/12522552018@19da529e))), 
+values: List(Header(a3770cc3-b45c-4f90-a663-ebd4f333a343), ())
+```
+
+Trying to manually map like
+
+```
+Endpoint[..., ..., (H, Unit), Nothing]  = ...
+      .out(statusCode(StatusCode.NoContent))
+      .mapOut(header => (header, ()))(tuple => tuple._1)
+```
+throws `java.lang.ClassCastException: H cannot be cast to scala.Tuple2`.
+
+This would make it easier to make composable logic for 204 endpoints in particular so my Unit response from the central logic could be used as `O` in the reusable functions that add my headers, cookies, etc.
+
+Would this be solvable with something like `.out(noBody)`, or possibly have the option for a 204 No Content to be an output that tuples Unit?
+I have been looking for an example of using oauth2, tapir and http4s but haven't found it.
+
+Even though an example using http4s would be a perfect fit for me, any examples of using tapir and oauth2 will be appreciated.
+With endpoint output defined like this:
+
+```
+      .out(
+        jsonBody[Seq[User]]
+          .example(Seq(User(..., Some(address))))
+          .description("Response with embedded address.")
+          .example(Seq(User(..., None)))
+          .description("Response without embeddings.")
+      )
+```
+only the last example is included in the open-api yaml.
+
+I would expect both to be present.
+First, thanks for putting together a strong foundation for defining API's from the Scala Type system. It has been a great help already.
+
+As I have used the package more, I was trying to build a schema to describe flexible filters in the body and I am running into some oddities in the Yaml OAS generation. I am currently using 0.11.9, but from the release notes, I don't think it will be different in 0.12.3 (planning to upgrade soon)
+
+I have boiled down the issues I am seeing to this sample test:
+
+```
+object SimpleTest extends App {
+	sealed trait Term
+	sealed trait Literal extends Term
+	case class I(v: Long)
+	case class D(v: Double)
+	case class S(v: String)
+
+	sealed trait Reference extends Term
+	case object IRef extends Reference
+	case object DRef extends Reference
+	case object SRef extends Reference
+
+	sealed trait Op
+	case object Eq extends Op
+	case object Lt extends Op
+	case object Gt extends Op
+
+	sealed trait Compose
+	case object And extends Compose
+	case object Or extends Compose
+
+	sealed trait Clause
+	case class Expression(op: Op, l: Reference, r: Term) extends Clause
+	case class Not(not: Clause) extends Clause
+	case class Composite(op: Compose, over: List[Clause]) extends Clause
+
+	import tapir._
+	import io.circe.generic.auto._
+	import io.circe.{Decoder, Encoder}
+	import tapir.json.circe.encoderDecoderCodec
+
+	private lazy val body =   jsonBody[Clause]
+
+	val endpointDef =
+		endpoint.post
+			.in(body)
+			.out(jsonBody[String].description("OK"))
+			.errorOut(jsonBody[String].description("An error occurred"))
+
+	import tapir.docs.openapi._
+	import tapir.openapi.OpenAPI
+	import tapir.openapi.circe.yaml._
+	val oas: OpenAPI = (endpointDef :: Nil).toOpenAPI("FILTER ENDPOINT", "1.0.0-SNAMPSHOT")
+	val schema = oas.toYaml
+	println(s"Schema:\n$schema")
+}
+```
+
+The generated Yaml is:
+
+```
+Schema:
+openapi: 3.0.1
+info:
+  title: FILTER ENDPOINT
+  version: 1.0.0-SNAMPSHOT
+paths:
+  /:
+    post:
+      operationId: postRoot
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Clause'
+        required: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: string
+        default:
+          description: An error occurred
+          content:
+            application/json:
+              schema:
+                type: string
+components:
+  schemas:
+    Or:
+      type: object
+    Term:
+      oneOf:
+      - $ref: '#/components/schemas/IRef'
+      - $ref: '#/components/schemas/DRef'
+      - $ref: '#/components/schemas/SRef'
+    Not:
+      required:
+      - not
+      type: object
+      properties:
+        not:
+          $ref: '#/components/schemas/Clause'
+    Expression:
+      required:
+      - op
+      - l
+      - r
+      type: object
+      properties:
+        op:
+          $ref: '#/components/schemas/Op'
+        l:
+          $ref: '#/components/schemas/Reference'
+        r:
+          $ref: '#/components/schemas/Term'
+    Clause:
+      oneOf:
+      - $ref: '#/components/schemas/Expression'
+    Reference:
+      oneOf:
+      - $ref: '#/components/schemas/IRef'
+      - $ref: '#/components/schemas/DRef'
+      - $ref: '#/components/schemas/SRef'
+    IRef:
+      type: object
+    DRef:
+      type: object
+    Op:
+      oneOf:
+      - $ref: '#/components/schemas/Eq'
+      - $ref: '#/components/schemas/Lt'
+      - $ref: '#/components/schemas/Gt'
+    Eq:
+      type: object
+    Compose:
+      oneOf:
+      - $ref: '#/components/schemas/And'
+      - $ref: '#/components/schemas/Or'
+    Gt:
+      type: object
+    Composite:
+      required:
+      - op
+      - over
+      type: object
+      properties:
+        op:
+          $ref: '#/components/schemas/Compose'
+        over:
+          type: array
+          items:
+            $ref: '#/components/schemas/Clause'
+    And:
+      type: object
+    SRef:
+      type: object
+    Lt:
+      type: object
+```
+
+The things that are stumping me are:
+
+ 1. The `Clause` schema only lists `Expression` as a one of its options, I would expect to see `Expression`, `Composite`, `Not`
+ 2. The schema for `Term` should be `oneOf` with options `Reference` and `Literal` instead of repeating the `Reference` Options and skipping `Literal` altogether.
+ 3. I would expect the `case object` types to be translated as a `string` schemas with an `enum` constraint instead of unqualified `objects`
+
+I have tried to provide some hints using the custom types descriptions in the docs but with not much success. The results vary a bit, but I am not able to get them to line up, in particular #1, & #2 
+
+Could you give me some guidance on how to give enough information to be able to get the schema (and hopefully then validators, encoders and decoders) to generate the code I am expecting? Or may be I am missing something in the way I am approaching the problem.
+
+Thanks a lot for your help.
+
+Miguel
+
+PS. Please feel free to use the example in any way it may be useful for unit test, docs, or anything else.
+
+Targeting #98 @fgrutsch and I decided to try how easy it is to introduce Scala.js support for tapir as it would be really cool to use the tapir-sttp-client from Scala.js applications.
+
+What we did so far was introducing `sbt-crossproject` and changing the following modules to build on the `JSPlatform`:
+* coreJS,
+* tapirCatsJS
+* circeJsonJS
+* playJsonJS
+* uPickleJsonJS
+* sttpClientJS
+
+As far as we have seen, all other modules have dependencies that don't allow building for the `JSPlatform`, which would not be useful as they are mainly the server implementations. 
+
+All modules that somehow depend on `circe-yaml` can not be built for the `JSPlatform` as of the transitive dependency on `snakeyaml`. This affects only openapi modules which also doesn't seem to be critical. (As long as there is no Scala.js server implementation it barely makes sense to have the openapi modules for Scala.js).
+
+The strategy for introducing Scala.js support has been copied over from the `sttp` and `sttp-model` repository. Scala Native support was dropped intentionally to reduce the scope of this PR.
+
+Things we found out:
+* `playJson` has to be built with `CrossType.Full` as `play-json` doesn't excludes the `Reads[java.util.Date]` from the js build and only introduces it on the jvm. We currently decided to comment out the affected tests and wait on feedback on how to proceed.
+* `spray.boilerplate.BoilerplatePlugin` doesn't play nicely with cross projects
+
+Depending on how far the implementation of Scala.js support should go we see the following open tasks:
+
+- [ ] Introduce tapir-sttp-client tests for js as the existing tests depend on `async-http-client-backend-fs2` and we would need to introduce separate tests using the fetch backend, including the same selenium ceremony as in sttp.
+- [ ] Either keep the `playJson` tests ignored or switch this project over to `CrossType.Full` only testing the `java.util.Date` for the jvm.
+- [ ] Fix core to run the tests successfully on JS
+- [ ] Fix upickle to run the tests successfully on JS

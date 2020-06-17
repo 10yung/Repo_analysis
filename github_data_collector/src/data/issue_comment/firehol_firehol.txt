@@ -1,0 +1,182 @@
+As I just spent 12+ hours trying to figure out why Firehol stopped working when upgrading to Buster, I just want to re-iterate the solution for others having the same problem:
+```
+# update-alternatives --set iptables /usr/sbin/iptables-legacy
+# update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+```
+For multicast, it looks like I have to insert two `interface`s:
+```
+interface4 "eth0" carp_in src 192.168.86.0/24 dst 224.0.0.18
+  server ucarp accept
+
+interface4 "eth0" carp_out dst 192.168.86.0/24 src 224.0.0.18
+  server ucarp accept
+```
+which gets me pointless iptables rules like
+```
+Chain OUTPUT (policy DROP)
+target     prot opt source               destination
+ACCEPT     all  --  0.0.0.0/0            0.0.0.0/0
+[...]
+out_carp_in  all  --  224.0.0.18           192.168.86.0/24
+```
+and
+```
+Chain INPUT (policy DROP)
+target     prot opt source               destination
+ACCEPT     all  --  0.0.0.0/0            0.0.0.0/0
+[...]
+in_carp_out  all  --  224.0.0.18           192.168.86.0/24
+```
+
+Is there a way to prevent these?
+
+I've defined a service in `/etc/firehol/services/ucarp.conf`:
+
+(VRRP/ucarp, sends to 224.0.0.18, see [here](https://en.wikipedia.org/wiki/Common_Address_Redundancy_Protocol))
+
+```
+#FHVER: 1:213
+
+# dit is rules_multicast uit firehol binary
+rules_ucarp() {
+        local   in=in out=out \
+                client_ports="${DEFAULT_CLIENT_PORTS}" \
+                mychain="${1}" \
+                type="${2}"
+        shift 2
+
+        if [ "${type}" = "client" ]
+        then
+                in=out
+                out=in
+        fi
+
+        # ----------------------------------------------------------------------
+
+        # match multicast packets in both directions
+        rule ${out}        action "${@}" chain "${out}_${mychain}" dst 224.0.0.18 proto 112 || return 1
+        rule ${in} reverse action "${@}" chain "${in}_${mychain}"  src 224.0.0.18 proto 112 || return 1
+
+        echo "FOO"
+
+        return 0
+}
+```
+but if I set `helper_all='ucarp'` in `firehol.conf` this runs nothing for this interface;
+```
+interface4 "eth2 eth0:0" internal dst 192.168.86.71,192.168.84.10
+  policy reject
+  server all accept
+  client all accept
+```
+(got the suggestion from the deprecated warning)
+
+```
+root@osm-1:/etc/firehol# firehol debug | fgrep 224
+FireHOL: Saving active firewall to a temporary file...  OK
+FireHOL: Processing file '/etc/firehol/firehol.conf'...  OK  (272 iptables rules)
+```
+
+Adding `server ucarp accept` does work:
+
+```
+root@osm-1:/etc/firehol# firehol debug | fgrep 224
+FireHOL: Saving active firewall to a temporary file...  OK
+FireHOL: Processing file '/etc/firehol/firehol.conf'...  OK  (274 iptables rules)
+-A out_internal -p 112 -d 224.0.0.18 -j ACCEPT
+-A in_internal -p 112 -d 224.0.0.18 -j ACCEPT
+```
+
+Changing `rules_ucarp()` to `helper_ucarp()` in `/etc/firehol/services/ucarp.conf` does not make a difference.
+https://firehol.org/guides/adding-services/
+
+using it returns:
+
+```
+ALL_SHOULD_ALSO_RUN has been deprecated. Service 'all' now runs all these conntrack helper
+```
+overriding `IPTABLES_CMD` in `firehol.conf` for fail2ban integration:
+
+```
+#https://github.com/firehol/firehol/wiki/fail2ban
+IPTABLES_CMD="/sbin/iptables -w"
+```
+makes firehol complain on activation:
+
+```
+FireHOL: Saving active firewall to a temporary file...  OK
+FireHOL: Processing file '/etc/firehol/firehol.conf'...
+
+ERROR:
+/etc/firehol/firehol.conf contains /sbin/iptables or /sbin/ip6tables statements.
+
+Replace these statements iptables or ip6tables respectively,
+without a path, so that FireHOL can execute these commands at
+firewall activation.
+```
+Pretty much unavoidable, I think.
+hello!
+
+i like to port-forward http to a lxc container
+where a nginx proxy is waiting for connections
+
+i like to use firehol to forward over the bridge 
+with this rule i am trying it
+
+        dnat4 to 192.168.122.83 proto tcp dport 80
+
+but after enabling it the container cant connect to the internet 
+i get the default nginx website (lxc proxy container) from the host 
+
+/etc/firehol/firehol.conf
+version 6
+
+wan="enp35s0"
+
+dnat4 to 192.168.122.83 proto tcp dport 80 
+
+interface4 any world
+        protection bad-packets 
+        server all accept
+        client all accept       
+
+router4 lxc inface virbr0 outface "${wan}"
+        masquerade
+        route all accept
+
+After looking at the [KDE connect documention](https://community.kde.org/KDEConnect#iptables), I added the rules:
+```
+server_kdeconnect_ports="udp/1714:1764 tcp/1714:1764"
+client_kdeconnect_ports="default 1714:1764"
+```
+to my config so that I could open this between my wifi and lan. I don't know if this would be appropriate to include in the firehol list of services, but I figured I'd submit it in case it is.
+
+The problem:
+I use [pihole](https://pi-hole.net/) for DNS on my network (customized to send email DNSBL lookups directly to my active spam block lists).
+
+When updating coinbl (coinbl_hosts, coinbl_hosts_optional, coinbl_hosts_browser) or  hphosts (hphosts_ats, hphosts_dme, hphosts_exp, hphosts_fsa, hphosts_grm, hphosts_hfs, hphosts_hjk, hphosts_mmt, hphosts_pha, hphosts_psh, hphosts_wrz), pi-hole steps in and returns "0.0.0.0" for hostnames that would be blocked or "127.0.0.x" for hostnames listed in any of my spam blocklists when doing dns lookups using the 'hphosts2ips' & 'hostname_resolver' functions to get IP addresses.
+
+The question:
+Is there an easy way to have update-ipsets use a DNS resolver other than the system default?
+Sorry for posting here.
+I am looking to contribute to firehol and need communication channel details (If any). 
+
+Can you please help me out?
+Regards
+As reported @bunder2015 in #265, the href for maxmind_proxy_fraud sample IPs has changed again.
+
+```
+# diff -u update-ipsets- update-ipsets
+--- update-ipsets-	2019-09-21 10:33:23.683548561 -0400
++++ update-ipsets	2019-09-21 10:34:03.325093583 -0400
+@@ -3616,7 +3616,7 @@
+ 
+ # extract IPs from the maxmind proxy fraud page
+ parse_maxmind_proxy_fraud() {
+-	$GREP_CMD "href=\"high-risk-ip-sample/" |\
++	$GREP_CMD "href=\"/en/high-risk-ip-sample/" |\
+ 		$CUT_CMD -d '>' -f 2 |\
+ 		$CUT_CMD -d '<' -f 1
+ }
+```
+

@@ -1,0 +1,318 @@
+This carries on from the work in #83 from @rylev. I've tried to address the issues in that thread.
+We could add a re-export of chrono here. The reason for this is that to use chrono in the browser, you must use a feature that isn't very discoverable (I spent about 30 mins getting chrono working). We could re-export with the feature turned on by default.
+## Summary
+
+> Note: I've written this using futures 0.3, but this is something that one could change.
+
+Provide a set of async functions with the following signature
+
+```rust
+fn example() -> impl Future<Output = ()>
+```
+
+where the futures resolves in the following places
+
+ - on the next tick of the microtask queue (`Promise.then`)
+ - at the end of the task queue (i.e. after scheduled repaints) (`setTimeout(0)`)
+ - when the browser thinks we should update an animation (`requestAnimationFrame`)
+ - after a certain amount of time, using `setTimeout`
+ - possibly more places
+
+[This post about Tasks, microtasks etc.](https://jakearchibald.com/2015/tasks-microtasks-queues-and-schedules/) is how I learnt about all this.
+
+## Motivation
+
+This library would serve 2 purposes. 
+
+It would make it easy to select the right time to do your operation, and it also educates the user of the library about the intricacies of the JavaScript event loop. I think grouping all these together because they are all futures that resolve to nothing at some point make them much easier to understand than how they are arranged in JavaScript (scattered everywhere).
+
+## Detailed Explanation
+
+I would envisage the functions looking like
+
+```rust
+/// This future will resolve after current execution has finished, but before the browser does 
+/// anything else (e.g. screen repaints). This is the fastest choice.
+fn next_microtask() -> impl Future<Output = ()>;
+
+/// This future will resolve after the browser has finished the current execution, and after any 
+/// other scheduled events (e.g. screen repaints)
+fn next_task() -> impl Future<Output = ()>;
+
+/// This future will resolve when the browser determines that another frame of an animation 
+/// should be drawn. This will be in general slower than `next_task`, as the browser can process 
+/// events faster than the screen will refresh.
+fn next_animation_frame() -> impl Future<Output = ()>;
+
+/// This future will resolve in the future, at least `ms` milliseconds in the future. If you set `ms`
+/// to `0`, then this future behaves like `next_task`.
+///
+/// # Panics
+///
+/// This function will panic if `ms` is greater than the maximum safe JavaScript integer.
+/// Fortunately, this number is so big that waiting for the future to resolve would take 285 
+/// thousand years.
+fn next_ms(ms: u64) -> impl Future<Output = ()>;
+```
+
+## Drawbacks, Rationale, and Alternatives
+
+The main drawback is that this is different to the way that JavaScript itself handles all these things. The alternative is to not do it.
+
+## Unresolved Questions
+
+Callbacks are executed before promises, so in theory there could be another function `next_callback` that executes before `next_microtask`, but since they both execute before any browser events are handled, I think that would be overkill.
+
+The `setTimeout` wrapper could not panic, instead using the nearest f64. That method could also take a `Duration`.
+
+**EDIT** Formatting
+## Summary
+
+Add a crate to parse the `KeyboardEvent.key` field.
+
+## Motivation
+If you're writing a game or similar, you may want to handle raw keyboard events. The [`key`] event is a string, meaning that the names of the special keys are not discoverable. By parsing it into an enum, we make them discoverable, while also making the key cheaper to copy, except for the `Unknown` degenerate case.
+
+It seems like a good candidate for inclusion in `gloo` since it doesn't make any design decisions (it's just parsing the ECMAScript spec), but it's quite a lot of work to implement.
+
+## Detailed Explanation
+
+The enum would look like (modulo bikeshedding)
+
+```rust
+enum Key {
+    Visible(char),
+    Alt,
+    Ctrl,
+    Backspace,
+    // ...
+    Unknown(String),
+}
+```
+
+and would be parsed like
+
+```rust
+
+impl Key {
+    fn from_js(raw: &str) -> Self {
+        match raw {
+            "Backspace" => Key::Backspace,
+            // ....
+            maybe_char => {
+                let mut maybe_char_iter = maybe_char.chars();
+                let first = maybe_char_iter.next();
+                if let Some(ch) = first {
+                    if maybe_char_iter.next().is_some() {
+                        Key::Unknown(raw.to_string())
+                    } else {
+                        Key::Visible(ch)
+                    }
+                } else {
+                    Key::Unknown(raw.to_string())
+                }
+            }
+        }
+    }
+}
+```
+
+## Drawbacks, Rationale, and Alternatives
+
+### Possible drawbacks
+ - It could possibly be slower than working directly with strings, although it would be cheaper to clone/etc unless you are in the degenerate "Unknown" case.
+
+ - Maybe no-one will use it
+
+The alternative is to not do this.
+
+## Unresolved Questions
+
+ - Should the name of the "Visible" case be short, e.g. `K`, to be more concise? 
+ - Which `char` methods should we implement?
+ - Should we convert non-visible characters (like `Backspace`) to their char code (e.g. `char::from_u32(8)`)
+
+[`key`]: https://developer.mozilla.org/en-US/docs/Web/API/KeyboardEvent/key
+
+Seems to me like "spawn a future" is something that gloo would aim to solve - but the crate already exists under `rustwasm` ... wondering if it should be moved here?
+## Summary
+
+Macro to simplify creating DOM elements
+
+## Motivation
+
+web-sys often requires multiple steps and type conversions to accomplish the same results as typical html.
+
+For example: `<a href="/foo"><div>Foo</div></a>` currently requires something like this:
+
+```
+//create the div element with text "Foo"
+let div: HtmlElement = document.create_element("div")?.dyn_into()?;
+div.set_text_content(Some("Foo"));
+
+//create the a element and append the div as a child
+let anchor: HtmlElement = document.create_element("a")?.dyn_into()?;
+anchor.append_child(&div);
+
+//set the href on the a element
+let anchor = anchor.unchecked_into::<HtmlHyperlinkElementUtils>();
+anchor.set_href("/foo");
+```
+
+## Detailed Explanation
+
+From a consumers point of view, the above could be simplified as:
+
+```
+el![ "a", AnchorOptions{href: "/foo"},
+    el!["div", None, "Foo"]
+]; 
+```
+
+The concept is following the same idea as React's createElement() wherein the arguments are:
+
+1. element type
+2. element props (optional)
+3. children (optional)
+
+Children must be another element, or raw text, or slices of those.
+
+Macros can be used to allow for shorthand and remove the need for wrapping things in `Some()`, in other words all of these are legal and mean the same thing:
+
+```
+el!["div", None, None]
+el!["div", None]
+el!["div"]
+```
+Same with these:
+
+```
+el!["div", None, Some("Foo")]
+el!["div", None, "Foo"]
+```
+
+And multiple children could be wrapped in brackets:
+
+```
+el!["div", None, [
+  el!["div", None, "Hello"],
+  el!["div", None, "World"]
+]]
+```
+
+## Prior Art
+
+The concept of the above is exactly the same as React createElement, only instead of creating proprietary elements it creates real elements
+
+There are a few known projects that use a macro to ultimately create html elements as well - either through a vDom or directly:
+
+* [Seed](https://github.com/David-OConnor/seed)
+* [Dominator](https://github.com/Pauan/rust-dominator)
+
+## Drawbacks, Rationale, and Alternatives
+
+Not sure - I'm opening this issue more for discussion than a direct proposal :) Feel free to shoot it down!
+
+## Unresolved Questions
+
+* Where does `Document` come from?
+
+* How to interop with other crates?
+
+For interop, I think as long as the macro returns native HtmlElements I'd imagine that will flow organically?
+
+Specifically - how do we attach an event listener to nested children? On one foot it seems that this is doable if we break it apart:
+
+```
+let child =  el!["button", None, "Click Me!"];
+
+EventListener::new("click", &child, move |_e| {....});
+
+let parent = el![ "div", None, child]; 
+```
+
+Implementation for [rfc-1](https://github.com/rustwasm/gloo/blob/master/rfcs/001-mid-level-file-api.md).
+
+This implementation is not complete. Left to do:
+* [ ] Finalize design for errors
+* [ ] Implement event based callbacks
+* [ ] Tests
+* [ ] Documentation
+Continuing from issue [#5](https://github.com/rustwasm/gloo/issues/5)
+## Summary
+
+I propose adding a crate that wraps common web_sys features with a cleaner API.
+
+Examples:
+- Wrap things like `Window`, `Document` and `History` in a way that handles failures automatically with `expect_throw`
+- Provide shims to get or set the `value` of input etc elements
+- Wrap `console::log` and `console::error` with a more flexible API
+
+## Motivation
+
+The `web_sys` api can be verbose; high-level crates needn't each provide their own wrappers.
+
+## Detailed Explanation
+
+Some common features of `web_sys` are verbose when used directly. It's likely that many `Gloo` crates will make use of them - let's settle on a general wrapping API higher-level crates can use. [Example](https://github.com/David-OConnor/seed/blob/master/src/util.rs)
+
+Examples:
+```rust
+/// Convenience function to avoid repeating expect logic.
+pub fn window() -> web_sys::Window {
+    web_sys::window().expect_throw("Can't find the global Window")
+}
+
+/// Convenience function to access the web_sys DOM document.
+pub fn document() -> web_sys::Document {
+    window().document().expect_throw("Can't find document")
+}
+
+/// Convenience function to access the web_sys history.
+pub fn history() -> web_sys::History {
+    window().history().expect_throw("Can't find history")
+}
+
+/// Simplify getting the value of input elements; required due to the need to cast
+/// from general nodes/elements to HTML__Elements.
+pub fn get_value(target: &web_sys::EventTarget) -> String {
+    if let Some(input) = target.dyn_ref::<web_sys::HtmlInputElement>() {
+        return input.value();
+    }
+    if let Some(input) = target.dyn_ref::<web_sys::HtmlTextAreaElement>() {
+        return input.value();
+    }
+    if let Some(input) = target.dyn_ref::<web_sys::HtmlSelectElement>() {
+        return input.value();
+    }
+    "".into()
+}
+
+/// Similar to get_value
+pub fn set_value(target: &web_sys::EventTarget, value: &str) {
+    if let Some(input) = target.dyn_ref::<web_sys::HtmlInputElement>() {
+        input.set_value(value);
+    }
+    if let Some(input) = target.dyn_ref::<web_sys::HtmlTextAreaElement>() {
+        input.set_value(value);
+    }
+    if let Some(input) = target.dyn_ref::<web_sys::HtmlSelectElement>() {
+        input.set_value(value);
+    }
+}
+```
+
+## Drawbacks, Rationale, and Alternatives
+
+The original `web_sys` APIs aren't that clumsy - this might clutter up `Gloo` without providing much benefit. Perhaps we want to use pattern matching to handle failures of `web_sys::Window` etc instead of using `expect_throw`.
+
+It's easy to create a collection of helper functions that are intended to be general, but spread over a wide range of uses, some of which may not be common. It's possible that they may cover a smaller set of use-cases than intended. Thin wrappers in general can be seen as obfuscating the original, well-known API. Why build a new API that causes confusion with the one it wraps, when it's not much better?
+
+## Unresolved Questions
+
+It's unclear what the scope of this should be. There are surely grey areas about what's appropriate here, and how cohesive/comprehensive it should be. What causes `web_sys::Window` etc to fail?
+
+I'm certainly biased by my own use-cases. Do y'all think these are, in-fact useful, general wrappers that would see use in many/most `Gloo` crates?
+
+I've only scratched the surface. What else should be added?
+This is the first step of #64 

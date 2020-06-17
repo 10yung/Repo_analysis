@@ -1,0 +1,83 @@
+
+after `graceNet.StartProcess()`, process may exec some cmd. Carrying env variable `LISTEN_FDS` are unnecessary.  
+In my process, the cmd is start another grace net process which cause error `ERROR: error inheriting socket fd 3: file filetnet listener: getsockopt: socket operation on non-socket`
+I am a bot. Please reach out to [@azillion](https://github.com/azillion) if you have any issues, or just close the PR.
+An example unix socket server:
+https://gist.github.com/teknoraver/5ffacb8757330715bcbcc90e6d46ac74
+
+The punch line is:
+```golang
+	server := http.Server{
+		Handler: http.FileServer(http.Dir(root)),
+	}
+
+	unixListener, err := net.Listen("unix", os.Args[1])
+	if err != nil {
+		panic(err)
+	}
+	server.Serve(unixListener)
+```
+
+I tried this here and sadly our types don't match net.http's interface.
+From: https://golang.org/pkg/net/http/#Server
+`func (srv *Server) Serve(l net.Listener) error`
+
+However [here](https://github.com/facebookgo/grace/blob/75cf19382434e82df4dd84953f566b8ad23d6e9e/gracehttp/http.go#L191), we're asking for `func Serve(servers ...*http.Server)`
+and then we hardcode `tcp` 
+```
+		l, err := a.net.Listen("tcp", s.Addr)
+```
+
+[here in listen](https://github.com/facebookgo/grace/blob/75cf19382434e82df4dd84953f566b8ad23d6e9e/gracehttp/http.go#L58)
+
+It seems like we should match net.http here and take a https://golang.org/pkg/net/#Listener which would allow us to grab https://golang.org/pkg/net/#Addr so we can open tcp/udp/unix as appropriate.
+
+I could be missing something, but I didn't see anything too TCP specific in the fork/exec/inherit code.
+
+My use case is that I want to front multiple versions of the same service with nginx, and I don't want to play games with ports. 
+While that particular case is admittedly a little wacky, fronting a service with nginx or the like isn't too unreasonable (say for handling auth somewhere else).
+At the StartProcess function, while Listener' s File() is called, this will puts the Listener fd into blocking mode. This should lead to Accept() can't return even if Listener.Close() is called.
+Listener File() -->  (fd *netFD) dup()
+``` Golang
+func (fd *netFD) dup() (f *os.File, err error) {
+    ns, err := dupCloseOnExec(fd.pfd.Sysfd)
+    if err != nil {
+        return nil, err 
+    }   
+
+    // We want blocking mode for the new fd, hence the double negative.
+    // This also puts the old fd into blocking mode, meaning that
+    // I/O will block the thread instead of letting us use the epoll server.
+    // Everything will still work, just with more threads.
+    if err = fd.pfd.SetBlocking(); err != nil {
+        return nil, os.NewSyscallError("setnonblock", err)
+    }   
+
+    return os.NewFile(uintptr(ns), fd.name()), nil 
+}
+```
+So, User either use Shutdown to close socket, or use syscall.SetNonblock to put the Listener fd into the nonblock. 
+Uses golang.org/x/net/netutil.LimitListener to wrap the grace Listener
+This PR implements a Win fall back version of Serve function to fix #15. This change will make the package buildable on Windows, though graceful restarts / shutdowns will not be supported on it.
+### Changelog
+- `gracehttp/`
+  1. `http.go` and `http_test.go` are moved as-is to the `nix.go` and `nix_test.go`.
+  2. `+build !windows` tags are added to both and to the `testbin_test.go`.
+  3. `pprintAddr` and modification of `(*app).listen(...)` are moved from from the `nix.go` to the `http.go` where they can be reused between *nix and fallback versions of serve.
+  4. `serveFallback` is implemented in the `http.go` and covered by tests (`http_test.go`). It doesn't have a `+build windows` tag to make testing of the function on other platforms possible.
+  5. `win.go` with `+build windows` tag and `Serve` function (wrapper around the `serveFallback`) are added to be used on Windows.
+- `gracedemo/`
+  1. `gracehttp.Serve` call is wrapped by `log.Fatal` to show the errors if any occur.
+
+If this is not the approach you'd like to take, feel free to close the PR.
+
+Running a `go get github.com/facebookgo/grace/gracehttp` gives me:
+
+```
+# github.com/facebookgo/grace/gracehttp
+c:\gobits\src\github.com\facebookgo\grace\gracehttp\http.go:101: undefined: syscall.SIGUSR2
+c:\gobits\src\github.com\facebookgo\grace\gracehttp\http.go:111: undefined: syscall.SIGUSR2
+c:\gobits\src\github.com\facebookgo\grace\gracehttp\http.go:151: undefined: syscall.Kill
+```
+
+Add the close interface for listener and check the closed while restart.

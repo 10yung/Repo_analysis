@@ -1,0 +1,152 @@
+Any plans on making async version of refresh? 
+I was implementing my own LRU cache on top of evmap and was having problems, decided to re-implement the test with *just* evmap and I think I may have found a bug where this test usually fails with the `len()` being `0`. Occasionally it passes.
+
+```rust
+    #[test]
+    fn ev_multi_threaded() {
+        let (read_handle, mut write_handle) = evmap::new();
+        let reader_a = read_handle.clone();
+        let reader_b = read_handle.clone();
+        let reader_c = read_handle.clone();
+        let barrier = Arc::new(Barrier::new(4));
+        let ba = barrier.clone();
+        let bb = barrier.clone();
+        let bc = barrier.clone();
+        // The write-side thread (the one that does inserts)
+        std::thread::spawn(move || {
+            for i in 1..=10 {
+                write_handle.insert(i, i.to_string());
+                write_handle.refresh();
+            }
+            dbg!("A");
+            ba.wait();
+        });
+        // Two "read" sides
+        std::thread::spawn(move || {
+            while let None = reader_a.get_and(&6, |v| v[0].clone()) {}
+            while let None = reader_a.get_and(&8, |v| v[0].clone()) {}
+            dbg!("B");
+            bb.wait();
+        });
+        std::thread::spawn(move || {
+            while let None = reader_b.get_and(&7, |v| v[0].clone()) {}
+            while let None = reader_b.get_and(&9, |v| v[0].clone()) {}
+            dbg!("C");
+            bc.wait();
+        });
+        barrier.wait();
+        dbg!("Done");
+        assert_eq!(reader_c.len(), 10);
+    }
+```
+
+Am I misusing something here? I might be doing dumb things with Barrier. From what I can tell this should pass consistently. You can even put a long sleep in before the call to len() and it'll still fail.
+
+Thanks for your work on this library! Hopefully this helps and isn't a fluke.
+
+This definitely relates to https://github.com/jonhoo/rust-evmap/issues/29
+
+So, all that understood, I'm wondering it there's a particular trick for this usecase that might stay efficient (namely, I want my value sets/vecs to always be N or fewer elements, a sort of LRU cache)? Intuitively it seems this could be implemented in terms of `retain` and keeping a tiny bit of extra metadata on each item.
+
+Alternatively, I had started implementing this with a `get_and`, copy, and then `update` with the new values. Only to realize `update` doesn't swap out the entire value set, but rather replaces the new set with a one-value set. Adding a `replace` method that allows you to provide an entire set/vec as the second param would be desirable. I think the `update` method is a bit unintutive in that respect.
+
+Really like the library! Thanks for your work!
+Write some test cases (even simple ones are welcome!) to help increase [code coverage](https://codecov.io/gh/jonhoo/rust-evmap/tree/master/src).
+Thanks for this great crate!
+
+Is there a way to work with values inside an `evmap` mutably? I am storing larger records inside an evmap and would like the ability to update them without making copies. Something like `get_and`, but with a `FnMut`? The desire is for something akin to the Entry API that allows fetching and updating a value with a single operation.
+
+As I understand it, this is a bit more complex since this is a multivalued map, and every operation must be encoded as, well, an `Operation`. But perhaps it could be done by index, for instance
+```rust
+let result: Option<()> = rh.get_and_update(&key, idx, |elem| elem += 1)
+```
+where, similarly to `get_and`, `None` is returned if the key or index didn't lead to an element.
+
+If I'm understanding `Operation` correctly, perhaps this could be encoded as
+`Update(K, Index, NewV)`, or simply as a `Remove` followed by an `Add`.
+
+If this sounds at all like a reasonable or possible thing to add, I would be happy to try and help with implementation. Thanks again!
+Guys, is it possible to sort values vector without replacing whole array?
+I mean just make vector.sort() or like that to save new values order?
+subj
+Hi,
+
+Not an issue but what is the best way to save the content of evmap into a file and load it back at runtime?
+
+IO BufReader reading line by line with a split?
+Thanks again :)
+@carllerche recently published [`loom`](https://docs.rs/loom/) which does correctness checking for concurrent algorithms. It'd be neat to try to get that working for `evmap`'s tests!
+Branching off of https://github.com/Amanieu/hashbrown/issues/43
+
+I'm not sure what the best way to do this is, so this issue is inviting ideas.
+
+A simple start would be a trait such as:
+
+```rust
+pub trait Backend<K, V>: Extend<(K, V)>
+where 
+    K: Hash + Eq,
+    V: Eq + ShallowCopy,
+{
+    fn apply_first(&mut self, ops: ...);
+    fn apply_second(&mut self, ops: ...);
+
+    unsafe fn clear_nodrop(&mut self);
+}
+
+impl<K, V, S> Backend<K, V> for hashbrown::HashMap<K, V, S>
+where
+    K: Hash + Eq,
+    V: Eq + ShallowCopy,
+    S: BuildHasher,
+{ /*...*/ }
+
+// also for std::collections::HashMap
+// also for rahashmap::HashMap
+// etc.
+```
+
+Perhaps the `S` hash builder parameter could be replaced with the above, so that:
+
+```rust
+pub struct WriteHandle<K, V, M = (), S = RandomState>
+where
+    K: Eq + Hash + Clone,
+    S: BuildHasher + Clone,
+    V: Eq + ShallowCopy,
+    M: 'static + Clone,
+{ /*...*/ }
+```
+
+becomes:
+
+```rust
+pub struct WriteHandle<K, V, M = (), B = hashbrown::HashMap<K, V, RandomState>>
+where
+    K: Eq + Hash + Clone,
+    V: Eq + ShallowCopy,
+    M: 'static + Clone,
+    B: Backend<K, V>
+{ /*...*/ }
+```
+
+This would allow us to leverage the particular features and algorithms for different libraries.
+
+If necessary, two traits could be used to hide the real implementation:
+
+```rust
+mod internal {
+    pub trait RealTrait {
+        fn real_operation_we_dont_want_seen();
+    }
+}
+
+pub trait PublicTrait: internal::RealTrait {}
+
+impl<T> PublicTrait for T where T: internal::RealTrait {}
+
+pub struct Structure<B>
+where
+    B: PublicTrait
+{ /*...*/ }
+```

@@ -1,0 +1,133 @@
+The current nix implementation of readlink, which is a rather nice improvement over the previous version, is:
+
+```rust
+fn wrap_readlink_result(v: &mut Vec<u8>, res: ssize_t) -> Result<OsString> {
+    match Errno::result(res) {
+        Err(err) => Err(err),
+        Ok(len) => {
+            unsafe { v.set_len(len as usize) }
+            Ok(OsString::from_vec(v.to_vec()))
+        }
+    }
+}
+
+pub fn readlink<P: ?Sized + NixPath>(path: &P) -> Result<OsString> {
+    let mut v = Vec::with_capacity(libc::PATH_MAX as usize);
+    let res = path.with_nix_path(|cstr| {
+        unsafe { libc::readlink(cstr.as_ptr(), v.as_mut_ptr() as *mut c_char, v.capacity() as size_t) }
+    })?;
+
+    wrap_readlink_result(&mut v, res)
+}
+```
+
+The Linux man page for `readlink` has this to say:
+
+> Using a statically sized buffer might not provide enough room for the symbolic link contents. The required size for the buffer can be obtained from the `stat.st_size` value returned by a call to `lstat(2)` on the link. ... Dynamically allocating the buffer for `readlink()` and `readlinkat()` also addresses a common portability problem when using `PATH_MAX` for the buffer size, as this constant is not guaranteed to be defined per POSIX if the system does not have such limit.
+
+Per the above, the fixed-size buffer should be replaced by one of the following approaches:
+
+- Use `lstat` to read the size of the link, allocate a buffer that large plus one, `readlink`. If the return value isn't exactly `v.capacity()-1`, start over. (An approach like this is recommended in the Linux manpage, but supposedly some filesystems' `stat` implementations report a size of zero bytes for all symlinks, so...)
+- Starting with a reasonable minimum size (`PATH_MAX.max(128)` or something?) and increasing each time, repeatedly `readlink` until the returned size is *strictly less than* the buffer size. (maybe fall back to this if `lstat` returns zero size?)
+
+Also, we should probably guard against `readlink` returning a size larger than the buffer. I don't know of any actual UNIXoid that does this, but... this is Rust after all.
+
+I would take a crack at this myself, but I'm still recovering from some nastiness. Just composing this issue took me six hours, drifting in and out of dizzy semi-consciousness. Not the best state to write important code in.
+
+One more solution #1164 
+The code is adapted from the [shadow](https://crates.io/crates/shadow) crate, which is MIT licensed.
+So I've just added them #1164 
+Can't find any analogues to these macros: 
+S_ISREG()
+S_ISDIR()
+S_ISCHR()
+S_ISBLK()
+S_ISFIFO()
+S_ISLNK()
+S_ISSOCK()
+I noticed that the filesystem checks API `setfsuid` and `setfsgid` where missing (while available in `libc`). This PR adds the implementation for both of them.
+This pull request adds support for setting the IP_RECVERR sockopt, and then decoding the resulting messages from recvmsg.  My intent is to use this to implement a traceroute program (And so need ICMP TTL exceeded messages), though IP_RECVERR is useful in general when writing UDP network programs.  It is, unfortunately, a linux-specific API.  
+
+There's no tests here, but I've been trying it out with this bit of code:
+https://github.com/mcpherrinm/traceroute/commit/8a92b6d66d7a44a60b261ff382f38f307b435ef5
+
+SockExtendedErr is the struct type returned as a Cmsg from recvmsg.   It (like the C linux/errqueue.h which defines it) uses u8 and u32.  I think we'll want something more user-friendly here, so I'd say this PR is still a work-in-progress.
+
+I am new to the `nix` codebase (and am not very experienced with Rust), so would appreciate early feedback.
+I'd like to have some conversion sugar to get an `nix::errno::Errno` from a `std::io::Error`. That is, going in the opposite direction of https://github.com/nix-rust/nix/issues/613.
+
+Strawman would be:
+```rust
+/// Convert into an `Errno`.
+pub trait AsErrno {
+    /// Try to convert into an `Errno`.
+    ///
+    /// If the conversion is not semantically meaningful, `None` is returned.
+    fn as_errno(&self) -> Option<Errno>;
+}
+
+impl AsErrno for std::io::Error {
+    fn as_errno(&self) -> Option<Errno> {
+        self.raw_os_error().map(Errno::from_i32)
+    }
+}
+```
+
+The use case is to improve ergonomics when pattern matching on stdlib results, like this:
+```rust
+use nix::errno::{AsErrno, Errno};
+match std::io::xyz() {
+        Err(ref err) if err.as_errno() == Some(Errno::EPERM) => foo(),
+       _ => bar()
+}
+```
+
+Would something like this be welcome in `nix::errno`?
+
+I am using the wait module to check after the child processes after receiving a SIGCHLD signal. Naturally I want to collect all available events at once as SIGCHLD might be sent only once for multiple child process events.
+
+I am using an iterator for that which might be useful for other users. It would be nice to see this integrated into the modules API
+
+```
+// this would be a cool addition to the API
+pub fn event_iter() -> std::iter::FromFn<fn() -> Option<Result<(i32, i8), nix::Error>> {
+    let event_iter = std::iter::from_fn(get_next_exited_child)
+}
+
+// I use this function to make my iterator
+fn get_next_exited_child() -> Option<Result<(i32, i8), nix::Error>> {
+    match nix::sys::wait::waitpid(-1, Some(nix::sys::wait::WNOHANG)) {
+        Ok(exit_status) => match exit_status {
+            nix::sys::wait::WaitStatus::Exited(pid, code) => Some(Ok((pid, code))),
+            nix::sys::wait::WaitStatus::Signaled(pid, signal, dumped_core) => {
+                // signals get handed to the parent if the child got killed by it but didnt handle the
+                // signal itself
+                if signal == libc::SIGTERM {
+                    if dumped_core {
+                        Some(Ok((pid, signal as i8)))
+                    } else {
+                        Some(Ok((pid, signal as i8)))
+                    }
+                } else {
+                    None
+                }
+            }
+            nix::sys::wait::WaitStatus::StillAlive => {
+                trace!("No more state changes to poll");
+                None
+            }
+            _ => {
+                trace!("Child signaled with code: {:?}", exit_status);
+                None
+            }
+        },
+        Err(e) => {
+            if let nix::Error::Sys(nix::errno::ECHILD) = e {
+            } else {
+                trace!("Error while waiting: {}", e.description().to_owned());
+            }
+            Some(Err(e))
+        }
+    }
+}
+```

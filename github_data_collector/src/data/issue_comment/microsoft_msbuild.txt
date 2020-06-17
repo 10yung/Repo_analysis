@@ -1,0 +1,75 @@
+
+As part of allowing System.Text.Json to be used in VS
+See, for example, [AB#1050605](https://devdiv.visualstudio.com/0bdbc590-a062-4c3f-b0f6-9383f67865ee/_workitems/edit/1050605).
+VS insertions are currently failing with problems reported about our new `System.Text.Json` dependency.
+We are trying to tune our build servers to speed up build times and we are looking for documentation on how Parallel Builds actually work in MSBuild; with special focus to C#.
+
+There is not a wiki page, and I am not smart enough to chase this in code. If I could be given a pointer on where to start I can dig from there. There is good discussion on #74 which gives a little background (but focuses more on C++), are there other places that do a more in-depth dive?
+
+Historically we have naively assumed that looking at our dependency graph in a breadth-first manner would give us a good gauge for optimal core/worker allocation. However we do not believe that this accurately depicts what MSBuild does. Rather it appears that MSBuild, when given a solution file, will attempt to crawl the dependency tree in a depth-first manner. It is unclear if this is by design or just an artifact of the current implementation.
+
+What we are trying to find is a way to determine a rough estimate (simply by evaluating the dependency tree, without building) on the value of adding N+1 cores to an existing build instance. Is that even possible?
+I have Visual Studio 2019 version `16.4.1 `and MSBuild version `16.4.0+e901037fe for .NET Framework`.
+
+I have a solution with around 250 projects (mix of `csproj` and `vcxproj`). All target `net4.8` or produces native images.  All projects are currently using "old" style `csproj` (`<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003" ToolsVersion="4.0">`). `ToolsVersion` is `4.0` but I think it is not important to my case.
+
+Recently I wanted to have a look on "new style" builds ("sdk") and I converted one small `csproj`  with excellent [CsprojToVs2017](https://github.com/hvanbakel/CsprojToVs2017). This went smooth and there is no problem (except I had to set `AppendTargetFrameworkToOutputPath` to `false` to adjust `OutputPath`). This `cspro`j has one direct dependency but more than 70 indirect ones.
+
+My problem is that it takes too long for subsequent builds to complete. Even smallest change in my project takes around 8 seconds to build in Visual Studio (via `r-click-> Build` or `Ctrl+B`).  I installed [Project System Tools](https://marketplace.visualstudio.com/items?itemName=VisualStudioProductTeam.ProjectSystemTools) and by looking into resulting logs I see that biggest offender is  `_GetProjectReferenceTargetFrameworkProperties:`
+
+```
+       34 ms  FindReferenceAssembliesForReferences       1 calls
+       59 ms  _CopyFilesMarkedCopyLocal                  1 calls
+       88 ms  AssignTargetPaths                         81 calls
+      148 ms  ResolveAssemblyReferences                  1 calls
+      483 ms  GetCopyToOutputDirectoryItems             81 calls
+     1227 ms  ResolveProjectReferences                   1 calls
+     5699 ms  _GetProjectReferenceTargetFrameworkProperties  81 calls
+
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+
+Time Elapsed 00:00:08.60
+```
+
+Looking at definition for [`_GetProjectReferenceTargetFrameworkProperties`](https://github.com/microsoft/msbuild/blob/e812790eabece155f9ea7cbc13d57ce1ad7bff19/src/Tasks/Microsoft.Common.CurrentVersion.targets#L1581) I tried setting `SkipGetTargetFrameworkProperties` but it did not change situation
+
+```
+ <ProjectReference Include="..\project\project.csproj" SkipGetTargetFrameworkProperties="true" />
+```
+
+Do I hit some edge case or is it just "regular" RAR problem mentioned so often in issues here? Is there any workaround? I do not need multitargetting currently.
+
+
+https://github.com/microsoft/msbuild/pull/5026 introduced logging execution context details, but they do not get captured by the MuxLogger. Investigate and decide if the MuxLogger should capture these events or not.
+Should enable https://github.com/microsoft/msbuild/pull/5007 to log places where msbuild searches for command line arguments.
+### Steps to reproduce
+
+I have the following repro solution structure (see attachmeent):
+
+```
+Solution
+|- ProjectA "DependentProjectsOutputNotCopied_Dependency"
+   |- Content: Content.txt (Copy if newer)
+|- ProjectB "DependentProjectsOutputNotCopied_Reference"
+   |- ProjectReference: ProjectA
+```
+
+Both projects target .NET Framework 4.7.2, both are using the new SDK-styled project format.
+
+### Expected  behavior
+
+When I build ProjectB in such a way that ProjectA is built at the same time (e.g., if ProjectA is not up-to-date or by performing “Rebuild all”) the Content.txt is correctly put into the output folder of ProjectB. This should also be the case if ProjectA is not built in this MSBuild run.
+
+### Actual behavior
+
+In all cases where ProjectA is not built (e.g., because it is up-to-date), the Content.txt is NOT copied to the output folder of ProjectB. When I “execute” ProjectB (unit test project) it runs into runtime problems because the necessary Content.txt is not available.
+
+### Environment data
+MSBuild used by VS 2019 16.4.1
+
+OS info: Windows 10 1903
+I think warnings elevated to errors should have different output compared to errors that are always errors. The NuGet team has received numerous complaints from people asking why something they don’t consider serious has failed their build, and we have to keep repeating that NuGet treats it as a warning and help them understand how their project has opted into warnings as errors.
+
+I think if the error said “Warning As Error: NU1234” instead of just “Error: NU1234”, or “Error (elevated warning): NU1234”, “Error: NU1234 (elevated warning)” or something similar, customers would more quickly understand that their project configuration has asked for this. However, I suspect changing the message could cause problems with people who run regex on the build output, maybe the VS error list will be affected. So, I’d like input from other teams what might be a good approach, plus see if there’s any buy-in from other teams to do this in a consistent way

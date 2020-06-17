@@ -1,0 +1,91 @@
+The [Elastic Support Matrix](https://www.elastic.co/support/matrix#matrix_jvm) shows that Java 11 (Oracle/OpenJDK 11) is supported for Logstash (version 6.7 and newer), but does not mention AdoptOpenJDK 11.  
+
+For Elasticsearch, the support matrix clearly shows AdoptOpenJDK 11 is compatible with multiple versions.  However, the Logstash section does not include AdoptOpenJDK specifically.
+
+This enhancement request is to either: 1) Clarify and document if AdoptOpenJDK 11 is supported for Logstash, or 2) Open the floor to discussion on if AdoptOpenJDK 11 can/will be supported for Logstash.
+I have created [this image](https://hub.docker.com/r/iteratec/logstash-rspec) for testing own logstash filters.
+
+It works well so far and I am using it quite a while successfully.  I have described my problem with image size in the readme of the image:
+
+_The image is currently quite huge what might be a burden on a CI server. I am more a logstash user than a developer. So if anybody has more insights about what is really necessary (and what's not) to run rspec tests: Using a multi-stage docker build to decrease image size would be a very nice PR ;) . In the github repo there is also a variant using an alpine-jdk base image. But that one doesn't work so far and I don't have the time right now to investigate._
+
+Can anybody of the Logstash contributors help with that? Or just give me a hint, what could be removed from the image for running the tests?
+This PR simply use deprecation logger to write a warn message once the internal monitoring collector is used, because it's going do be removed in version 8.
+Solves  #11346
+
+NB must be included in LS [7.7..8)
+the underlying Java exceptions leak out - thus its hard to rescue an invalid URI
+
+sample spec: 
+```ruby
+ # consider
+ config :proxy, :validate => :uri
+ # with parameter set to smt invalid : 
+ proxy => ":"
+
+ # one can not simply
+ expect { subject.register }.to raise_error(ArgumentError, /URI is not valid/i)
+
+ # but needs to know the specific Java exceptions :   
+  begin
+    subject.register
+  rescue ArgumentError => e
+    expect(e.message).to match /URI is not valid/i
+  rescue java.net.URISyntaxException => e
+    expect(e.message).to match /scheme name/i
+  else
+    fail 'exception not raised'
+  end
+```
+
+
+The Module is broken with the current version. The Type needs to be changed from syslog to _doc to fix the issue.
+~Because our source files for java pipeline execution are independent of each
+other~ (_SPOILER: they are_), ~we do not need to share a single instance of `SimpleCompiler` nor chain
+our `ClassLoader`s sequentially with `ISimpleCompiler#setParentClassLoader`~ (_ERGO: we do_).
+
+Discovered while reviewing https://github.com/elastic/logstash/pull/11482
+
+Additionally, I think this gives us the benefit of not having indefinitely chained classloaders, meaning pipelines that have been stopped _may_ be able to reclaim more of their memory once their classes are dereferenced.
+
+A middle-ground implementation allowing us to continue the hacked reuse of `SimpleCompiler` would be to have a `static final ThreadLocal<ISimpleCompiler> COMPILER = ThreadLocal.withInitial(SimpleCompiler::new)`, which would ensure that we don't interleave calls to `ISimpleCompiler#cook` and `ISimpleCompiler#getClassLoader`.
+Per discussion in https://github.com/elastic/logstash/pull/11492#issuecomment-574264320 per @yaauie observation:
+
+> Note that WorkerLoop.THREAD_CONTEXT is a ThreadLocal, so each java thread can pull its own ruby thread context out. The trouble arises if and when a java thread ever runs multiple ruby threads in the course of its lifetime (which I do not know), since we only populate it with ThreadLocal#withInitial and then use WorkerLoop.THREAD_CONTEXT in to pass a ThreadContext to various ruby internals that then use it to determine interrupt state.
+
+
+This is the code in question:
+
+https://github.com/elastic/logstash/blob/5c4d35343acadc3ab735882c4511228189abe3ea/logstash-core/src/main/java/org/logstash/execution/WorkerLoop.java#L19-L20
+
+We should investigate further into this.
+- Version:8.0.0-SNAPSHOT
+- Operating System: any
+- Config File: 
+```
+input { 
+	stdin {
+		codec => json {
+			charset => "UTF-8"
+		}
+	} 
+} 
+
+filter { 
+	sleep { 
+		time => 1
+	}
+}
+
+output {
+	stdout { 
+		codec => rubydebug
+	} 
+}
+```
+- Steps to Reproduce:
+ - run logstash (`bin/logstash -f <path to config file> --java-execution=true`)
+
+With breakpoint on https://github.com/elastic/logstash/blob/master/logstash-core/src/main/java/org/logstash/plugins/PluginFactoryExt.java#L150 the execution pass twice for same plugin definition because invoked by `CompiledPipeline.convertArgs` and `CompiledPipeline.convertJavaArgs` from https://github.com/elastic/logstash/blob/master/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java#L190-L191.
+
+The 2 convert invocations are one for Ruby plugin and the other for Java plugin, but at the end the pipeline use only one of the two. Then there is also different behaviour for Java part because invokes the expandConfigVariables to substitute the variables while the other no. About this eventual case look at #10546 

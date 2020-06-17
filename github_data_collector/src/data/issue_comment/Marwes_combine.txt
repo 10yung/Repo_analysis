@@ -1,0 +1,320 @@
+I am trying to create a program that reads files (potentially not fitting into memory) and folds over items found in the file. An item can span over several lines.
+My problem is that I found no example for "combine" that I could adapt to my use-case.
+(`examples/async.rs` seems to go into the right direction, but it is too complicated for me.)
+
+So consider the simplified assignment:
+Assume we want to implement `wc -l`, with the little twist that the program should fail when encountering a non-alphabetic and non-newline character.
+Effectively, this program should recognise the grammar `([a-zA-z]*\n)*` and then output the number of newlines. The program should be able to handle files that do not fit into RAM.
+
+A naive attempt at handling this assignment is:
+
+~~~ rust
+extern crate combine;
+use combine::parser::char::newline;
+use combine::parser::range::take_while;
+use combine::{sep_by, Parser};
+
+fn main() {
+  let word = take_while(|c: char| c.is_ascii_alphabetic());
+  let mut lines = sep_by(word, newline());
+
+  let result : Result<(Vec<&str>, &str), _> = lines.parse("a\naa\naaa");
+  println!("result: {:?}", result);
+
+  let n_lines = result.unwrap().0.iter().fold(0, |acc, x| acc + 1);
+  println!("number of lines: {}", n_lines);
+}
+~~~
+
+However, the problem here is that:
+
+* We do not read from a file, but from a fixed string.
+* We need to have the *whole* string on which we are operating in memory.
+
+I would love a solution where I could just specify a `line` parser, then run `fold(0, |acc, word| acc + 1)` on repeated parses of `line` on some file to obtain the number of lines.
+The file should be read lazily, e.g. by using `BufRead`.
+thanks
+https://github.com/Marwes/combine/blob/v4.0.0-beta.1/src/parser/mod.rs#L70
+
+..._needs to be at least one implementation of_ two parse_streams or one parse_lazy?  I'm not sure what the third option should be, or if there are only two options.
+I want to parse a large file to 2G. I wonder if there exists a multithread way to acclerate the parsing work.  
+Hello !
+
+The combination of `BufferedStream`, `ReadStream` and `BufReader` is really great to read data from streaming stdin or else (eg. network input). But `BufferedStream` has a fixed size and it's complicated to find the good one when we don't know the content we will receive.
+
+So I developed a new Stream, named `ElasticBufferedReadStream` (I'm not good at finding short names) combining the features of `BufferedStream`, `ReadStream` and `BufReader` and adapting its size according to the checkpoints still owned by the parsers.
+It uses `Rc` and `Weak` to track the checkpoints lifetimes.
+
+You can see my project here : https://github.com/kompass/combine-elastic-buffered-stream
+
+It's still under development, I will add the `RangeStream` feature and continue to test everything to be sure it's stable.
+What dou you think about it ? Maybe we can add this stream into your project ?
+https://crates.io/crates/cargo-deadlinks works well in my experience so should just set that up 
+I experimented with adding a `.debug()` combinator. This is my draft code:
+```rust
+mod combineext {
+    use combine::parser::{Parser, ParseMode};
+    use combine::stream::{RangeStream, StreamOnce};
+    use combine::error::{ConsumedResult, FastResult, Tracked}; //, Info, ParseError, StreamError, Tracked};
+
+    pub trait ParserExt {
+        fn debug(self, tag: &'static str) -> Debug<Self> where Self : Sized;
+    }
+
+    impl<P> ParserExt for P
+    where
+        P: Parser,
+    {
+        fn debug(self, tag: &'static str) -> Debug<Self> {
+            Debug { tag, parser : self }
+        }
+    }
+
+    pub struct Debug<P> {
+        tag: &'static str,
+        parser : P,
+    }
+
+    impl<P, I, O> Parser for Debug<P>
+    where
+        I: RangeStream,
+        P: Parser<Input = I, Output = O>,
+        I::Position : std::fmt::Display,
+        I::Error : std::fmt::Display
+     {
+        type Input = I;
+        type Output = P::Output;
+        type PartialState = P::PartialState;
+
+        #[inline]
+        fn parse_lazy(&mut self, input: &mut Self::Input) -> ConsumedResult<O, I> {
+            println!("#{} at {}", self.tag, input.position());
+
+            let before = input.checkpoint();
+            let result = self.parser.parse_lazy(input);
+            let consumed_len = input.distance(&before);
+
+            print!("#{} finished and consumed {} bytes, now at {}, result = ", self.tag, consumed_len, input.position());
+
+            let result = match result {
+                FastResult::ConsumedOk(x) => {
+                    println!("ok");
+                    FastResult::ConsumedOk(x)
+                }
+                FastResult::EmptyOk(x) => {
+                    println!("ok, nothing consumed");
+                    FastResult::EmptyOk(x)
+                }
+                FastResult::ConsumedErr(err) => {
+                    println!("err, consumed, {}", err);
+                    FastResult::ConsumedErr(err)
+                }
+                FastResult::EmptyErr(err) => {
+                    println!("err, nothing consumed, {} [{:?}]", err.error, err.offset);
+                    FastResult::EmptyErr(err)
+                }
+            };
+
+
+            result
+        }
+
+        fn add_error(&mut self, error: &mut Tracked<<Self::Input as StreamOnce>::Error>) {
+            self.parser.add_error(error)
+        }
+
+        fn add_consumed_expected_error(&mut self, error: &mut Tracked<<Self::Input as StreamOnce>::Error>) {
+            self.parser.add_consumed_expected_error(error)
+        }
+
+        fn parser_count(&self) -> combine::ErrorOffset {
+            self.parser.parser_count()
+        }
+
+
+
+    }
+}
+```
+
+Together with this example code:
+
+```rust
+    use crate::combineext::ParserExt;
+
+    fn p2<'a, I>() -> impl Parser<Input = I, Output = char>
+    where
+        I: RangeStream<Item = char, Range = &'a str>,
+        I::Position : std::fmt::Display,
+        I::Error : std::fmt::Display,
+        I::Error: ParseError<I::Item, I::Range, I::Position>,
+    {
+        choice::choice((
+            combinator::attempt(char::char('{').debug("{1").with(char::char('a')).debug("{0")),
+            combinator::attempt(char::char('[').debug("[2")).debug("[1").with(char::char('b')).debug("[0"),
+        ))
+        // The error will look like this:
+        //   Unexpected `c`
+        //   Expected `{` or `[`
+    }
+
+    println!("------------- 1 -----------------");
+    assert_eq!(p2().easy_parse("{a"), Ok(('a', "")));
+    println!("------------- 2 -----------------");
+    assert!(p2().easy_parse("{b").is_err());
+    println!("------------- 3 -----------------");
+    assert!(p2().easy_parse("[a").is_err());
+    println!("------------- 4 -----------------");
+    assert_eq!(p2().easy_parse("[b"), Ok(('b', "")));
+    println!("------------- 5 -----------------");
+    assert!(p2().easy_parse("c").is_err());
+    println!("------------- 6 -----------------");
+    println!("{}", p2().easy_parse("c").unwrap_err());
+    assert!(false);
+```
+
+It generated the following output:
+
+```
+------------- 1 -----------------
+#{0 at 0x55a87771160a
+#{1 at 0x55a87771160a
+#{1 finished and consumed 1 bytes, now at 0x55a87771160b, result = ok
+#{0 finished and consumed 2 bytes, now at 0x55a87771160c, result = ok
+
+
+------------- 2 -----------------
+#{0 at 0x55a87771162e
+#{1 at 0x55a87771162e
+#{1 finished and consumed 1 bytes, now at 0x55a87771162f, result = ok
+#{0 finished and consumed 2 bytes, now at 0x55a877711630, result = err, consumed, Parse error at 0x55a87771162f
+Unexpected `b`
+Expected `a`
+
+#[0 at 0x55a87771162e
+#[1 at 0x55a87771162e
+#[2 at 0x55a87771162e
+#[2 finished and consumed 1 bytes, now at 0x55a87771162f, result = err, nothing consumed, Parse error at 0x55a87771162e
+ [ErrorOffset(1)]
+#[1 finished and consumed 0 bytes, now at 0x55a87771162e, result = err, nothing consumed, Parse error at 0x55a87771162e
+Unexpected `{`
+Expected `[`
+ [ErrorOffset(1)]
+#[0 finished and consumed 0 bytes, now at 0x55a87771162e, result = err, nothing consumed, Parse error at 0x55a87771162e
+Unexpected `{`
+Expected `[`
+ [ErrorOffset(1)]
+
+
+------------- 3 -----------------
+#{0 at 0x55a877711682
+#{1 at 0x55a877711682
+#{1 finished and consumed 1 bytes, now at 0x55a877711683, result = err, nothing consumed, Parse error at 0x55a877711682
+ [ErrorOffset(1)]
+#{0 finished and consumed 1 bytes, now at 0x55a877711683, result = err, nothing consumed, Parse error at 0x55a877711682
+ [ErrorOffset(1)]
+#[0 at 0x55a877711682
+#[1 at 0x55a877711682
+#[2 at 0x55a877711682
+#[2 finished and consumed 1 bytes, now at 0x55a877711683, result = ok
+#[1 finished and consumed 1 bytes, now at 0x55a877711683, result = ok
+#[0 finished and consumed 2 bytes, now at 0x55a877711684, result = err, consumed, Parse error at 0x55a877711683
+Unexpected `a`
+Expected `b`
+
+------------- 4 -----------------
+#{0 at 0x55a8777116d6
+#{1 at 0x55a8777116d6
+#{1 finished and consumed 1 bytes, now at 0x55a8777116d7, result = err, nothing consumed, Parse error at 0x55a8777116d6
+ [ErrorOffset(1)]
+#{0 finished and consumed 1 bytes, now at 0x55a8777116d7, result = err, nothing consumed, Parse error at 0x55a8777116d6
+ [ErrorOffset(1)]
+#[0 at 0x55a8777116d6
+#[1 at 0x55a8777116d6
+#[2 at 0x55a8777116d6
+#[2 finished and consumed 1 bytes, now at 0x55a8777116d7, result = ok
+#[1 finished and consumed 1 bytes, now at 0x55a8777116d7, result = ok
+#[0 finished and consumed 2 bytes, now at 0x55a8777116d8, result = ok
+
+
+------------- 5 -----------------
+#{0 at 0x55a8777116fa
+#{1 at 0x55a8777116fa
+#{1 finished and consumed 1 bytes, now at 0x55a8777116fb, result = err, nothing consumed, Parse error at 0x55a8777116fa
+ [ErrorOffset(1)]
+#{0 finished and consumed 1 bytes, now at 0x55a8777116fb, result = err, nothing consumed, Parse error at 0x55a8777116fa
+ [ErrorOffset(1)]
+#[0 at 0x55a8777116fa
+#[1 at 0x55a8777116fa
+#[2 at 0x55a8777116fa
+#[2 finished and consumed 1 bytes, now at 0x55a8777116fb, result = err, nothing consumed, Parse error at 0x55a8777116fa
+ [ErrorOffset(1)]
+#[1 finished and consumed 0 bytes, now at 0x55a8777116fa, result = err, nothing consumed, Parse error at 0x55a8777116fa
+Unexpected `c`
+Expected `[`
+ [ErrorOffset(1)]
+#[0 finished and consumed 0 bytes, now at 0x55a8777116fa, result = err, nothing consumed, Parse error at 0x55a8777116fa
+Unexpected `c`
+Expected `[`
+ [ErrorOffset(1)]
+
+
+------------- 6 -----------------
+#{0 at 0x55a8777116fa
+#{1 at 0x55a8777116fa
+#{1 finished and consumed 1 bytes, now at 0x55a8777116fb, result = err, nothing consumed, Parse error at 0x55a8777116fa
+ [ErrorOffset(1)]
+#{0 finished and consumed 1 bytes, now at 0x55a8777116fb, result = err, nothing consumed, Parse error at 0x55a8777116fa
+ [ErrorOffset(1)]
+#[0 at 0x55a8777116fa
+#[1 at 0x55a8777116fa
+#[2 at 0x55a8777116fa
+#[2 finished and consumed 1 bytes, now at 0x55a8777116fb, result = err, nothing consumed, Parse error at 0x55a8777116fa
+ [ErrorOffset(1)]
+#[1 finished and consumed 0 bytes, now at 0x55a8777116fa, result = err, nothing consumed, Parse error at 0x55a8777116fa
+Unexpected `c`
+Expected `[`
+ [ErrorOffset(1)]
+#[0 finished and consumed 0 bytes, now at 0x55a8777116fa, result = err, nothing consumed, Parse error at 0x55a8777116fa
+Unexpected `c`
+Expected `[`
+ [ErrorOffset(1)]
+Parse error at 0x55a8777116fa
+Unexpected `c`
+Expected `{` or `[`
+```
+
+I think the Idea is nice, but it requires a lot of additional trait bounds that make it a pain to use.
+
+By specifying the input type not generically via `I`, but explicit (by using a type alias), it is possible to mitigate this. But the question is what we consider idiomatic parsers.
+```
+type MyInput<'a> = combine::easy::Stream<State<&'a str, combine::stream::state::SourcePosition>>;
+```
+
+If there is no very easy way to implement this, this issue can be closed. I just wanted to introduce the idea.
+Hi @Marwes 
+
+I'm hitting the error part in https://github.com/Marwes/combine/wiki/Documentation-Draft and I have some questions regarding the overall design.
+
+Why is the End-Of-File error handled by the Error traits/types? Wouldn't it be better to handle it right with Consumed<> or so?
+
+Next is about `Consumed::Empty`. I think it means that the parser has not consumed any bytes from the input (or that he has `reset()` the input to the original position). Why is it called `Empty` and not  `Nothing` or `Unchanged` or so. Am I missing the point?
+
+`FastResult` is a flattened `ParseResult`. But why is there a unflattened version when all user facing functions `parse()`, `easy_parse()` .... aaa, `parse_stream()` never asked...
+
+If I write out `ConsumedResult` it becomes
+```
+type ConsumedResult<O, I> = FastResult<O, <I as StreamOnce>::Error>;
+    ConsumedOk(O)
+    EmptyOk(O)
+    ConsumedErr(I::Error)
+    EmptyErr( Tracked { error : I::Error, offset : u8 })
+```
+Why is EmptyErr `Tracked` and `ConsumedErr` not? Is `ConsumedErr` always not recoverable and therefore don't need the Tracking? 
+
+Why `ParseMode` and  `is_partial`? They do the same, except that ParseMode monomorphizes. I guess because carrying another associated type from `StreamOnce` would be noisy?
+
+Thanks a lot,
+Daniel
+Now that implement Trait is stable, could you use it both for code and examples in order to simplify the API?
+I'm just starting out with combine and I'm having a hard time dealing with what I assume are common errors and mistakes. It would help if there were a guide pointing to the right bits in the docs and also some best practice guides.

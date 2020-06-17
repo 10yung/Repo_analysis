@@ -1,0 +1,167 @@
+
+Hello,
+
+Apollo has the very useful [useLazyQuery](https://www.apollographql.com/docs/react/v3.0-beta/data/queries/#executing-queries-manually) which allows to trigger the query independently of the component rendering.
+
+I didn't see an equivalent with urql.
+
+Right now I'm wiring things manually :
+```tsx
+const SelectBoxForm: FC<{ onChange: any }> = ({ onChange }) => {
+  const graphqlClient = useClient();
+  const onSubmit = async ({ boxBarcode }: SelectBoxFormData) => {
+    const { data } = await graphqlClient
+      .query<GetBoxQuery, GetBoxQueryVariables>(GET_BOX, {
+        barcode: boxBarcode
+      })
+      .toPromise();
+    onChange(data?.boxByBarcode);
+  };
+
+  return (/* JSX */)
+}
+```
+
+I think it would be a great addition to the lib as these lazy queries are quite common (at least in my apps? 😄)
+
+Also we could then leverage this hook to generate more typesafe utilities with graphql-codegen!
+Not sure if the other guides need to be updated as well, but this is the change I needed to make in my project for the file exchange.
+## Description
+
+1\) 404 cases lead to different SSR and Browser representations of `error`.
+2\) SSR representation seems to be slightly off.
+
+### Steps to reproduce
+
+1) Access 404 API from Browser directly (trigger SSR).
+2) Access 404 API from Browser via link (trigger client fetching).
+
+By 404 API I mean any API returning `message: "Not Found", code: INTERNAL_SERVER_ERROR` which is probably not perfect but is the default ApolloServer behavior:
+
+> AuthenticationError — for authentication failures
+> ForbiddenError — for authorization failures
+> UserInputError — for validation errors on user input
+> **As a fallback for uncaught failures, any other unknown errors thrown within your resolver will add the code INTERNAL_SERVER_ERROR**
+> https://blog.apollographql.com/full-stack-error-handling-with-graphql-apollo-5c12da407210
+
+and shouldn't really matter for the context of this issue.
+
+### Code
+
+```
+// some NextJS page
+
+let [dataResult] = useQuery({
+  query,
+})
+
+if (dataResult.error) {
+  console.log(dataResult.error) // !!!
+  return <Error message={dataResult.error.toString()}/>
+}
+```
+
+### SSR Error
+
+```
+[CombinedError: [Network] undefined] {
+  name: 'CombinedError',
+  message: '[Network] undefined',
+  graphQLErrors: [
+    GraphQLError: Not Found
+        at rehydrateGraphQlError (/.../node_modules/urql/dist/cjs/index-dddbd19e.js:23:12)
+        at Array.map (<anonymous>)
+        at new CombinedError (/.../node_modules/urql/dist/cjs/index-dddbd19e.js:39:61)
+        ...
+        at b (/.../node_modules/wonka/dist/wonka.js:865:14)
+        at Array.forEach (<anonymous>) {
+      message: 'Not Found'
+    }
+  ],
+  networkError: Error: undefined
+      at /.../node_modules/urql/dist/cjs/core.js:525:25
+      ...
+      at d (/.../node_modules/wonka/dist/wonka.js:137:16),
+  response: undefined
+}
+```
+
+`error.toString()` currently produces (at server) `[Network] undefined`.
+Somehow it misses the informative ` GraphQLError: Not Found` part and goes for the weird  `[Network] undefined`
+
+### Browser
+
+Talking about the same error in Browser.
+
+`error.toString()` currently produces `[GraphQL] Not Found`.
+Which LGTM.
+
+---
+
+The same error should probably lead to the same structures in Browser and Server.
+At least, the error in Server should be improved to match the Browser one. 
+Stacktraces will be different for sure, but the final messages of `toString` should match IMO.
+**Describe the bug**
+I tried out updating Tripadvisor to 1.8.0 today and discovered an unfortunate bug that appears to only surface in ConcurrentMode (Real concurrent mode, not StrictMode)—It seems that while hydrating useQuery will occasionally return a `fetching: true` state with no data even with a fully populated SSR cache. This happens non-deterministically, about 50% of the time, and only when there are multiple queries on the page. Setting breakpoints prevents the failure case. As best I can tell, nothing is getting dispatched at all for the second query, however, they are both dispatched.
+
+**Steps to reproduce**
+https://codesandbox.io/s/cranky-bas-2nz2q
+
+As noted, the behavior is nondeterministic, so it can take a few refreshes to see the error show up. A note on versions: React 16.9.0 is the latest semver'd release with access to the createRoot API, but I also validated that we see the same behavior with the experimental release corresponding to 16.12.0. 
+
+**Expected behavior**
+Expectation here would be that the initial call to useQuery always returns available SSR data.
+
+**Actual behavior**
+`Warning: Expected server HTML to contain a matching <div> in <div>.` alongside the accompany nastiness that comes with React failing to hydrate.
+
+**Additional context**
+Interestingly, uncommenting the non-concurrent-mode hydration forces the concurrent mode one to work.
+
+Guess it's worth noting that the reason I was so quick to try this out is that we were seeing some other funky (but far more minor) concurrent mode behavior with urql on 1.6.3 so after 1.8.0's release notes I was pretty excited for a potential solution!
+Instead we'd like to explore more idiomatic APIs for suspense like `readFragment` and not have any suspense mode on `useQuery`.
+
+This does mean that our current SSR-support will need to change or be preserved using an SSR-only suspense mode.
+I am not a 100% sure if this restriction comes from urql, but it only allows absolute urls. When using next.js [api routes](https://github.com/zeit/next.js/issues/7297) it hinders me from an easier config, since I could theoretically just pass`'/api/graphql'` as url
+
+## About
+Exchange for executing queries locally using an executable schema.
+
+This may be particularly useful for us when making example projects as we could mock responses here rather than implementing a server.
+We recently had a problem on our site where we were re-fetching a bunch of data at a surprisingly high rate and discovered that the culprit was the cache exchange and how it invalidates caches.
+
+99% of the time the approach of the cache exchange to invalidate based on type names works fine, but in our case it didn't.
+
+The page we were having the problem on is one that loads a bunch of `Idea`s from the site to show to the user. The user can then like or dislike these ideas via a button on the site. When the user does this it triggers a mutation, `SetIdeaSentiment`, that updates the idea accordingly.
+
+Our problem is that `SetIdeaSentiment` returns part of the `Idea` back. This meant that urql's `cacheExchange` would see the `__typename: 'Idea'` in the result and immediately invalidate the cache and queue an operation to fetch the ideas again.
+
+However, in this case this isn't required. The frontend knows that the sentiment has changed, and so we don't want to do any refetching of ideas. But what we want is a way to tell urql that and that's what this feature request is.
+
+We fixed it by forking `cacheExchange` to include these extra lines in the `handleAfterMutation` function:
+
+```
+  pendingOperations.forEach(key => {
+    if (resultCache.has(key)) {
+      const operation = resultCache.get(key).operation;
+
+     // this conditional is the code we added
+      if (!operation.context.cacheAndNeverInvalidate) {
+        resultCache.delete(key);
+        reexecuteOperation(client, operation);
+      }
+    }
+  });
+```
+
+And when we make the request we pass `cacheAndNeverInvalidate: true` as an option.
+
+This works, and we think it's an OK solution, but the main thing we don't like is having to fork the `cacheExchange` and diverge from master. What we'd like to suggest is either:
+
+- `cacheExchange` provides some way for us to hook in and tell if it a request should be invalidated or not
+- We introduce some mechanism (maybe another `requestPolicy` of `fetch-then-permanently-cache`) that lets some request get cached for the rest of time.
+- or some other much better idea that we haven't thought of yet :)
+
+Thanks,
+
+Jack

@@ -1,0 +1,285 @@
+Main Changes are-
+1. Updated latest llvm version to 11.0
+     a. Since 10.0 has branched but released, using the temporary branch in alloy. Has to update this once 10.0 official release happens
+2. LLVM moved openmp to a new library - frontendopenmp. Modified Cmake to add this
+3. Changes in headers caused us to add some new headers
+4. setjmp and longjmp deprecated and removed. From what I understand they have not been supported for a while now. Hence the complete removal.
+5. BasicBlockPass removed in llvm. switched to FunctionPass
+6. Alignment no longer use integer values. have to use llvm::MaybeAlign
+Here is some code which has valid ISPC syntax but causes LLVM to die.
+```C++
+void MyFunc(uniform int x) {
+	print("Hello %\n", x);
+}
+
+struct MyObject {
+	void (* MyFuncPtr)(uniform int);
+};
+
+export void TestMain()
+{
+	MyObject obj;
+	obj.MyFuncPtr = MyFunc;
+
+	uniform int x = 60;
+	obj.MyFuncPtr(x);
+}
+
+export void TestMainBroken()
+{
+	uniform MyObject obj; // The only difference
+	obj.MyFuncPtr = MyFunc; 
+
+	uniform int x = 60;
+	obj.MyFuncPtr(x);
+}
+```
+
+When assigning a function pointer to a uniform struct the output is: 
+`Assertion failed: getOperand(0)->getType() == cast<PointerType>(getOperand(1)->getType())->getElementType() && "Ptr must be a pointer to Val type!", file c:\iusers\aneshlya\llvm_release\llvm-8.0\llvm\lib\ir\instructions.cpp, line 1210`.
+Though it passes all the syntax checks.
+Sample code fragment:
+
+const uniform float* uniform src = src_pixels;
+for (uniform unsigned int i = 0; i < width; i += programCount)
+{
+    float r, g, b, a;
+    aos_to_soa4(&src[i], &r, &g, &b, &a);
+}
+
+fails to compile with the following error:
+
+Error: Unable to find any matching overload for call to function "aos_to_soa4". 
+Passed types: (const uniform float * uniform, varying float * uniform, varying float * uniform, varying float * uniform, varying float * uniform) 
+
+casting the first argument to (uniform float* uniform) fixes the error.
+Is it possible to add AMD znver1 & znver2 architecture support?
+I observed the following error while building ispc 1.12.0 from sources using the build.sh script on a Raspberry Pi 4 Model B running 32-bit Raspbian 10 (buster) OS on a 64-bit aarch64 Linux kernel.
+
+Trying to configure release version ERROR.
+Fatal error: can't configure release version 
+I observed the following error while building ispc 1.12.0 from sources using the build.sh script on a Raspberry Pi 4 Model B running Raspbian 10 (buster) OS on a 32-bit armv7l Linux kernel.
+
+[ 31%] Generating builtins-c-32-linux-armv7.cpp
+clang-8: warning: unknown platform, assuming -mfloat-abi=soft
+clang-8: warning: unknown platform, assuming -mfloat-abi=soft
+In file included from builtins/builtins.c:68:
+In file included from /usr/include/unistd.h:25:
+/usr/include/features.h:424:12: fatal error: 'sys/cdefs.h' file not found
+#  include <sys/cdefs.h>
+           ^~~~~~~~~~~~~
+
+Please see minute 4:57 of the following video on my YouTube channel for an occurrence of this specific error I observed during the build process:
+https://youtu.be/4odfdd8opqs
+
+The build.sh script completed producing an ispc binary. However, none of the ispc examples would compile with the resulting binary.
+Execution mask and loop termination condition is not being efficiently evaluated for for/while/do loops on AVX512 targets.
+```
+export void while_loop_test(uniform float cmp[], uniform float vout[],
+                   uniform int count) {
+    foreach (index = 0 ... count) {
+        varying float c = cmp[index];
+
+        while(c > 1.0)
+        {
+            c = c - 1.0;
+        }
+
+        vout[index] = c;
+    }
+}
+```
+`--target=avx512knl-i32x16` assembly:
+```
+.LBB5_4:                                # %foreach_full_body
+        leal    (,%rax,4), %ecx
+        movslq  %ecx, %r9
+        vmovups (%rdi,%r9), %zmm3
+        vcmpnleps       .LCPI5_0(%rip){1to16}, %zmm3, %k1
+        kortestw        %k1, %k1
+        je      .LBB5_5
+        vpternlogd      $255, %zmm1, %zmm1, %zmm1 {%k1} {z}
+        vpmovdb %zmm1, %xmm1
+.LBB5_7:                                # %for_loop
+        vaddps  .LCPI5_1(%rip){1to16}, %zmm3, %zmm2
+        vpcmpeqb        %xmm0, %xmm1, %xmm4
+        vpmovsxbd       %xmm4, %zmm4
+        vptestmd        %zmm4, %zmm4, %k1
+        vmovaps %zmm3, %zmm2 {%k1}
+        vcmpnleps       .LCPI5_0(%rip){1to16}, %zmm2, %k1
+        vpternlogd      $255, %zmm3, %zmm3, %zmm3 {%k1} {z}
+        vpmovdb %zmm3, %xmm3
+        vpand   %xmm1, %xmm3, %xmm1
+        vpcmpeqb        %xmm0, %xmm1, %xmm3
+        vpternlogq      $15, %zmm3, %zmm3, %zmm3
+        vpmovmskb       %xmm3, %ecx
+        testw   %cx, %cx
+        vmovaps %zmm2, %zmm3
+        jne     .LBB5_7
+        jmp     .LBB5_8
+.LBB5_5:                                #   in Loop: Header=BB5_4 Depth=1
+        vmovaps %zmm3, %zmm2
+.LBB5_8:                                # %for_exit
+```
+`--target=avx512skx-i32x16` assembly:
+```
+.LBB5_3:                                # %foreach_full_body
+        leal    (,%rax,4), %ecx
+        movslq  %ecx, %rcx
+        vmovups (%rdi,%rcx), %zmm0
+        vcmpnleps       .LCPI5_0(%rip){1to16}, %zmm0, %k0
+        kortestw        %k0, %k0
+        je      .LBB5_4
+        vpmovm2b        %k0, %xmm1
+.LBB5_6:                                # %for_loop
+        vaddps  .LCPI5_1(%rip){1to16}, %zmm0, %zmm2
+        vptestnmb       %xmm1, %xmm1, %k1
+        vmovaps %zmm0, %zmm2 {%k1}
+        vcmpnleps       .LCPI5_0(%rip){1to16}, %zmm2, %k1
+        vmovdqu8        %xmm1, %xmm1 {%k1} {z}
+        vptestmb        %xmm1, %xmm1, %k0
+        kortestw        %k0, %k0
+        vmovaps %zmm2, %zmm0
+        jne     .LBB5_6
+        jmp     .LBB5_7
+.LBB5_4:                                #   in Loop: Header=BB5_3 Depth=1
+        vmovaps %zmm0, %zmm2
+.LBB5_7:                                # %for_exit
+```
+
+The SKX target looks a bit cleaner due to the AVX512 VL+BW instructions, but there is still no reason to use byte-word instructions to manipulate the mask.  The loop entry test in both cases uses optimal instructions.
+While compiling for an `avx512knl-i32x16` target it appears sub-optimal code is being generated for simple comparisons of varying `int` types (`float` comparisons appear to use efficient instructions).  The issue is occurring with the 1.12.0 binary but can also be reproduced on Godbolt with multiple ispc versions.  Examples below illustrate `float` and `int` cases.
+
+`float` code:
+```
+export void float_compare(uniform float vin[], uniform float cmp[], uniform float vout[],
+                   uniform int count) {
+    foreach (index = 0 ... count) {
+        varying float v = vin[index];
+        varying float c = cmp[index];
+
+        if (c < 0.0)
+            v = v * v;
+        else
+            v = sqrt(v);
+
+        vout[index] = v;
+    }
+}
+```
+`float` assembly (foreach full body section):
+```
+.LBB1_3:                                # %foreach_full_body
+        cltq
+        vmovups (%rdi,%rax), %zmm1
+        vcmpnleps       (%rsi,%rax), %zmm0, %k1
+        kortestw        %k1, %k1
+        je      .LBB1_5
+        vmulps  %zmm1, %zmm1, %zmm1 {%k1}
+.LBB1_5:                                # %foreach_full_body
+        jb      .LBB1_7
+        vsqrtps %zmm1, %zmm2
+        vmovaps %zmm1, %zmm2 {%k1}
+        vmovaps %zmm2, %zmm1
+.LBB1_7:                                # %foreach_full_body
+        vmovups %zmm1, (%rdx,%rax)
+        addl    $16, %r9d
+        addl    $64, %eax
+        cmpl    %r8d, %r9d
+        jl      .LBB1_3
+        cmpl    %ecx, %r9d
+        jl      .LBB1_9
+```
+
+`int` code:
+```
+export void int_compare(uniform float vin[], uniform int cmp[], uniform float vout[],
+                   uniform int count) {
+    foreach (index = 0 ... count) {
+        varying float v = vin[index];
+        varying int   c = cmp[index];
+
+        if (c < 0)
+            v = v * v;
+        else
+            v = sqrt(v);
+
+        vout[index] = v;
+    }
+}
+```
+`int` assembly (foreach full body section):
+```
+.LBB2_5:                                # %foreach_full_body
+        movslq  %r10d, %r10
+        vmovups (%rdi,%r10), %zmm2
+        vpsrad  $31, (%rsi,%r10), %zmm3
+        vpmovdb %zmm3, %xmm3
+        vpcmpeqb        %xmm0, %xmm3, %xmm4
+        vmovdqa64       %zmm4, %zmm5
+        vpternlogq      $15, %zmm4, %zmm4, %zmm5
+        vpmovmskb       %xmm5, %eax
+        testw   %ax, %ax
+        je      .LBB2_6
+        vmulps  %zmm2, %zmm2, %zmm5
+        vpmovsxbd       %xmm4, %zmm4
+        vptestmd        %zmm4, %zmm4, %k1
+        vmovaps %zmm2, %zmm5 {%k1}
+        vmovaps %zmm5, %zmm2
+.LBB2_6:                                # %safe_if_after_true
+        vpcmpeqb        %xmm1, %xmm3, %xmm3
+        vmovdqa64       %zmm3, %zmm4
+        vpternlogq      $15, %zmm3, %zmm3, %zmm4
+        vpmovmskb       %xmm4, %eax
+        testw   %ax, %ax
+        je      .LBB2_8
+        vsqrtps %zmm2, %zmm4
+        vpmovsxbd       %xmm3, %zmm3
+        vptestmd        %zmm3, %zmm3, %k1
+        vmovaps %zmm2, %zmm4 {%k1}
+        vmovaps %zmm4, %zmm2
+.LBB2_8:                                # %if_done
+        vmovups %zmm2, (%rdx,%r10)
+        addl    $16, %r9d
+        addl    $64, %r10d
+        cmpl    %r8d, %r9d
+        jl      .LBB2_5
+        cmpl    %ecx, %r9d
+        jge     .LBB2_3
+```
+
+The expected output for the `int` case would replace the `vcmpnleps` instruction with a `vpcmpd` variant.   Note the `avx512skx-i32x16` target also seems affected.
+
+Currently, the list of target types only seems to include one `i8` target for the x86-ISA SIMD extensions(`sse4-i8x16`).
+
+```
+       host, sse2-i32x4, 
+       sse2-i32x8, sse4-i32x4, sse4-i32x8, sse4-i16x8, sse4-i8x16, avx1-i32x4, 
+       avx1-i32x8, avx1-i32x16, avx1-i64x4, avx2-i32x4, avx2-i32x8, 
+       avx2-i32x16, avx2-i64x4, avx512knl-i32x16, avx512skx-i32x16, 
+       avx512skx-i32x8, generic-x1, generic-x4, generic-x8, generic-x16, 
+       generic-x32, generic-x64, *-generic-x16, neon-i8x16, neon-i16x8, 
+       neon-i32x4, neon-i32x8
+```
+Are there any plans or blockers stopping support for targets such as `avx512skx-i8x64` or `avx2-i8x32`? These would be especially useful when making kernels that deal with text and image data.
+
+Right now (ispc 1.12.0) returns the following assembly with `-O3 --target=avx512skx-i32x16`:
+
+```c
+int8 func(int8 a, int8 b)
+{
+    return a + b;
+}
+```
+
+```
+func___vytvyt:                          # @func___vytvyt
+        vpaddb  xmm0, xmm1, xmm0
+        ret
+```
+
+It is only using the `xmm` registers, adding x16 at a time, when it could be adding x64 at a time and doing the equivalent of `_mm512_add_epi8` with the `zmm` registers.
+
+I could possibly be misunderstanding these flags though and `avx512skx-i8x64` means it will try and force a 32-bit addition to use 8-bit additions which would involve a _lot_ more code moving around than usual.
+How would I try and get ispc to emit the more optimal 8-bit arithmetic though?
+[VS Code Plugin](https://marketplace.visualstudio.com/items?itemName=intel-corporation.ispc) support LSP. It is undermaintained currently. E.g., the plugin doesn't support remote editing.

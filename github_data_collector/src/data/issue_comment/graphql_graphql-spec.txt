@@ -1,0 +1,284 @@
+Resolves https://github.com/graphql/graphql-spec/issues/577
+
+This change adds the proposed addition by @leebyron from https://github.com/graphql/graphql-spec/issues/577#issuecomment-519226398
+
+It seems to me that #373 forgot to update 3.7 Interfaces grammar. There should be `ImplementsInterfaces` token like one in _3.6 Objects_.
+The URL https://graphql.github.io/graphql-spec/ no longer works.
+
+It redirects to http://graphql.github.io/ which appears identical to https://graphql.org/
+
+There is a "Spec" link at the top that just continues the same cycle.
+
+in SQL we can use the [SQL IN operator](https://www.w3schools.com/sql/sql_in.asp)
+```
+SELECT * FROM table
+WHERE table.key IN UNNEST (@keylist)
+```
+where keylist is an array of keys like `[1, 1000, 50, 10000]` [[source](https://cloud.google.com/spanner/docs/sql-best-practices#write_efficient_queries_for_range_key_lookup)]
+[ the UNNEST operator converts from array to vertical vector ]
+
+the keys are random, not adjacent, not predictable
+similar to a server-side pagination cursor, so we can say "client cursor"
+
+use case in graphQL?
+parallel pagination. broad first search / breadth-first search.
+and: dealing with "read only" servers = we cannot change the server schema
+
+workaround?
+using a list of N keys, we can repeat the same selector [sub-query] for N times
+and append the key index to all variable names
+
+code sample in javascript
+with the compound key `{ repoOwner, repoName }`
+```js
+const url = 'https://api.github.com/graphql'
+
+// basic authentication - only for testing
+const username = 'your_github_username'
+const password = 'your_github_password'
+
+// query object
+const qObj = {
+
+  variables: {
+
+    repoOwner_0: "graphql",
+    repoName_0: "graphql-spec",
+
+    repoOwner_1: "graphql",
+    repoName_1: "graphql-js",
+  },
+
+  query: `query
+    (
+      $repoOwner_0: String!,
+      $repoName_0: String!,
+
+      $repoOwner_1: String!,
+      $repoName_1: String!,
+    ){
+
+      r0: repository
+      (
+        owner: $repoOwner_0,
+        name: $repoName_0,
+      ){
+        nameWithOwner
+        pushedAt
+        createdAt
+        stargazers { totalCount }
+      }
+
+      r1: repository
+      (
+          owner: $repoOwner_1,
+          name: $repoName_1,
+      ){
+        nameWithOwner
+        pushedAt
+        createdAt
+        stargazers { totalCount }
+      }
+
+    }`
+}
+
+// send query
+const headers = new Headers({
+  'Authorization': 'Basic '+btoa(username+":"+password),
+  'Content-Type': 'application/json',
+  'Accept': 'application/json',
+})
+fetch(url, {
+  method: 'POST',
+  headers: headers,
+  body: JSON.stringify(qObj),
+})
+.then(r => r.json())
+.then(response => {
+  // print response
+  console.log('response = '+JSON.stringify(response, null, '  '))
+})
+```
+result:
+```txt
+response = {
+  "data": {
+    "r0": {
+      "nameWithOwner": "graphql/graphql-spec",
+      "pushedAt": "2019-12-19T01:02:54Z",
+      "createdAt": "2015-07-01T01:26:56Z",
+      "stargazers": {
+        "totalCount": 12274
+      }
+    },
+    "r1": {
+      "nameWithOwner": "graphql/graphql-js",
+      "pushedAt": "2019-12-26T02:31:06Z",
+      "createdAt": "2015-06-30T12:16:50Z",
+      "stargazers": {
+        "totalCount": 15304
+      }
+    }
+  }
+}
+```
+this selector
+```
+      repository
+      (
+        owner: [$repoOwner_0, $repoOwner_1],
+        name: [$repoName_0, $repoName_1],
+      )
+```
+is not supported by the server:
+> List dimension mismatch on variable $var_name and argument name ([String!]! / String!)
+
+the fields [repository, repositry] must be renamed to [r0, r1], otherwise i get
+> Field 'field_name' has an argument conflict
+
+[on stackoverflow.com](https://stackoverflow.com/questions/59482349/graphql-client-side-query-batching-repeat-one-query-for-a-list-of-keys) i posted some more code, to generate such "concat queries"
+inspired by [Batching queries with GraphQL & Python, by Julien Danjou](https://medium.com/mergify/batching-queries-with-graphql-94983b648c3c)
+
+questions:
+
+1. am i re-inventing the wheel here? and just too blind to see a better solution?
+2. are there plans to implement such a feature? i could not even find a similar request
+
+implementation sketch:
+add a `@repeat` directive / pseudo-object / block / container
+
+```js
+const qObj = {
+
+  variables: {
+
+    repoOwner: ["graphql",      "graphql"   ],
+    repoName:  ["graphql-spec", "graphql-js"],
+
+    constVar: 1234,
+  },
+
+  query: `query
+    (
+      $repoOwner: String!,
+      $repoName: String!,
+      $constVar: Int!,
+    ){
+
+      # repeat this block for all keys
+      # = for the longest array, fill shorter arrays
+      
+      @repeat {
+        repository
+        (
+          owner: $repoOwner,
+          name: $repoName,
+        )
+        {
+          pushedAt
+          stargazers { totalCount }
+
+          sampleobject(arg: $constVar)
+        }
+      }
+
+    }`
+}
+```
+
+It would be very useful, if we can get an introspection endpoint, where we can get a response of the full nested tree object for all used subtypes of a type
+
+for example, if we have a type called "Page" and inside, we have the id and status, which are just scalars.... but for example we have a title field, which can be multilanguage
+
+so we create a type called "LocaleContent" which have subfields like locale and content... all good, just one stage deep...
+
+but, what if we got a type called "Seo" and inside, we have a field called description, which is also multilanguage.... and so on...
+
+it would be great to have at least a single point, we can recursively fetch the complete data structure of a type without knowing, what is inside the type...
+
+if we can't have that, we all are ending up writing an introspection __type query, which is 100th of lines long.... which is a mess
+
+I often use GraphQL to make accessing nested data act more similar to the way it is done with object (ie `obj.prop.subprop.targetValue`).  Unfortunately, GraphQL has no way to say "give me targetValue or bust," so what I end up doing is requesting a big multilayered object, then doing lots and lots of checks to make sure the value is there.
+
+Something like this:
+```
+const resp = await queryGQL(`
+  User(id: "123") {
+    Story(id: "123") {
+      Event(type: "beginning") {
+        timestamp
+      }
+    }
+  }
+`);
+
+if (!resp
+  || !resp.data
+  || !resp.data.User
+  || !resp.data.User.Story
+  || !resp.data.User.Story.Event
+) throw apiErr(`Could not find Event`);
+```
+
+It would be really nice to be able do say something like:
+
+```
+const resp = await queryGQL(`
+  User(id: "123") {
+    Story(id: "123") {
+      // brackets symbolize where "data" begins
+      <<Event(type: "beginning") {
+        timestamp
+      }>>
+    }
+  }
+`);
+
+if (!resp || !resp.data) throw apiErr(`Could not find event`);
+
+const event = resp.data;
+console.log("It all started in " + event.timestamp);
+```
+
+As long as a query only has one set of request brackets `<<>>` and none of the layers above it request properties, it would be valid.  And it would really help with digging in quickly to a multilayered data structure.
+
+As an alternative, I'm thinking of trying to build a query builder and then adding all sorts of features and watching it never take off then become deprecated... which is hardly a solution compared to it being added as a core feature of the query syntax.
+Is this schema correct? Inadvertently, I redefined the type.
+
+```graphql
+type Query {
+  SendEmail(messageDto: EmailMessageDtoInput): Boolean
+}
+
+input EmailMessageDtoInput {
+  url: String
+  data: String 
+}
+
+input EmailMessageDtoInput {
+  url: String
+  data: String 
+}
+```
+With 99% probability, I guess the answer is NO. However, does the specification speak explicitly about this? I spent a lot of time to find the source of error in one of out services running graphql-dotnet package. It turned out that the error was due to the fact that the type was re-defined in the service SDL. Now I think where it is worth doing the type check - at the [graphql-dotnet](https://github.com/graphql-dotnet) level or at the [graphql-parser](https://github.com/graphql-dotnet/parser) (lower) level - graphql-dotnet uses parsed SDL document from graphql-parser. In general, I am inclined to do a check in both places. I just want to get confirmation that this situation is really unacceptable.
+I'm not submitting a detailed proposal or PR because I'm not sure if this even makes sense.  Maybe there's some other way to already alleviate my concern, which is the need of creating too many types.  
+
+The basic problem: 
+I often create a query that returns an array but has other metadata attached to that array.  So what I would like to make life is easier is something like: 
+```graphql
+type ReportReasons {
+  category: String
+  reasons: [{
+    id: ID
+    title: String
+    body: String
+  }]
+}
+```
+Otherwise, I have to always create 2 separate types.  
+
+Or maybe there's a way to create some kind of generic type, that I can then reuse for all queries that have a similar structure? 
+
+How do other people deal with queries that return complex structures (like array or arrays, etc)
+This PR contains the specification changes needed for https://github.com/graphql/graphql-spec/issues/635.

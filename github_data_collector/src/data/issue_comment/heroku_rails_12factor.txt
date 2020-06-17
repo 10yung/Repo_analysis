@@ -1,0 +1,141 @@
+Rails 6.1 is deprecating ::LoggerSilence call 
+Culprit seems to be in `lib/rails_stdout_logging/rails.rb:3`
+
+Fixed it by updating code to:
+
+`include ActiveSupport::LoggerSilence if defined?(ActiveSupport::LoggerSilence)`
+
+I'm trying to change logger level to `:warn` in production, but with no success.
+
+Here's what I have:
+
+```rb
+# config/environments/production.rb
+# removed unrelated lines
+
+Rails.application.configure do
+  # Disable serving static files from the `/public` folder by default since
+  # Apache or NGINX already handles this.
+  config.public_file_server.enabled = ENV['RAILS_SERVE_STATIC_FILES'].present?
+
+  # Use the lowest log level to ensure availability of diagnostic information
+  # when problems arise.
+  # :debug, :info, :warn, :error, :fatal, and :unknown
+  config.log_level = :warn
+
+  # Prepend all log lines with the following tags.
+  config.log_tags = [:request_id]
+
+  # Use default logging formatter so that PID and timestamp are not suppressed.
+  config.log_formatter = ::Logger::Formatter.new
+
+  # Use a different logger for distributed setups.
+  # require 'syslog/logger'
+  # config.logger = ActiveSupport::TaggedLogging.new(Syslog::Logger.new 'app-name')
+
+  if ENV['RAILS_LOG_TO_STDOUT'].present?
+    logger           = ActiveSupport::Logger.new(STDOUT)
+    logger.formatter = config.log_formatter
+    logger.level     = :warn
+    config.logger    = ActiveSupport::TaggedLogging.new(logger)
+  end
+end
+```
+
+
+I also have these ENV vars:
+
+```
+LOG_LEVEL:                               WARN
+RAILS_LOG_TO_STDOUT:                     enabled
+RAILS_SERVE_STATIC_FILES:                enabled
+```
+
+Note that I don't have `STDOUT.sync = true`. That seems unrelated. Do I need to add that?
+
+What am I missing?
+
+
+I'm not sure why it is more important on Heroku to sync STDOUT than any other time, or if the setting is there to prevent surprising out of order messages and there is a negligible performance penalty when not in a tty.
+
+I made this PR in part to ask a question about the importance of this setting.
+
+I am currently replacing `rails_stdout_logging` with `rails_semantic_logger`, and was overriding the rails_stdout_logging logger:
+
+```ruby
+  # turn off file logging
+  config.rails_semantic_logger.add_file_appender = false
+  # configure logging to STDOUT like rails_stdout_logging (i.e. 'io: STDOUT' and 'STDOUT.sync = true')
+  config.semantic_logger.add_appender(io: STDOUT, level: config.log_level, formatter: config.rails_semantic_logger.format)
+  STDOUT.sync = true
+  # no need for rails_stdout_logging (via rails_12factor), but heroku still requires it
+  fail "remove the block which overrides the RailsStdoutLogging override" unless defined?(RailsStdoutLogging)
+  initializer(:override_rails_stdout_logging_logger, after: :rails_stdout_logging) do
+    ::Rails.logger = config.logger = SemanticLogger[Rails]
+  end
+```
+
+So that now I have
+
+```ruby
+    # per rails_12factor, example of ussing ENV var to need for rails_stdout_logging
+    # On Heroku, RAILS_LOG_TO_STDOUT=true
+    if ENV["RAILS_LOG_TO_STDOUT"].present?
+      # turn off file logging
+      config.rails_semantic_logger.add_file_appender = false
+      # configure logging to STDOUT like rails_stdout_logging (i.e. 'io: STDOUT' and 'STDOUT.sync = true')
+      config.semantic_logger.add_appender(io: STDOUT, level: config.log_level, formatter: config.rails_semantic_logger.format)
+      STDOUT.sync = true
+    end
+```
+Logs are printed twice in `heroku console`, but not in `heroku logs --tail`. Here's the example app: https://github.com/jamesfzhang/loggertest
+
+<img width="383" alt="screen shot 2016-08-04 at 10 11 30 am" src="https://cloud.githubusercontent.com/assets/2057670/17411151/d623bf56-5a2b-11e6-911e-ebbcf6375a42.png">
+
+Related to https://github.com/heroku/rails_12factor/issues/10
+
+E.g. I want to include severity to messages logged to Heroku:
+
+``` ruby
+class Logger::MyFormatter < Logger::Formatter
+  def call(severity, _time, _progname, msg)
+    "[#{severity}] #{msg}\n"
+  end
+end
+
+Rails.application.configure do
+  config.log_formatter = Logger::MyFormatter.new
+end
+```
+
+This works fine without rails_12factor, but not with it.
+
+P.S. with rails_12factor this doesn't work either (and it does work without it):
+
+``` ruby
+Rails.application.configure do
+  STDOUT.sync = true
+  logger = Logger.new(STDOUT)
+  config.log_formatter = Logger::MyFormatter.new
+  logger.formatter = config.log_formatter
+  config.logger = logger
+end
+```
+
+As described here: http://stackoverflow.com/questions/34560144/nameerror-undefined-local-variable-or-method-broadcast-messages-for-railsst
+
+I've run into the same issue
+
+I had recieved the following error when try to install rails_12factor, i'm using rails 4.2.1 and ruby 2.2.1
+![screen shot 2015-10-01 at 3 07 06 pm](https://cloud.githubusercontent.com/assets/3076073/10231733/2e1c1e18-684e-11e5-8b0a-53859a380df2.png)
+
+I have been switching apps to use the `.env` file plus the [dotenv](https://github.com/bkeepers/dotenv) gem by default. 
+Primarily this is to centralize the configuration into one place as it is in production on 12factor hosts. 
+
+This involves removing configuration files, if possible, and pushing the configuration values into `.env`. 
+
+`DATABASE_URL` and `NEWRELIC_LICENSE_KEY` are 2 examples which can be moved without any work. 
+
+Others like the `config.secret_token` would require switching the initializer to use the environment. 
+
+I think this allows for more explicit documentation of parts of rails which could be improved for the future as described in #3. 

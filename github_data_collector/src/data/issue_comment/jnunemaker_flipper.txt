@@ -1,0 +1,163 @@
+Just want to say thanks for the great work done on this gem 🙌 
+
+> The individual actor gate is typically not designed for hundreds or thousands of actors to be enabled. 
+
+Quoting the [Caveats](https://github.com/jnunemaker/flipper/blob/master/docs/Caveats.md#caveats) section, I am wondering if this design decision can be tweaked.
+
+I can think of plenty of use cases requiring Actors to be in the hundreds or thousands, i.e.: rolling out a feature incrementally to waves of customers, where each wave is about 100 customers. Feature Flags is an ideal candidate for this mode of release, it is safer, and easier to manage than most methods.
+
+Assuming the ActiveRecord adapter is used, if the Actor based FF check was at a performance critical path in the application, we will need to always: 
+
+```sql
+SELECT `flipper_gates`.* FROM `flipper_gates` WHERE `flipper_gates`.`feature_key` = 'my-cool-feature'
+```
+
+Which is not ideal, and it can slow things down significantly, specifically if it was in a pipeline-based code path where hundreds or thousands of jobs being processed.
+
+If an Actor object is passed, I propose either:
+
+1. Look up for a "[get_by_value](https://github.com/jnunemaker/flipper/compare/master...khalilovcmd:query-single-gate-if-actor-is-provided?expand=1#diff-076f15bc0496c95e3b3657b153002fedR111)" method support in an adapter to do a query fetch by ID
+
+In the ActiveRecord adapter, it would look like this:
+
+```sql
+SELECT `flipper_gates`.* FROM `flipper_gates` WHERE `flipper_gates`.`feature_key` = 'my-cool-feature' AND `flipper_gates`.`value` = '3'
+```
+
+2. Or introduce an entirely new method, let's say, `enabled_single?(....)` (bad naming, sorry!) that does the same operation as above.
+
+On another note, the newly introduced method would probably have an equivalent in other adapters too, maybe it is worth the effort.
+
+-----
+
+⚠️  @jnunemaker  My implementation attempt here is definitely not ideal, but I would love to know what you think of the proposal in general 🙌  
+Right now in flipper our actor names look something like:
+
+![image](https://user-images.githubusercontent.com/380914/49762461-ae96d700-fc7e-11e8-85c9-d2176e9c39dc.png)
+
+It would be nice if there was a way to specify a human readable string, eg by using the `to_s` method on the model. Perhaps there is a way to do this and I'm missing it? If so apologies. 
+Right now percentage of actors is shared across all types that are checked. This is easiest to understand with a use case. Let's say you want to check if something is enabled by user and by some other type (say project, organization, repository, etc.). Currently, if you set % of actors to 20, that means 20% of users and projects (or any other type) would all be enabled. 
+
+It would be neat to be able to users for 20% and not enable % of actors for other types or any other number of combinations. I have no idea how I want to do this yet, but I want to at least track it as an issue so if others hit this they have a place to voice for or against or even start hacking.
+
+The big thing is we'd need adapter storage for options or some other sort of meta data per feature (or gate value). #163 would make storage easy if I finally pull the trigger on that.
+
+We'll also need a standard way to deserialize flipper_id's into type/id. Currently people seem to use colon or semicolon, but likely we'll need an actual serializer/deserializer with a default of semicolon and then allow people to use a custom serializer if they need different.
+Over in rollout, [they tweaked](https://github.com/fetlife/rollout/pull/120) the percentage of actors feature from modulus to ([source](https://github.com/fetlife/rollout/issues/58#issuecomment-307970042)):
+
+> Doing a < or > vs an appropriate boundary in the 32 bit integer space
+
+Might be nice to port this to flipper as well.
+I was reviewing Flipper and how to apply it to our Rails app, when I started looking into the memoization code to see how it's meant to be used. My understanding is there needs to be a Singleton instance such as `App.flipper` that holds the memoized state between every call to check features.
+
+Am I right that the middleware clears the memoized features around each web request? Since this is happening on the cache instance variable in Memoizable (via `flipper.adapter.memoize = true`), it looks like concurrent threads would be continuously clearing over each other's caches.
+
+There is a note in the [changelog for version 0.7][1] about thread safety:
+
+> * Moved memoizable decorator to instance variable storage from class level thread local stuff.
+>   Now not thread safe, but we can make a thread safe version later.
+
+I expect this is still the case? Was there a reason not to keep the cache storage in a `Thread.current` variable?
+
+Or, would it make more sense for us to initialize our "Singleton" flipper instance in a thread local instead, something like this?
+
+```
+def App.flipper
+  Thread.current[:flipper] ||= Flipper.new(*@flipper_options)
+end
+```
+
+Related to this, I might want a middleware for Sidekiq if the Rack middleware doesn't "just work". 😄  Could this be a useful contribution to the project? I'll see what makes sense based on the above.
+
+Thanks!
+
+[1]: https://github.com/jnunemaker/flipper/blob/master/Changelog.md#07
+It would be great if there were more options available for customizing the routes that `flipper-ui` can mount to.
+
+As of present, the route for the home page is defined as `"/features"` (see https://github.com/jnunemaker/flipper/blob/81e92592c499005aabf42a7ffbe32ba7582859aa/lib/flipper/ui/actions/features.rb#L9). This means that whatever path I mount the `flipper-ui` routes to in my Rails application's `routes.rb` file, the home page is at least forced to have a URL path of `"/features"` appended to it. Mounting the `Flipper::UI` app to "/" will not work because this will affect my app's other routes, so I am forced to choose another URL path to mount the UI app to. Thus, at the very least the URL of the Flipper UI home page must be `"/my-custom-path/features"`.
+
+I think that there should be more routing customization available for users of `flipper-ui`. At the very least, routing the home page to `"/"` would be nice; it allows my app to mount the `Flipper::UI` app to "`/features"` and open the home page at `"/features"` instead of `"/features/features"`. Otherwise, if there must be a non-root route name to route the Rack actions to, perhaps adding an `options` Hash parameter to the contract of `Flipper::UI.app()` could enable customization of the route names.
+One of the things I'm exploring using Flipper for would be enabling a feature for a short period of time. Like "enable this feature for the next 2 hours". Is that something other people would be interested in, or something that's already supported? 
+## Tasks
+
+- [ ] Storage#get_multi needs to be efficient; need to add get_multi to v2 adapters and use it in Storage
+- [ ] Add a migration path
+
+## Original Write Up
+
+While thinking about or working on [description for features](https://github.com/jnunemaker/flipper/issues/26), [custom gates for features](https://github.com/jnunemaker/flipper/issues/121) and [runtime controls](https://github.com/jnunemaker/flipper/issues/162), it became apparent that the current adapter style of a method per thing we want to store isn't going to scale to more functionality well. 
+## The Beginning
+
+Initially when I started with adapters for flipper (way back in the day), the interface was more key/value based (get, set, delete). All the information for a feature was stored in one key (other rollout tools do similar). 
+### The Benefits of Key/Value
+- **flexibility** - we can store a feature in one key and serialize whatever data makes sense for the feature, e. g. a description for the feature, a collection of disabled gates, or even use the key/value style for new features (think runtime controls). Several new features (just listed and also listed above) are kind of stuck because of the amount of work needed not having this flexibility is annoying.
+- **simplicity** - Making an adapter becomes dramatically easier. All adapter creators would need is get, set and delete.
+### The Problem (read then write race)
+
+The main problem with key/value and storing all information in a feature (to make reads faster) is that without some form of locking, race conditions exist. Imagine the following scenario:
+- developer 1 views "profile_next" feature
+- developer 2 views "profile_next" feature
+- developer 1 adds "fred" to enabled actors and developer 2 removes "barney" from enabled actors at the same time, flipper does a `get` for the feature, modifies the actor set and then does a `set` for the feature
+- whichever `set` happens last nullifies the other developers change, this would be frustrating/confusing to not see a change you just made that appeared to be successful
+### A Solution (to read then write race)
+
+The solution is to either lock around the read/write operation or use datastore functionality that allows adding or removing a thing from a set (`sadd`/`srem` in redis, `insert`/`delete` in mysql with unique index, etc.). For this reason, I went with making it so adapters could take advantage of data store functionality to avoid this read then write race. That is why adapters have an enable and disable method, to allow for adapter creators to customize the operation of enabling or disabling something to be atomic for the backend they are adapting to.
+### The Reality
+
+The reality is that features are enabled and disabled very rarely compared to how often they are checked. Write throughput (enable/disable) is usually so low that the chance of this race happening is extremely low. 
+
+For times where flipper is used with lots of writes are happening (thus making the race more likely), it would be pretty simple to use some form of locking (optimistic/pessimistic) to get around the issue. I really don't think it will be a problem in practice though. If it becomes a problem, flipper could even provide a lock adapter that does nothing by default (simplest/fastest), but allows users to customize for their needs.
+## The Future
+
+Since key/value has a big upside and, in reality, very little downside, my goal is to move to key/value for adapters. A ton of people rely on flipper to control functionality on their sites, so my top goals are:
+- **safety** - flipper should support both adapter versions for a period of time, v1 is the current adapter interface and it will be deprecated, v2 is the new adapter interface and all new functionality will be built on it
+- **performance** - flipper should perform the same or better with the new adapter interface
+- **migrateability** - it should be extremely easy to upgrade flipper from v1 to v2. My current plan is to provide a bridge adapter that can do a one time migration of all data (ensure no one is changing features, run script, profit) or on the fly (something like read from v2, fallback to v1, migrate v1 data to v2 format, and then delete v1)
+## Status
+
+I've got a [branch](https://github.com/jnunemaker/flipper/compare/backwards-compatible-kv) started that is getting pretty close (already supports v1 and v2 and should perform the same, needs migration path still) and a [project](https://github.com/jnunemaker/flipper/projects/1) where you can track the status. Currently the project just has a few notes, but I'll try to flesh it out soon. 
+
+Features that can be dynamically enabled and disabled at runtime are very powerful, but they aren't the only kinds of things that a developer/operator might want to flip at runtime. At GitHub and nearly every application I've worked on, the app stores controls in a variety of ways (env var, memcached, redis, mysql, etc.). I've noticed that having a standard way of controlling applications at runtime would be valuable.
+## What are controls?
+
+Features are all about is something enabled for an actor or not. They are more on/off. Controls, on the other hand, are for things you want to control that are not as simple as on/off. Perhaps an integer, string or even a collection of things that when used in the application, change the behavior of the app.
+### Concrete Example
+
+One example would be poll interval. Backends for mobile apps (and even the github API) often report back to the mobile app a poll interval header or similar to inform the mobile app when to contact the backend again. This allows shedding load during problems by increasing the poll interval and reducing traffic from the mobile app. Poll interval is a great example of something that is not on or off, but perhaps configured to a number, which represents the number of seconds for mobile apps to wait between contacting the service. 
+
+```
+# perhaps something like this...
+flipper = Flipper.new(...)
+flipper.set_control(:poll_interval, 5)
+flipper.control(:poll_interval) # => 5
+
+# or even
+flipper.controls[:poll_interval] # => 5
+```
+## Why flipper instead of some new gem?
+
+I considered spinning up a new gem, but then I realized all that flipper had to offer that I would have to duplicate and decided it just would not be worth it to start over. Flipper has a great base setup for controlling things at runtime:
+- **instrumentation** - flipper's automatic instrumentation can publish performance details to statsd/graphite
+- **memoization** - flipper and its memoizing middleware can handle ensuring that control data is only load this once per request or job
+- **performance** - controls can be stored wherever it makes sense (on disk, consul, mysql, memcached, redis, whatever) thanks to the adapter pattern flipper uses; this means you can eek out every ounce of performance you need by using whatever backend you desire
+- **auditing** - flipper's instrumentation makes it easy to add audit log entries for all changes (e.g. poll interval control value changed from 5 seconds to 10 seconds at this point in time)
+- **UI** - flipper has a UI that controls could be added to which increases the visibility of the  controls in a system for developers and operators
+
+Because of the aforementioned flipper functionality, I think it makes sense to add the idea of "controls" to flipper itself. Additionally, flipper is about controlling things at runtime, not just features. I just happened to start with features. 
+## Status
+
+I started a [branch to add controls](https://github.com/jnunemaker/flipper/compare/controls). While working on the branch, I realized that it is inconvenient to need to modify adapters for every new bit of functionality I want to add. What might make more sense is a more generic way of storing data that can be used for features, controls and anything else we come up with that makes sense inside of flipper.
+
+For this reason, I started venturing down the path of making adapters key/value based. This makes it dramatically easier to create adapters and increases flexibility of the adapters, which means new features can be added to flipper and persisted without needing to change adapters each time.
+
+I'd like to hold off on shipping controls until the KV project is done. I hope to write more up about the KV project soon, but I did [kick off a project board](https://github.com/jnunemaker/flipper/projects/1) with a few internal (to me) notes for those that are curious and I'd love to get feedback on the control idea if anyone has any.
+
+Groups are nice and powerful but they are limited to predefined rules. It would be really great to be able to do something like:
+
+``` ruby
+Flipper.attribute_gate { |data, thing| data[:values].include?(thing.send(data[:method])) }
+```
+
+This would allow features to be enabled or disabled on the fly based on granular attributes. For example, a feature that is on for all users who have `en-US` as their locale or who are members of a specific organization.
+
+We have a multi-tenant application and a lot of times features are on for certain tenants but creating a group for each tenant seems excessive.

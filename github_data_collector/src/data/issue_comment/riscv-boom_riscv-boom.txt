@@ -1,0 +1,276 @@
+<!-- choose all that apply -->
+**Type of issue**: bug report
+
+<!-- if the issue is NOT a question, fill out the following sections -->
+
+<!-- choose one -->
+**Impact**: new rtl
+
+<!-- choose one -->
+**Development Phase**: request
+
+**Other information**
+<!-- include detailed explanation, stacktraces, related issues, suggestions how to fix, links for us to have context -->
+Pipeview is currently broken in boom, at least in commit:
+commit 2a0ea2e7acfd4605eed513e15062848e4e5be309
+
+When the trace is generated, all of the fetches have a zero for a sequence number, which produces a pipeview that only shows the fetches. This was happening because the sequence number is trying to be read from the f3_fetch_bundle, but the sequence number is not being assigned until the Fetch Buffer.
+
+I fixed this by instead assigning the sequence number to the f3_fetch_bundle, at least it looks fixed to me when I try to generate the pipeview. Someone more experienced with BOOM may want to look at it though. The change is as follows:
+
+```
+diff --git a/src/main/scala/ifu/fetch-control-unit.scala b/src/main/scala/ifu/fetch-control-unit.scala
+index 2c41f914..05215353 100644
+--- a/src/main/scala/ifu/fetch-control-unit.scala
++++ b/src/main/scala/ifu/fetch-control-unit.scala
+@@ -501,6 +501,15 @@ class FetchControlUnit(implicit p: Parameters) extends BoomModule
+   //-------------------------------------------------------------
+ 
+   when (f3_fire) {
++    for (i <- 0 until fetchWidth) {
++      if (i == 0) {
++        f3_fetch_bundle.debug_events(i).fetch_seq := fseq_reg
++      } else {
++        f3_fetch_bundle.debug_events(i).fetch_seq := fseq_reg +
++          PopCount(f3_fetch_bundle.mask.asUInt()(i-1,0))
++      }
++    }
++    
+     r_f4_req := f3_req
+     r_f4_fetchpc := f3_imemresp.pc
+     r_f4_taken := f3_taken
+@@ -526,14 +535,6 @@ class FetchControlUnit(implicit p: Parameters) extends BoomModule
+   fb.io.status := io.status
+   fb.io.bp     := io.bp
+ 
+-  for (i <- 0 until fetchWidth) {
+-    if (i == 0) {
+-      fb.io.enq.bits.debug_events(i).fetch_seq := fseq_reg
+-    } else {
+-      fb.io.enq.bits.debug_events(i).fetch_seq := fseq_reg +
+-        PopCount(f3_fetch_bundle.mask.asUInt()(i-1,0))
+-    }
+-  }
+ 
+   //-------------------------------------------------------------
+   // **** FetchTargetQueue ****
+```
+Not a functional bug. We just want to match the behavior of ISA simulators.
+<!-- choose all that apply -->
+**Type of issue**: feature request
+
+<!-- if the issue is NOT a question, fill out the following sections -->
+
+<!-- choose one -->
+**Impact**: no rtl change
+
+<!-- choose one -->
+**Development Phase**: request
+
+**Other information**
+
+As stated by @jerryz123 in #415 
+
+- [ ] Confirm how far BOOM gets into Linux simulation without a block device.
+- [ ] Consider changing Dromajo to have `to/fromhost` addresses be MMIO addresses.
+- [x] Consider changing Dromajo to simulate interactions with the block device? The key is that we don't need to simulate the entire device, we only need to simulate the sequence of stores the block device writes into RAM.
+- [ ] Modify DromajoCosimBlackBox so that it can be used as a Firesim bridge?
+
+Currently the `COMMIT_LOG_PRINTF`, `MEMTRACE_PRINTF`, and the `DEBUG_PRINTF` are executed as chisel prints which are emitted to `stderr` However you can only have one of these at a time, since they all go to `stderr`. 
+
+We should create C DPI widgets that also direct the logs into files. Preferably this would be some templated thing, since there are lots of things we potentially want to trace out. (Log of instructions, log of branch predictions, debug visualization, log of cache hits/misses, etc.)
+
+It would be nice if we could build 1 VCS/verilator simulator, and generate all these different logs at once. 
+I just started to study riscv-boom several days ago, if I'm wrong please correct me. BTB only stores partial tags for instructions, so aliasing could happen for branch instructions. But when it happens, it seems that you don't correct it in f3-stage. 
+
+For example, if we have 2 fetch packets:
+Fetch boundary of 1st fetch packet is 0x0000_0200, it contains 4 RVC instructions:
+0x0000_0200: rvc_0(not a jal/jalr instruction)
+0x0000_0202: rvc_1(not a jal/jalr instruction)
+0x0000_0204: c.beqz to target_0
+0x0000_0206: rvc_2(not a jal/jalr instruction)
+
+Fetch boundary of 2nd fetch packet is 0x8000_0200, it also contains 4 RVC instructions:
+0x8000_0200: rvc_3(not a jal/jalr instruction)
+0x8000_0202: rvc_4(not a jal/jalr instruction)
+0x8000_0204: c.beqz to target_1
+0x8000_0206: rvc_5(not a jal/jalr instruction)
+
+Let's assume that btb has already stored information about 1st fetch packet and will predict instruction at 0x0000_0204 as taken. But btb hasn't recorded information about 2nd fetch packet. If we begin to execute instructions in 2nd fetch packet. It will point to the same entry in btb (because their partial tags are equal and aliasing happens).  Therefore, when fetch_pc = 0x8000_0200, btb will also predict that frontend should jump to target_0.
+
+In f3-stage, the complex branch predictor(gshare or tage) maybe also predict ```c.beqz to target_1``` as taken. 
+
+
+https://github.com/riscv-boom/riscv-boom/blob/master/src/main/scala/ifu/fetch-control-unit.scala#L365-L396:
+```
+  when (f3_valid && f3_btb_resp.valid) {
+    // btb made a prediction
+    // Make a redirect request if:
+    //    - the BPD (br) comes earlier than the BTB's redirection.
+    //    - If both the BTB and the BPD predicted a branch, the BPD wins (if disagree).
+    //       * involves refetching the next cacheline and undoing the current packet's mask if we "undo" the BT's
+    //       taken branch.
+
+
+    val btb_idx = f3_btb_resp.bits.cfi_idx
+
+
+    when (BpredType.isAlwaysTaken(f3_btb_resp.bits.bpd_type)) {
+      f3_bpd_may_redirect_taken := io.f3_bpd_resp.valid && f3_bpd_br_taken && f3_bpd_br_idx < btb_idx
+
+
+      assert (f3_btb_resp.bits.taken)
+    } .elsewhen (f3_btb_resp.bits.taken) {
+      // does the bpd predict the branch is taken too? (assuming bpd_valid)
+      val bpd_agrees_with_btb = f3_bpd_predictions(btb_idx)
+      f3_bpd_may_redirect_taken := io.f3_bpd_resp.valid && f3_bpd_br_taken &&
+        (f3_bpd_br_idx < btb_idx || !bpd_agrees_with_btb)
+      f3_bpd_may_redirect_next := io.f3_bpd_resp.valid && !f3_bpd_br_taken
+
+
+      assert (BpredType.isBranch(f3_btb_resp.bits.bpd_type))
+    } .elsewhen (!f3_btb_resp.bits.taken) {
+      f3_bpd_may_redirect_taken := io.f3_bpd_resp.valid && f3_bpd_br_taken
+    }
+  } .otherwise {
+    // BTB made no prediction - let the BPD do what it wants
+    f3_bpd_may_redirect_taken := io.f3_bpd_resp.valid && f3_bpd_br_taken
+    // add branch to the BTB if we think it will be taken
+    f3_bpd_btb_update_valid := f3_bpd_may_redirect_taken
+  }
+
+```
+We have bpd_agrees_with_btb = 1, f3_bpd_may_redirect_taken = f3_bpd_may_redirect_next  = 0.
+
+
+https://github.com/riscv-boom/riscv-boom/blob/master/src/main/scala/ifu/branch-checker.scala#L77-L105:
+```
+    when (io.btb_resp.valid) {
+    when (io.btb_resp.bits.cfi_type === CFI_BR && (io.btb_resp.bits.taken || bpd_predicted_taken)) {
+      wrong_cfi := !io.is_br(btb_idx)
+      wrong_target := io.br_targs(btb_idx) =/= btb_target
+    } .elsewhen (io.btb_resp.bits.cfi_type === CFI_JAL) {
+      wrong_cfi := !io.is_jal(btb_idx)
+      wrong_target := io.jal_targs(btb_idx) =/= btb_target
+    } .elsewhen (io.btb_resp.bits.cfi_type === CFI_JALR) {
+      wrong_cfi := !io.is_jr(btb_idx)
+    } .otherwise {
+      wrong_cfi := io.btb_resp.bits.cfi_type === CFI_X && io.btb_resp.bits.taken
+      when (io.valid) {
+        assert (io.btb_resp.bits.cfi_type =/= CFI_X, "[fetch] predicted on a non-cfi type.")
+      }
+    }
+  }
+
+
+  val nextline_pc = nextFetchStart(io.aligned_pc)
+
+
+  val btb_was_wrong = io.btb_resp.valid && (wrong_cfi || wrong_target || !io.inst_mask(btb_idx))
+
+
+  val jal_idx = PriorityEncoder(io.is_jal.asUInt)
+  val btb_hit  = io.btb_resp.valid
+  val jal_wins = io.is_jal.reduce(_|_) &&
+                 (!btb_hit ||
+                 btb_was_wrong ||
+                 (jal_idx < btb_idx) ||
+                 !io.btb_resp.bits.taken)
+
+
+  //-------------------------------------------------------------
+  // Perform redirection
+
+
+  // Redirect if:
+  //    - JAL comes before BTB's cfi_idx
+  //       * kill everything behind JAL -- including BTB's predinfo
+  //    - BTB was wrong
+  //       * if JAL, take JAL (if valid instructions available)
+  //       * if !JAL, request nextline (set all masks to valid).
+  //    - No JAL, BTB correct
+  //       * do nothing
+
+
+  io.req.valid := jal_wins || btb_was_wrong
+  io.req.bits.addr := Mux(jal_wins, io.jal_targs(jal_idx), nextline_pc)
+  // Help mask out instructions after predicted cfi.
+  io.req_cfi_idx := Mux(jal_wins, jal_idx, (fetchWidth-1).U)
+```
+
+So wrong_target = 1 ,btb_was_wrong = 1, req.valid = 1, req.bits.addr = nextline_pc (because no jal occurs).
+
+
+https://github.com/riscv-boom/riscv-boom/blob/master/src/main/scala/ifu/fetch-control-unit.scala#L417-L422:
+```
+  // who wins? bchecker or bpd?
+  val jal_overrides_bpd = f3_has_jal && f3_jal_idx < f3_bpd_redirect_cfiidx && f3_bpd_may_redirect_taken
+  val f3_bpd_overrides_bcheck = f3_bpd_may_redirect && !jal_overrides_bpd &&
+                                (!bchecker.io.req.valid || f3_bpd_redirect_cfiidx < bchecker.io.req_cfi_idx)
+  f3_req.valid := f3_valid && (f3_bpd_may_redirect && !jal_overrides_bpd || bchecker.io.req.valid)
+  f3_req.bits.addr := Mux(f3_bpd_overrides_bcheck, f3_bpd_redirect_target, bchecker.io.req.bits.addr)
+```
+
+Finally it will redirect f0-stage to fetch the next fetch packet. But actually we should redirect f0-stage to target_1.
+
+Such as results of CoreMark and Dhrystone. That would be very useful, thanks!
+
+I find a picture from Western Digital, but I don't know why SweRV(2-wide superscalar in-order cpu) has higher score than BOOM(2/4-wide out-of-order cpu):
+![图片](https://user-images.githubusercontent.com/18757974/68592929-30b2ff80-04cf-11ea-8a61-c3a492843eb2.png)
+
+I guess the performance of the latest verison of BOOM should be improved a lot, comparing to the picture above.
+
+**Related issue**: <!-- if applicable -->
+
+<!-- choose one -->
+**Type of change**: new feature
+
+<!-- choose one -->
+**Impact**: no rtl change
+
+<!-- choose one -->
+**Development Phase**: implementation
+
+**Release Notes**
+This PR adds FireSim (https://fires.im/) FPGA integration to CI to check both Buildroot and Fedora Linux boot on LargeBoom. This uses Chipyard to initialize and setup FireSim. FireSim runs are started at 0:00am on Thursdays (weekly) only on the `master` branch. In order to start the FPGA image build one of the BOOM developers must click the "aws-approval" button in the CircleCI UI. 
+
+<!-- choose all that apply -->
+**Type of issue**: bug report
+
+<!-- if the issue is NOT a question, fill out the following sections -->
+
+<!-- choose one -->
+**Impact**:  new rtl
+
+<!-- choose one -->
+**Development Phase**: request 
+
+**Other information**
+I got an error message when booting linux. It passes all RISC-V tests.
+Configuration: The number of INT Registers: 80 
+Error message: 
+sstatus: 0000000200000100 sbadaddr: fffffffb63b62868 scause: 000000000000000d
+Kernel panic - not syncing: Attempted to kill init! exitcode=0x0000000b
+end Kernel panic - not syncing: Attempted to kill init! exitcode=0x0000000b
+
+Other trials: 128 INT Reg, 70 INT Reg => Works fine for Linux
+
+
+
+**Related issue**: <!-- if applicable -->
+
+<!-- choose one -->
+**Type of change**: enhancement
+
+<!-- choose one -->
+**Impact**: new rtl
+
+<!-- choose one -->
+**Development Phase**: implementation
+
+**Release Notes**
+<!-- Text from here to the end of the body will be considered for inclusion in the release notes for the version containing this pull request. -->
+
+The LSU used to attempt to clear busy bits on every addrgen/datagen. 
+This PR introduces a `stq_clr_head` to the LSU which marks the next store to clear the busy bit for. The LSU now uses this head to clear busy bits for stores, which should simplify future decoupling of the addrgen/datagen pipelines.
+

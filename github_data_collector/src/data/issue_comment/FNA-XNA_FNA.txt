@@ -1,0 +1,109 @@
+…cranks
+
+We crank library versions pretty aggressively on OpenBSD and libFAudio is already out of sync. Better to leave out the SO version suffix on OpenBSD and leave it to the porter (me).
+The current FNA code implements this logic structure to push data to the main thread from a different one:
+
+```csharp
+public class ADevice : IGLDevice
+{
+    public void A_GL_MethodCall()
+    {
+#if !DISABLE_THREADING
+        ForceToMainThread() => {
+#endif
+			/* ...
+			/* code
+			/* ...
+			*/
+#if !DISABLE_THREADING
+			});
+#endif
+    }
+}
+```
+
+This patch aims to remove the implicit ```new Action( () => {} );``` allocation in runtime in this way:
+
+```csharp
+public class ADevice : IGLDevice
+{
+    public void A_GL_MethodCall()
+    {
+#if !DISABLE_THREADING
+	if (mainThreadId == Thread.CurrentThread.ManagedThreadId)
+	{
+#endif
+
+		/* ...
+		/* code
+		/* ...
+		*/
+
+#if !DISABLE_THREADING
+	}
+	else 
+	{		 
+		ForceToMainThread() => {
+
+			/* ...
+			/* code
+			/* ...
+			*/
+
+		});
+	}
+#endif
+    }
+}
+```
+
+The code formatting should be the same now. 
+I have a set of RenderTarget2Ds I rotate through and then call GetData on to read back the result of rendering operations. GetData operations usually (occasionally don't for no obvious reason) block until vsync under these circumstances, while they take about 0.5ms under windows d3d9 XNA.
+
+I tried lots of stuff and have come up with exactly one workaround: If it's blocking on vsync, what if I get rid of vsync?
+
+```csharp
+                SDL2.SDL.SDL_GL_SetSwapInterval(0);
+                instance?.GetData(buffer);
+                SDL2.SDL.SDL_GL_SetSwapInterval(-1);
+```
+
+Occasionally I don't seem to get a Cursed Context at startup and the GetData calls are speedy without doing this, so it seems to be something weird in the GL ICD. It's more likely to work right in Release builds of FNA. Forcing the core context (or compatibility context) seems to have no impact.
+
+EDIT: Also, this applies to both forms of readback - glReadPixels from an RT while it's bound, and reading via glGetTextureSubImage.
+The Vulkan 1.0 specification has been released:
+
+https://www.khronos.org/vulkan/
+
+The quick reference manual is here:
+
+https://www.khronos.org/registry/vulkan/specs/1.0/refguide/Vulkan-1.0-web.pdf
+
+Example code can be found here:
+
+https://github.com/SaschaWillems/Vulkan/
+
+This will act as a tracker for a possible alternative to the FNA OpenGLDevice that uses Vulkan for graphics driver interaction. There would be a handful of benefits, including a dramatic reduction in CPU overhead (something we desperately need as a C# project) as well as better use of XNA4's GraphicsDevice render state bindings, but the downside is that it requires higher-spec graphics hardware no matter how fast it ends up being. Additionally, this would mean maintaining two separate devices, which means more regression testing for critical graphics changes. Apple does not have native Vulkan support, but MoltenVK should allow us to use it via Metal, similar to our D3D11 support via ANGLE.
+
+A high level overview of the work needed to get a VulkanDevice:
+- [x] Implement a SPIR-V emitter for MojoShader
+- [x] Integrate [ARB_gl_spirv](https://www.opengl.org/registry/specs/ARB/gl_spirv.txt) into MojoShader
+- [ ] Start with a clone of the ModernGLDevice or MetalDevice
+- [ ] Port individual pieces of the GLDevice to Vulkan until device is 100% Vulkan
+    - [ ] If required, create a MOJOSHADER_vk\* API
+
+In theory Vulkan should be more compatible with XNA4 than OpenGL, and we may even be able to use XNA4's own limitations to our advantage when wrangling any possible use cases (thereby eliminating overly generic cases typically handled by drivers and further reducing overhead), but part of having explicit control will mean taking in responsibilities previously handled by driver vendors, and the difficulty of such responsibilities should NOT be underestimated.
+
+This will act as the monolithic thread for bringing our static analysis warnings down to 0, for ALL possible analyzers. For starters, here are our current reports:
+
+VS 2017: http://fna.flibitijibibo.com/analyze2017.txt
+
+The Utilities/ folder is the only folder that is NOT to be touched. This is because we need to keep MonoGame compatibility for these files in particular. In addition, we will NOT be touching the StockEffects since those came directly from Microsoft, so changing them would only be more inaccurate. Lastly, these reports include messages for third-party libs; you ignore these warnings.
+
+For this task, simply take any task in the report you want (letting us know you're doing so), send me the PR to fix it, and I'll update the report.
+
+Ideally we should be able to properly fix all of these defects, but some are by XNA4's design... for example, Microsoft.Xna.Framework.Input.Touch is a massive namespace, and Gendarme reports this, but we can't change this without breaking XNA4 compatibility. In these situations, add a line to suppress the warning and document why the suppression is needed.
+
+As we get closer to resolving all the warnings I'll be lowering the threshold for warning level and certainty, so expect more defects to show up as the list gets smaller.
+
+If you decide to take a task, please post here and let us know you're working on it. Because we're doing so much work on so much code, we need to be sure we're not conflicting with other branches.

@@ -1,0 +1,118 @@
+As noted in https://github.com/terralang/terra/issues/422#issuecomment-574390811, LuaJIT 2.0 is broken in macOS Catalina. Rather than following Homebrew and maintain custom patches for 2.0, just upgrade to 2.1 where the problem does not exist in the first place.
+This is a pretty nasty issue that I've been working at for hours. The output of the dummy linker invocation is too long, so it gets cut off while writing to build/llvm_objects/llvm_list. Here's my llvm_list: https://gist.github.com/SeekingMeaning/fc5761ba5baf4319f5a03fab3ff36480
+
+The bottom line is cut off, so the linker gets confused and says that there's no file named SelectionDAGPr when actually, it should be SelectionDAGPrinter.cpp.o. I've tried everything, and it seems that the only way to get the full output is to print it directly to the terminal. Here are the changes I made: https://github.com/SeekingMeaning/terra/commit/51958829a345a4b9d0a0f8daec1213f73386dd0b
+
+What I have to do is copy the list of filepaths from terminal to a file named libs_list. Once the list is an actual file, _then_ it can used to generate llvm_list. It's hacky, but it works.
+Running this code
+```terra
+local struct foo {}
+local terra bar(a: foo) end
+local function baz(a) return bar(a) end
+local function quux() return baz(5) end
+quux()
+```
+produces this stack trace
+```
+st_test.t:5: bad argument #1 to 'quux' (cannot convert 'number' to 'struct foo')
+stack traceback:
+        [C]: in function 'quux'
+        st_test.t:5: in main chunk
+```
+
+The stack trace ends a frame up from the actual error, saying that a bad argument was passed to a function that doesn't take an argument, misrepresenting the origin of the function quux, and not including the position of the actual error.
+This is new for us: I'm going to try to write out an RFC for a proposed syntax change in #416, which adds a `switch` statement to the language. The goal here is to get the syntax changes all in one place so that there is a definitive definition of what we're trying to do (and so you don't have to go chasing comment threads to track the latest state). I will edit this RFC as we make changes.
+
+Bear with me since this is new and we may evolve the process as we go along.
+
+# Motivation
+
+Switch is a useful construct to have in a low-level language like Terra because it exposes a low-level machine feature (jump tables) in a zero-cost way that otherwise you would not be able to hand-code without language support. The initial support suggested here is fairly minimal (i.e. we're not going to full-on Rust-style `match`) which makes it a good fit for Terra's low-level optimization goals. Higher level constructs can be metaprogrammed, or possibly considered as future additions to the language.
+
+# Syntax Proposal
+
+This proposal adds the following syntax:
+
+```
+switch value_expr
+case case_const then
+  case_body
+case case_const then
+  case_body
+...
+else
+  else_body
+end
+```
+
+The `else` is optional and provides a default block that runs if no case matches. `case_const` are constant values (currently just integers). `*_body` are blocks of statements like you'd have in any control flow construct. `value_expr` is an arbitrary expression of the same type as the case constants.
+
+# No Default Fallthrough
+
+This proposal does **NOT** provide default fallthrough between case statements, unlike C. Therefore, there is no need to use `break` or `return` to avoid fallthrough.
+
+If we provide fallthrough in the future it will be via explicit keyword (to be determined). Therefore code written for today's semantics will work on future versions even if fallthrough is later added.
+
+# Variable Scoping
+
+Each case block is its own scope, just like normal Lua control flow constructs. This means in the future if we support fallthrough, if the user wants variables to be visible across multiple blocks they will need to declare then in an outer scope (just like chained `if`/`else`).
+
+# Semantics
+
+I think the semantics are otherwise fairly obvious but let me know if that's not true and I will expand this section.
+
+# Alternatives
+
+Originally the suggested syntax for this statement was `switch ... do case ... then ...` (i.e. with an extra `do` after `value_expr`). This is not entirely a stylistic choice, since `do` is required in order to implement Duff's Device (which would require regular statements to be placed in the `switch` block but outside of any `case` blocks). The other option to enable Duff's Device is something like a native jump table object `terralib.jumptable(...)` or similar.
+
+# Open Questions
+
+  * What values can we match on? The current implementation only does integers, but it may be worth defining in this RFC a larger set of values that we expect to eventually be supported.
+  * Do `case` blocks define their own scopes? This is relevant because it influences variable lifetimes in the event of fallthrough. I've suggested one option above but this is open to discussion.
+Adding syntax for a switch statement to the language.
+The chosen syntax is
+ ```
+switch expr do
+  case expr then
+    block
+  case expr then
+    block
+  else
+    block
+end
+```
+This includes the addition of two new keyword tokens `switch` and `case`, but avoids the addition of any other keywords that most implementations would use such as `default`.
+This syntax is still up for discussion.
+
+There is no case fallthrough by default; adding optional case fallthrough is future development.
+When I build Terra with CMake and CUDA is enabled, I'm seeing repeated rebuilds every time I run `make`. This is apparently a [known issue](https://cmake.org/pipermail/cmake/2011-January/042173.html) though that link is talking about VS (and I'm on Ubuntu). There is some indication that the newer support for CUDA as a first-class language [may fix this issue](https://cmake.org/pipermail/cmake/2019-April/069250.html). That would require bumping the CMake required version to 3.10, which is in Ubuntu 18.04 but not in Ubuntu 16.04.
+
+If there are other options that don't require a bump in the minimum CMake version I'm open to suggestions.
+Once #412 is merged, the only remaining external lua script being run will be `geninternalizedfiles.lua`, which just creates a header file full of gigantic byte arrays of a bunch of files used by Terra. This is a silly thing to do when there are standard ways of including read-only data inside executables. Windows has resource files, and [Linux has this method](https://stackoverflow.com/questions/5479691/is-there-any-standard-way-of-embedding-resources-into-linux-executable-image) of embedding resources in the .rodata section.
+
+However, both of these techniques are fully general - they can embed any kind of binary data, but all of the data Terra is embedding are just text strings. There's no errant null terminators inside of them (I checked), which means they could just be embedded as strings inside the code. It is possible that doing this might not guarantee then end up in the correct `.rodata` section, but I am reasonably certain it is possible to interpret an entire header file as a raw string by doing some absurd preprocessor shenanigans.
+
+The only tricky part about this is that Terra uses this mechanism to absorb the entire contents of the clang resource directory. This means the build step would still have to construct, at minimum, some sort of simplified header file that contains the logic to include the files, without the complex machinations of `geninternalizedfiles.lua`.
+
+If successful, this would eliminate the only remaining external lua script in the build process, which will hopefully reduce the chances of it failing for strange reasons.
+Executing this (1.2 million lines of printing hello world being compiled to an executable)
+```
+terralib.saveobj("stupidhello", {main = terra() escape local printf = terralib.externfunction("printf", rawstring -> {}); local printstat = quote printf "Hello world\n" end; for i = 1, 1200000 do emit(printstat) end end return 0 end})
+```
+
+causes this on my machine
+
+```
+terra: /nix/store/qlmx0jhbl4ab8am2qmbgjiqk569ls5gw-llvm-6.0.1/include/llvm/Support/ErrorOr.h:256: llvm::ErrorOr<T>::storage_type* llvm::ErrorOr<T>::getStorage() [with T = std::__cxx11::basic_string<char>; llvm::ErrorOr<T>::storage_type = std::__cxx11::basic_string<char>]: Assertion `!HasError && "Cannot get value when an error exists!"' failed.
+Aborted (core dumped)
+```
+
+Just recording for now, will troubleshoot and add details later.
+`leaktest.t` is failing on Windows with LLVM 6 when built with CMake. The best part of this bug is, it depends on whose fork you are in. In my fork, [it passes](https://ci.appveyor.com/project/elliottslaughter/terra/builds/27742340/job/l8jfupaedgwwt921). In the main repo, [it fails](https://ci.appveyor.com/project/zdevito/terra/builds/27742441/job/dfbgl62coj30a5b5). I was seeing issues with PRs onto my repo too. All identical commits.
+
+Anyway, there's clearly something bizarre going on, but I'm going to just turn this test off on Windows for the moment until we figure out what's going on. This issue is here as a reminder to turn it back on if we ever get around to looking at it.
+Related to #383, now that we support CMake on Windows it would be nice to get rid of the old NMake build, particularly because NMake is even less full-featured than regular Make is.
+
+As far as I know the CMake build on Windows is full-featured, so I'm not aware of any reason to put this off except to give time to let the CMake build get tested in the wild.
+
+Windows users: please test CMake now and make sure it works for you.

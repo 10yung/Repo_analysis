@@ -1,0 +1,275 @@
+implements #986 
+Hi, I recently try to build node image myself and found an interesting thing: I pre-loaded images like `etcd`, `coredns` that out of `bazel build` range. But kind does not use pre-loaded images, instead, it pulls from upstream ignoring loaded images - according to this line 
+https://github.com/kubernetes-sigs/kind/blob/master/pkg/build/node/node.go#L455
+it calls `docker.Pull()` method.  
+
+But I also see a `PullIfNotPresent()` method (https://github.com/kubernetes-sigs/kind/blob/master/pkg/build/node/internal/container/docker/pull.go#L29)
+
+I want to know that why don't use `PullIfNotPresent()` while building node image?
+Minor change to the flag description `--all` for `kind delete clusters`. Just being a bit more explicit about what it does at the moment.
+
+See #1260 for more information.
+**What would you like to be added**:
+
+The current implementation of `kind delete clusters --all` only takes into account [one kubeconfig path](https://github.com/kubernetes-sigs/kind/pull/1204#discussion_r367097369) at a time. It would be nice to take into account if clusters created by kind have different kubeconfig paths. 
+
+**Why is this needed**:
+
+The purpose of `kind delete clusters --all` is to delete all clusters, not just clusters associated with a particular kubeconfig. It's by no means a major issue to only delete all clusters by a particular kubeconfig, and I believe this should satisfy most users of kind. 
+
+However, it would be nice to support both options of deleting all by a kubeconfig and actually deleting all clusters regardless of kubeconfig path. 
+
+**What happened**:
+config.yaml:
+
+```
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  ipFamily: ipv6
+```
+*exactly as in https://kind.sigs.k8s.io/docs/user/configuration/
+$ kind create cluster --config=config.yaml
+Creating cluster "kind" ...
+ ✓ Ensuring node image (kindest/node:v1.17.0) 🖼
+ ✓ Preparing nodes 📦  
+ ✓ Writing configuration 📜 
+ ✗ Starting control-plane 🕹️ 
+ERROR: failed to create cluster: failed to init node with kubeadm: command "docker exec --privileged kind-control-plane kubeadm init --ignore-preflight-errors=all --config=/kind/kubeadm.conf --skip-token-print --v=6" failed with error: exit status 1
+
+
+
+**Environment:**
+$ kind version
+kind v0.7.0 go1.13.5 linux/amd64
+
+$ kubectl version
+Client Version: version.Info{Major:"1", Minor:"15+", GitVersion:"v1.15.8-beta.0", GitCommit:"6c143d35bb11d74970e7bc0b6c45b6bfdffc0bd4", GitTreeState:"archive", BuildDate:"2020-01-02T00:00:00Z", GoVersion:"go1.13.5", Compiler:"gc", Platform:"linux/amd64"}
+
+$ docker info
+Containers: 6
+ Running: 0
+ Paused: 0
+ Stopped: 6
+Images: 7
+Server Version: 18.09.8
+Storage Driver: overlay2
+ Backing Filesystem: xfs
+ Supports d_type: true
+ Native Overlay Diff: true
+Logging Driver: journald
+Cgroup Driver: systemd
+Plugins:
+ Volume: local
+ Network: bridge host macvlan null overlay
+ Log: awslogs fluentd gcplogs gelf journald json-file local logentries splunk syslog
+Swarm: inactive
+Runtimes: runc
+Default Runtime: runc
+Init Binary: /usr/libexec/docker/docker-init
+containerd version: 
+runc version: ce97911e3cd37a5ce3ef98f7f1d4add21a3ac162
+init version: v0.18.0 (expected: fec3683b971d9c3ef73f284f176672c44b448662)
+Security Options:
+ seccomp
+  Profile: default
+ selinux
+Kernel Version: 5.3.16-300.fc31.x86_64
+Operating System: Fedora 31 (Workstation Edition)
+OSType: linux
+Architecture: x86_64
+CPUs: 8
+Total Memory: 62.6GiB
+Docker Root Dir: /var/lib/docker
+Debug Mode (client): false
+Debug Mode (server): false
+Registry: https://index.docker.io/v1/
+Labels:
+Experimental: false
+Insecure Registries:
+ 127.0.0.0/8
+Live Restore Enabled: true
+**What happened**:
+
+Whe configuring a pod subnet, a subnet smaller than `/24` will cause the `kube-controller-manager-kind-control-plane` to enter a CrashLoop due to this error:
+
+```
+# k -n kube-system logs kube-controller-manager-kind-control-plane | grep cidr
+F0114 15:54:20.877255       1 node_ipam_controller.go:110] Controller: Invalid --cluster-cidr, mask size of cluster CIDR must be less than --node-cidr-mask-size
+```
+
+**What you expected to happen**:
+
+If there is a minimum size of a podSubnet, the config should validate that the subnet given meets the criteria. Otherwise it should function normally (perhaps by adjusting the CIDR mask)
+
+**How to reproduce it**:
+
+```shell
+$ cat <<EOF > ./cluster.yaml
+apiVersion: kind.sigs.k8s.io/v1alpha3
+kind: Cluster
+networking:
+  podSubnet: 172.16.64.0/26
+EOF
+$ kind create cluster --config=./cluster.yaml
+Creating cluster "kind" ...
+ ✓ Ensuring node image (kindest/node:v1.15.6) 🖼
+ ✓ Preparing nodes 📦
+ ✓ Creating kubeadm config 📜
+ ✓ Starting control-plane 🕹️
+ ✓ Installing CNI 🔌
+ ✓ Installing StorageClass 💾
+ ✗ Waiting ≤ 10m0s for control-plane = Ready ⏳
+ • WARNING: Timed out waiting for Ready ⚠️
+Cluster creation complete. You can now use the cluster with:
+
+export KUBECONFIG="$(kind get kubeconfig-path --name="kind")"
+kubectl cluster-info
+$ docker exec -it kind-control-plane kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system get pod kube-controller-manager-kind-control-plane
+NAME                                         READY   STATUS             RESTARTS   AGE
+kube-controller-manager-kind-control-plane   0/1     CrashLoopBackOff   7          15m
+```
+
+**Anything else we need to know?**:
+
+```sh
+host $ docker exec -it kind-control-plane /bin/sh
+docker $ export KUBECONFIG=/etc/kubernetes/admin.conf
+docker $ kubectl -n kube-system get pod  kube-controller-manager-kind-control-plane
+NAME                                         READY   STATUS             RESTARTS   AGE
+kube-controller-manager-kind-control-plane   0/1     CrashLoopBackOff   5          6m13s
+docker $ kubectl -n kube-system logs kube-controller-manager-kind-control-plane | grep cidr
+F0114 16:04:31.674717       1 node_ipam_controller.go:110] Controller: Invalid --cluster-cidr, mask size of cluster CIDR must be less than --node-cidr-mask-size
+docker $ kubectl -n kube-system get pod kube-controller-manager-kind-control-plane -o yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    kubernetes.io/config.hash: 5956ad6fb3d745e44e5f3d05dc4cc747
+    kubernetes.io/config.mirror: 5956ad6fb3d745e44e5f3d05dc4cc747
+    kubernetes.io/config.seen: "2020-01-14T15:59:17.0778636Z"
+    kubernetes.io/config.source: file
+  creationTimestamp: "2020-01-14T15:59:55Z"
+  labels:
+    component: kube-controller-manager
+    tier: control-plane
+  name: kube-controller-manager-kind-control-plane
+  namespace: kube-system
+  resourceVersion: "572"
+  selfLink: /api/v1/namespaces/kube-system/pods/kube-controller-manager-kind-control-plane
+  uid: d648a806-1fd3-4ed5-b1e0-6acb8ebca5d6
+spec:
+  containers:
+  - command:
+    - kube-controller-manager
+    - --allocate-node-cidrs=true
+    - --authentication-kubeconfig=/etc/kubernetes/controller-manager.conf
+    - --authorization-kubeconfig=/etc/kubernetes/controller-manager.conf
+    - --bind-address=127.0.0.1
+    - --client-ca-file=/etc/kubernetes/pki/ca.crt
+    - --cluster-cidr=172.16.64.0/26
+    - --cluster-signing-cert-file=/etc/kubernetes/pki/ca.crt
+    - --cluster-signing-key-file=/etc/kubernetes/pki/ca.key
+    - --controllers=*,bootstrapsigner,tokencleaner
+    - --enable-hostpath-provisioner=true
+    - --kubeconfig=/etc/kubernetes/controller-manager.conf
+    - --leader-elect=true
+    - --node-cidr-mask-size=24
+    - --requestheader-client-ca-file=/etc/kubernetes/pki/front-proxy-ca.crt
+    - --root-ca-file=/etc/kubernetes/pki/ca.crt
+    - --service-account-private-key-file=/etc/kubernetes/pki/sa.key
+    - --use-service-account-credentials=true
+... <snip> ...
+```
+
+**Environment:**
+
+```sh
+$ kind version
+v0.5.1
+$ kubectl version
+Client Version: version.Info{Major:"1", Minor:"15", GitVersion:"v1.15.1", GitCommit:"4485c6f18cee9a5d3c3b4e523bd27972b1b53892", GitTreeState:"clean", BuildDate:"2019-07-18T09:18:22Z", GoVersion:"go1.12.5", Compiler:"gc", Platform:"linux/amd64"}
+Server Version: version.Info{Major:"1", Minor:"15", GitVersion:"v1.15.7", GitCommit:"6c143d35bb11d74970e7bc0b6c45b6bfdffc0bd4", GitTreeState:"clean", BuildDate:"2019-12-11T12:34:17Z", GoVersion:"go1.12.12", Compiler:"gc", Platform:"linux/amd64"}
+$ docker info | grep -i version
+ Server Version: 19.03.5
+ containerd version: b34a5c8af56e510852c35414db4c1f4fa6172339
+ runc version: 3e425f80a8c931f88e6d94a8c831b9d5aa481657
+ init version: fec3683
+ Kernel Version: 4.9.184-linuxkit
+$ cat /etc/os-release
+NAME="Ubuntu"
+VERSION="18.04.3 LTS (Bionic Beaver)"
+ID=ubuntu
+ID_LIKE=debian
+PRETTY_NAME="Ubuntu 18.04.3 LTS"
+VERSION_ID="18.04"
+HOME_URL="https://www.ubuntu.com/"
+SUPPORT_URL="https://help.ubuntu.com/"
+BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"
+PRIVACY_POLICY_URL="https://www.ubuntu.com/legal/terms-and-policies/privacy-policy"
+VERSION_CODENAME=bionic
+UBUNTU_CODENAME=bionic
+```
+
+
+just the Dual Stack PR with an additional commit that forces the IP family to dual stack so we can test it in the CI
+**What happened**:
+
+Block device tests running inside the KinD cluster are flaky (https://github.com/kubernetes-csi/csi-driver-host-path/issues/119). It looks like this is because the Docker container  in which kubelet runs has a static copy of the host's `/dev`. In `devfs`, new loop devices are added by the kernel as needed. But inside the container only those `/dev/loop*` devices are available which existed already on the host when the container was created, causing losetup to fail:
+```
+losetup: /tmp/testfile: failed to set up loop device: No such file or directory
+```
+
+**What you expected to happen**:
+
+`/dev` needs to be shared with the host. This isn't nice from a security perspective, but I don't see another solution.
+
+**How to reproduce it (as minimally and precisely as possible)**:
+
+Create a KinD cluster, pick one container with `docker ps`, then run `losetup` repeatedly:
+```
+$ docker exec f049e80f378a sh -c 'ls /dev/loop*'
+/dev/loop-control
+/dev/loop0
+/dev/loop1
+/dev/loop2
+/dev/loop3
+/dev/loop4
+/dev/loop5
+/dev/loop6
+/dev/loop7
+$ docker exec f049e80f378a sh -c 'truncate -s 1G /tmp/testfile; losetup -f --show /tmp/testfile'
+/dev/loop0
+....
+$ docker exec f049e80f378a sh -c 'truncate -s 1G /tmp/testfile; losetup -f --show /tmp/testfile'
+/dev/loop7
+$ docker exec f049e80f378a sh -c 'truncate -s 1G /tmp/testfile; losetup -f --show /tmp/testfile'
+losetup: /tmp/testfile: failed to set up loop device: No such file or directory
+```
+
+**Environment:**
+- kind version: (use `kind version`): v0.6.0-alpha
+
+Hi,
+
+1. Why do I get this error?
+Also - this is after configuring `service/kubernetes` to listen on port 80 rather than 443. 
+
+![image](https://user-images.githubusercontent.com/38348846/72209605-d6c3bb80-34b8-11ea-9d9b-58b265139d69.png)
+
+
+2. Is it possible in `kind` to have a pod that lives on control-plane-node to send `http POST` requests to the kubernetes code? If yes - am I meant to wrap this pod with the `service/kubernetes` for this purpose? How do I make this work network-wise in kind?
+
+Thanks in advance.
+
+<!-- Please only use this template for submitting enhancement requests -->
+
+**What would you like to be added**:
+
+Add a special node to the Kind cluster with 'registry' role. This node can run docker registry without the user having to run any extra scripts to configure Kind cluster
+
+**Why is this needed**:
+
+This can be an alternative to 'kind load docker-image' and naturally integrates with 'docker push' CI workflows.
+
+Also, the registry storage can be mounted from the host and kind load can be avoided for easier setup.

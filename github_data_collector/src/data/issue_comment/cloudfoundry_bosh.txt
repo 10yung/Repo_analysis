@@ -1,0 +1,290 @@
+**Is your feature request related to a problem? Please describe.**
+The [TcpConnection](https://github.com/cloudfoundry/bosh/blob/716ffe2a12fec6b14cd6a7731d40da7bbd586ca7/src/bosh-monitor/lib/bosh/monitor/protocols/tcp_connection.rb#L4) retries 35 times until it gives up. If the service the plugin tries to connect is not available within those retries the plugin just gives up. The only way to resolve this is, to restart the hm job on the BOSH vm.
+
+**Describe the solution you'd like**
+Remove the limit and let plugins retry forever. Since it has been configured the plugin should successfully connect as soon as the service is available, even days later. I don't see a scenario where an operator actually want the plugin to give up.
+
+**Describe alternatives you've considered**
+Work around this by monitoring for the error and restarting the health monitor job.
+
+
+**Is your feature request related to a problem? Please describe.**
+https://bosh.io/docs/nats-ca-rotation/#step-3-update-the-director-health-monitor-and-nats-server-jobs-to-remove-references-for-the-old-nats-ca-and-certificates-signed-by-it
+
+In this guide you explain how to rotate Nats CA certificates. In step one you add the new CA certificates and in step 2 you set everything to use the new CA. The issue is if you forget to remove this ops file after running the step renaming and removing the new certs to the name of the old CA certificate, you will get a new set of certificates and all agents will be unresponsive. In the same fashion, you can use the Step 3 Ops file in the first step, resulting in unresponsive agents as bosh expects the new certs. Those issues can be avoided by removing the variables block from the second ops file. If you ran it with ops file 1 first, the vars are already present. If you ran the ops file that replaces the old Certificate with the new ones, the script will error, as it will do if you use the second ops file on the first run. This makes sure you do not do the Rotation in the wrong order. 
+
+**Describe the solution you'd like**
+Change the second ops file to: 
+
+```yaml
+---
+- type: replace
+  path: /instance_groups/name=bosh/properties/nats/tls/ca?
+  value: ((nats_server_tls_2.ca))
+
+- type: replace
+  path: /instance_groups/name=bosh/properties/nats/tls/server?
+  value:
+    certificate: ((nats_server_tls_2.certificate))
+    private_key: ((nats_server_tls_2.private_key))
+
+- type: replace
+  path: /instance_groups/name=bosh/properties/nats/tls/client_ca?
+  value:
+    certificate: ((nats_ca_2.certificate))
+    private_key: ((nats_ca_2.private_key))
+
+- type: replace
+  path: /instance_groups/name=bosh/properties/nats/tls/director?
+  value:
+    certificate: ((nats_clients_director_tls_2.certificate))
+    private_key: ((nats_clients_director_tls_2.private_key))
+
+- type: replace
+  path: /instance_groups/name=bosh/properties/nats/tls/health_monitor?
+  value:
+    certificate: ((nats_clients_health_monitor_tls_2.certificate))
+    private_key: ((nats_clients_health_monitor_tls_2.private_key))
+```
+(aka remove all the variables addition)
+This will make sure that you get an error if you try to run the ops files out of order by accident, also the variables should already be there at this point.
+**Describe alternatives you've considered**
+Changing the documentation so first you move the old certificate to _old and change all scripts so no variable block is needed at any point and the ops for the first step uses _old for most things and later ops files get shorter.
+
+
+### Problem
+Rotating the NATS and blobstore CAs through all of the director and deployed VMs takes an immense amount of time, due to the need for deployed VMs to be recreated to update the certificates. 
+
+The certificates have essentially no meaning to operators, as they're created during `create-env` and distributed as VMs are deployed. 
+
+The only way to transfer new NATS/Blobstore CAs/certs to VMs is via a recreate of the entire VM. 
+
+This is an _optimization_ that can be performed when needing to rotate the CAs. The [three-legged deploy](https://bosh.io/docs/nats-ca-rotation/) should still be performed if operators are concerned about leaked certificates.
+
+### Proposal
+Given a healthy director, an operator can execute some CLI command that executes a task that will update director and deployed VM NATS/blobstore certificates without the operator recreating all deployed VM or the director VM.
+
+#### Director
+Given a director, execute a bosh cli command that:
+1. Starts a task that can be tracked
+1. Shows each instance being updated during task execution
+1. Handles failing VMs gracefully, allowing idempotent retries
+1. Distributes the new CA and leaves to deployed VMs
+1. Accepts the `--vars-store` option in order to update the creds.yml file after completion
+1. Director reloads gnatsd when appropriate
+
+#### Agents
+A deployed VM, with an agent that has successfully checked in recently will:
+1. Receive a message over NATS to begin the process
+1. Accept a new NATS CA and leaf certificate via message from director
+1. Install the new CA, concatenated with the old CA
+1. Respond to ping over NATS using the new leaf certificate
+1. Clean up unused artifacts from the process
+
+### Problems
+1. Security of transferring new credentials over a potentially compromised channel
+1. A VM may fail to respond to a ping with the new leaf certificate, for reasons other than TLS
+1. The task could be cancelled by operator(s)
+1. There could be other tasks going on at once that use NATS (everything)
+1. Locking the entire director and deployed VMs may be unreasonable
+
+#### Potential Solutions to above
+1. An agent could generate a keypair, and send the public key to the director to encrypt the new CA and generated leaf. If an attacker can respond as the director with a compromised CA, then using the public key could send a replacement certificate to an agent. Operators should default to the recreation-based approach in the event of a compromised NATS CA.
+1. Process should be idempotent, and write enough state so the process can be resumed at any time. Old and new CAs are concatenated as the certificate authority. Retry a couple times quickly.
+1. If the task is cancelled, then if the process is idempotent in all steps, then the task could be resumed. VMs should still be able to health check.
+1. Deployment locks, work on one deployment at a time.
+1. Director may need to have a manual 'start' and 'finish' command in order for operators to update deployments at their leisure. Expecting all deployments to be rotated at once is unreasonable.
+
+### Security/Risks
+1. What if the NATS CA is compromised? The DH key exchange would help here, but if the attacker has access to the director VM, they could also generate the keypair.
+1. At the moment, the recreate is helpful as the channel for credentials is the cloud provider's metadata service. This isn't necessarily secure at all, but at least doesn't use the same channel for its own credential update. Operators concerned about the proposed optimization can still perform the three-step approach.
+1. Health monitor and updating the VMs may cause some chaos, if the check intervals and updates are timed in a certain way.
+1. The time it takes for gnatsd on the director to reload, and the reload/re-establish connection to NATS server from a VM could result in timeouts and necessitate more retries.
+
+### Performance
+Clearly there will be a gain in performance as operators are not required to recreate VMs, and not reinstall/start jobs back up again. Any downtime should also be eradicated. The key exchange shouldn't be that intensive. Concurrency rules like `max_in_flight` can still be honoured. Waiting for gnatsd on the director to reload and agent reconnects could take some time, but much less than a whole recreate would.
+
+#### Accompanying Picture
+
+![Screen Shot 2019-12-27 at 1 56 38 PM](https://user-images.githubusercontent.com/105841/71529035-c0aade00-28b0-11ea-82a5-21d6ff9d411b.png)
+**Is your feature request related to a problem? Please describe.**
+
+Currently instance group updating order is supported not individual instances in a group. 
+But one of my customer believes It's desirable to have newly added diegocells to be updated in the first place among all other diegocells because they'd prefer those new cells to be ready first so that redundancy to other cells could be increasing during upgrade.
+
+**Describe the solution you'd like**
+It's desirable to have newly added diegocells to be updated in the first place among all other diegocells. If possible, we'd like bosh can support updating order of specific instances in an instance group. 
+
+**Additional context**
+Slack conversation: https://pivotal.slack.com/archives/C3M0B3TV3/p1575451558373700
+**Is your feature request related to a problem? Please describe.**
+
+We ship our functionality (APM monitoring) almost exclusively over BOSH `runtime-configurations`. Currently it is pretty hard for us to know if our jobs are going to be purged from a machine due to the removal of the runtime configuration and the update of the deployment. (We need to look up the deployment manifest.)
+
+**Describe the solution you'd like**
+
+Get a clear indication of "This job won't be here again after being stopped", which is pretty much the semantics I would expect from a `BOSH_JOB_NEXT_STATE = delete` env var in [pre-stop](https://bosh.io/docs/pre-stop/).
+
+**Describe alternatives you've considered**
+
+Over the current `pre-stop`, we look up the runtime configurations listed in the BOSH director over the REST API and, if the one that deploys the current job is no longer listed, we do long-term clean-up. Unfortunately, it requires I/O to the BOSH Rest API and a `bosh.read` token accessible from the VM we'd rather not have there :-)
+
+**Additional context**
+
+N/A
+**Describe the bug**
+
+After upgrade from `456.x` to `621.x` line of `bosh-aws-xen-hvm-ubuntu-xenial-go_agent` stemcell we noticed issues with resolving hostnames that are not FQDN.
+It looks that the newest stemcell versions missing `search ec2.internal` search domain entry in `/etc/resolv.conf`
+
+**To Reproduce**
+On instance based on `bosh-aws-xen-hvm-ubuntu-xenial-go_agent 456.74`:
+```
+$ cat /etc/resolv.conf
+nameserver 10.100.0.2
+search ec2.internal
+```
+On instance based on `bosh-aws-xen-hvm-ubuntu-xenial-go_agent 621.5`:
+```
+$ cat /etc/resolv.conf
+nameserver 10.100.0.2
+```
+
+**Expected behavior**
+
+hostnames pointing to other internal EC2 instances will be resolved properly.
+
+
+We have a cluster with 2 instances (VM1 and VM2) in AZ1 and need to distribute to 2 AZs (AZ1 and AZ2 together with some updates), each AZ has an instance to make better HA. The current BOSH update strategy on this task is:
+1. Delete unneeded VM2 in AZ1
+2. Create a new VM3 (with no jobs installed) in AZ2
+(The above two steps may be in different order which has the same result - now we have only one working instance VM1)
+3. Update VM1 in AZ1 - During the update, there is no working instances and the outage happens!!!
+4. Update VM3 in AZ2
+
+Is it possible for BOSH to make better strategy, for example, put the `delete unneeded instance` at the end of the task? So that we always has a working instance to avoid outage.
+**Describe the bug**
+When a bosh release gets uploaded it does appear in the existing releases before the last upload steps are executed and the task is finished. Subsequent deploys assume that the release exists even if the upload is not yet finalized and fail with ` job is not found in the template table`. 
+The timeframe in which this can happen increases with the size of the bosh release and may only be problematic with releases of a certain size.
+
+**To Reproduce**
+1. Create a huge bosh release > 5 GB
+2. Create two manifests, which download and use the bosh release
+3. Run the following script
+
+```
+bosh deploy <first_manifest>.yml -n
+while true; do
+  release="$(bosh curl /releases | jq -r '.[] | select(.name == "<release_name>") | .release_versions[] | select(.version == "release_version")')"
+  if [[ -n "$release" ]]; then
+    break
+  fi
+  echo "release upload pending"
+  sleep 1
+done
+bosh deploy <second_manifest>.yml -n
+```
+
+**Expected behavior**
+A release is only returned by the `releases` endpoint after the upload has completely finished and the release is ready to use.
+
+**Versions (please complete the following information):**
+ - Infrastructure: does not matter
+ - BOSH version 270.x.x
+ - BOSH CLI version 6.x
+ - Stemcell version xenial 456.x
+**Describe the bug**
+During stemcell upgrade we noticed that Cloud Controller is failing to talk to one of the doppler instances. We have 4 doppler instances. One of the instances was being updated and Cloud Controller was trying to talk to that IP address. We confirmed that issue by running `dig doppler.service.cf.internal` and it was returning all 4 IPs, even for VMs that were being updated. After bringing the issue with the Bosh team we were suggested to update the doppler host URL to include the healthiness filter. 
+
+But it seems like they don't work. With 4 instances of doppler running `q-s0.doppler.default.cf.bosh` returns 4 instances. But both `dig q-s1.doppler.service.cf.internal` and `dig q-s3.doppler.service.cf.internal` return 0 instances. Documentation states that the `q-s1` should return unhealthy and `q-s3` healthy instances. 
+
+We ran `bosh recreate doppler/<some-guid>` and watched the above commands. The output has not changed.
+
+Cloud controller is configured with doppler service URL as `doppler.service.cf.internal` and we use cf-deployment https://github.com/cloudfoundry/cf-deployment/blob/5f5b327ad6d1e9a4d72f1bc9eeea7e7cd20f51d8/cf-deployment.yml#L172-L178
+
+Slack conversation with bosh team: https://cloudfoundry.slack.com/archives/C02HPPYQ2/p1569524830094900
+
+**To Reproduce**
+Steps to reproduce the behavior:
+1. Deploy a bosh director on GCP with bbl
+2. Deploy cf-deployment https://github.com/cloudfoundry/cf-deployment/blob/7dfd55990ded725ea30127307f373b11e0628c83/cf-deployment.yml and ops-file https://github.com/cloudfoundry/cf-deployment/blob/7dfd55990ded725ea30127307f373b11e0628c83/operations/test/add-datadog-firehose-nozzle.yml
+3. `bosh ssh` to a `api/0`
+4. Run:
+`watch "dig q-s0.doppler.service.cf.internal"`
+`watch "dig q-s1.doppler.service.cf.internal"`
+`watch "dig q-s3.doppler.service.cf.internal"`
+5. Run `bosh recreate doppler/0`
+
+**Expected behavior**
+at some point:
+`dig q-s0.doppler.service.cf.internal` - should return 3 instances instead of 4
+`dig q-s1.doppler.service.cf.internal` - should return 1 instance instead of 0
+`dig q-s3.doppler.service.cf.internal` - should return 3 instances instead of 0
+
+**Versions (please complete the following information):**
+ - Infrastructure: GCP
+ - BOSH version: 270.5.0 (00000000)
+ - Stemcell version [e.g. ubuntu-xenial/97.10]
+ - cf-deployment version: 7dfd55990ded725ea30127307f373b11e0628c83 
+
+**Deployment info:**
+Deployment was deployed with concourse: https://github.com/cloudfoundry/cf-deployment-concourse-tasks/blob/master/bosh-deploy/task.yml
+Task config: https://gist.github.com/mariash/612714710a82131b855aeda3b115c3f9
+**Is your feature request related to a problem? Please describe.**
+
+As a bosh operator, in order to troubleshoot failing communications with credhub config server, I need to access https wire traces for bosh to credhub communications.
+
+**Describe the solution you'd like**
+
+bosh debug logs to include config server api calls wire traces when [director.log_level](https://bosh.io/jobs/director?source=github.com/cloudfoundry/bosh&version=270.5.0#p%3ddirector.log_level) is set to debug or more verbose (trace?) level
+
+**Describe alternatives you've considered**
+
+Manually patching the bosh director package ruby calls to turn on http client verbose logging.
+
+Caveats:
+- ephemeral: the patch may not survive bosh director stemcell upgrades
+- no clear whether logs will end up in `bosh logs --debug` output or stdout and require sshing into director box, and be rotated soon by log rotation (whereas `bosh logs --debug` might be more durable in director db?)
+
+**Additional context**
+
+Some bugs such as 
+https://github.com/orange-cloudfoundry/paas-templates/issues/46#issuecomment-518579916
+
+produce the following stack trace. Credhub HTTPS response seem useful to troubleshoot the root cause
+
+```
+, [2019-08-05T20:07:28.364052 #23511] [task:1882836] DEBUG -- DirectorJobRunner: (0.000930s) (conn: 47020238158520) COMMIT
+E, [2019-08-05T20:07:28.364170 #23511] [task:1882836] ERROR -- DirectorJobRunner: wrong chunk size line:
+/var/vcap/data/packages/ruby-2.6.3-r0.17.0/9748a2ea55cae0004dc26b99cdf9024c2156cdde/lib/ruby/2.6.0/net/http/response.rb:317:in `read_chunked'
+/var/vcap/data/packages/ruby-2.6.3-r0.17.0/9748a2ea55cae0004dc26b99cdf9024c2156cdde/lib/ruby/2.6.0/net/http/response.rb:285:in `block in read_body_0'
+/var/vcap/data/packages/ruby-2.6.3-r0.17.0/9748a2ea55cae0004dc26b99cdf9024c2156cdde/lib/ruby/2.6.0/net/http/response.rb:278:in `inflater'
+/var/vcap/data/packages/ruby-2.6.3-r0.17.0/9748a2ea55cae0004dc26b99cdf9024c2156cdde/lib/ruby/2.6.0/net/http/response.rb:283:in `read_body_0'
+/var/vcap/data/packages/ruby-2.6.3-r0.17.0/9748a2ea55cae0004dc26b99cdf9024c2156cdde/lib/ruby/2.6.0/net/http/response.rb:204:in `read_body'
+/var/vcap/data/packages/ruby-2.6.3-r0.17.0/9748a2ea55cae0004dc26b99cdf9024c2156cdde/lib/ruby/2.6.0/net/http.rb:1229:in `block in get'
+/var/vcap/data/packages/ruby-2.6.3-r0.17.0/9748a2ea55cae0004dc26b99cdf9024c2156cdde/lib/ruby/2.6.0/net/http.rb:1518:in `block in transport_request'
+/var/vcap/data/packages/ruby-2.6.3-r0.17.0/9748a2ea55cae0004dc26b99cdf9024c2156cdde/lib/ruby/2.6.0/net/http/response.rb:165:in `reading_body'
+/var/vcap/data/packages/ruby-2.6.3-r0.17.0/9748a2ea55cae0004dc26b99cdf9024c2156cdde/lib/ruby/2.6.0/net/http.rb:1517:in `transport_request'
+/var/vcap/data/packages/ruby-2.6.3-r0.17.0/9748a2ea55cae0004dc26b99cdf9024c2156cdde/lib/ruby/2.6.0/net/http.rb:1479:in `request'
+/var/vcap/data/packages/ruby-2.6.3-r0.17.0/9748a2ea55cae0004dc26b99cdf9024c2156cdde/lib/ruby/2.6.0/net/http.rb:1472:in `block in request'
+/var/vcap/data/packages/ruby-2.6.3-r0.17.0/9748a2ea55cae0004dc26b99cdf9024c2156cdde/lib/ruby/2.6.0/net/http.rb:920:in `start'
+/var/vcap/data/packages/ruby-2.6.3-r0.17.0/9748a2ea55cae0004dc26b99cdf9024c2156cdde/lib/ruby/2.6.0/net/http.rb:1470:in `request'
+/var/vcap/data/packages/ruby-2.6.3-r0.17.0/9748a2ea55cae0004dc26b99cdf9024c2156cdde/lib/ruby/2.6.0/net/http.rb:1228:in `get'
+/var/vcap/data/packages/director/930f4d7076d66cb4e3a53f53ee5bd26f54867fef/gem_home/ruby/2.6.0/gems/bosh-director-0.0.0/lib/bosh/director/config_server/auth_http_client.rb:24:in `block in get'
+/var/vcap/data/packages/director/930f4d7076d66cb4e3a53f53ee5bd26f54867fef/gem_home/ruby/2.6.0/gems/bosh_common-0.0.0/lib/common/retryable.rb:28:in `block in retryer'
+/var/vcap/data/packages/director/930f4d7076d66cb4e3a53f53ee5bd26f54867fef/gem_home/ruby/2.6.0/gems/bosh_common-0.0.0/lib/common/retryable.rb:26:in `loop'
+/var/vcap/data/packages/director/930f4d7076d66cb4e3a53f53ee5bd26f54867fef/gem_home/ruby/2.6.0/gems/bosh_common-0.0.0/lib/common/retryable.rb:26:in `retryer'
+/var/vcap/data/packages/director/930f4d7076d66cb4e3a53f53ee5bd26f54867fef/gem_home/ruby/2.6.0/gems/bosh-director-0.0.0/lib/bosh/director/config_server/auth_http_client.rb:21:in `get'
+/var/vcap/data/packages/director/930f4d7076d66cb4e3a53f53ee5bd26f54867fef/gem_home/ruby/2.6.0/gems/bosh-director-0.0.0/lib/bosh/director/config_server/retryable_http_client.rb:9:in `block in get'
+/var/vcap/data/packages/director/930f4d7076d66cb4e3a53f53ee5bd26f54867fef/gem_home/ruby/2.6.0/gems/bosh_common-0.0.0/lib/common/retryable.rb:28:in `block in retryer'
+/var/vcap/data/packages/director/930f4d7076d66cb4e3a53f53ee5bd26f54867fef/gem_home/ruby/2.6.0/gems/bosh_common-0.0.0/lib/common/retryable.rb:26:in `loop'
+/var/vcap/data/packages/director/930f4d7076d66cb4e3a53f53ee5bd26f54867fef/gem_home/ruby/2.6.0/gems/bosh_common-0.0.0/lib/common/retryable.rb:26:in `retryer'
+/var/vcap/data/packages/director/930f4d7076d66cb4e3a53f53ee5bd26f54867fef/gem_home/ruby/2.6.0/gems/bosh-director-0.0.0/lib/bosh/director/config_server/retryable_http_client.rb:8:in `get'
+/var/vcap/data/packages/director/930f4d7076d66cb4e3a53f53ee5bd26f54867fef/gem_home/ruby/2.6.0/gems/bosh-director-0.0.0/lib/bosh/director/config_server/config_server_http_client.rb:20:in `get'
+/var/vcap/data/packages/director/930f4d7076d66cb4e3a53f53ee5bd26f54867fef/gem_home/ruby/2.6.0/gems/bosh-director-0.0.0/lib/bosh/director/config_server/client.rb:358:in `get_variable_id_and_value_by_name'
+/var/vcap/data/packages/director/930f4d7076d66cb4e3a53f53ee5bd26f54867fef/gem_home/ruby/2.6.0/gems/bosh-director-0.0.0/lib/bosh/director/config_server/client.rb:238:in `block in fetch_values_with_deployment'
+/var/vcap/data/packages/director/930f4d7076d66cb4e3a53f53ee5bd26f54867fef/gem_home/ruby/2.6.0/gems/bosh-director-0.0.0/lib/bosh/director/config_server/client.rb:223:in `each'
+/var/vcap/data/packages/director/930f4d7076d66cb4e3a53f53ee5bd26f54867fef/gem_home/ruby/2.6.0/gems/bosh-director-0.0.0/lib/bosh/director/config_server/client.rb:223:in `fetch_values_with_deployment'
+/var/vcap/data/packages/director/930f4d7076d66cb4e3a53f53ee5bd26f54867fef/gem_home/ruby/2.6.0/gems/bosh-director-0.0.0/lib/bosh/director/config_server/client.rb:55:in `interpolate_with_versioning'
+```
+

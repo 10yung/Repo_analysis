@@ -1,0 +1,93 @@
+- easy for custom `iter.ReadMapCB`, we need to use NextToken to check is there more token, for example, we check ',' token to know the end. 
+
+
+Change-Id: Ia335036825df098503f7008bf013b9442fe14298
+I believe that WriteMore should not call Flush for these reasons:
+
+1. This is surprising for users because of inconsistency. Why call Flush in WriteMore and not in WriteObjectEnd?
+2. It is not necessary; callers are free to call Flush if their use case demands it.
+3. It harms performance in the common case by flushing the buffer much more frequently than it needs to be flushed.
+
+The stream benchmark shows a 7% benefit to removing the Flush call, and I
+observed a similar speedup in my real-world use case.
+
+    benchmark                                        old ns/op     new ns/op     delta
+    Benchmark_encode_string_with_SetEscapeHTML-8     442           437           -1.13%
+    Benchmark_jsoniter_large_file-8                  21222         21062         -0.75%
+    Benchmark_json_large_file-8                      40187         40266         +0.20%
+    Benchmark_stream_encode_big_object-8             8611          7956          -7.61%
+
+    benchmark                                        old allocs     new allocs     delta
+    Benchmark_encode_string_with_SetEscapeHTML-8     6              6              +0.00%
+    Benchmark_jsoniter_large_file-8                  78             78             +0.00%
+    Benchmark_json_large_file-8                      13             13             +0.00%
+    Benchmark_stream_encode_big_object-8             0              0              +0.00%
+
+    benchmark                                        old bytes     new bytes     delta
+    Benchmark_encode_string_with_SetEscapeHTML-8     760           760           +0.00%
+    Benchmark_jsoniter_large_file-8                  4920          4920          +0.00%
+    Benchmark_json_large_file-8                      6640          6640          +0.00%
+    Benchmark_stream_encode_big_object-8             0             0             +0.00%
+
+Backwards compatibility - I believe there is little to no risk that this breaks
+callers. WriteMore does not leave the JSON in a valid state, so it must be
+followed by other Write* methods. To get the finished JSON out, the caller must
+already be calling Flush.
+Speeds up the example Stream usage in the benchmark by 20%
+
+Stream.Flush copies the contents of the stream's buffer to the output, but instead of resetting its buffer to reuse the allocation, it keeps appending to the end of the buffer. For large JSON objects this results in much more allocation than necessary. 
+
+```go
+// Flush writes any buffered data to the underlying io.Writer.
+func (stream *Stream) Flush() error {
+	if stream.out == nil {
+		return nil
+	}
+	if stream.Error != nil {
+		return stream.Error
+	}
+	n, err := stream.out.Write(stream.buf)
+	if err != nil {
+		if stream.Error == nil {
+			stream.Error = err
+		}
+		return err
+	}
+	stream.buf = stream.buf[n:]  // <--- HERE
+	return nil
+}
+```
+
+I think the marked line above should instead be
+```go
+	stream.buf = stream.buf[:0]
+```
+
+Am I missing something?
+Add unit test for `iterator.ReadAny()` function.
+Now the bufSize is 512. bytes.makeSlice will happen when the json size is larger than bufSize.  If most of my json are larger than 512, I want to set it to a larger size, let's say, 4096 to avoid alloc space. Could you support this feature?
+**背景**
+我们在json-iterator做序列化时，发现有疑似内存泄露的现象，内存持续增长，无法回收。
+
+**原因**
+发现Stream中的buf每次在扩容后，没有进行缩容操作。即如此次数据大小为1M，下次数据为1K，buf大小仍为1M，有非常多的内存被“池化”，无法被gc回收。针对有偶发的超大数据的现象，会将整个stream pool撑的非常大。
+
+**详细参数**
+单机QPS 2.5K，平均大小500K
+超大数据单机QPS为五分钟一条。 大小超20M，最大可达60M
+超大数据主要存在超大的string类型字段，单个字段长度可达2M
+
+**版本**
+1.0.4
+最新版本代码发现Reset()中重置了buf的长度，此操作貌似也不会归还多余内存。
+
+JSON standard does not allow NaN or Infinity, but some applications
+produce output that contains such values. One example of such
+application would be TensorFlow Serving[1]. An example of JSON parser
+that accepts NaN and Infinity is the one that comes with Python[2]. This
+commit introduces a new configuration parameter AllowNaN, that enables
+jsoniter to unmarshal input containing NaN and Infinity.
+
+1. https://www.tensorflow.org/tfx/serving/api_rest#json_conformance
+2. https://docs.python.org/3/library/json.html#infinite-and-nan-number-values
+If a struct's type is anonymous, the decoder should not return an error message with its definition when it meets an error.

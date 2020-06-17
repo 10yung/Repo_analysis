@@ -1,0 +1,82 @@
+it's a bit annoying right now to have two different binaries, and the different cargo features increase compilation times.
+We could merge the code of sozuctl in sozu. The biggest issue right now is that sozuctl use structopt, but sozu uses clap directly. But it would be a good opportunity to clean up sozu's command line options.
+
+To reproduce:
+
+Client:
+```javascript
+const WebSocket = require('ws');
+
+const ws = new WebSocket('ws://lolcatho.st:8080/hello');
+
+ws.on('open', function open() {
+  console.log("open");
+  ws.send('something');
+});
+
+ws.on('message', function incoming(data) {
+  console.log(data);
+});
+```
+
+Server:
+```javascript
+const http = require('http');
+const WebSocket = require('ws');
+const url = require('url');
+
+const server = http.createServer();
+const wss1 = new WebSocket.Server({ noServer: true });
+
+wss1.on('connection', function connection(ws) {
+ ws.on('message', function incoming(message) {
+    console.log('received: %s', message);
+    ws.send("hello "+message);
+  });
+});
+
+server.on('upgrade', function upgrade(request, socket, head) {
+  const pathname = url.parse(request.url).pathname;
+
+  console.log("got req n "+request.url);
+  if (pathname === '/hello') {
+    wss1.handleUpgrade(request, socket, head, function done(ws) {
+      wss1.emit('connection', ws, request);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+server.listen(1024);
+```
+
+Launch a sozu that listens on 8080 and will proxy HTTP traffic to the server.
+When launching and stopping the client, no issues, messages are sent and received.
+But when I do an upgrade with sozuctl, sometimes nothing happens.
+The node client establishes the TCP connection, but I sometimes see invalid behaviour on the sozu side: no event is generated for the listen socket. Sozu is never notified that the accept socket is readable.
+Note: the listen socket is transmitted from the first worker to the new one with SCM_RIGHTS.
+the systemd unit file should set the max open files limit.
+
+The code that checks the limits compared to the max number of connections should check the soft limit too, not only the hard limit
+we regularly have to test new behaviour, but activating or deactivating it from the configuration would result in breaking changes, since the configuration protocol expects stable types for serialization.
+I can ship test versions with the new behaviour, but in case of problems, rolling back quickly can be hard.
+What I have in mind: a global object that can be accessed from anywhere in the code (like logs and metrics), that would get its information from environment variables.
+Test code would look up information with a key, and I'd like to return a tuple `(String, number)`:
+- the string to compare a thing and decide to run the test or not (like an application id or a path prefix)
+- the number to define a sampling rate (so we can run the test on 5, 10, 50% of traffic, etc)
+If the key is not present, the test does not run
+when shutting down a worker, we deactivate the listener sockets, and wait for all session to die down before stopping the worker process. Some sessions, like websockets, could stay connected indefinitely and keep the worker up.
+We should keep track of which connections we should wait on (like current HTTP requests, but not the ones that are in keepalive waiting for a new request) and which ones can be killed without asking (most websocket libraries assume they have to reconnect at some point).
+workers start by allocating the entire buffer pool, even if most of it is never used. The idea was to prevent big allocations when handling requests, especially when under pressure, to get stable latency.
+It complicates some use cases, like upgrading a worker: we would need to leave enough free memory for an entire worker, otherwise it would not be able to start before we can remove the old worker.
+We could have a config option for that, deciding whether we want to preallocate or not.
+in some cases we might want to limit the number of concurrent connections to an application or backend, and reject other connections
+We could need to have such answers available in `Http<Front>` directly. Currently, we need this for 413 and would need it for 502. For now, 413 is hardcoded: https://github.com/sozu-proxy/sozu/blob/master/lib/src/protocol/http/mod.rs#L567
+Fixes #529
+
+I made a naive implementation, let me know if this can be done in a better way :)
+It only makes sense to have such error if the metrics section
+is defined
+
+A user got confused about this when trying to start sozu for the first time.

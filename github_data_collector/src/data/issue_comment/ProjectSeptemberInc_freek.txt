@@ -1,0 +1,303 @@
+Cats 1.0 has been released. Any chance that you may take some time to update freek to this latest version ?
+
+cheers,
+Romain
+can not pull this dependency. 
+
+could you please give me a hint on how to set my build.sbt for this dependency?
+
+
+my build.sbt is as follow:
+
+name := "free-monad-coproduct-example"
+
+version := "1.0"
+
+scalaVersion := "2.11.8"
+
+```scala
+lazy val `free-monad-coproduct-example` =
+  (project in file("."))
+    .settings(Seq(addCompilerPlugin("com.milessabin" % "si2712fix-plugin_2.11.8" % "1.2.0")))
+
+resolvers += Resolver.jcenterRepo
+// resolvers += Resolver.bintrayRepo("projectseptemberinc", "maven")
+
+libraryDependencies ++= {
+  Seq(
+    "org.typelevel"             %% "cats"     % "0.8.1",
+    "com.projectseptember"      %% "freek"    % "0.6.7"
+  )
+}
+```
+Suppose I've got a basic DSL defined and have a subprogram type using a couple of them.
+
+```scala
+import freek._
+import cats.{Id, ~>}
+
+object KVStore {
+  sealed trait DSL[A]
+
+  final case class Put[A](key: String, v: A) extends DSL[Unit]
+  final case class Get[A](key: String)       extends DSL[Option[A]]
+
+  object Interpreter extends (DSL ~> Id) {
+    def apply[A](fa: DSL[A]): Id[A] = ???
+  }
+}
+
+object WebIO {
+  sealed trait DSL[A]
+
+  final case class Fetch(key: String) extends DSL[String]
+
+  object Interpreter extends (DSL ~> Id) {
+    def apply[A](fa: DSL[A]): Id[A] = ???
+  }
+}
+
+object FileIO {
+  sealed trait DSL[A]
+
+  final case class Lift[A](value: A) extends DSL[A]
+
+  // Interpreter for Lifting.DSL is simple. Just use Applicative.pure
+  object Interpreter extends (DSL ~> Id) {
+    def apply[A](fa: DSL[A]): Id[A] = ???
+  }
+}
+
+// The subprogram
+object KVStoreWithWeb {
+  type PRG = KVStore.DSL :|: WebIO.DSL :|: NilDSL
+}
+```
+
+Later on, I define another program in which I use the aforementioned subprogram in addition to a yet-unused DSL (`FileIO.DSL`). I'd like to have a type for my `App` level `Interpreter, since I might use it in other parts of the app.
+
+```scala
+// Main program that uses subprogram
+object AnotherProgram {
+
+  type PRG = FileIO.DSL :|: KVStoreWithWeb.PRG
+  val PRG = DSL.Make[PRG]
+
+  type Interp[M[_]] = Interpreter[PRG.Cop, M]
+
+}
+```
+
+If I try to instantiate an `Interp[Id]` with the order mixed up, the compiler blows up with an interesting error.
+ 
+```scala
+val interpreter: Interp[Id] = KVStore.Interpreter :&: WebIO.Interpreter :&: FileIO.Interpreter
+```
+
+```sbt
+[error]   last tree to typer: TypeTree
+[error]        tree position: line 55 of /Users/Lloyd/Documents/scala_dev/freek-test/test/freeky/App.scala
+[error]             tree tpe: <error>
+[error]               symbol: <none>
+[error]    symbol definition: <none> (a NoSymbol)
+[error]       symbol package: <none>
+[error]        symbol owners: 
+[error]            call site: object App in package freeky in package freeky
+[error] 
+[error] == Source file context for tree position ==
+[error] 
+[error]     52   type Interp[M[_]] = Interpreter[PRG.Cop, M]
+[error]     53 
+[error]     54   val interpreter: Interp[Id] = KVStore.Interpreter :&: WebIO.Interpreter :&: Lifting.Interpreter
+[error]     55 
+[error]     56 }
+```
+
+If I fix the ordering to match the DSL type, everything works fine:
+
+```scala
+val interpreter: Interp[Id] = FileIO.Interpreter :&: KVStore.Interpreter :&: WebIO.Interpreter
+```
+I couldn't get my usage of this feature to compile without using `expand[PRG]` in the subprogram as shown [in this test](https://github.com/ProjectSeptemberInc/freek/blob/master/src/test/scala/FreekitSpec.scala#L158).
+Example:
+```scala
+object TestService {
+  sealed trait Account
+
+  sealed trait RepoF[A]
+
+  sealed trait Repo[A]
+  case class Query(no: String) extends Repo[Either[String, Account]]
+  case class Store(account: Account) extends Repo[Either[String, Account]]
+  case class Delete(no: String) extends Repo[Either[String, Unit]]
+
+  object Repo {
+    type PRG = Repo :|: NilDSL
+    val PRG = freek.DSL.Make[PRG]
+    type O = Either[String, ?] :&: Bulb
+  }
+
+  def query(no: String) = Query(no)
+  def store(account: Account) = Store(account)
+  def delete(no: String) = Delete(no)
+
+  // How do I write this function here ?
+  def update(no: String): OnionT[Free, Repo.PRG.Cop, Repo.O, Int] = for {
+    a <-  Query(no).freeko[Repo.PRG, Repo.O]
+    _ <-  Store(a).freeko[Repo.PRG, Repo.O]
+  } yield 1
+}
+```
+
+when `import cats.instances.either._` isn't imported, it gives a bit confusing compile error. 
+```scala
+could not find implicit value for parameter lifter2:
+freek.Lifter2.Aux[Either[String,TestService.Account],TestService.Repo.O,TestService.Account]
+```
+
+basically it doesn't tell an implicit `Application[G[_]]` is missing in the scope. Any way to escalate [implicitNotFound](https://github.com/ProjectSeptemberInc/freek/blob/master/src/main/scala/Onion.scala#L340) of Lifter2 into this scope?
+ADT:
+```scala
+sealed trait UserGetter[A]
+object UserGetter {
+  final case class Get(userName: UserName) extends UserGetter[Either[Error, Option[User]]]
+}
+sealed trait UserPasswordChecker[A]
+object UserPasswordChecker {
+  final case class Check(clientSecret: UserPassword, hashText: BcryptHashText)
+      extends UserPasswordChecker[Either[Error, Boolean]]
+}
+```
+
+Program:
+```scala
+    type PRG = UserGetter :|: UserPasswordChecker :|: NilDSL
+    type O = Either[Error, ?] :&: Option :&: Bulb
+
+    for {
+      u <- UserGetter.Get(UserName(username)).freeko[PRG, O]
+      r <- UserPasswordChecker.Check(UserPassword(password), u.hashedPassword).freeko[PRG, O]
+      if (r)
+    } yield {
+      Option(u)
+    }
+```
+
+Compile Error:
+```scala
+value filter is not a member of freek.OnionT[cats.free.Free,[A]freek.In2[oauth2.domain.adt.UserGetter,oauth2.domain.adt.UserPasswordChecker,A],O,Boolean]
+```
+
+`OnionT` should implement `[MonadFilter](https://github.com/typelevel/cats/blob/master/core/src/main/scala/cats/MonadFilter.scala)` !?
+
+I think it is very common to use  guards in for comprehensions.
+
+If `FreeK` offers this feature, it should be more nicer~
+It seem that the version 0.6.5 depends on cats 0.8.0 and scala 2.12.0-RC2. Could you publish against scala 2.12.0 (cats 0.8.1) ?
+
+```
+info]   +-fr.iscpif.freedsl:random_2.12:1.0-SNAPSHOT
+[info]   | +-com.projectseptember:freek_2.12:0.6.5
+[info]   | | +-org.typelevel:cats-free_2.12.0-RC2:0.8.0
+[info]   | | | +-com.github.mpilquist:simulacrum_2.12.0-RC2:0.10.0
+[info]   | | | | +-org.typelevel:macro-compat_2.12.0-RC2:1.1.1
+[info]   | | | | | +-org.typelevel:scala-library:2.12.0
+```
+
+DSL:
+
+```
+sealed trait KVS[A]
+object KVS {
+ case class Get(key: String) extends KVS[String]
+ case class Put(key: String, value: String) extends KVS[Unit]
+}
+
+sealed trait FileIO[A]
+object FileIO {
+ case class Get(name: String) extends FileIO[File]
+ case class Delete(name: String) extends FileIO[Unit]
+}
+```
+
+Interpreter:
+
+```
+val FileInterpreter = new (FileIO ~> Future) {
+  def apply[A](a: FileIO[A]): Future[A] = a match {
+    case FileIO.Get(name) =>
+      Future {
+        new File(name)
+      }
+
+    case FileIO.Delete(name) =>
+      Future {
+        new File(name).delete()
+        ()
+      }
+  }
+}
+
+val KVSInterpreter = new (KVS ~> Future) {
+  def apply[A](a: KVS[A]): Future[A] = a match {
+    case KVS.Get(id) =>
+      Future {
+        "123"
+      }
+    case KVS.Put(id, value) =>
+      Future {
+        ()
+      }
+  }
+}
+
+
+val interpreter = KVSInterpreter :&: FileInterpreter
+```
+
+It could compile successfully.
+
+When I modify interpreters to
+
+```
+
+val FileInterpreter = new (FileIO ~> Lambda[A => Future[Xor[Exception, A]]]) {
+  override def apply[A](fa: FileIO[A]): Future[Xor[Exception, A]] = fa match {
+    case FileIO.Get(name) =>
+      Future {
+        Xor.right(new File(name))
+      }
+
+    case FileIO.Delete(name) =>
+      Future {
+        new File(name).delete()
+        Xor.right(())
+      }
+  }
+}
+
+val KVSInterpreter = new (KVS ~> Lambda[A => Future[Xor[Exception, A]]]) {
+ def apply[A](a: KVS[A]): Future[Xor[Exception, A]] = a match {
+  case KVS.Get(id) =>
+   Future {
+     Xor.right("123")
+   }
+  case KVS.Put(id, value) =>
+   Future {
+     Xor.right(())
+   }
+ }
+}
+```
+
+I can't compile it ..., and it tells me
+
+```
+value :&: is not a member of cats.~>[A$A48.this.FileIO,[A]scala.concurrent.Future[cats.data.Xor[Exception,A]]]
+lazy val interpreter: Interpreter[({type λ[γ] = In2[KVS, FileIO, γ]})#λ, ({type Λ$[A] = Future[Xor[Exception, A]]})#Λ$] = KVSInterpreter :&: FileInterpreter;}
+```
+
+Does someone know what's going on?
+
+
+Currently freek pulls in all cats dependencies and hence you get test dependencies such as `cats-laws`. The dependencies should be kept to a minimum and ideally only the module which `freek` uses which I would assume to be `cats-free`.

@@ -1,0 +1,248 @@
+* Uses refPrefix() when using patch-from mode
+* Fills ldm tables when using patchFrom mode
+* Forces dictBuffer to be freed only after compression ends (because of refPrefix)
+* Forces --single-thread when using --patch-from (multithreaded support planned in future pr)
+* Forces --long when using --patch-from on dictionaries larger than 128 mb
+zstd is available as a port in VCPKG , documenting the install process here will help users get started by providing a single set of commands to build zstd , ready to be included in their projects.
+
+VCPKG is a C++ library manager that simplifies installation for zstd and other project dependencies, we also test whether our library ports build in various configurations (dynamic, static) on various platforms (OSX, Linux, Windows: x86, x64, UWP, ARM) to keep a wide coverage for users.
+
+I'm a maintainer for vcpkg, and here is what the port script looks like. We try to keep the library maintained as close as possible to the original library.
+I am looking into improving the compression of a messaging system.
+
+Due to data concerns is there a way to train a dictionary while in use?
+
+I have looked through the manual and had a quick dig through the zdict.h and it appears not.  Has anyone attempted or done something like this?  
+
+What would be needed to implement this?  Is it unfeasible due to how the compression works? 
+In preparation for new dictionary search structure. I don't think I nee to refactor opt since there is only one place where dictionary searching happens. 
+Memory is allocated
+https://github.com/facebook/zstd/blob/6cf04c03443134f04c949707f46877a15d87bf79/doc/educational_decoder/harness.c#L36
+but at the end of function，never free it
+
+
+**Platform:**
+Windows 10
+Visual Studio 2010
+Intel Compiler 2013
+
+**Result:**
+Some streams blow-up on decompress
+
+**Cause:**
+Incorrect results leading to a blow-up are created by bitstream.h when doing an 02 optimized compile:
+
+```
+MEM_STATIC unsigned BIT_highbit32 (U32 val)
+{
+    assert(val != 0);
+    {
+#   if defined(_MSC_VER)   /* Visual */
+        unsigned long r=0;
+        _BitScanReverse ( &r, val );
+        return (unsigned) r;
+...
+}
+```
+
+_BitScanReverse returns success (!=0)  or failure (0).  The Microsoft definition is:
+
+```
+__success(return!=0)
+BOOLEAN
+_BitScanReverse (
+    __out DWORD *Index,
+    __in DWORD Mask
+    );
+
+```
+The Zstd code assumed that 'r' will be left at zero when the success if false.  However, I don't think the intrinsic is defined that way.  The 'r' value is likely undefined on failure.  Certainly, the Intel Compiler is making this assumption during its optimization at level O2 (O1 or below don't have the bug).
+
+This could be an Intel Compiler bug, but it is more likely a bug in the zstd code assuming that 'r' has a valid value on failure.
+
+This code stops giving the wrong value when changed to:
+
+```
+MEM_STATIC unsigned BIT_highbit32 (U32 val)
+{
+    assert(val != 0);
+    {
+#   if defined(_MSC_VER)   /* Visual */
+        unsigned long r;
+        return (_BitScanReverse ( &r, val )) ? (unsigned)r : 0;
+...
+}
+```
+
+The following Microsoft Intrinsics are used on zstd:
+
+_BitScanForward
+_BitScanReverse
+_BitScanForward64
+_BitScanReverse64
+
+All of these calls will potentially be affected by this bug, and all cased should be fixed.
+
+### Summary
+I would like to produce a diff file (quickly) of the changes from some binary file A to B (where B is a changed version of A). *(i managed to do this with zstd, but, see below: "What I tried" section)*.
+
+It could be said (from my naive viewpoint) that finding differences between files is somewhat the domain of dictionary-based compression programs. So why re-invent the wheel (and create yet another new software)?
+
+### Reasoning
+For starters, there currently seems to be a lack of stand-alone utilities that do this. All of them seem to be tied to something else. Be it zsync (unmaintained, as far as I see) being tied to urls and http, bsdiff taking nearly 30 seconds to generate the diff file (whereas zstd does this in under a second). Then bigger tools such as casync require all-or-nothing adoption of their way of doing things.
+
+Secondly, most(?) Linux distros provide package updates as a totally new files-to-be-downloaded. There are major bandwidth (and monetary) savings that could be had here if an efficient (and easy / stand alone) binary diff could be had.
+
+.. And again, since zstd needs to find repetitions and their positions in files, exposing functionality that supports using all of this to produce and use diff files (or at least stapling this functionality to public api) could be a good fit here.
+
+### What I tried
+I managed to use zstd to produce a very small diff file of changes from binary file A to B (with very fast creation time; less than 1sec) of around 1-2KB for both test cases ("simple" and "complex"). This small diff file was then given to zstd as the-file-to-be-decompressed and the original binary file (A) was given to zstd to use as dictionary. This procedure was able to reproduce the binary file B.
+
+<details><summary>[Click to show transcript of the commands used]</summary>
+preparing the file that's being used in this experiment:
+```fish
+$ cp /bin/qemu-system-x86_64 bin
+```
+
+splitting the binary file in two and showing that the when combined, the splits are equal to the original
+```fish
+$ split -n 2 -d bin bin.split-
+
+$ cat bin.split-00 bin.split-01 | diff -s bin /dev/stdin
+Files bin and /dev/stdin are identical
+```
+
+putting second half of the file in place
+```fish
+$ cat bin.split-01 bin.split-00 > binrev
+
+$ cat bin.split-01 > bintailhalf
+```
+
+listing current state of directory
+```fish
+$ lf
+16227960  ./bin
+8113980   ./bin.split-00
+8113980   ./bin.split-01
+16227960  ./binrev
+8113980   ./bintailhalf
+```
+
+test #1 ("simple"): compressing, decompressing and comparing (using the original binary file as dictionary)
+```fish
+# compressing
+$ zstd -D bin --long=31 --zstd=ldmHashRateLog=25,chainLog=28 -vv -f -3 binrev -o binrev.bindict.zstd
+*** zstd command line interface 64-bits v1.4.4, by Yann Collet ***
+Loading bin as dictionary 
+binrev               :  0.01%   (16227960 =>   1521 bytes, binrev.bindict.zstd) 
+binrev               : Completed in 0.16 sec  (cpu load : 98%)
+
+# decompressing
+$ zstd -D bin -vv -d -o binrev.bindict.zstd.decompressed binrev.bindict.zstd
+*** zstd command line interface 64-bits v1.4.4, by Yann Collet ***
+Loading bin as dictionary 
+binrev.bindict.zstd : 16227960 bytes
+
+# comparing to original
+$ diff -s binrev binrev.bindict.zstd.decompressed
+Files binrev and binrev.bindict.zstd.decompressed are identical
+```
+
+test #2 ("complex"): compressing, decompressing and comparing (using the original binary file as dictionary)
+```fish
+# compressing
+$ zstd -D bin --long=31 --zstd=ldmHashRateLog=25,chainLog=28 -vv -f -3 bintailhalf -o bintailhalf.bindict.zstd
+*** zstd command line interface 64-bits v1.4.4, by Yann Collet ***
+Loading bin as dictionary 
+bintailhalf          :  0.01%   (8113980 =>    742 bytes, bintailhalf.bindict.zstd) 
+bintailhalf          : Completed in 0.13 sec  (cpu load : 100%)
+
+# decompressing
+$ zstd -D bin -vv -d -o bintailhalf.bindict.zstd.decompressed bintailhalf.bindict.zstd
+*** zstd command line interface 64-bits v1.4.4, by Yann Collet ***
+Loading bin as dictionary 
+bintailhalf.bindict.zstd: 8113980 bytes
+
+# comparing to original
+$ diff -s bintailhalf bintailhalf.bindict.zstd.decompressed
+Files bintailhalf and bintailhalf.bindict.zstd.decompressed are identical
+```
+
+listing current state of directory
+```fish
+$ lf
+16227960  ./bin
+8113980   ./bin.split-00
+8113980   ./bin.split-01
+16227960  ./binrev
+8113980   ./bintailhalf
+742       ./bintailhalf.bindict.zstd
+8113980   ./bintailhalf.bindict.zstd.decompressed
+1521      ./binrev.bindict.zstd
+16227960  ./binrev.bindict.zstd.decompressed
+```
+</details>
+
+**Question #1:**
+As can be witnessed, I found that I can give to zstd *any* file to be used as a dictionary. zstd happily ingests it, even if the given dictionary file was *not* generated using the zstd's own --train argument.  
+.. Question: Is this allowed? Can I rely on zstd allowing me to do this in the future?
+
+**Question #2:**
+Would it be reasonable to expose this functionality via the API in some way, so that the "otherwise unnecessary parts" (whatever they are) could be avoided?
+
+**Question #3:**
+Currently I ran against a wall when trying this procedure on files bigger than 32MB. zstd refuses to use dictionaries bigger than this:<details><summary>..the error</summary>
+```fish
+*** zstd command line interface 64-bits v1.4.4, by Yann Collet ***
+Loading /usr/bin/docker as dictionary 
+zstd: error 32 : Dictionary file /usr/bin/docker is too large (> 32 MB) 
+```
+</details>
+Question: Is this a necessity? Could this check be removed from the source code without any ill effect? (thus allowing bigger binaries to be "diffed")
+This fixes the build for the current mesa master on my mulitlib Slackware system when `ld(1)` is given `/usr/lib/libzstd.so` instead of `/usr/lib64/libzstd.zo`.
+
+For an example pkgconfig file see `libpkgconf.pc.in` from the pkgconf project.
+
+https://github.com/pkgconf/pkgconf/blob/c862e030cf83447f679e4f49876f5298f0fc9691/libpkgconf.pc.in
+Hello,
+
+I tried to use zstd to compress log files which are continuously appended. 
+
+Execute:
+```bash
+#!/bin/bash
+while true
+do
+echo "line" >> /tmp/log.txt
+done
+```
+When I tried to compress in another session I were faced to this issue:
+```
+zstd --compress --stdout /tmp/log.txt > /tmp/log.txt.zst
+zstd: error 27 : Read error : Incomplete read : 66205544 / 66194080 B 
+zstd -t /tmp/log.txt.zst
+/tmp/log.txt.zst     : 0 MB...     /tmp/log.txt.zst : Decoding error (36) : Corrupted block detected 
+```
+
+Note gzip handle this:
+```
+gzip  --stdout /tmp/log.txt > /tmp/log.txt.gz 
+gzip: /tmp/log.txt: file size changed while zipping
+gzip -v -t /tmp/log.txt.gz
+/tmp/log.txt.gz:	 OK
+```
+
+Same for lz4:
+```
+lz4 --compress --stdout /tmp/log.txt > /tmp/log.txt.lz4
+lz4 -t /tmp/log.txt.lz4                                
+/tmp/log.txt.lz4     : decoded 71455396 bytes                    
+```
+
+
+
+Regards,
+Rather than do string comparisons to exclude `/dev/null` specifically, it makes more sense to me to avoid all special files (i.e.: devices, FIFOs, symlinks, sockets, and directories). This change does that, although it finds that in most places that chmod / chown are called from, there are already `UTIL_isRegularFile()` guards.
+
+So I guess this is my proposal to amend #1905 to fix #1904 better.

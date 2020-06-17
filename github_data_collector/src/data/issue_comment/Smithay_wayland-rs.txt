@@ -1,0 +1,30 @@
+This library is currently the bloatiest part of my application according to `cargo bloat --release`:
+
+`0.1%   2.8% 123.4KiB            wayland_sys wayland_sys::client::WaylandClient::open`
+
+`123.4 KiB` is a lot of data, this data is included when using `gfx-hal`. Is there any way to cut this down?
+By default cargo only uses the `-lwayland-client` flag (for the client) and assume that `ld` will find it. It is not the case with the nix package manager, where the library cannot be found without using `pkg_build`.
+
+One way to solve this problem is to use the [pkg_config](https://github.com/rust-lang/pkg-config-rs) crate in the `build.rs` script like this (for wayland-client):
+```
+extern crate pkg_config;
+...
+fn main() {
+   ...
+   pkg_config::Config::new().atleast_version("1").probe("wayland-client").unwrap();
+}
+```
+I've tried it and that allowed me to use the client crate on nixos, however I don't know how to write a proper fix that will interact well with all the other crates and their features (in particular `dlopen`, etc.).
+There is interest for an effort to properly port wayland to the BSD systems. In this direction, it would be nice to manage to effectively test wayland-rs on them (OpenBSD and FreeBSD at least).
+Currently, `EventQueue::prepare_read()` is partially mocked in the pure-rust backend of wayland-client. The proper behavior, matching the C library is that:
+
+- `prepare_read` increases an internal counter of threads getting ready to read
+- when `read_events()` is called, the threads are blocked on a fence until all threads either are currently blocked or have cancelled their read
+- at that point, one threads is unlocked and proceeds to the actual read, and then all other threads are released with "nothing to read yet" return value
+
+Right now, `read_events` just acquires an exclusive lock on the socket, and reads from it. meaning if several threads try to read at the same time, 1 will read, and then the other will also try to read (the syscall will be sent and processed) to discover that there is nothing to read.
+
+This is not a safety issue, but a performance one. Though it should likely only be an issue in applications trying to read events from different threads concurrently and are quite performance sensitive wrt to that.
+There is no hard dependency on the `libwayland-cursor.so` system library, and we can re-implement this in rust, the main blocker is having a tool for finding/parsing/loading the cursor system theme files.
+If  the compositor destroys a global at the same time as a client tries to bind it, we can end up with a situation where the client is killed for trying to bind a non-existing global because its request just arrived a little late. There should be some grace period after the destruction of a global.
+The C libs do it. I'm not 100% clear about the reasons, but I think it should help with races and re-using leftover sockets from a dead server that did not properly cleanup.

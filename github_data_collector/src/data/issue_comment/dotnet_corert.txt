@@ -1,0 +1,123 @@
+Good morning! Sometimes, such an error occurs when publishing (dotnet publish -c Release -r win-x64). They in no way treated, but disappears by itself after a while. Prompt, what to see and how to fix?
+Microsoft.DotNet.ILCompiler package version: 1.0.0-alpha-28327-01, but I tried on 1.0.0-alpha-28510-01
+
+Generating compatible native code. To optimize for size or speed, visit https://aka.ms/OptimizeCoreRT
+16:06:21 EXEC : warning : RD.XML processing will change before release (https://github.com/dotnet/corert/issues/5001) [D:\Jenkins\workspace\Project.csproj]
+16:06:21 EXEC : error : External component has thrown an exception. [D:\Jenkins\workspace\Project.csproj]
+16:06:21   System.Runtime.InteropServices.SEHException (0x80004005): External component has thrown an exception.
+16:06:21      at ILCompiler.DependencyAnalysis.ObjectWriter.FinishObjWriter(IntPtr objWriter)
+16:06:21      at ILCompiler.DependencyAnalysis.ObjectWriter.EmitObject(String objectFilePath, IEnumerable`1 nodes, NodeFactory factory, IObjectDumper dumper)
+16:06:21      at ILCompiler.Compilation.ILCompiler.ICompilation.Compile(String outputFile, ObjectDumper dumper)
+16:06:22      at ILCompiler.Program.Run(String[] args)
+16:06:22      at ILCompiler.Program.Main(String[] args)
+16:06:22 C:\Users\rpt-virtual\.nuget\packages\microsoft.dotnet.ilcompiler\1.0.0-alpha-28327-01\build\Microsoft.NETCore.Native.targets(226,5): error MSB3073: The command ""C:\Users\user\.nuget\packages\runtime.win-x64.microsoft.dotnet.ilcompiler\1.0.0-alpha-28327-01\tools\ilc" @"obj\Release\netcoreapp2.2\win-x64\native\Project.ilc.rsp"" exited with code 1. [D:\Jenkins\workspace\Project.csproj]
+So far CoreRT only had to deal with platforms that have straightforward mangling for `extern "C"` symbols (which is what we shoot for in CoreRT).
+
+Windows x86 stdcall calling convention does the weird thing where `@XXX` is appended to symbol names (where XXX is the number of bytes of arguments to the method).
+
+This pull request implements enough of what's needed to get p/invokes up and running.
+
+I'm marking it as draft because we probably want to make a decision on how to mangle our symbol definitions too (right now this only does something for p/invoke references).
+The Uno Platform makes use of https://github.com/mono/mono/blob/59a1eade7ce4fb79c56a47d043151fbdd5363b1b/sdks/wasm/src/driver.c#L323 for JS interop.  It does this here: https://github.com/unoplatform/uno/blob/1dede9e628108c7c7b71d6aee4cd759c0f9bf9d9/src/Uno.Foundation/Runtime.wasm.cs#L21.  
+
+How would that be best handled so that CoreRT could be a drop in replacement for mono?  Could it intercept the call to `WebAssembly.Runtime.InvokeJS` in https://github.com/dotnet/corert/blob/f52a8e504b0485dff9e4737a6fb9535d5eccb77d/src/ILCompiler.WebAssembly/src/CodeGen/ILToWebAssemblyImporter.cs#L1575 and replace with a call to a similar method perhaps in https://github.com/yowl/corert/blob/uno-js-llvm/src/CoreRT.WebAssembly.Interop/InternalCalls.cs.  Not asking how to actually get into JS, but what would be the right way to start.
+
+Thanks.
+Link.exe is not available as a standalone tool and gets bundled with the Windows SDK/DDK that is a huge download.
+
+Investigate whether we can bundle [LLD](https://lld.llvm.org/).
+
+- [ ] make sure it can embed NatVis files when targeting Windows
+- [ ] make sure it can generate all the debug records we emit
+- [ ] make sure it supports SourceLink (I have a WIP SourceLink support in a branch that I can never get to - https://github.com/MichalStrehovsky/corert/commit/84e53e3eec9ff24e666eb55792de95eb4b4e6585)
+- [ ] make sure it can generate import libraries out of DEF files a la `link.exe /lib /def:foo.def /machine:x64 /out:foo.lib` (this is our way out of the "what kind of import libraries to specify" hell + gets rid of the Windows SDK dependency)
+
+This is also a stepping stone to enable cross-compilation (e.g. target Windows from Linux and Linux from Windows).
+First commit is xcopy from crossgen2, the rest is adjustments. I'm going to squash and merge, this is just for posterity.
+
+I'm planning to sync things back to the runtime repo because we're starting to accumulate changes on this side.
+This fixes a few issues encountered when compiling the Uno platform with regards to shared generics.
+
+- Handling of generic structs when passing to functions and when returned.
+- Getting the generic context in finally blocks
+- Creation of incorrect type for some generic structures.
+
+Fixes #7935 
+As an example, take
+https://github.com/dotnet/corert/blob/88d75715f4c84c383365a33734d6f0cffe837061/src/System.Private.CoreLib/shared/System/Threading/WaitHandle.cs#L295
+
+The second call parameter `safeWaitHandles` is an implicit op to a `Span<SafeWaitHandle?>` from its declaration
+```
+SafeWaitHandle?[]? safeWaitHandles = RentSafeWaitHandleArray(waitHandles.Length);
+```
+ This implicit method  is a shared generic method so the call in LLVM looks like
+
+```
+%45 = call %"[S.P.CoreLib]System.Span`1<System.__Canon>" @"S_P_CoreLib_System_Span_1<System___Canon>__op_Implicit"(i8* %43, i8* %CastPtr163)
+```
+Where the return is the Canon type, `[S.P.CoreLib]System.Span`1<System.__Canon>`
+
+This is not a valid type to pass into `ObtainSafeWaitHandles` as in LLVM that is defined on the concrete type
+
+```
+define void @S_P_CoreLib_System_Threading_WaitHandle__ObtainSafeWaitHandles(i8*, %"[S.P.CoreLib]System.ReadOnlySpan`1<System.Threading.WaitHandle>", %"[S.P.CoreLib]System.Span`1<Microsoft.Win32.SafeHandles.SafeWaitHandle>", %"[S.P.CoreLib]System.Span`1<native int>")
+```
+
+What would be the right way to solve this?  Should it always convert types to their canonical versions to the extent that `System.Span`1<Microsoft.Win32.SafeHandles.SafeWaitHandle>` is invalid in the LLVM?  
+This test fails for Wasm.  Have tried the suggestion at https://github.com/dotnet/corert/pull/7897/files#r362161168, but hits the assert at https://github.com/dotnet/corert/blob/7cb8f8c93161ac5e365c6feef1379fe16188e191/src/ILCompiler.Compiler/src/Compiler/DependencyAnalysis/ReadyToRunGenericHelperNode.cs#L48 with target `{[S.P.CoreLib]System.Collections.Generic.ICollection`1<T_System.__Canon>}`
+
+Stack
+
+```
+ 	System.Private.CoreLib.dll!System.Diagnostics.Debug.Assert(bool condition, string message, string detailMessage)	Unknown
+>	ILCompiler.Compiler.dll!ILCompiler.DependencyAnalysis.ReadyToRunGenericHelperNode.GetLookupSignature(ILCompiler.DependencyAnalysis.NodeFactory factory, ILCompiler.DependencyAnalysis.ReadyToRunHelperId id, object target) Line 48	C#
+ 	ILCompiler.Compiler.dll!ILCompiler.DependencyAnalysis.ReadyToRunGenericHelperNode.ReadyToRunGenericHelperNode(ILCompiler.DependencyAnalysis.NodeFactory factory, ILCompiler.DependencyAnalysis.ReadyToRunHelperId helperId, object target, Internal.TypeSystem.TypeSystemEntity dictionaryOwner) Line 34	C#
+ 	ILCompiler.Compiler.dll!ILCompiler.DependencyAnalysis.ReadyToRunGenericLookupFromTypeNode.ReadyToRunGenericLookupFromTypeNode(ILCompiler.DependencyAnalysis.NodeFactory factory, ILCompiler.DependencyAnalysis.ReadyToRunHelperId helperId, object target, Internal.TypeSystem.TypeSystemEntity dictionaryOwner) Line 296	C#
+ 	ILCompiler.WebAssembly.dll!ILCompiler.DependencyAnalysis.WebAssemblyReadyToRunGenericLookupFromTypeNode.WebAssemblyReadyToRunGenericLookupFromTypeNode(ILCompiler.DependencyAnalysis.NodeFactory factory, ILCompiler.DependencyAnalysis.ReadyToRunHelperId helperId, object target, Internal.TypeSystem.TypeSystemEntity dictionaryOwner) Line 12	C#
+ 	ILCompiler.WebAssembly.dll!ILCompiler.DependencyAnalysis.WebAssemblyCodegenNodeFactory.CreateGenericLookupFromTypeNode(ILCompiler.DependencyAnalysis.NodeFactory.ReadyToRunGenericHelperKey helperKey) Line 88	C#
+ 	System.Collections.Concurrent.dll!System.Collections.Concurrent.ConcurrentDictionary<ILCompiler.DependencyAnalysis.NodeFactory.ReadyToRunGenericHelperKey, ILCompiler.DependencyAnalysis.ISymbolNode>.GetOrAdd(ILCompiler.DependencyAnalysis.NodeFactory.ReadyToRunGenericHelperKey key, System.Func<ILCompiler.DependencyAnalysis.NodeFactory.ReadyToRunGenericHelperKey, ILCompiler.DependencyAnalysis.ISymbolNode> valueFactory)	Unknown
+ 	ILCompiler.Compiler.dll!ILCompiler.DependencyAnalysis.NodeFactory.NodeCache<ILCompiler.DependencyAnalysis.NodeFactory.ReadyToRunGenericHelperKey, ILCompiler.DependencyAnalysis.ISymbolNode>.GetOrAdd(ILCompiler.DependencyAnalysis.NodeFactory.ReadyToRunGenericHelperKey key) Line 150	C#
+ 	ILCompiler.Compiler.dll!ILCompiler.DependencyAnalysis.NodeFactory.ReadyToRunHelperFromTypeLookup(ILCompiler.DependencyAnalysis.ReadyToRunHelperId id, object target, Internal.TypeSystem.TypeSystemEntity dictionaryOwner) Line 910	C#
+ 	ILCompiler.WebAssembly.dll!Internal.IL.ILImporter.GetGenericLookupHelperAndAddReference(ILCompiler.DependencyAnalysis.ReadyToRunHelperId helperId, object helperArg, out LLVMSharp.LLVMValueRef helper, System.Collections.Generic.IEnumerable<LLVMSharp.LLVMTypeRef> additionalArgs) Line 3981	C#
+ 	ILCompiler.WebAssembly.dll!Internal.IL.ILImporter.CallGenericHelper(ILCompiler.DependencyAnalysis.ReadyToRunHelperId helperId, object helperArg) Line 1538	C#
+ 	ILCompiler.WebAssembly.dll!Internal.IL.ILImporter.ImportCasting(Internal.IL.ILOpcode opcode, int token) Line 1516	C#
+ 	ILCompiler.WebAssembly.dll!Internal.IL.ILImporter.ImportBasicBlock(Internal.IL.ILImporter.BasicBlock basicBlock) Line 597	C#
+ 	ILCompiler.WebAssembly.dll!Internal.IL.ILImporter.ImportBasicBlocks() Line 304	C#
+ 	ILCompiler.WebAssembly.dll!Internal.IL.ILImporter.Import() Line 167	C#
+ 	ILCompiler.WebAssembly.dll!Internal.IL.ILImporter.CompileMethod(ILCompiler.WebAssemblyCodegenCompilation compilation, ILCompiler.DependencyAnalysis.WebAssemblyMethodCodeNode methodCodeNodeNeedingCode) Line 85	C#
+ 	ILCompiler.WebAssembly.dll!ILCompiler.WebAssemblyCodegenCompilation.ComputeDependencyNodeDependencies(System.Collections.Generic.List<ILCompiler.DependencyAnalysisFramework.DependencyNodeCore<ILCompiler.DependencyAnalysis.NodeFactory>> obj) Line 74	C#
+ 	ILCompiler.DependencyAnalysisFramework.dll!ILCompiler.DependencyAnalysisFramework.DependencyAnalyzer<ILCompiler.DependencyAnalysisFramework.NoLogStrategy<ILCompiler.DependencyAnalysis.NodeFactory>, ILCompiler.DependencyAnalysis.NodeFactory>.ComputeDependencies(System.Collections.Generic.List<ILCompiler.DependencyAnalysisFramework.DependencyNodeCore<ILCompiler.DependencyAnalysis.NodeFactory>> deferredStaticDependencies) Line 139	C#
+```
+Add supports for passing the generic context to finally funclets so that `foreach` statements over e.g. `List<>` can be compiled.  `foreach` will add a finally to call dispose on the enumerator which if the method is generic and needs the context from a hidden parameter was previously not compiling.
+
+Added test for this case.
+
+WIP as depends on #7248 
+source code works fine on windows.
+osx encounter error:
+
+> EXEC : error : The data area passed to a system call is too small. [/Users/xxxxx.csproj]
+   (Exception from HRESULT: 0x8007007A)
+  System.Runtime.InteropServices.COMException (0x8007007A): The data area passed to a system call is too small.
+   (Exception from HRESULT: 0x8007007A)
+     at System.StubHelpers.MngdNativeArrayMarshaler.ConvertContentsToNative(IntPtr pMarshalState, Object& pManagedHome, IntPtr pNativeHome)
+     at ILCompiler.DependencyAnalysis.ObjectWriter.GetEnumTypeIndex(IntPtr objWriter, EnumTypeDescriptor enumTypeDescriptor, EnumRecordTypeDescriptor[] typeRecords)
+     at ILCompiler.DependencyAnalysis.ObjectWriter.GetEnumTypeIndex(EnumTypeDescriptor enumTypeDescriptor, EnumRecordTypeDescriptor[] typeRecords)
+     at ILCompiler.UserDefinedTypeDescriptor.GetEnumTypeIndex(TypeDesc type)
+     at ILCompiler.UserDefinedTypeDescriptor.GetVariableTypeIndex(TypeDesc type, Boolean needsCompleteIndex)
+     at ILCompiler.UserDefinedTypeDescriptor.GetClassTypeIndex(TypeDesc type, Boolean needsCompleteType)
+     at ILCompiler.UserDefinedTypeDescriptor.GetTypeIndex(TypeDesc type, Boolean needsCompleteType)
+     at ILCompiler.UserDefinedTypeDescriptor.GetVariableTypeIndex(TypeDesc type, Boolean needsCompleteIndex)
+     at ILCompiler.UserDefinedTypeDescriptor.GetVariableTypeIndex(TypeDesc type)
+     at ILCompiler.DependencyAnalysis.ObjectWriter.EmitDebugVar(DebugVarInfo debugVar)
+     at ILCompiler.DependencyAnalysis.ObjectWriter.EmitDebugVarInfo(ObjectNode node)
+     at ILCompiler.DependencyAnalysis.ObjectWriter.EmitObject(String objectFilePath, IEnumerable`1 nodes, NodeFactory factory, IObjectDumper dumper)
+     at ILCompiler.RyuJitCompilation.CompileInternal(String outputFile, ObjectDumper dumper)
+     at ILCompiler.Compilation.ILCompiler.ICompilation.Compile(String outputFile, ObjectDumper dumper)
+     at ILCompiler.Program.Run(String[] args)
+     at ILCompiler.Program.Main(String[] args)
+/Users/xxxx/.nuget/packages/microsoft.dotnet.ilcompiler/1.0.0-alpha-28426-01/b
+uild/Microsoft.NETCore.Native.targets(226,5): error MSB3073: The command ""/User
+s/xxxx/.nuget/packages/runtime.osx-x64.microsoft.dotnet.ilcompiler/1.0.0-alpha
+-28426-01/tools/ilc" @"obj/release/netcoreapp3.1/osx-x64/native/xxxxxxxx.ilc.rsp
+"" exited with code 1. [/Users/xxxxxxxxxxxx.csproj]

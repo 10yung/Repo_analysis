@@ -1,0 +1,280 @@
+Hi,
+I m looking for options which allows only recent logs in log file or if i can limit the log file size,
+Is anything that can be helpful for it?
+Thanks
+There are various issues and no commits for over 2 years. I'm still using god for many projects in production, but I am wondering what the state of god is? Will there be any future releases? @mojombo @eric 
+Maybe I'm doing things wrong, but I have defined some custom God notifier plugins, and I need to load those dependencies before starting god for the first time.
+
+But then, when I try to release a new app version (I'm deploying with Capistrano), my flow is to update God config using `god load`. Problem, this causes crashes when I require modules that extend `ActiveSupport::Concern` and have `included` blocks with the following error
+
+> Cannot define multiple 'included' blocks for a Concern
+
+Here is a sample of my God file (Note that `<%= %>` are compiled before execution)
+
+```
+require 'active_support/all'
+require 'slack-notifier'
+require '<%= release_path.join("lib/service_connector") %>'
+require '<%= release_path.join("lib/slack_connector") %>'
+require '<%= release_path.join("lib/god/contacts/slack_notifier") %>'
+
+God.contact(:email) do |c|
+
+God.contact(:slack_notifier) do |c|
+  c.name = 'priority-errors'
+  c.group = 'developers'
+  c.webhook = '<%= Capistrano::SecretsYml.local_secrets_yml("deploy")&.dig("slack") %>'
+end
+```
+
+My restart task with Capistrano
+
+```
+desc "Restart god's child processes"
+  task :restart do
+    on roles(fetch(:god_roles)) do
+      within release_path do
+        with RAILS_ENV: fetch(:rails_env) do
+          if god_is_running?
+            execute :bundle, 'exec god load config/god/god.rb'
+            execute :bundle, 'exec god restart'
+          else
+            start_god
+          end
+        end
+      end
+    end
+  end
+```
+The `execute :bundle, 'exec god load config/god/god.rb'` command 
+
+By the way, [my "God"](https://github.com/JordanMicahBennett/God) is an Edward Witten inspired, [Supersymmetric learning algorithm](https://github.com/JordanMicahBennett/Supersymmetric-artificial-neural-network).
+
+1. Gods ought to be learning algorithms, not basic code as you currently have in your repo.
+2. Notably I am an atheist, so I observe that Gods as defined [within the realm of artificial general intelligence](https://m.youtube.com/watch?feature=youtu.be&t=849&v=8nt3edWLgIg) ought ***not*** to be worshipped and [ought to be atheism compatible](https://www.researchgate.net/publication/316662636_A_scientific_redefinition_of_God_by_an_atheist)!!
+(I'm really a devops/sysadmin, so God isn't really my area of expertise, so apologies if I'm asking stupid questions here)
+
+We've just had a situation where a missing dependency means that our Resque scheduler won't start on some machines (it throws a terminal exception on startup). However, `god status` always says `resque-scheduler: up` (and so our monitoring hasn't picked this up, and we didn't know there was a problem). It seems we attempt to restart the scheduler every 5 seconds, I won't paste the whole stack trace, but the scheduler says this on startup:
+
+    rake aborted!
+    cannot load such file -- tzinfo/indexes/timezones
+    ...
+    Tasks: TOP => resque:scheduler
+    (See full trace by running task with --trace)
+
+...which I assume means the process would have returned a non-zero exit code (if that matters).
+
+Our god config for the scheduler looks like this:
+
+     God.watch do |w|
+      w.dir          = RAILS_ROOT
+      w.name         = "resque-scheduler"
+      w.stop_signal  = 'QUIT'
+      w.env          = {"RAILS_ENV"=>RAILS_ENV}
+      w.interval     = 5.seconds
+      w.start        = "rake resque:scheduler"
+      w.err_log      = "#{RAILS_ROOT}/log/resque-scheduler_error.log"
+      w.log          = "#{RAILS_ROOT}/log/resque-scheduler.log"
+      w.uid          = DEFAULT_RUNAS_USER
+      w.gid          = DEFAULT_RUNAS_GROUP
+
+      w.transition(:up, :restart) do |on|
+        on.condition(:memory_usage) do |c|
+          c.above = 350.megabytes
+          c.times = 2
+        end
+      end
+
+      w.transition(:init, { true => :up, false => :start }) do |on|
+        on.condition(:process_running) do |c|
+          c.running = true
+        end
+      end
+
+      # determine when process has finished starting
+      w.transition([:start, :restart], :up) do |on|
+        on.condition(:process_running) do |c|
+          c.running = true
+          c.interval = 5.seconds
+        end
+
+        # failsafe
+        on.condition(:tries) do |c|
+          c.times = 5
+          c.transition = :start
+          c.interval = 5.seconds
+        end
+      end
+
+      # start if process is not running
+      w.transition(:up, :start) do |on|
+        on.condition(:process_running) do |c|
+          c.running = false
+        end
+      end
+    end
+
+What strategies can we employ to make `god status` say something other than "up" when this sort of thing happens? Obviously, if the process stops we want to restart it as quickly as possible, but if it's just continuously restarting, we'd like to catch that situation in some way.
+
+Versions in use:
+
+    $ god --version
+    Version 0.13.7
+    $ ruby --version
+    ruby 2.1.10p492 (2016-04-01 revision 54464) [x86_64-linux]
+Fixes #250, where god continues to monitor and resurrect a process after executing `god stop <task name>`. This particular issue occurs when using `keepalive`, a custom stop command using a `QUIT` signal, and a process that does not terminate within the `stop_timeout` period.
+
+This commit forces a return after the execution of `ensure_stop` and prevents god from writing a new PID - the PID of a process spawned to run the custom stop command - and continuing to track the process which was previously killed.
+God resurrects a process after `god stop <task name>` is run if the god config for that process uses `keepalive`, a custom stop command using `-QUIT`, and does not terminate within the `stop_timeout` period.
+
+### Reproduction
+
+#### Setup
+
+Create a simple script, `fodder.rb`, that just logs messages:
+```fodder.rb
+require 'logger'
+
+@logger = Logger.new "/home/pair/fodder/output.log"
+@logger.info "Start feeding!"
+@feeding_time = true
+
+def quit_feeding
+  @feeding_time = false
+end
+
+Signal.trap("QUIT") { quit_feeding }
+
+while @feeding_time do
+  @logger.info "More fodder!"
+  sleep 1
+end
+
+@logger.info "Starting graceful quit..."
+sleep_time = 12
+@logger.info "Sleeping for #{sleep_time}s..."
+sleep sleep_time
+@logger.info "We're finally quitting, BYE!"
+```
+
+Create the following simple god config, `god-fodder.rb`, which uses `keepalive`, a custom stop command, and an interval:
+```god-fodder.rb
+God.watch do |w|
+  PID_PATH = "/var/run/god/fodder.pid"
+
+  w.name = "fodder"
+  w.start = "ruby /home/pair/fodder/fodder.rb"
+  w.stop = "kill -QUIT `cat #{PID_PATH}`"
+  w.keepalive
+
+  w.interval = 1.second
+end
+```
+
+#### Execution
+
+Start god with the `god-fodder` config, then after a few seconds execute god's stop command:
+```
+$ god -c god-fodder.rb
+$ god stop fodder
+```
+
+#### Output
+
+The output from the `fodder` script:
+```output.log
+I, [2017-10-24T15:10:29.797266 #30297]  INFO -- : Start feeding!
+I, [2017-10-24T15:10:29.797423 #30297]  INFO -- : More fodder!
+I, [2017-10-24T15:10:30.797660 #30297]  INFO -- : More fodder!
+I, [2017-10-24T15:10:31.798036 #30297]  INFO -- : More fodder!
+I, [2017-10-24T15:10:32.798408 #30297]  INFO -- : More fodder!
+I, [2017-10-24T15:10:33.798786 #30297]  INFO -- : More fodder!
+I, [2017-10-24T15:10:34.799169 #30297]  INFO -- : More fodder!
+I, [2017-10-24T15:10:35.799517 #30297]  INFO -- : More fodder!
+I, [2017-10-24T15:10:36.799891 #30297]  INFO -- : More fodder!
+I, [2017-10-24T15:10:37.800278 #30297]  INFO -- : More fodder!
+I, [2017-10-24T15:10:38.800637 #30297]  INFO -- : More fodder!
+I, [2017-10-24T15:10:39.801020 #30297]  INFO -- : More fodder!
+I, [2017-10-24T15:10:40.801379 #30297]  INFO -- : Starting graceful quit...
+I, [2017-10-24T15:10:40.801521 #30297]  INFO -- : Sleeping for 12s...
+I, [2017-10-24T15:10:50.689377 #30352]  INFO -- : Start feeding!
+I, [2017-10-24T15:10:50.689526 #30352]  INFO -- : More fodder!
+I, [2017-10-24T15:10:51.689765 #30352]  INFO -- : More fodder!
+I, [2017-10-24T15:10:52.690183 #30352]  INFO -- : More fodder!
+I, [2017-10-24T15:10:53.690517 #30352]  INFO -- : More fodder!
+I, [2017-10-24T15:10:54.690874 #30352]  INFO -- : More fodder!
+I, [2017-10-24T15:10:55.691255 #30352]  INFO -- : More fodder!
+I, [2017-10-24T15:10:56.691608 #30352]  INFO -- : More fodder!
+```
+
+Output from god's log:
+```god.log
+Oct 24 15:10:29 god[30255]: Syslog enabled.
+Oct 24 15:10:29 god[30257]: Loading /etc/god/god.conf.rb
+Oct 24 15:10:29 god[30257]: Using pid file directory: /var/run/god
+Oct 24 15:10:29 god[30257]: Started on drbunix:///tmp/god.17165.sock
+Oct 24 15:10:29 god[30257]: fodder move 'unmonitored' to 'init'
+Oct 24 15:10:29 god[30257]: fodder moved 'unmonitored' to 'init'
+Oct 24 15:10:29 god[30257]: fodder [trigger] process is not running (ProcessRunning)
+Oct 24 15:10:29 god[30257]: fodder move 'init' to 'start'
+Oct 24 15:10:29 god[30257]: fodder start: ruby /home/pair/fodder/fodder.rb
+Oct 24 15:10:29 god[30257]: fodder moved 'init' to 'start'
+Oct 24 15:10:29 god[30257]: fodder [trigger] process is running (ProcessRunning)
+Oct 24 15:10:29 god[30257]: fodder move 'start' to 'up'
+Oct 24 15:10:29 god[30257]: fodder registered 'proc_exit' event for pid 30297
+Oct 24 15:10:29 god[30257]: fodder moved 'start' to 'up'
+Oct 24 15:10:40 god[30257]: fodder stop: kill -QUIT `cat /var/run/god/fodder.pid`
+Oct 24 15:10:40 god[30257]: fodder ensuring stop...
+Oct 24 15:10:50 god[30257]: fodder still alive after 10s; sent SIGKILL
+Oct 24 15:10:50 god[30257]: fodder move 'up' to 'unmonitored'
+Oct 24 15:10:50 god[30257]: fodder deregistered 'proc_exit' event for pid 30322
+Oct 24 15:10:50 god[30257]: fodder moved 'up' to 'unmonitored'
+Oct 24 15:10:50 god[30257]: fodder [trigger] process 30297 exited {:pid=>30297, :exit_code=>9, :exit_signal=>17, :thread_group_id=>30297} (ProcessExits)
+Oct 24 15:10:50 god[30257]: fodder move 'unmonitored' to 'start'
+Oct 24 15:10:50 god[30257]: fodder start: ruby /home/pair/fodder/fodder.rb
+Oct 24 15:10:50 god[30257]: fodder moved 'unmonitored' to 'start'
+Oct 24 15:10:50 god[30257]: fodder [trigger] process is running (ProcessRunning)
+Oct 24 15:10:50 god[30257]: fodder move 'start' to 'up'
+Oct 24 15:10:50 god[30257]: fodder registered 'proc_exit' event for pid 30352
+Oct 24 15:10:50 god[30257]: fodder moved 'start' to 'up' 
+```
+
+### Investigation
+
+During initialization, god creates a new thread for an `EventHandler` loop and then registers the `:process_exits` condition used in the `keepalive` method with the `EventHandler`.
+
+When a command is sent through the CLI (e.g.` god stop fodder`), a new thread is created. This new thread pushes a `:stop` event, followed by an `:unmonitored` event onto the god event driver queue.
+
+The `:stop` event will be processed on the original monitoring thread (not the `EventHandler` loop thread or the CLI command thread), and if the `:stop_timeout` time period is reached **and** the original process is still running, a KILL signal will be sent through this original thread. [This particular stop logic](https://github.com/mojombo/god/blob/92c06aa5f6293cf26498a306e9bb7ac856d7dca0/lib/god/process.rb#L269-L289) never tries to detach or stop tracking the PID, instead, god continues to track our PID process.
+
+At this point the KILL signal triggers the `:process_exits` condition on the `EventHandler` thread, which then pushes an event responsible for starting the process back up onto the event queue. The original monitoring thread _immediately_ tries to handle that trigger event.
+
+_IF_ a `stop_grace` is added to the god config, the pause in code execution, via `sleep` in [lib/god/watch.rb](https://github.com/mojombo/god/blob/92c06aa5f6293cf26498a306e9bb7ac856d7dca0/lib/god/watch.rb#L273) after executing the action actually allows one of the thread loops to clean up after itself and clear out our events queue containing the most recently triggered `:process_exits` event. Once that thread cleans up, there's no action for the original monitoring thread to take since our app is registered as `:unmonitored` at this point. This particular behavior skirts the problem and allows god to move the process to unmonitored, but it does not fix the underlying issue.
+Our application is a JRuby application, and something about the way it is configured causes this to occur.   I can install god  in a Ruby 2.3.3 / Rails 4.2 app without issue.   Jruby 9.05 and 9.01 / Rails 3.2 however, gives me the "C extensions" error on OSX and CentOS.   
+
+My objective is to automatically start Resque servers in production, and I don't like the other options, so I'm hoping someone can suggest a workaround or configuration option.  
+
+Here's the output.  It deletes the ./siteconf.*rb on each run and the filename is unique as well:
+
+```
+Mongo:plus jeff$ gem install god
+Building native extensions.  This could take a while...
+ERROR:  Error installing god:
+	ERROR: Failed to build gem native extension.
+
+    current directory: /Users/jeff/.rvm/gems/jruby-9.0.5.0@rails3.2god/gems/god-0.13.7/ext/god
+/Users/jeff/.rvm/rubies/jruby-9.0.5.0/bin/jruby -r ./siteconf20170905-61042-zgo8dn.rb extconf.rb
+NotImplementedError: C extensions are not supported
+    <top> at /Users/jeff/.rvm/rubies/jruby-9.0.5.0/lib/ruby/stdlib/mkmf.rb:1
+  require at org/jruby/RubyKernel.java:937
+   (root) at /Users/jeff/.rvm/rubies/jruby-9.0.5.0/lib/ruby/stdlib/rubygems/core_ext/kernel_require.rb:1
+    <top> at extconf.rb:1
+
+extconf failed, exit code 1
+
+Gem files will remain installed in /Users/jeff/.rvm/gems/jruby-9.0.5.0@rails3.2god/gems/god-0.13.7 for inspection.
+Results logged to /Users/jeff/.rvm/gems/jruby-9.0.5.0@rails3.2god/extensions/universal-java-1.8/2.2.0/god-0.13.7/gem_make.out
+
+```
+
+Some transition diagram issues I'm facing. 

@@ -1,0 +1,154 @@
+After successfull build of release target (Ubuntu), while running  
+```
+$ RUST_BACKTRACE=1 ./target/release/toshi
+```
+
+I keep on getting:
+```
+ INFO  toshi > Settings { host: "127.0.0.1", port: 8080, path: "data/", place_addr: "0.0.0.0:8082", log_level: "info", writer_memory: 200000000, json_parsing_threads: 4, auto_commit_duration: 10, bulk_buffer_size: 10000, merge_policy: ConfigMergePolicy { kind: "log", min_merge_size: Some(8), min_layer_size: Some(10000), level_log_size: Some(0.75) }, consul_addr: "127.0.0.1:8500", cluster_name: "kitsune", enable_clustering: true, master: true, nodes: ["127.0.0.1:8081", "127.0.0.1:8082"] }
+
+  ______         __   _   ____                 __
+ /_  __/__  ___ / /  (_) / __/__ ___ _________/ /
+  / / / _ \(_-</ _ \/ / _\ \/ -_) _ `/ __/ __/ _ \
+ /_/  \___/___/_//_/_/ /___/\__/\_,_/_/  \__/_//_/
+ Such Relevance, Much Index, Many Search, Wow
+ 
+ ERROR toshi > Error: Failed registering Node: Inner(Inner(Error { kind: Connect, cause: Os { code: 111, kind: ConnectionRefused, message: "Connection refused" } }))
+thread 'main' panicked at 'internal error: entered unreachable code: Shutdown signal channel should not error, This is a bug.', src/bin/toshi.rs:68:22
+stack backtrace:
+   0: std::sys::unix::backtrace::tracing::imp::unwind_backtrace
+             at src/libstd/sys/unix/backtrace/tracing/gcc_s.rs:49
+   1: std::panicking::default_hook::{{closure}}
+             at src/libstd/sys_common/backtrace.rs:71
+             at src/libstd/sys_common/backtrace.rs:59
+             at src/libstd/panicking.rs:211
+   2: std::panicking::rust_panic_with_hook
+             at src/libstd/panicking.rs:227
+             at src/libstd/panicking.rs:491
+   3: std::panicking::continue_panic_fmt
+             at src/libstd/panicking.rs:398
+   4: std::panicking::begin_panic_fmt
+             at src/libstd/panicking.rs:353
+   5: toshi::main::{{closure}}
+   6: <futures::task_impl::Spawn<T>>::enter::{{closure}}
+   7: toshi::main
+   8: std::rt::lang_start::{{closure}}
+   9: main
+  10: __libc_start_main
+  11: _start
+```
+
+netstat shows me that 8080 isn't in use by another process, and running command with sudo doesn't change anything. Message clearly state that this is a bug. So... is there a solution or not?
+## What happened
+
+Accidentally omitting document content returns `500 Internal Server Error` with a body of `{"message":"Internal error","uri":"/new_index"}`
+
+## What was expected
+
+Emitting any kind of helpful message would be helpful. Also, in my experience, when the client receives a 500 response, there is usually **something** informative on the server-side. But in this case, the server emits the same message that the client receives, which isn't helpful.
+
+This bug is actually just the worst offender of a whole class of bugs where if something doesn't go Toshi's way, it just gives back a raspberry, but I'd say getting a 500 for an empty document is pretty far up the list for me
+
+## How to reproduce
+
+Assuming you create an index based on the `cargo test` schema, then send in an indexing request of the form
+
+```console
+$ echo '{}' | curl ... -X PUT -d @- 127.0.0.1:9200/new_index
+```
+
+I totally get that refactoring to be agnostic to discovery mechanisms would be a significant time investment. On that front, I'd be happy to contribute the kubernetes part if you decide to go that route.
+
+With that said, it's fairly straightforward to use the kubernetes API. An HTTP request is made to `https://kubernetes.default.svc.cluster.local/api/v1/namespaces/<namespace>/endpoints?labelSelector=<name-defined-in-k8s-config>`. The response is something like this, assuming serde for serialization
+
+```rust
+#[derive(Serialize, Deserialize, Debug)]
+struct Addresses {
+    ip: String,
+    #[serde(rename = "nodeName")]
+    node_name: String,
+    #[serde(rename = "targetRef")]
+    target_ref: TargetRef,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Items {
+    metadata: Metadata1,
+    subsets: Vec<Subsets>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Labels {
+    app: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Metadata {
+    #[serde(rename = "selfLink")]
+    self_link: String,
+    #[serde(rename = "resourceVersion")]
+    resource_version: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Metadata1 {
+    name: String,
+    namespace: String,
+    #[serde(rename = "selfLink")]
+    self_link: String,
+    uid: String,
+    #[serde(rename = "resourceVersion")]
+    resource_version: String,
+    #[serde(rename = "creationTimestamp")]
+    creation_timestamp: String,
+    labels: Labels,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Ports {
+    name: String,
+    port: i64,
+    protocol: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct K8sEndpoint {
+    kind: String,
+    #[serde(rename = "apiVersion")]
+    api_version: String,
+    metadata: Metadata,
+    items: Vec<Items>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Subsets {
+    addresses: Vec<Addresses>,
+    ports: Vec<Ports>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct TargetRef {
+    kind: String,
+    namespace: String,
+    name: String,
+    uid: String,
+    #[serde(rename = "resourceVersion")]
+    resource_version: String,
+}
+```
+Retrieving the ip addresses is as simple as
+```rust
+let mut list_of_nodes = Vec::new();
+for item in endpoints.items {
+    for subset in item.subsets {
+        for address in subset.addresses {
+            list_of_nodes.push(address.ip);
+        }
+    }
+}
+```
+Per #19 if leader election wanted to be done, kubernetes has a unique number tied to each API object called `resourceVersion`. Here, each `Address` has a `TargetRef` field which will have `resource_version` field. The leader can be chosen via min/max of the resource version associated with it. Kubernetes can also expose the pod name to the container via environment variable so any toshi node can know its kubernetes identifier.
+This is just a tracking issue for additional config items that need to be added:
+
+- [ ] Consul client buffer size
+`SIGTERM, SIGINT` should also be captured to trigger a graceful shutdown.

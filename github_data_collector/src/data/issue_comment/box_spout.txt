@@ -1,0 +1,224 @@
+In a symfony project, i use oneup flystem with a custom stream wrapper name "pj" configure like this.
+
+```
+# /config/packages/oneup_flysystem.yaml
+
+# Read the documentation: https://github.com/1up-lab/OneupFlysystemBundle/tree/master/Resources/doc/index.md
+oneup_flysystem:
+  adapters:
+    my_adapter:
+      local:
+        directory: "%kernel.project_dir%/var/uploads"
+        permissions:
+          file:
+            # Fix. for windows... otherwise stream_wrapper fail to recognize the file as public.
+            public: 438
+
+  filesystems:
+    my_filesystem:
+      adapter: my_adapter
+      alias: League\Flysystem\Filesystem
+      # Allows to read files with any stream function using "pj:/path/of/file/in/flysystem"
+      stream_wrapper: pj
+```
+
+For example in a symfony controller, i use this stream wrapper without problem like this
+
+```php
+    /**
+     * @Route("/attachment-files/download/{id}", name="download_attachment_file", methods={"GET"})
+     */
+    public function downloadAttachmentFile(AttachmentFile $attachmentFile): Response
+    {
+        return $this->file(
+            \sprintf('pj://%s', $attachmentFile->getPathFileName()),
+            $attachmentFile->getFileName(),
+            ResponseHeaderBag::DISPOSITION_ATTACHMENT
+        );
+    }
+```
+
+I would like use spout to parse and get data in Excel file. I use it like this
+
+```
+    public function extractExcelSheetIndicators(FlysystemFile $file): ?array
+    {
+        if ($file->getExtension() === 'xlsx') {
+            $filePathname = 'pj://' . $file->getPathname();
+            $reader = ReaderEntityFactory::createReaderFromFile($filePathname);
+            $reader->open($filePathname);
+
+            /** @var Sheet $sheet */
+            $datas = [];
+            foreach ($reader->getSheetIterator() as $sheet) {
+                if ('INDICATEURS' === $sheet->getName()) {
+                    foreach ($sheet->getRowIterator() as $row) {
+                        $datas[] = $row->getCells();
+                    }
+                    break;
+                }
+            }
+            $reader->close();
+
+            return $datas;
+        } else {
+            return null;
+        }
+    }
+```
+
+But an exception occurs on `reader->open`
+
+```
+type: "https://tools.ietf.org/html/rfc2616#section-10"
+title: "An error occurred"
+status: 500
+detail: "Could not open pj://foo/bar/myFile.xlsx for reading! Stream wrapper used is not supported for this type of file."
+class: "Box\Spout\Common\Exception\IOException"
+```
+
+The exception thrown is defined as row 101 in *src/Spout/Reader/XLSX/Reader.php*
+
+I don't know why :(
+
+If u have an idea to help me or fix it, i thank you in advance.
+
+2o1oo
+Protected function allow overwrite without full copy paste
+Even if you have to rewrite the factory method anyway ...
+
+first filename will be a fallback in ASCII for browser not supporting second filename with asterisk
+Adds support for setting default row height, default column width and custom column widths configuration.
+Fixes #118, among others.
+I checked what other PRs had been created to fix this and the objections in the conversations there. Hopefully this fits your standards.
+
+Things to note:
+- Supports xlsx and ods
+- Has tests
+- PSR-2
+- Default row height and column widths can be set on the writer or using the options manager
+- To be more flexible on when the column widths are set, sheet initialisation was moved to when the first row is written
+
+Known issues:
+- Widths/heights not configurable per worksheet, only for the whole workbook
+- ODS default column width only applies to the columns after the right-most custom column width
+- No dynamic option, should be a separate PR imho
+- No docs yet, let's see if you like the approach first
+
+The writer is missing support for rtl cell styling and rtl direction for spreadsheets;
+This is a follow up of issue #668. Cell formats have been implemented for XLSX, we need to propose the same implementation for ODS files.
+
+We also need to update the documentation.
+The XLSX writer (and maybe also ODS, I haven't check) is missing support for date cells.
+When I do some quick manual test, the v3 branch seems a lot slower? Or am I missing something obvious? In a quick test (50.000 rows with 20 columns with 20 char strings), v2 is about 20 secs while v3 is 30 seconds. That is a 50% increase..
+
+v2:
+```php
+$writer = WriterFactory::create(Type::XLSX);
+$writer->openToFile('output/spout2.xlsx');
+$writer->addRows($data);
+$writer->close();
+```
+
+v3:
+```php
+$writer = WriterEntityFactory::createWriter(Type::XLSX);
+$writer->openToFile('output/spout3.xlsx');
+foreach ($data as $row) {
+    $writer->addRow(WriterEntityFactory::createRowFromArray($row));
+}
+$writer->close();
+```
+
+Probably because you have to create `Row` objects for each row (which create `Cell` objects for each key)? So in this testcase 50.000 array_maps creating 1 million objects..
+
+Edit: Full files here: https://gist.github.com/barryvdh/08576d8b8d7a8d171338737851e7ccf4
+I have large XLSX file about 1 million rows and 5 columns. First col with unique values and last 2 with the same values. When I try to read this file I saw that performance is not so good. After investigation I found that in FileBasedStrategy::getStringAtIndex() method file with cache is rereading for each row because string index is differ greatly between first and last column of xlsx document.
+
+I have optimized cache by adding additional index file with offset and length for each data and increase reading speed about 4 times (depends on column count).
+
+P.S.
+
+Cant attach whole XLSX file because it is too big. So attached only 300K rows
+[test.xlsx](https://github.com/box/spout/files/2764347/test.xlsx)
+
+
+```php
+<?php
+
+use Box\Spout\Reader\Common\Creator\ReaderFactory;
+use Box\Spout\Common\Type;
+
+require_once __DIR__ . '/vendor/autoload.php';
+
+$reader = ReaderFactory::create(Type::XLSX);
+$reader->open(__DIR__ . '/test.xlsx');
+
+$time = mktime();
+foreach ($reader->getSheetIterator() as $sheet) {
+	foreach ($sheet->getRowIterator() as $n => $row) {
+		if ($n % 100000 == 0) {
+			echo "Read $n in " . (mktime() - $time) . " seconds\n";
+		}
+	}
+	break; // no need to read more sheets
+}
+echo "Read $n in " . (mktime() - $time) . " seconds\n";
+
+$reader->close();
+```
+
+**Current realization**
+```
+php ./test.php
+Read 100000 in 44 seconds
+Read 200000 in 92 seconds
+Read 300000 in 139 seconds
+```
+
+**After optimization**
+```
+php ./test.php
+Read 100000 in 14 seconds
+Read 200000 in 30 seconds
+Read 300000 in 46 seconds
+```
+Hey there,
+I always needed the formula in my reports, so I've made an implementation of that, And it would be nice to have it within the original package.
+
+P.S. Really needed that on production ASAP so had to change the composer package, if this causes a problem with the PR, I can fork to different repo
+
+Thanks
+Eli
+Hi,
+
+I just got bitten by the problem described in #168, but mine is quite different. I was trying to store floats in the generated spreadsheet and kept getting errors. I started digging and discovered that floats in XML are stored in a locale-aware way. They are written as-is, but PHP can sometimes format them with a different decimal separator, other than a dot (eg. in Poland we are using a comma), if you start messing with `setlocale(LC_ALL, 'pl')`.
+
+This results in: `<c r="C7" s="0"><v>3,5</v></c>`
+
+If you manually change it to `<c r="C7" s="0"><v>3.5</v></c>` then Excel is happy and formats the value as a number.
+
+The solution is quite simple, instead of doing:
+
+```
+} elseif ($cell->isNumeric()) {
+        $cellXML .= '><v>' . $cell->getValue() . '</v></c>';
+```
+
+do
+
+```
+} elseif ($cell->isNumeric()) {
+            $cellXML .= '><v>' . sprintf('%F', $cell->getValue()) . '</v></c>';
+```
+
+or even better
+
+```
+} elseif ($cell->isNumeric()) {
+            $cellXML .= '><v>' . sprintf(\is_float($cell->getValue()) ? '%F' : '%d', $cell->getValue()) . '</v></c>';
+```
+
+or temporarily reset LC_ALL / LC_NUMERIC during the export.
+
+I'm changing my code to use LC_TIME, because that's what I actually need right now, but you need to be aware of the unusual side-effects of locale for Spout.

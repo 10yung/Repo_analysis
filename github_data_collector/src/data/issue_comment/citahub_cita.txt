@@ -1,0 +1,180 @@
+fix run-in-docker judge error.
+## Description
+Daily benchmark show that:
+4000 TPS at 11.19, But only 3600 TPS at 12.11.
+
+## Additional Information
+Upgrade rustc from 1.34 to 1.39.
+
+## Description
+
+[快照时最近100块的历史数据未保存，仅保存了状态]
+
+## Steps to Reproduce
+
+1. [创建三个共识节点： 
+mac需先端口映射
+ `bin/cita create --super_admin "0x4b5ae4567ad5d9fb92bc9afd6a657e6fa13a2523" --nodes "127.0.0.1:4000,127.0.0.1:4001,127.0.0.1:4002"  --enable_version --contract_arguments SysConfig.economicalModel=1`
+setup并start
+bin/cita setup test-chain/0到2
+bin/cita start test-chain/0到2
+]
+
+2. [在块高为5(快照100块范围外), 块高为30(快照100块范围内),块高为150(快照后)的时候对不同的账户进行交易转账不同的金额(便于区分) ` transfer --address 0x0d5c23dc41956c8aca3b6f3fa581a4fd640f7997 --private-key 0x5f0258a4778057a8a7d97809bd209055b2fbafa654ce7d31ec7191066b9225e6 --value 100`]  
+
+3. [进入docker内节点0，进行快照`../../bin/snapshot_tool -m snapshot -e 120`]
+4. [新增节点3，
+`./scripts/create_cita_config.py append --chain_name test-chain --node "127.0.0.1:4003" `  
+
+使其成为共识节点： `scm NodeManager approveNode --address 0x4bf0e52ed703c9a46efaac0761a17365dc09dace --admin-private 0x5f0258a4778057a8a7d97809bd209055b2fbafa654ce7d31ec7191066b9225e6` 
+查看添加共识成功：`rpc getMetaData` ]
+
+5.[进入docker ,进入节点3对其，进行快照恢复。`cp ../0/snapshot_* ./ `
+`../../bin/snapshot_tool -m restore`]
+
+6.[快照恢复后，分别根据步骤2中交易hash，向节点3 http://127.0.0.1:1340发送 rpc getTransaction，查看交易数据是否保存 ]
+  
+**Expected behavior**: [快照时最近100块的历史数据保存]
+
+**Actual behavior**: [步骤6中，仅可以查询到块高为5(快照100块范围外), 块高为30(快照100块范围内)的交易状态，查询不到数据]
+![image](https://user-images.githubusercontent.com/48231505/58301218-26655200-7e18-11e9-8405-569f319bba10.png)
+
+**Reproduce how often**: [every]
+
+## Versions
+
+[v0.24]
+
+
+
+snapshot 需求
+
+* snapshot 有两个参与角色: 提供 db 备份的*供方节点, *接受和读取 db 的*需方节点*
+
+* 需方节点(比如新加入的节点)通过读取快照(db)可以迅速跟上最新高度, 从而跳过缓慢的同步过程
+* 区块链可以回退到某个高度(在解决某些非常棘手的 bug 时有必要, 但是需要所有节点约定某个高度一起回退)
+
+snapshot 功能
+
+* 供方节点收到 snapshot 命令时, 备份 db
+* 需方节点读取拷贝的 db, 迅速跟上最新的状态
+
+当前实现
+
+* 实现了需方节点在线拷贝 db
+* 有 5 个命令
+    * Snapshot: 让供方节点的 chain 和 executor 开始备份 db
+    * Begin:  需方节点停止处理共识和同步的消息
+    * Restore: 需方节点开始读取 db 数据
+    * Clear: 需方节点清除缓存的临时数据
+    * End: 需方节点恢复处理共识和同步的消息
+
+问题
+
+* 需方节点在线拷贝 db 是一个伪需求
+* 代码逻辑比较复杂, 容易隐藏 bug
+
+解决方案
+
+* 需方节点离线拷贝 db, 通过启动时传入参数来完成读取 db, 清理缓存的临时数据(主要是wal_log), 以及提供恰当的 proof 给 bft 以重启共识
+
+
++ In linux, run `bin/cita start`:
+
+  https://github.com/cryptape/cita/blob/5df437406fe4c885cbc3554004b254570b12b8c1/env.sh#L52-L62
+
+  `--net=host` and `-p` are conflicted.
+
++ IMHO, use `host networking` as default present a potential security risk. 
+
+Ref: [Docker Docs: Use host networking](https://docs.docker.com/network/host/)
+panic的时候stack backtrace里面没有文件名和行号信息，会降低排查问题的效率。
+```
+2019-03-21T20:15:29.115766569+08:00 - ERROR - 
+============================
+stack backtrace:
+   0:     0x5642f6852d6d - backtrace::backtrace::trace::hb8d08f317ffdbb76
+   1:     0x5642f6851f82 - <backtrace::capture::Backtrace as core::default::Default>::default::hc15511ee717eefc8
+   2:     0x5642f6851ff9 - backtrace::capture::Backtrace::new::hffa0563475b270c1
+   3:     0x5642f6851230 - panic_hook::panic_hook::hfada2be48bd7e1fa
+   4:     0x5642f6850f68 - core::ops::function::Fn::call::hb4cc12001ad3eb7f
+   5:     0x5642f6adbb16 - std::panicking::rust_panic_with_hook::hde420d6fd4455550
+                        at libstd/panicking.rs:480
+   6:     0x5642f6adb661 - std::panicking::continue_panic_fmt::h8f394f3c578bcc76
+                        at libstd/panicking.rs:390
+   7:     0x5642f6adb5ae - std::panicking::begin_panic_fmt::hdc47edb03f340b76
+                        at libstd/panicking.rs:345
+   8:     0x5642f652e799 - cita_auth::config::Config::new::{{closure}}::h5b7cf3733d436286
+   9:     0x5642f652e4dc - cita_auth::config::Config::new::h8662fe2f273e0dd2
+  10:     0x5642f652a935 - cita_auth::main::hc2e01840915087c9
+  11:     0x5642f655bd62 - std::rt::lang_start::{{closure}}::hd57d056db23f6603
+  12:     0x5642f6adb4e2 - std::rt::lang_start_internal::{{closure}}::hafa8ecdacd368ebb
+                        at libstd/rt.rs:59
+
+```
+我们可以看到标准库里面是有文件名行号信息的。
+
+解决方法：
+在根目录下的Cargo.toml里增加
+```
+[profile.release]
+debug = 1
+```
+debug = 1的意思是只保留文件名行号相关的调试信息。
+改了之后，release包的大小由50M增加到300M。
+大家看下是否可以接受？
+## Description
+
+Now it is in the changelog and release note.
+
+## Versions
+
+develop
+
+## Additional Information
+
+-----------Chinese-------
+把各版本的升级提示移到单独的一个文件夹
+
+We can use https://github.com/holmgr/cargo-sweep to avoid the cache explosion problem in the CircleCi.
+
+https://github.com/cryptape/cita/blob/develop/.circleci/config.yml#L75
+
+And how about to remove the Travis ci? We have not used it anymore.
+
+
+
+## Description
+
+How to educe the disk footprint?
+
+* Remove the block data form rocksdb #236  It seems that it's better to write file instead of using rocksdb. @yangby-cryptape 
+* Auto adjust consensus time #275 Can increase consensus time when there are less transactions.
+* No empty block.
+* Clear empty blocks.
+* Use snapshot
+
+Need to discuss. 
+
+## Versions
+
+develop
+
+## Additional Information
+
+-----------Chinese---------
+如何减少磁盘占用空间?
+
+* 不使用 rocksdb 存储 block data，使用文件存储好像效果更好
+* 动态调整出块时间，在交易量少的时候可以增加出块时间
+* 不出空块
+* 清理旧的空快
+* 快照
+# Auto adjust consensus time
+
+## Description
+The default value of ```SysConfig.blockInterval``` is 3000, which means 3 seconds. The whole network will keeps this fixed interval to generate empty blocks even there is no transactions at all.
+If one empty block occupied 12K, it will cost at least ```12K*3600*24*365/3/1024/1024 = 120.3G``` storage for each single node running for 1 year. 
+That's quite diseconomy. So I propose to make the consensus time adjustable dynamically. E.g. we can turn down the interval to 3 secs or even 1 sec to speed up the block generation at work time / peak time, and turn up the interval to 1 hour or higher to reduce the useless storage occupation.
+
+CITAHub Topic Reference: https://talk.citahub.com/t/topic/138, ```Eason``` replied you are working on it.

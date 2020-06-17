@@ -1,0 +1,205 @@
+Add util class DeferCache[T] to generalize future cache a little bit, and change fetch method and reflect caller(AsynchbaseQueryBuilder) to use this util class instead of manually mutating guava cache. 
+
+since toEdge is called lots of times, we think it is worth to optimize. 
+
+This is what @daewon reported 
+
+![2016-03-22 7 35 00](https://cloud.githubusercontent.com/assets/1264825/13953110/9085dab4-f07d-11e5-85ea-f4f691842428.png)
+
+based on profile, we can notice that toMap on list and ++ on two list takes many cpu time on toEdge.
+we can avoid toMap and ++ by using mutable map and give up functional style here. I think code looks ugly(not too bad), but we can remove unnecessary cpu usage. I would be minor tuning but toEdge is called many many times(called once on every fetched edges).
+
+PR to master. now our master is same with apache master.
+
+Add feature manually cache update .
+
+first trial.
+
+The hbase-site.xml of our configuration has the zookeeper.znode.parent property becuase we operate the multiple HBase clusters in one zookeeper cluster.
+
+Can you support zookeeper.znode.parent property in reference.conf?
+
+Thank you.
+
+Ratio value in their service is common use cases of  service analysis. Known methods to calculate ratio is that divide values between counting data or aggregating values. Already, S2Graph query supports counting or aggregating values within S2Graph storage. With S2Graph's function, you can calculate ratio just dividing values. That is an easy way to calculate the ratio. However, it can be a more simple way to calculate the ratio. It is that calculation occurred in S2Graph web application with just one RPC, one graph query call.
+This is a suggestion of the ratio calculation query. 
+If we suppose to have two labels(impression feedbacks label and click feedbacks label), we can get a number of impressions and a number of clicks by a user. Using two value, we can calculate CTR(Click Through Rate) with below two count query.
+
+Impression query
+
+```
+{
+  "srcVertices": [{
+    "serviceName": "some_service",
+    "columnName": "user_id",
+    "id": "user_a"
+  }],
+  "steps": [{
+    "step": [{
+      "label": "impression_feedback_label",
+      "direction": "out",
+      "offset": 0,
+      "limit": 100
+    }]
+  }]
+}
+```
+
+Click query
+
+```
+{
+  "srcVertices": [{
+    "serviceName": "some_service",
+    "columnName": "user_id",
+    "id": "user_a"
+  }],
+  "steps": [{
+    "step": [{
+      "label": "click_feedback_label",
+      "direction": "out",
+      "offset": 0,
+      "limit": 100
+    }]
+  }]
+}
+```
+
+After fetching each result with upper queries, we can get a CTR.
+
+However, we can make a one query with `divide` operation to `scorePropagageOp`.
+
+```
+{
+  "limit" : 10,
+  "groupBy" : [ "from" ],
+  "duplicate" : "sum",
+  "srcVertices" : [ {
+    "serviceName" : "some_service",
+    "columnName" : "user_id",
+    "id" : "user_a"
+  } ],
+  "steps" : [ {
+    "step" : [ {
+      "label" : "impression_feedback_label",
+      "direction" : "out",
+      "offset" : 0,
+      "limit" : 10,
+      "groupBy" : [ "from" ],
+      "duplicate" : "countSum",
+      "transform" : [ [ "_from" ] ]
+    } ]
+  }, {
+    "step" : [ {
+      "label": "click_feedback_label",
+      "direction" : "out",
+      "offset" : 0,
+      "limit" : 10,
+      "scorePropagateOp" : "divide",
+      "scorePropagateShrinkage" : 500
+    } ]
+  } ]
+}
+```
+
+There is another query param option key, `scorePropagateShrinkage`. It is used to try normalizing results. We use just ratio value to sort the results. However, ratio value can be non-deterministic. Ratio 1.0 by 1/1 is larger than 0.9 by 9/10. For this reason, we can add `scorePropagateShrinkage` score value which is sufficiently big to the denominator. Now we can re-calculate by 1 / (1 + 500) =0.00199600798403 and 9 / (1 + 500) = 0.01796407185629, then the latter is larger value.
+
+just fixed a typo that I found while reading introduction
+
+## step to reproduce.
+### create service.
+
+```
+curl -XPOST localhost:9000/graphs/createService -H 'Content-Type: Application/json' -d '
+{"serviceName": "s2graph-test"}
+'
+```
+### create label.
+
+```
+curl -XPOST alpha-s2graph.daumkakao.io:9000/graphs/createLabel -H 'Content-Type: Application/json' -d '
+{
+    "label": "friend",
+    "srcServiceName": "s2graph-test",
+    "srcColumnName": "user_id",
+    "srcColumnType": "string",
+    "tgtServiceName": "s2graph-test",
+    "tgtColumnName": "user_id",
+    "tgtColumnType": "string",
+    "indices": [],
+    "props": [],
+    "serviceName": "s2graph-test",
+    "consistencyLevel": "strong"
+}
+'
+```
+### insert test data.
+
+```
+curl -XPOST localhost:9000/graphs/edges/insert -H 'Content-Type: Application/json' -d '
+[
+{"timestamp": 1451374817379, "from": "4c9343846613f66931000007", "to": "4cc8ad306899f56692000004", "label": "friend"}
+]
+'
+```
+### delete above relation
+
+```
+curl -XPOST localhost:9000/graphs/edges/delete -H 'Content-Type: Application/json' -d '
+[
+{"timestamp": 1451374817380, "from": "4c9343846613f66931000007", "to": "4cc8ad306899f56692000004", "label": "friend"}
+]
+'
+```
+### select index edges.
+
+```
+curl -XPOST localhost:9000/graphs/getEdges -H 'Content-Type: Application/json' -d '
+{
+    "srcVertices": [{
+        "serviceName": "s2graph-test",
+        "columnName": "user_id",
+        "id": "4c9343846613f66931000007"
+    }],
+    "steps": [{
+        "step": [{
+            "label": "path_friend",
+            "direction": "out",
+            "offset": 0,
+            "limit": 10
+        }]
+    }]
+}
+'
+```
+
+this gives no edges which is expected.
+### with "_to" specified, then it gives deleted edge.
+
+```
+curl -XPOST localhost:9000/graphs/getEdges -H 'Content-Type: Application/json' -d '
+{
+    "srcVertices": [{
+        "serviceName": "s2graph-test",
+        "columnName": "user_id",
+        "id": "4c9343846613f66931000007"
+    }],
+    "steps": [{
+        "step": [{
+            "label": "path_friend",
+            "direction": "out",
+            "offset": 0,
+            "limit": 10, 
+            "_to": "4cc8ad306899f56692000004"
+        }]
+    }]
+}
+'
+```
+
+I think after delete operation finished, there should be no edge left even with "_to" option.
+
+Many duplication code exists Query/Experiment controller and Netty Rest handler.
+So extract common functions to some module(like RestUtil ...)
+- RestServer(Play, Netty) should call graph functions through restUtil layer
+- RestUtil layer only return Future(Failure, Succesuful) for handling exception one way

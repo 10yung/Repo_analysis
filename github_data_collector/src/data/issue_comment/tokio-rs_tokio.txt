@@ -1,0 +1,394 @@
+condvar.notify_one() is called without holding the tail mutex causing
+the notification to be lost and leaving the sender waiting.
+
+This is a partial fix for #2123.
+## Motivation
+
+now the example `echo` cannot run with cargo, 
+
+`cargo run --example echo` will stop with error
+```bash
+error: `cargo run` can run at most one executable, but multiple were specified
+```
+and there are two `echo` target in the example list, `examples/echo.rs`,  `tokio-tls/examples/echo.rs`
+
+```bash
+# cargo run --example
+error: "--example" takes one argument.
+Available examples:
+    chat
+    connect
+    download-rust-lang
+    echo
+    echo
+    echo-udp
+    hello_world
+    print_each_packet
+    proxy
+    tinydb
+    tinyhttp
+    udp-client
+    udp-codec
+```
+
+## Solution
+
+rename `tokio-tls/examples/echo.rs` to `tokio-tls/examples/tls-echo.rs`
+
+## Version
+
+tokio-0.2.9
+
+## Platform
+
+All platforms
+
+## Description
+
+It looks like `tokio::sync::boardcast::RecvError` and `tokio::sync::boardcast::SendError` don't implement `std::format::Error`. I feel like this is a potential oversight - what would be the best way to have this rectified? 
+## Motivation
+
+As discussed on discord, with interest and suggestions on how to proceed from Carl.
+
+* The _parking_lot_ crate's `Mutex` and `Condvar` still best _libstd_ in benchmarks.  
+* From Amanieu/parking_lot#119 (and linked rust-lang PR), it does not appear (AFAICT) that replacing libstd's current implementations with _parking_lot_ inspired types is particularly close to being accepted. (When that does happen and in MSRV, this PR should be easy enough to revert.)
+
+So far I haven't found a case in the current codebase where tokio attempts to recover from a poisoned Mutex.  Since _parking_lot_ doesn't poison, this could possibly mean less panic's (in some heretofore unknown edge-case!) OK, that's a bit hypothetical.
+
+## Solution
+
+To help simplify working with both primitive APIs, I added an `IdentityUnwrap` extension trait for _parking_lot_'s `MutexGuard`.   That handles the simple acquire lock with `.unwrap()` case (see above note on poisoning).  For `Condvar`, the API differences are a bit more significant so its so far done as a combination of feature gated code blocks and some creative use of `match`.
+
+## TODO
+
+1. This will start as just a _draft_,  proof of concept (e.g. rather unlikely to pass CI on first go!) but I would appreciate any feedback on the approach before polishing it further.
+
+2. Not all references to `Mutex` and `Condvar` in the tree go through the `loom` module. It may or may not make sense to replace all of these cases, including in tests? 
+
+``` txt
+git grep -n -E  "use.*Mutex" | grep -v "loom::" | grep -v "tokio::sync" | grep -v "src/loom"
+src/process/unix/orphan.rs:3:use std::sync::Mutex;
+src/signal/registry.rs:11:use std::sync::Mutex;
+src/sync/barrier.rs:3:use std::sync::Mutex;
+src/sync/mod.rs:27:    pub use mutex::{Mutex, MutexGuard};
+src/sync/watch.rs:61:use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, Weak};
+src/task/error.rs:4:use std::sync::Mutex;
+src/tests/loom_schedule.rs:5:use std::sync::Mutex;
+src/tests/mock_schedule.rs:5:use std::sync::Mutex;
+src/time/clock.rs:38:    use std::sync::{Arc, Mutex};
+tests/fs_dir.rs:7:use std::sync::{Arc, Mutex};
+tests/io_driver.rs:12:use std::sync::{mpsc, Arc, Mutex};
+tests/support/mock_file.rs:10:use std::sync::{Arc, Mutex};
+```
+
+3. I'm also wondering, if for convenience and hygiene there should be some more top level prelude-like import path for these types, not going through `::loom::`?  For example:
+
+``` rust
+use tokio::syncro::*; 
+```
+
+This way I'd introduce fewer import lines, not needing to conditionally import `IdentityUnwrap` (which without parking_lot becomes an unused warning.)
+
+Thoughts?
+
+
+# Motivation
+
+Based on a [URLO thread](https://users.rust-lang.org/t/blocking-permit/36865/7) and discord conversation with @hawkw and @Matthias247, I learned a great deal about what `tokio::task::yield_now` does, noticing that the rustdoc for that method can be improved.
+
+## Solution
+
+rustdoc-o
+
+
+impl AsyncRead for RedisTcpStream {
+    unsafe fn prepare_uninitialized_buffer(&self, _: &mut [MaybeUninit<u8>]) -> bool {
+        false
+    }
+
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context_A<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        // tokio src/net/tcp/stream poll_read_priv function must make  to pub
+        self.socket.lock().unwrap().poll_read_priv(cx, buf)
+    }
+}
+
+impl AsyncWrite for RedisTcpStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context_A<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        // tokio src/net/tcp/stream poll_write_priv  function must make to pub
+        self.socket.lock().unwrap().poll_write_priv(cx, buf)
+    }
+
+    fn poll_write_buf<B: Buf>(
+        self: Pin<&mut Self>,
+        cx: &mut Context_A<'_>,
+        buf: &mut B,
+    ) -> Poll<io::Result<usize>> {
+        // tokio src/net/tcp/stream poll_write_buf_priv  function must make to pub
+        self.socket.lock().unwrap().poll_write_buf_priv(cx, buf)
+    }
+<!--
+Thank you for your Pull Request. Please provide a description above and review
+the requirements below.
+
+Bug fixes and new features should include tests.
+
+Contributors guide: https://github.com/tokio-rs/tokio/blob/master/CONTRIBUTING.md
+-->
+
+## Motivation
+
+Currently it's not possible to configure the buffer size when creating a `BufStream`.
+I'm using `BufStream` to wrap a `TcpStream` and having to`tokio::io::split` it and pass each half to `BufReader::with_capacity` and `BufWriter::with_capacity` seems sub-optimal.
+
+## Solution
+
+This PR adds a `BufStream::with_capacity` method that takes as input both the capacity of the read buffer and the capacity of the write buffer.
+Not sure if this is the best API, but it seemed more flexible than having a single capacity as input.
+
+API docs are out of sync right now with website.  API docs have been fixed, but website has broken links and out of date content.  See https://github.com/tokio-rs/website/pull/404 for a stop-gap fix of the website 
+
+* https://docs.rs/tokio/0.2.9/tokio/ and 
+* https://tokio.rs/docs/overview/ 
+
+## Version
+
+0.2.9
+
+## Description
+
+At minimum we should have a note in the code here: https://github.com/tokio-rs/tokio/blob/master/tokio/src/lib.rs#L26 for docs that are duplicated on the website.  
+
+Ideally the website would pull content from the API docs (and maybe some of the narrative docs which are getting very long should be migrated to the website).  
+
+It would be good to keep the jumping back-and-forth and cross linking to a minimum.  It would be awesome to have an auto-generated list of links to API docs referenced in the guides and create some kind of build errors when they get out of sync.  We might even consider having the guides in this repo to make it easier to keep them in sync (and then CI with doc tests would enforce updating examples whenever APIs changes).
+
+## Version
+
+tokio 0.2.9
+
+## Description
+
+I am having some issues trying to use sync::broadcast. Sometimes I receive "lagged" with a wrapped around value (near 2^64) followed shortly after by "closed" even though there are still senders. Related to this I also got this panic calling sync::broadcast::Receiver::recv():
+
+```
+thread 'tokio-runtime-worker' panicked at 'attempt to add with overflow', __bazel_redacted_pwd/external/raze__tokio__0_2_9/src/sync/broadcast.rs:946:56
+stack backtrace:
+thread 'tokio-runtime-worker' panicked at 'attempt to add with overflow', __bazel_redacted_pwd/external/raze__tokio__0_2_9/src/sync/broadcast.rs:946:56
+   0:     0x55baa818b014 - backtrace::backtrace::libunwind::trace::h65597d255cb1398b
+                               at /cargo/registry/src/github.com-1ecc6299db9ec823/backtrace-0.3.40/src/backtrace/libunwind.rs:88
+   1:     0x55baa818b014 - backtrace::backtrace::trace_unsynchronized::hd4f479d7150ec4a0
+                               at /cargo/registry/src/github.com-1ecc6299db9ec823/backtrace-0.3.40/src/backtrace/mod.rs:66
+   2:     0x55baa818b014 - std::sys_common::backtrace::_print_fmt::h015072984a2b172c
+                               at src/libstd/sys_common/backtrace.rs:77
+   3:     0x55baa818b014 - <std::sys_common::backtrace::_print::DisplayBacktrace as core::fmt::Display>::fmt::h6df05d3335f32194
+                               at src/libstd/sys_common/backtrace.rs:61
+   4:     0x55baa81a7ffc - core::fmt::write::h1f444f4312eb6c27
+                               at src/libcore/fmt/mod.rs:1028
+   5:     0x55baa8187a07 - std::io::Write::write_fmt::h8d147888220078ef
+                               at src/libstd/io/mod.rs:1412
+   6:     0x55baa818d56e - std::sys_common::backtrace::_print::h8a6df0fa81d6af62
+                               at src/libstd/sys_common/backtrace.rs:65
+   7:     0x55baa818d56e - std::sys_common::backtrace::print::h6f05b4733407e509
+                               at src/libstd/sys_common/backtrace.rs:50
+   8:     0x55baa818d56e - std::panicking::default_hook::{{closure}}::h0d0a23bd02315dd8
+                               at src/libstd/panicking.rs:188
+   9:     0x55baa818d261 - std::panicking::default_hook::h8d15a9aecb4efac6
+                               at src/libstd/panicking.rs:205
+  10:     0x55baa818dc6b - std::panicking::rust_panic_with_hook::hbe174577402a475d
+                               at src/libstd/panicking.rs:464
+  11:     0x55baa818d80e - std::panicking::continue_panic_fmt::h4d855dad868accf3
+                               at src/libstd/panicking.rs:373
+  12:     0x55baa818d6f6 - rust_begin_unwind
+                               at src/libstd/panicking.rs:302
+  13:     0x55baa81a55be - core::panicking::panic_fmt::hdeb7979ab6591473
+                               at src/libcore/panicking.rs:139
+  14:     0x55baa81a550a - core::panicking::panic::hb5daa85c7c72fc62
+                               at src/libcore/panicking.rs:70
+  15:     0x55baa7acf22d - tokio::sync::broadcast::Slot<T>::try_rx_lock::hec7b473c05bb0675
+                               at __bazel_redacted_pwd/external/raze__tokio__0_2_9/src/sync/broadcast.rs:946
+  16:     0x55baa7ad1a78 - tokio::sync::broadcast::Receiver<T>::recv_ref::h122b834c8eba0356
+                               at __bazel_redacted_pwd/external/raze__tokio__0_2_9/src/sync/broadcast.rs:656
+  17:     0x55baa7ad251e - tokio::sync::broadcast::Receiver<T>::try_recv::hcd31567e1283173f
+                               at __bazel_redacted_pwd/external/raze__tokio__0_2_9/src/sync/broadcast.rs:744
+  18:     0x55baa7ad2e39 - tokio::sync::broadcast::Receiver<T>::poll_recv::hff75e67a009d5e19
+                               at __bazel_redacted_pwd/external/raze__tokio__0_2_9/src/sync/broadcast.rs:750
+  19:     0x55baa7ad191b - tokio::sync::broadcast::Receiver<T>::recv::{{closure}}::{{closure}}::hc068ae9c96e715a8
+                               at __bazel_redacted_pwd/external/raze__tokio__0_2_9/src/sync/broadcast.rs:830
+  20:     0x55baa7b65510 - <tokio::future::poll_fn::PollFn<F> as core::future::future::Future>::poll::hfe3333e65bf9822a
+                               at __bazel_redacted_pwd/external/raze__tokio__0_2_9/src/future/poll_fn.rs:36
+  21:     0x55baa7aab065 - std::future::poll_with_tls_context::{{closure}}::he70e267cb2f1d860
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/future.rs:121
+  22:     0x55baa7aa3c15 - std::future::get_task_context::hacb5275e78fe758c
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/future.rs:111
+  23:     0x55baa7aaa365 - std::future::poll_with_tls_context::h7b785f713e02a29a
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/future.rs:121
+  24:     0x55baa7ad175a - tokio::sync::broadcast::Receiver<T>::recv::{{closure}}::ha4a4a3da44631c98
+                               at __bazel_redacted_pwd/external/raze__tokio__0_2_9/src/sync/broadcast.rs:830
+  25:     0x55baa7abbfd2 - <std::future::GenFuture<T> as core::future::future::Future>::poll::{{closure}}::h84884c05b755b67c
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/future.rs:43
+  26:     0x55baa7aa76f3 - std::future::set_task_context::h65332ba09e588ec4
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/future.rs:79
+  27:     0x55baa7ab996c - <std::future::GenFuture<T> as core::future::future::Future>::poll::h857edae155448df1
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/future.rs:43
+  28:     0x55baa7aaaed5 - std::future::poll_with_tls_context::{{closure}}::hb92e2987aedee7f6
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/future.rs:121
+  29:     0x55baa7aa4155 - std::future::get_task_context::hbd9c920848f2f36a
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/future.rs:111
+  30:     0x55baa7aaa0f5 - std::future::poll_with_tls_context::h4a140328eb4a8d41
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/future.rs:121
+  31:     0x55baa7c39367 - imagemux::series::SeriesSender::run::{{closure}}::h2a5bfdb68d0af95f
+                               at daq/imagemux/src/series.rs:52
+  32:     0x55baa7abd72c - <std::future::GenFuture<T> as core::future::future::Future>::poll::{{closure}}::hfc202844d0aba7b4
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/future.rs:43
+  33:     0x55baa7aa7ed1 - std::future::set_task_context::h8f0e70e8ceca7ab4
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/future.rs:79
+  34:     0x55baa7ab9178 - <std::future::GenFuture<T> as core::future::future::Future>::poll::h194382a73e6f2750
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/future.rs:43
+  35:     0x55baa7aaabce - std::future::poll_with_tls_context::{{closure}}::h78fe203445fa47c2
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/future.rs:121
+  36:     0x55baa7aa3575 - std::future::get_task_context::h9490ec6e7c73c985
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/future.rs:111
+  37:     0x55baa7aaa1ae - std::future::poll_with_tls_context::h550dcc8b9178ac3e
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/future.rs:121
+  38:     0x55baa7bf1211 - imagemux::Service::new::{{closure}}::h376bf108d68a6963
+                               at daq/imagemux/src/lib.rs:111
+  39:     0x55baa7aba56b - <std::future::GenFuture<T> as core::future::future::Future>::poll::{{closure}}::h1f19510b588cfe66
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/future.rs:43
+  40:     0x55baa7aa84c1 - std::future::set_task_context::hcfadf4d1e487e4be
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/future.rs:79
+  41:     0x55baa7ab9568 - <std::future::GenFuture<T> as core::future::future::Future>::poll::h499832d7ebb465f6
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/future.rs:43
+  42:     0x55baa7ab5371 - tokio::task::core::Core<T>::poll::hc56659f8b0c374e9
+                               at __bazel_redacted_pwd/external/raze__tokio__0_2_9/src/task/core.rs:128
+  43:     0x55baa7c0da38 - tokio::task::harness::Harness<T,S>::poll::{{closure}}::{{closure}}::ha06057b15a3740c5
+                               at __bazel_redacted_pwd/external/raze__tokio__0_2_9/src/task/harness.rs:120
+  44:     0x55baa7b3fa9c - core::ops::function::FnOnce::call_once::h1d5c0c77272010a2
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libcore/ops/function.rs:227
+  45:     0x55baa7c42d8e - <std::panic::AssertUnwindSafe<F> as core::ops::function::FnOnce<()>>::call_once::h33d29956f93517af
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/panic.rs:317
+  46:     0x55baa7b10da5 - std::panicking::try::do_call::h6cd5d779d5add4d9
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/panicking.rs:287
+  47:     0x55baa8190f9a - __rust_maybe_catch_panic
+                               at src/libpanic_unwind/lib.rs:78
+  48:     0x55baa7b0d5b7 - std::panicking::try::h2b5be32b5e98b339
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/panicking.rs:265
+  49:     0x55baa7c441c5 - std::panic::catch_unwind::h7cf404f1403f11be
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/panic.rs:396
+  50:     0x55baa7c0d433 - tokio::task::harness::Harness<T,S>::poll::{{closure}}::hed51a4db54e6cc6c
+                               at __bazel_redacted_pwd/external/raze__tokio__0_2_9/src/task/harness.rs:101
+  51:     0x55baa7be350f - tokio::loom::std::causal_cell::CausalCell<T>::with_mut::h017aaae5d26e7017
+                               at __bazel_redacted_pwd/external/raze__tokio__0_2_9/src/loom/std/causal_cell.rs:41
+  52:     0x55baa7c0c090 - tokio::task::harness::Harness<T,S>::poll::he9df223b309fe84f
+                               at __bazel_redacted_pwd/external/raze__tokio__0_2_9/src/task/harness.rs:100
+  53:     0x55baa7c55768 - tokio::task::raw::poll::hec3a4dc09da670b0
+                               at __bazel_redacted_pwd/external/raze__tokio__0_2_9/src/task/raw.rs:162
+  54:     0x55baa7e77927 - tokio::task::raw::RawTask::poll::h6120c6f7b9221c7a
+                               at external/raze__tokio__0_2_9/src/task/raw.rs:113
+  55:     0x55baa7e8c0fc - tokio::task::Task<S>::run::hfb7d7f0dac92145a
+                               at external/raze__tokio__0_2_9/src/task/mod.rs:371
+  56:     0x55baa7e7fb58 - tokio::runtime::thread_pool::worker::GenerationGuard::run_task::h78fe7fd9509bd1a9
+                               at external/raze__tokio__0_2_9/src/runtime/thread_pool/worker.rs:446
+  57:     0x55baa7e7f261 - tokio::runtime::thread_pool::worker::GenerationGuard::process_available_work::h69ecc0dddb39ab0c
+                               at external/raze__tokio__0_2_9/src/runtime/thread_pool/worker.rs:314
+  58:     0x55baa7e7ef34 - tokio::runtime::thread_pool::worker::GenerationGuard::run::hca18b6fadcfd6ed6
+                               at external/raze__tokio__0_2_9/src/runtime/thread_pool/worker.rs:269
+  59:     0x55baa7e7ea99 - tokio::runtime::thread_pool::worker::Worker::run::{{closure}}::{{closure}}::h10fc008f178bb4ae
+                               at external/raze__tokio__0_2_9/src/runtime/thread_pool/worker.rs:158
+  60:     0x55baa7e14c0b - std::thread::local::LocalKey<T>::try_with::h37ceb3406786b63f
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/thread/local.rs:262
+  61:     0x55baa7e14058 - std::thread::local::LocalKey<T>::with::h51cf8a052b4d8c08
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/thread/local.rs:239
+  62:     0x55baa7e7eb3e - tokio::runtime::thread_pool::worker::Worker::run::{{closure}}::h4e773f792e23a46f
+                               at external/raze__tokio__0_2_9/src/runtime/thread_pool/worker.rs:134
+  63:     0x55baa7e22c8c - tokio::runtime::thread_pool::current::set::{{closure}}::h967b74cc4997a97a
+                               at external/raze__tokio__0_2_9/src/runtime/thread_pool/current.rs:47
+  64:     0x55baa7e15330 - std::thread::local::LocalKey<T>::try_with::h858b67cddf927784
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/thread/local.rs:262
+  65:     0x55baa7e140dc - std::thread::local::LocalKey<T>::with::h5ea2bea39fcafacd
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/thread/local.rs:239
+  66:     0x55baa7e22b82 - tokio::runtime::thread_pool::current::set::h8404018a799291b9
+                               at external/raze__tokio__0_2_9/src/runtime/thread_pool/current.rs:29
+  67:     0x55baa7e7e8c4 - tokio::runtime::thread_pool::worker::Worker::run::hea8c261e11e91e44
+                               at external/raze__tokio__0_2_9/src/runtime/thread_pool/worker.rs:130
+  68:     0x55baa7e7eee0 - tokio::runtime::thread_pool::worker::Worker::block_in_place::{{closure}}::hf9bde88c5c55399b
+                               at external/raze__tokio__0_2_9/src/runtime/thread_pool/worker.rs:260
+  69:     0x55baa7e6a7a4 - <tokio::runtime::blocking::task::BlockingTask<T> as core::future::future::Future>::poll::hedd486e8c1888266
+                               at external/raze__tokio__0_2_9/src/runtime/blocking/task.rs:30
+  70:     0x55baa7e76cb1 - tokio::task::core::Core<T>::poll::h19f0311bdba22e37
+                               at external/raze__tokio__0_2_9/src/task/core.rs:128
+  71:     0x55baa7eaf3c8 - tokio::task::harness::Harness<T,S>::poll::{{closure}}::{{closure}}::h13d0265c7ca5dac8
+                               at external/raze__tokio__0_2_9/src/task/harness.rs:120
+  72:     0x55baa7e953f8 - core::ops::function::FnOnce::call_once::he5c7a6d3473c4d96
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libcore/ops/function.rs:227
+  73:     0x55baa7e7884e - <std::panic::AssertUnwindSafe<F> as core::ops::function::FnOnce<()>>::call_once::hb9f0eb3269f2304f
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/panic.rs:317
+  74:     0x55baa7e4d635 - std::panicking::try::do_call::h6f242cb6e8ff5194
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/panicking.rs:287
+  75:     0x55baa8190f9a - __rust_maybe_catch_panic
+                               at src/libpanic_unwind/lib.rs:78
+  76:     0x55baa7e4d3d7 - std::panicking::try::hb751da53605c6666
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/panicking.rs:265
+  77:     0x55baa7e78b35 - std::panic::catch_unwind::h59c788bd058a6860
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/panic.rs:396
+  78:     0x55baa7eaf523 - tokio::task::harness::Harness<T,S>::poll::{{closure}}::h9ac89c9bb452dfd0
+                               at external/raze__tokio__0_2_9/src/task/harness.rs:101
+  79:     0x55baa7e49f3f - tokio::loom::std::causal_cell::CausalCell<T>::with_mut::h696eb28ce2f5d346
+                               at external/raze__tokio__0_2_9/src/loom/std/causal_cell.rs:41
+  80:     0x55baa7eae960 - tokio::task::harness::Harness<T,S>::poll::h1d2739a884353eb8
+                               at external/raze__tokio__0_2_9/src/task/harness.rs:100
+  81:     0x55baa7e77ae8 - tokio::task::raw::poll::hc8d3143120e4ae18
+                               at external/raze__tokio__0_2_9/src/task/raw.rs:162
+  82:     0x55baa7e77927 - tokio::task::raw::RawTask::poll::h6120c6f7b9221c7a
+                               at external/raze__tokio__0_2_9/src/task/raw.rs:113
+  83:     0x55baa7e8c03c - tokio::task::Task<S>::run::h99eb810c4b80888b
+                               at external/raze__tokio__0_2_9/src/task/mod.rs:371
+  84:     0x55baa7e1912d - tokio::runtime::blocking::pool::run_task::hd38480b24fa40ee2
+                               at external/raze__tokio__0_2_9/src/runtime/blocking/pool.rs:290
+  85:     0x55baa7e18742 - tokio::runtime::blocking::pool::Inner::run::hfa9336fe1beb7729
+                               at external/raze__tokio__0_2_9/src/runtime/blocking/pool.rs:206
+  86:     0x55baa7e1846e - tokio::runtime::blocking::pool::Spawner::spawn_thread::{{closure}}::{{closure}}::he2212b0d16d90025
+                               at external/raze__tokio__0_2_9/src/runtime/blocking/pool.rs:186
+  87:     0x55baa7e7d7a5 - tokio::runtime::context::enter::h05edf90f3ec19d1a
+                               at external/raze__tokio__0_2_9/src/runtime/context.rs:72
+  88:     0x55baa7e68db5 - tokio::runtime::handle::Handle::enter::heec6ffe6c8c8768c
+                               at external/raze__tokio__0_2_9/src/runtime/handle.rs:33
+  89:     0x55baa7e18507 - tokio::runtime::blocking::pool::Spawner::spawn_thread::{{closure}}::h512f8bfa3d7fa123
+                               at external/raze__tokio__0_2_9/src/runtime/blocking/pool.rs:185
+  90:     0x55baa7e4cba0 - std::sys_common::backtrace::__rust_begin_short_backtrace::h70c1e96c83cfe49c
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/sys_common/backtrace.rs:129
+  91:     0x55baa7e7a7c3 - std::thread::Builder::spawn_unchecked::{{closure}}::{{closure}}::hdde3a28c587007d3
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/thread/mod.rs:469
+  92:     0x55baa7e787f3 - <std::panic::AssertUnwindSafe<F> as core::ops::function::FnOnce<()>>::call_once::h8e39c6716420fc2d
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/panic.rs:317
+  93:     0x55baa7e4d6ce - std::panicking::try::do_call::ha11aa9e52f489072
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/panicking.rs:287
+  94:     0x55baa8190f9a - __rust_maybe_catch_panic
+                               at src/libpanic_unwind/lib.rs:78
+  95:     0x55baa7e4cc88 - std::panicking::try::h3d342e09d46ea85a
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/panicking.rs:265
+  96:     0x55baa7e78af3 - std::panic::catch_unwind::h44a26a95627a7117
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/panic.rs:396
+  97:     0x55baa7e7a5b2 - std::thread::Builder::spawn_unchecked::{{closure}}::h7a3a7289862ef871
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libstd/thread/mod.rs:468
+  98:     0x55baa7e95084 - core::ops::function::FnOnce::call_once{{vtable.shim}}::h630dafab2802bcc1
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/libcore/ops/function.rs:227
+  99:     0x55baa8182def - <alloc::boxed::Box<F> as core::ops::function::FnOnce<A>>::call_once::h3534c64212330b0c
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/liballoc/boxed.rs:942
+ 100:     0x55baa81903c0 - <alloc::boxed::Box<F> as core::ops::function::FnOnce<A>>::call_once::h338c10574a337ece
+                               at /rustc/73528e339aae0f17a15ffa49a8ac608f50c6cf14/src/liballoc/boxed.rs:942
+ 101:     0x55baa81903c0 - std::sys_common::thread::start_thread::h761ac6d57710d65d
+                               at src/libstd/sys_common/thread.rs:13
+ 102:     0x55baa81903c0 - std::sys::unix::thread::Thread::new::thread_start::h61c012ef60f933c0
+                               at src/libstd/sys/unix/thread.rs:79
+ 103:     0x7ff2f53a54aa - start_thread
+ 104:     0x7ff2f52ba3f3 - __clone
+ 105:                0x0 - <unknown>
+```

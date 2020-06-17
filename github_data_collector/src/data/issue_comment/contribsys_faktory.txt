@@ -1,0 +1,85 @@
+Have a problem with long-running jobs. After about 15 minutes, this keeps happening which then leaves the worker running, but the worker disappears from the UI. The job is still active, as it has a long reserve_for. 
+
+Any suggestions on how to debug? Why would the worker stop sending a heartbeat?
+
+```
+E 2020-01-18T16:26:30.595Z error=read tcp 10.42.5.47:7419->10.42.6.185:43966: use of closed network connection Unexpected socket error
+W 2020-01-18T16:26:30.595Z Reaped 1 lingering connections, this is a sign your workers are having problems
+W 2020-01-18T16:26:30.595Z All worker processes should send a heartbeat every 15 seconds
+```
+This is less of a request for @mperham and more of a question to the community.
+
+Before moving to Faktory, we made extensive use of https://github.com/utgarda/sidekiq-status
+
+Has anyone looked at building something similar? Obviously it's a bit more tricky as you would need an external data store since you cannot talk directly to the redis instance.
+`curl` is not available, so need another mechanism for establishing the health of faktory
+Hey
+
+We spoke about this via email, and you asked me to create a ticket to remind you to build it :)
+Almost all customers have been running Docker. Make their life easier by providing a private Faktory image repository with Faktory Pro and Enterprise docker images for ease of deployment.
+
+See:
+
+* https://docs.docker.com/registry/deploying/
+* https://hub.docker.com/_/registry/
+* https://docs.docker.com/registry/recipes/apache/
+
+TODO:
+
+* [x] Prototype to determine feasibility
+* [x] Machine setup
+* [x] Wiki documentation
+* [x] Publish images
+* [ ] Blog post
+
+Move forward under the assumption that people are using a Statsd server that understands metric tagging.
+
+## Deprecate
+
+These will be removed in a future release:
+
+| Name | Type | Desc | Tags
+| -- | -- | -- | --
+| jobs.{jobtype}.count | Counter | Execution count for {jobtype}, increments upon ACK/FAIL | "queue:{queue}"
+| jobs.{jobtype}.failed | Counter | Failed count for {jobtype}, increments on FAIL | "queue:{queue}"
+| jobs.{jobtype}.perform | Gauge (time) | Time between FETCH and ACK | "queue:{queue}"
+
+By creating metrics for each jobtype, we are exploding the cardinality, which can lead to big jumps in cost of storage. Many metrics SaaSes price based on unique metric name count. Instead each metric will have a `jobtype:#{jobtype}` tag, like so:
+
+| Name | Type | Desc | Tags
+| -- | -- | -- | --
+| jobs.count | Counter | Execution count, increments upon ACK/FAIL | "queue:{queue}", "jobtype:{jobtype}"
+| jobs.failed | Counter | Failed count, increments on FAIL | "queue:{queue}", "jobtype:{jobtype}"
+| jobs.perform | Gauge (time) | Time between FETCH and ACK | "queue:{queue}", "jobtype:{jobtype}"
+
+
+## Add
+
+| Name | Type | Desc | Tags
+| -- | -- | -- | --
+| jobs.expired | Counter | Job expiration | "queue:{queue}", "jobtype:{jobtype}"
+| uniq.lock | Counter | A unique job lock was taken | "queue:{queue}", "jobtype:{jobtype}"
+| uniq.denied | Counter | A job push was denied due to uniqueness | "queue:{queue}", "jobtype:{jobtype}"
+| uniq.unlock | Counter | A unique job lock was released | "queue:{queue}", "jobtype:{jobtype}"
+| cron.push | Counter | A periodic job was pushed  | "queue:{queue}", "jobtype:{jobtype}"
+
+How do I push (with Ruby lib) a job to a faktory queue that will be picked up by Go or other workers? 
+???.perform_async(:something)
+
+https://cl.ly/59475b2892e0
+
+Perhaps there's something that could be done like scaling the font size with the window width, or making content wrap instead of spill?
+A couple of times now I've had to dump a queue because it was backlogging.  In this queue, all jobs are meant to be unique:  Every few minutes I have a cron task that wakes up, determines a set of work to do (about 65k jobs), and fires jobs for each unit of work to be done.  My goal is that each job exists at most once in the queue at any given time.  I had been seeing backlogs form despite setting `unique_for=3600`.  (This doesn't make a ton of sense, as I have enough workers that most of the time I should be burning through all the jobs quite quickly.  I suspect it has to do with not-so-intermittent failures -- see the `dial` issues I talk about in another ticket --  and the jobs being enqueued for retry.  Add in a short uniqueness window of 1 hour, and after a few hours...)
+
+I made some changes, including setting `unique_for=86400`, `unique_until=start`, `reserve_for=300` (the period of the cron job).  Along the way I had to dump the queue again a few more times.  Somehow, I wound up with 60,000 keys in Redis of the form `unique:<hash>`, apparently set to have expiration times of 86,400 seconds.
+
+Clearing a queue, but leaving behind uniqueness tokens is a pretty surprising behavior, to say the least.  Perhaps you could store the uniqueness tokens for a given queue as a set, and clear the set when clearing the queue?  That would mean uniqueness is scoped to a specific queue, but honestly that was the behavior I was expecting in the first place...
+
+In the meantime, I'm open to suggestions on how best to proceed:  This is basically a "racetrack" of sorts where I just loop through and enqueue the same things every few minutes.   If it takes longer than that window to burn through the whole list of jobs, that's fine.  The units of work are hitting external systems and as such, things might get bogged down from time to time.  A backlog of duplicate items isn't meaningful/helpful, and presents an operational headache.  Expiring jobs out just runs the risk of certain units of work being starved out.
+(N.B. #241 is a symptom of this issue.)
+
+We're seeing bursts of this error in production.  We have 6 workers with concurrency of 64, plus one node that is not a Faktory worker but fires jobs into Faktory based on HTTP requests that come in.  Workers are seeing the error when trying to fire new jobs from existing ones, and  the web server is seeing these errors as well.  There's a bit of a pattern involved where we get a burst once every hour, spanning about 15 minutes -- however, I don't know if that's because we're getting bursts of requests every hour or there's some sort of network tuning issue at play.  We've covered the basics (max files for all processes involved, FIN_WAIT setting for all machines involved, etc), but are still trying to narrow this down.
+
+Our current best guess is that the 1 second dial timeout for establishing a connection to the Faktory server is relevant, and I'm going to be bypassing `faktory.Open` to modify that value and test things.
+
+At a minimum, exposing this as a configurable option seems like a prudent option, no?  Would you accept a PR that creates a second method -- maybe `OpenWithServer`, allowing clients to pass in a `Server` object, in order to allow configuring of relevant settings without having to copy-paste the logic of `Open()`?

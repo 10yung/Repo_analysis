@@ -1,0 +1,652 @@
+I am trying to write `N-API` rust wrapper for nodejs native bindings, and when I poll future in libuv async callback:
+https://github.com/Brooooooklyn/napi-rs/blob/std-future/napi/src/executor.rs#L118, Segmentation fault happened.
+
+core dump
+```
+error: need to add support for DW_TAG_base_type '()' encoded with DW_ATE = 0x7, bit_size = 0
+* thread #1, stop reason = signal SIGSTOP
+  * frame #0: 0x0000002b000005c3
+    frame #1: 0x0000000104d1a240 test_module.node`_$LT$core..task..wake..Waker$u20$as$u20$core..clone..Clone$GT$::clone::h0d06f603b4c47cf5(self=0x00007ffeefbfd270) at wake.rs:308:28
+    frame #2: 0x0000000104d191fe test_module.node`futures_core::task::__internal::atomic_waker::AtomicWaker::register::h5609db75c7a2f511(self=0x0000000104b01e30, waker=0x00007ffeefbfd270) at atomic_waker.rs:266:45
+    frame #3: 0x0000000104d0a851 test_module.node`_$LT$futures_channel..mpsc..Receiver$LT$T$GT$$u20$as$u20$futures_core..stream..Stream$GT$::poll_next::h93e981212af4d4f7(self=Pin<&mut futures_channel::mpsc::Receiver<usize>> @ 0x00007ffeefbf5af8, cx=0x0000000104b01f68) at mod.rs:920:16
+    frame #4: 0x0000000104d0a9da test_module.node`_$LT$futures_channel..mpsc..UnboundedReceiver$LT$T$GT$$u20$as$u20$futures_core..stream..Stream$GT$::poll_next::hbd93205e64703b8e(self=Pin<&mut futures_channel::mpsc::UnboundedReceiver<usize>> @ 0x00007ffeefbf5ba0, cx=0x0000000104b01f68) at mod.rs:977:8
+    frame #5: 0x0000000104d02a6e test_module.node`_$LT$futures_util..stream..stream..for_each..ForEach$LT$St$C$Fut$C$F$GT$$u20$as$u20$core..future..future..Future$GT$::poll::ha9618cbb59c88e10(self=Pin<&mut futures_util::stream::stream::for_each::ForEach<futures_channel::mpsc::UnboundedReceiver<usize>, futures_util::future::ready::Ready<()>, closure-0>> @ 0x00007ffeefbf5c80, cx=0x0000000104b01f68) at for_each.rs:77:25
+    frame #6: 0x0000000104d05196 test_module.node`futures_util::future::future::chain::Chain$LT$Fut1$C$Fut2$C$Data$GT$::poll::h656fb31a869d9558(self=(pointer = 0x0000000104b01f10), cx=0x0000000104b01f68, f=closure-0 @ 0x00007ffeefbf5e48) at chain.rs:44:40
+    frame #7: 0x0000000104d11352 test_module.node`_$LT$futures_util..future..future..then..Then$LT$Fut1$C$Fut2$C$F$GT$$u20$as$u20$core..future..future..Future$GT$::poll::h2de472b0249b38b9(self=Pin<&mut futures_util::future::future::then::Then<futures_util::stream::stream::for_each::ForEach<futures_channel::mpsc::UnboundedReceiver<usize>, futures_util::future::ready::Ready<()>, closure-0>, futures_util::future::ready::Ready<()>, closure-1>> @ 0x00007ffeefbf6050, cx=0x0000000104b01f68) at then.rs:44:8
+    frame #8: 0x0000000104d12f5c test_module.node`napi_rs::executor::poll_future::h0e73188bd82daf7d(handle=0x0000000104b01e90) at executor.rs:109:8
+    frame #9: 0x0000000100696bc4 node`uv__async_io + 294
+    frame #10: 0x00000001006a62a3 node`uv__io_poll + 1650
+    frame #11: 0x0000000100696ffe node`uv_run + 359
+    frame #12: 0x00000001000b7761 node`node::NodeMainInstance::Run() + 469
+    frame #13: 0x000000010006025c node`node::Start(int, char**) + 240
+    frame #14: 0x00007fff6d30f7fd libdyld.dylib`start + 1
+    frame #15: 0x00007fff6d30f7fd libdyld.dylib`start + 1
+```
+
+It could reproduce in [napi-rs](https://github.com/Brooooooklyn/napi-rs/tree/std-future)
+macos: `cargo build && cp target/debug/libtest_module.dylib ./test_module.node && node test_module/tests.js`
+
+linux: `cargo build && cp target/debug/libtest_module.so ./test_module.node && node test_module/tests.js`
+
+windows: `cargo build && cp target/debug/libtest_module.dll ./test_module.node && node test_module/tests.js`
+
+
+Follow up from https://github.com/rust-lang/futures-rs/pull/2016
+
+This adds two impls:
+
+- `impl<R: AsyncWrite> AsyncWrite for BufReader<R>`
+- `impl<W: AsyncRead> AsyncRead for BufWriter<W>`
+
+The motivation is that you often want to do something like: `BufReader::new(BufWriter::new(socket))`.
+
+If you have two futures and just want to get the result of whichever resolves first and drop the other you can use `futures::future::select`, but it's a little verbose. It may be worth adding a simple wrapper that does this, naming inspired by `async-std`'s function of the same(ish) signature.
+
+```rust
+pub async fn race<T>(a: impl Future<Output = T>, b: impl Future<Output = T>) -> T {
+    futures::pin_mut!(a);
+    futures::pin_mut!(b);
+    futures::future::select(a, b).await.factor_first().0
+}
+```
+Making a minimal example took a while because I could not reproduce it at first due to the very narrow circumstances that triggers this error. I don't know exactly what these circumstances are but my best guess is `assert_eq!` inside `futures::select!`. (however only when asserting equivalence of bools and not Strings, as explained further down.
+
+`Cargo.toml`
+```toml
+[package]
+name = "reproduce"
+version = "0.1.0"
+authors = ["Erlend Langseth <3rledhl@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+# Actix
+actix-web = "2.0"
+actix-rt = "1.0.0"
+actix-http = "1.0.0"
+
+# Serde
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Other
+futures = "0.3.1"
+```
+`src/main.rs`
+```rust
+use actix_http::http::StatusCode;
+use futures::{FutureExt, select};
+use serde::{Serialize, Deserialize};
+use actix_web::{
+    test::TestServer,
+    App
+};
+use std:: time::Duration;
+
+#[derive(Serialize, Deserialize)]
+struct Foo {
+    a: String,
+}
+impl Foo {
+    pub fn get_id(&self) -> &str {
+        &self.a
+    }
+    pub fn is_success(&self) -> bool {
+        true
+    }
+}
+
+macro_rules! response_to_string {
+    ($response:expr) => {
+        std::str::from_utf8($response.body().await.unwrap().as_ref())
+            .unwrap()
+            .to_string()
+    };
+}
+macro_rules! assert_status {
+    ($response:expr, $expected_status:expr) => {
+        if $response.status() != $expected_status {
+            panic!(
+                "Expected status {:?}, got {:?}.\nBODY:{}",
+                $expected_status,
+                $response.status(),
+                response_to_string!($response)
+            );
+        }
+    }
+}
+
+macro_rules! create_test_server {
+    ($srv:ident) => {
+        let $srv = actix_web::test::start({
+            move || App::new()
+        });
+    };
+}
+
+
+async fn poll_operation_until_done(id: String, srv: &TestServer) -> Foo {
+    loop {
+        // now, poll operation
+        let mut response = srv.get(format!("/admin/v1/operations/{}", id))
+            .send() .await.unwrap();
+        match response.status() {
+            StatusCode::OK => {
+                return response.json::<Foo>().await.unwrap();
+            }
+            StatusCode::NOT_FOUND => {
+                // ok -  not finished yet
+            }
+            status => panic!("Unexpected HTTP status code {}", status)
+        }
+        // assert_status!(response, StatusCode::OK);
+        actix_rt::time::delay_for(Duration::from_millis(60)).await;
+    }
+}
+
+#[actix_rt::test]
+async fn test_delete_articles() {
+    create_test_server!(srv);
+
+    macro_rules! run_test {
+        ($should_succeed:expr) => {
+            let mut response = srv.post("/api/v1/lala")
+                .send_json(&Foo {a: "abc".to_string()}).await.unwrap();
+            assert_status!(response, StatusCode::OK);
+            
+            let id = response.json::<Foo>().await.unwrap().get_id().to_owned();
+
+            select! {
+                op_info = poll_operation_until_done(id, &srv).fuse() =>
+                    assert_eq!(op_info.is_success(), $should_succeed), // line 85
+                _ = actix_rt::time::delay_for(Duration::from_secs(30)).fuse() =>
+                    panic!("timeout reached")
+            }
+        }
+    }
+    run_test!(false);
+}
+
+fn main() {
+}
+```
+
+Running it with `cargo c --tests` we get the error
+
+```
+error[E0425]: cannot find value `id` in this scope
+  --> src/main.rs:91:5
+   |
+91 |     run_test!(false);
+   |     ^^^^^^^^^^^^^^^^^
+   |     |
+   |     not found in this scope
+   |     in this macro invocation
+   |
+   = note: this error originates in a macro outside of the current crate (in Nightly builds, run with -Z external-macro-backtrace for more info)
+help: possible candidate is found in another module, you can import it into scope
+   |
+1  | use std::process::id;
+   |
+```
+(look below for more output)
+
+Now... a small change I found that could fix this error is to replace line 85 (annotated with a comment) with `assert_eq!(op_info.a, "heyhey"),`.
+So definitely something strange is going on - this line doesn't even have anything to do with `id`.
+
+## Appendix
+Maybe it's useful with the output of
+```
+RUSTFLAGS="-Z external-macro-backtrace" cargo c --tests
+```
+
+```
+error[E0425]: cannot find value `id` in this scope
+   --> <::futures_util::async_await::select_mod::select macros>:4:20
+    |
+1   |                           /  ($ ($ proc_macro : tt) *) =>
+2   |                           |  {
+3   |                           |      {
+4   |                           |          # [derive ($ crate :: proc_macro_hack_select)] enum ProcMacroHack
+    |                           |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |                           |                     |
+    |                           |                     not found in this scope
+    |                           |                     in this expansion of `proc_macro_call_2!` (#28)
+5   |                           |          { Nested = (stringify ! { $ ($ proc_macro) * }, 0) . 1, } $ crate ::
+    |  _________________________|____________________________________________________________________-
+6   | |                         |          proc_macro_call_select ! { ($ ($ proc_macro) *) }
+    | |_________________________|__________________________________________________________- in this macro invocation (#4)
+7   |                           |      }
+8   |                           |  } ;
+    |                           |____- in this expansion of `$crate::inner_macro::select!` (#3)
+    | 
+   ::: src/main.rs:75:5
+    |
+75  | /                                macro_rules! run_test {
+76  | |                                    ($should_succeed:expr) => {
+77  | |                                        let mut response = srv.post("/api/v1/lala")
+78  | |                                            .send_json(&Foo {a: "abc".to_string()}).await.unwrap();
+...   |
+83  | /                                        select! {
+84  |                                              op_info = poll_operation_until_done(id, &srv).fuse() =>
+85  |                                                  assert_eq!(op_info.is_success(), $should_succeed),
+86  |                                              _ = actix_rt::time::delay_for(Duration::from_secs(30)).fuse() =>
+87  |                                                  panic!("timeout reached")
+88  | |                                        }
+    | |________________________________________- in this macro invocation (#2)
+89  | |                                    }
+90  | |                                }
+    | |________________________________- in this expansion of `run_test!` (#1)
+91  |                                  run_test!(false);
+    |                                  ----------------- in this macro invocation (#1)
+    | 
+   ::: <::proc_macro_nested::dispatch macros>:1:29
+    |
+1   |                              (() $ ($ bang : tt) *) => { $ crate :: count ! ($ ($ bang) *) } ;
+    |                              -                           --------------------------------- in this macro invocation (#27)
+    |     _________________________|
+    |    |
+2   |    |                         ((($ ($ first : tt) *) $ ($ rest : tt) *) $ ($ bang : tt) *) =>
+3   |    |                         { $ crate :: dispatch ! (($ ($ first) * $ ($ rest) *) $ ($ bang) *) } ;
+    |    |                           -----------------------------------------------------------------
+    |    |                           |
+    |    |                           in this macro invocation (#5)
+    |    |                           in this macro invocation (#7)
+    |    |                           in this macro invocation (#9)
+    |    |                           in this macro invocation (#13)
+    |    |                           in this macro invocation (#15)
+    |    |                           in this macro invocation (#17)
+    |    |                           in this macro invocation (#19)
+    |    |                           in this macro invocation (#21)
+    |    |                           in this macro invocation (#25)
+4   |    |                         (([$ ($ first : tt) *] $ ($ rest : tt) *) $ ($ bang : tt) *) =>
+...      |
+9   |    |                         { $ crate :: dispatch ! (($ ($ rest) *) $ ($ bang) * !) } ;
+    |    |                           -----------------------------------------------------
+    |    |                           |
+    |    |                           in this macro invocation (#12)
+    |    |                           in this macro invocation (#24)
+...      |
+12  |    |                         (($ first : tt $ ($ rest : tt) *) $ ($ bang : tt) *) =>
+13  |    |                         { $ crate :: dispatch ! (($ ($ rest) *) $ ($ bang) *) } ;
+    |    |                           ---------------------------------------------------   -
+    |    |                           |                                                     |
+    |    |                           |                                                     in this expansion of `$crate::proc_macro_call_select!` (#4)
+    |    |                           |                                                     in this expansion of `$crate::dispatch!` (#5)
+    |    |                           |                                                     in this expansion of `$crate::dispatch!` (#6)
+    |    |                           |                                                     in this expansion of `$crate::dispatch!` (#7)
+    |    |                           |                                                     in this expansion of `$crate::dispatch!` (#8)
+    |    |                           |                                                     in this expansion of `$crate::dispatch!` (#9)
+    |    |                           |                                                     in this expansion of `$crate::dispatch!` (#10)
+    |    |                           |                                                     in this expansion of `$crate::dispatch!` (#11)
+    |    |                           |                                                     in this expansion of `$crate::dispatch!` (#12)
+    |    |                           |                                                     in this expansion of `$crate::dispatch!` (#13)
+    |    |                           |                                                     in this expansion of `$crate::dispatch!` (#14)
+    |    |                           |                                                     in this expansion of `$crate::dispatch!` (#15)
+    |    |                           |                                                     in this expansion of `$crate::dispatch!` (#16)
+    |    |                           |                                                     in this expansion of `$crate::dispatch!` (#17)
+    |    |                           |                                                     in this expansion of `$crate::dispatch!` (#18)
+    |    |                           |                                                     in this expansion of `$crate::dispatch!` (#19)
+    |    |                           |                                                     in this expansion of `$crate::dispatch!` (#20)
+    |    |                           |                                                     in this expansion of `$crate::dispatch!` (#21)
+    |    |                           |                                                     in this expansion of `$crate::dispatch!` (#22)
+    |    |                           |                                                     in this expansion of `$crate::dispatch!` (#23)
+    |    |                           |                                                     in this expansion of `$crate::dispatch!` (#24)
+    |    |___________________________|_____________________________________________________in this expansion of `$crate::dispatch!` (#25)
+    |                                |                                                     in this expansion of `$crate::dispatch!` (#26)
+    |                                in this macro invocation (#6)
+    |                                in this macro invocation (#8)
+    |                                in this macro invocation (#10)
+    |                                in this macro invocation (#11)
+    |                                in this macro invocation (#14)
+    |                                in this macro invocation (#16)
+    |                                in this macro invocation (#18)
+    |                                in this macro invocation (#20)
+    |                                in this macro invocation (#22)
+    |                                in this macro invocation (#23)
+    |                                in this macro invocation (#26)
+    | 
+   ::: <::proc_macro_nested::count macros>:1:1
+    |
+1   |   /                          () => { proc_macro_call_0 ! () } ; (!) => { proc_macro_call_1 ! () } ; (! !)
+2   |   |                          => { proc_macro_call_2 ! () } ; (! ! !) => { proc_macro_call_3 ! () } ;
+    |   |                               ---------------------- in this macro invocation (#28)
+3   |   |                          (! ! ! !) => { proc_macro_call_4 ! () } ; (! ! ! ! !) =>
+4   |   |                          { proc_macro_call_5 ! () } ; (! ! ! ! ! !) => { proc_macro_call_6 ! () } ;
+...     |
+104 |   |                           ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! !) =>
+105 |   |                          { proc_macro_call_64 ! () } ;
+    |   |______________________________________________________- in this expansion of `$crate::count!` (#27)
+    | 
+   ::: <::futures::select macros>:1:1
+    |
+1   |                            / ($ ($ tokens : tt) *) =>
+2   |                            | {
+3   |                            |     $ crate :: inner_macro :: select !
+    |  __________________________|_____-
+4   | |                          |     { futures_crate_path (:: futures) $ ($ tokens) * }
+    | |__________________________|______________________________________________________- in this macro invocation (#3)
+5   |                            | }
+    |                            |_- in this expansion of `select!` (#2)
+    |
+help: possible candidate is found in another module, you can import it into scope
+    |
+1   | use std::process::id;
+    |
+
+error: aborting due to previous error
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `reproduce`.
+```
+Operating as a Linux Vendor, its desirable for many, many reasons to be able to execute tests on published crates. ( For instance, when publishing a new rust version as a vendor, being able to re-execute all the tests for everything currently packaged to identify new compile errors, or functional regressions, helps make sure that all vendorized crates will be error-free at the time of user consumption )
+
+But anything relying on path dependencies pretty much screws this.
+
+See also:
+- https://github.com/rust-lang/futures-rs/issues/1017
+- https://github.com/rust-lang/futures-rs/issues/1020
+- https://github.com/rust-lang/futures-rs/issues/1019
+
+Which are all closed, and sill relevant, but I can't actually re-open a bug. 
+
+The filer of those bugs does appear to be potentially a fedora rep, confirming that multiple vendors have this as a complaint.
+
+Though our obligation is really only to make sure you know there's an issue, and know we're applying nasty hacks to get around it, and all such hacks are always better to be fixed upstream ( In part because it means a given vendor freshly trying to package this doesn't have to stumble upon the problem and DIY their own hack around it, and ensures closer vendor tracking of crates vs upstream )
+
+As a side note: A dozen or so crates having the same repository and the same bug tracker seems very sub-optimal, because its hard to directly map crate patches to git patches and vice-versa, and hard to find issues pertaining to a specific crate when there are a dozen crates using the same issue tracker, which github seems very sub-optimal for.
+
+```
+    Finished test [unoptimized + debuginfo] target(s) in 0.01s
+     Running target/debug/deps/futures_core-a2b3d337c4676fee
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+   Doc-tests futures_core
+
+running 2 tests
+test src/task/__internal/atomic_waker.rs - task::__internal::atomic_waker::AtomicWaker (line 38) ... FAILED
+test src/task/__internal/atomic_waker.rs - task::__internal::atomic_waker::AtomicWaker::register (line 233) ... FAILED
+
+failures:
+
+---- src/task/__internal/atomic_waker.rs - task::__internal::atomic_waker::AtomicWaker (line 38) stdout ----
+error[E0433]: failed to resolve: use of undeclared type or module `futures`
+ --> src/task/__internal/atomic_waker.rs:39:5
+  |
+4 | use futures::future::Future;
+  |     ^^^^^^^ use of undeclared type or module `futures`
+
+error[E0433]: failed to resolve: use of undeclared type or module `futures`
+ --> src/task/__internal/atomic_waker.rs:40:5
+  |
+5 | use futures::task::{Context, Poll, AtomicWaker};
+  |     ^^^^^^^ use of undeclared type or module `futures`
+
+error[E0433]: failed to resolve: use of undeclared type or module `AtomicWaker`
+  --> src/task/__internal/atomic_waker.rs:57:20
+   |
+22 |             waker: AtomicWaker::new(),
+   |                    ^^^^^^^^^^^ use of undeclared type or module `AtomicWaker`
+
+error[E0433]: failed to resolve: use of undeclared type or module `Poll`
+  --> src/task/__internal/atomic_waker.rs:74:20
+   |
+39 |             return Poll::Ready(());
+   |                    ^^^^ use of undeclared type or module `Poll`
+
+error[E0433]: failed to resolve: use of undeclared type or module `Poll`
+  --> src/task/__internal/atomic_waker.rs:82:13
+   |
+47 |             Poll::Ready(())
+   |             ^^^^ use of undeclared type or module `Poll`
+
+error[E0433]: failed to resolve: use of undeclared type or module `Poll`
+  --> src/task/__internal/atomic_waker.rs:84:13
+   |
+49 |             Poll::Pending
+   |             ^^^^ use of undeclared type or module `Poll`
+
+error[E0412]: cannot find type `AtomicWaker` in this scope
+  --> src/task/__internal/atomic_waker.rs:47:12
+   |
+12 |     waker: AtomicWaker,
+   |            ^^^^^^^^^^^ not found in this scope
+   |
+help: possible candidate is found in another module, you can import it into scope
+   |
+3  | use futures_core::task::__internal::AtomicWaker;
+   |
+
+error[E0405]: cannot find trait `Future` in this scope
+  --> src/task/__internal/atomic_waker.rs:68:6
+   |
+33 | impl Future for Flag {
+   |      ^^^^^^ not found in this scope
+   |
+help: possible candidates are found in other modules, you can import them into scope
+   |
+3  | use core::future::Future;
+   |
+3  | use futures_core::Future;
+   |
+3  | use futures_core::core_reexport::future::Future;
+   |
+3  | use futures_core::future::Future;
+   |
+     and 1 other candidate
+
+error[E0412]: cannot find type `Context` in this scope
+  --> src/task/__internal/atomic_waker.rs:71:44
+   |
+36 |     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+   |                                            ^^^^^^^ not found in this scope
+   |
+help: possible candidates are found in other modules, you can import them into scope
+   |
+3  | use core::task::Context;
+   |
+3  | use futures_core::core_reexport::task::Context;
+   |
+3  | use futures_core::task::Context;
+   |
+3  | use std::task::Context;
+   |
+
+error[E0412]: cannot find type `Poll` in this scope
+  --> src/task/__internal/atomic_waker.rs:71:60
+   |
+36 |     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+   |                                                            ^^^^ not found in this scope
+   |
+help: possible candidates are found in other modules, you can import them into scope
+   |
+3  | use core::task::Poll;
+   |
+3  | use futures_core::core_reexport::task::Poll;
+   |
+3  | use futures_core::task::Poll;
+   |
+3  | use std::task::Poll;
+   |
+
+error: aborting due to 10 previous errors
+
+Some errors have detailed explanations: E0405, E0412, E0433.
+For more information about an error, try `rustc --explain E0405`.
+Couldn't compile the test.
+---- src/task/__internal/atomic_waker.rs - task::__internal::atomic_waker::AtomicWaker::register (line 233) stdout ----
+error[E0433]: failed to resolve: use of undeclared type or module `futures`
+ --> src/task/__internal/atomic_waker.rs:234:5
+  |
+4 | use futures::future::Future;
+  |     ^^^^^^^ use of undeclared type or module `futures`
+
+error[E0433]: failed to resolve: use of undeclared type or module `futures`
+ --> src/task/__internal/atomic_waker.rs:235:5
+  |
+5 | use futures::task::{Context, Poll, AtomicWaker};
+  |     ^^^^^^^ use of undeclared type or module `futures`
+
+error[E0433]: failed to resolve: use of undeclared type or module `Poll`
+  --> src/task/__internal/atomic_waker.rs:254:13
+   |
+24 |             Poll::Ready(())
+   |             ^^^^ use of undeclared type or module `Poll`
+
+error[E0433]: failed to resolve: use of undeclared type or module `Poll`
+  --> src/task/__internal/atomic_waker.rs:256:13
+   |
+26 |             Poll::Pending
+   |             ^^^^ use of undeclared type or module `Poll`
+
+error[E0412]: cannot find type `AtomicWaker` in this scope
+  --> src/task/__internal/atomic_waker.rs:241:12
+   |
+11 |     waker: AtomicWaker,
+   |            ^^^^^^^^^^^ not found in this scope
+   |
+help: possible candidate is found in another module, you can import it into scope
+   |
+3  | use futures_core::task::__internal::AtomicWaker;
+   |
+
+error[E0405]: cannot find trait `Future` in this scope
+  --> src/task/__internal/atomic_waker.rs:245:6
+   |
+15 | impl Future for Flag {
+   |      ^^^^^^ not found in this scope
+   |
+help: possible candidates are found in other modules, you can import them into scope
+   |
+3  | use core::future::Future;
+   |
+3  | use futures_core::Future;
+   |
+3  | use futures_core::core_reexport::future::Future;
+   |
+3  | use futures_core::future::Future;
+   |
+     and 1 other candidate
+
+error[E0412]: cannot find type `Context` in this scope
+  --> src/task/__internal/atomic_waker.rs:248:44
+   |
+18 |     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+   |                                            ^^^^^^^ not found in this scope
+   |
+help: possible candidates are found in other modules, you can import them into scope
+   |
+3  | use core::task::Context;
+   |
+3  | use futures_core::core_reexport::task::Context;
+   |
+3  | use futures_core::task::Context;
+   |
+3  | use std::task::Context;
+   |
+
+error[E0412]: cannot find type `Poll` in this scope
+  --> src/task/__internal/atomic_waker.rs:248:60
+   |
+18 |     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+   |                                                            ^^^^ not found in this scope
+   |
+help: possible candidates are found in other modules, you can import them into scope
+   |
+3  | use core::task::Poll;
+   |
+3  | use futures_core::core_reexport::task::Poll;
+   |
+3  | use futures_core::task::Poll;
+   |
+3  | use std::task::Poll;
+   |
+
+error: aborting due to 8 previous errors
+
+Some errors have detailed explanations: E0405, E0412, E0433.
+For more information about an error, try `rustc --explain E0405`.
+Couldn't compile the test.
+
+failures:
+    src/task/__internal/atomic_waker.rs - task::__internal::atomic_waker::AtomicWaker (line 38)
+    src/task/__internal/atomic_waker.rs - task::__internal::atomic_waker::AtomicWaker::register (line 233)
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out
+
+error: test failed, to rerun pass '--doc'
+```
+I noticed that recently send_all signature was updated to require TryStream bound on passed stream (https://github.com/rust-lang/futures-rs/pull/1946).
+
+I wonder if there is a reason for this restriction?
+
+Consider the following code that I have:
+```
+type TestData = HashMap<String, usize>;
+
+let sink: Sink<TestData> = ...;
+let msg1 = HashMap::new();
+let msg2 = HashMap::new();
+
+let mut msgs = futures::stream::iter(vec![msg1, msg2]);
+
+sender.send_all(&mut msgs).await?;
+```
+This fails with following error:
+```
+error[E0271]: type mismatch resolving `<futures_util::stream::iter::Iter<std::vec::IntoIter<std::collections::HashMap<std::string::String, usize>>> as futures_core::stream::Stream>::Item == std::result::Result<_, _>`
+  --> examples/basic.rs:55:12
+   |
+55 |     sender.send_all(&mut msgs).await?;
+   |            ^^^^^^^^ expected struct `std::collections::HashMap`, found enum `std::result::Result`
+   |
+   = note: expected type `std::collections::HashMap<std::string::String, usize>`
+              found enum `std::result::Result<_, _>`
+   = note: required because of the requirements on the impl of `futures_core::stream::TryStream` for `futures_util::stream::iter::Iter<std::vec::IntoIter<std::collections::HashMap<std::string::String, usize>>>`
+```
+
+Took me some time to decrypt that this happens because stream::iter::Iter does not implement TryStream and gets automatic implementation only if stream's item is std::result::Result. So, in simple code above I have to wrap each message into Ok like `futures::stream::iter(vec![Ok(msg1), Ok(msg2)])` which looks weird.
+
+Shouldn't it be possible to send streams that produce items for sure and can't fail? Unless I am missing something obvious that makes it undesirable/not possible, I think sinking collection of values is rather often use case. 
+Use `assert_future` and `assert_stream` annotations in almost all
+`FutureExt`, `TryFutureExt`, `StreamExt` and `TryStreamExt` trait
+fns.
+
+My own style of working with third-party code is doing Cmd-Click
+in Idea and look at signature/implementation.
+
+I found these existing `assert_` annotations very helpful in
+understanding what this particular function does, what it expects,
+what it returns, much faster than reading documentation or opening
+actual future/stream implementation.
+
+For example, there's `TryStreamExt::and_then` function:
+
+```
+    fn and_then<Fut, F>(self, f: F) -> AndThen<Self, Fut, F>
+    where
+        F: FnMut(Self::Ok) -> Fut,
+        Fut: TryFuture<Error = Self::Error>,
+        Self: Sized,
+    { ... }
+```
+
+What does it do? Does it return a future or a stream?  Is stream
+item original stream item or returned from future?  Is error
+converted? Is it even `Try` object returned from this function?
+
+Now with the function body:
+
+```
+        assert_stream::<Result<Fut::Ok, Fut::Error>, _>(...)
+```
+
+it's easier to infer that function returns a stream with the same
+items as provided future.
+
+So this diff extends `assert_` function to almost all functions of
+these four traits.
+when I begin project I choose futures, But then I will use Tokio/async-std instead od futures and no back, because it lack "net" api,  I don't know, why here isn't the  "net" API.

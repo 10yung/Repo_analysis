@@ -1,0 +1,580 @@
+Hi, I'm trying to add EnTT to an Unreal project with C++17 enabled. When compiling, I see these warnings. Are these known, or have I done something wrong?
+
+Thanks!
+
+```
+   E:\testy\Source\entt\meta\meta.hpp(562) : error C4800: Implicit conversion from 'const entt::internal::meta_type_node *const ' to bool. Possible information loss
+  E:\testy\Source\entt\meta\meta.hpp(562): note: consider using explicit cast or comparison to nullptr to avoid this warning
+   E:\testy\Source\entt\meta\meta.hpp(690) : error C4800: Implicit conversion from 'const entt::internal::meta_prop_node *const ' to bool. Possible information loss
+  E:\testy\Source\entt\meta\meta.hpp(690): note: consider using explicit cast or comparison to nullptr to avoid this warning
+   E:\testy\Source\entt\meta\meta.hpp(728) : error C4800: Implicit conversion from 'const entt::internal::meta_base_node *const ' to bool. Possible information loss
+  E:\testy\Source\entt\meta\meta.hpp(728): note: consider using explicit cast or comparison to nullptr to avoid this warning
+   E:\testy\Source\entt\meta\meta.hpp(763) : error C4800: Implicit conversion from 'const entt::internal::meta_conv_node *const ' to bool. Possible information loss
+  E:\testy\Source\entt\meta\meta.hpp(763): note: consider using explicit cast or comparison to nullptr to avoid this warning
+   E:\testy\Source\entt\meta\meta.hpp(847) : error C4800: Implicit conversion from 'const entt::internal::meta_ctor_node *const ' to bool. Possible information loss
+  E:\testy\Source\entt\meta\meta.hpp(847): note: consider using explicit cast or comparison to nullptr to avoid this warning
+   E:\testy\Source\entt\meta\meta.hpp(984) : error C4800: Implicit conversion from 'const entt::internal::meta_data_node *const ' to bool. Possible information loss
+  E:\testy\Source\entt\meta\meta.hpp(984): note: consider using explicit cast or comparison to nullptr to avoid this warning
+   E:\testy\Source\entt\meta\meta.hpp(1095) : error C4800: Implicit conversion from 'const entt::internal::meta_func_node *const ' to bool. Possible information loss
+  E:\testy\Source\entt\meta\meta.hpp(1095): note: consider using explicit cast or comparison to nullptr to avoid this warning
+   E:\testy\Source\entt\meta\meta.hpp(1444) : error C4800: Implicit conversion from 'const entt::internal::meta_type_node *const ' to bool. Possible information loss
+  E:\testy\Source\entt\meta\meta.hpp(1444): note: consider using explicit cast or comparison to nullptr to avoid this warning
+   E:\testy\Source\entt\signal\delegate.hpp(281) : error C4800: Implicit conversion from 'void (__cdecl *const )(const void *,std::tuple<void *&&>)' to bool. Possible information loss
+  E:\testy\Source\entt\signal\delegate.hpp(279): note: consider using explicit cast or comparison to nullptr to avoid this warning
+  E:\testy\Source\entt\signal\delegate.hpp(279): note: while compiling class template member function 'entt::delegate<void (void *)>::operator bool(void) noexcept const'
+  E:\testy\Source\entt\entity\../signal/sigh.hpp(170): note: see reference to function template instantiation 'entt::delegate<void (void *)>::operator bool(void) noexcept const' being compiled
+  E:\testy\Source\entt\entity\../signal/sigh.hpp(182): note: see reference to class template instantiation 'entt::delegate<void (void *)>' being compiled
+
+```
+I often find myself doing things like this.
+
+```cpp
+entt::entity hovered { entt::null };
+for (auto entity : registry.view<Hovered>()) {
+    hovered = entity;
+    break;
+};
+```
+
+Where there may be many things carrying this particular component, e.g. behind or infront of the cursor, and where you may have sorted them front to back and only want the front-most one. Another usecase is for selection, where the "first" gets special treatment like a different kind of draw call.
+
+And was thinking that could be simplified to e.g.
+
+```cpp
+auto hovered = registry.first<Hovered>();
+```
+
+Along with, for symmetry..
+
+```cpp
+auto hovered = registry.last<Hovered>();
+```
+
+Thoughts?
+Closes #385.
+
+The name `invoke_on_component` is still [up for debate](https://github.com/skypjack/entt/issues/385#issuecomment-573482861) - as is this entire PR. Feel free to close, was just something I felt would be helpful. :)
+I propose adding a method of iterating over all components IDs that are currently attached to an entity. 
+
+What I want to achieve is mapping the components to my custom reflection system, and that could be done by mapping & looking them up with runtime component IDs generated via `registry.type<Component>()`. In addition to the type ID, I would also need a pointer to the actual component type that I could then cast to the correct type based on the ID.
+
+The resulting API could look something like the following:
+
+    registry.components(entity, [](entt::component component_id, void *instance) { ... });
+
+The naming of the method should probably be considered, maybe it should somehow clearly indicate that this is very "raw" data as it only feeds the caller void pointers.
+It would be quite nice to have an option to enable Thread Safety when the registry initializes its component pools.
+
+Basically as we talked about on the gitter, when you loop over your view for the first time, it will most likely (at least in my case) be the first time that the registry sees a given component type, therefore it has to initialize the pool for that specific type, however as it is right now, this isn't thread safe, and while there are plenty of work arounds, I think it would be nice to have an option to enable this.
+
+At the end of the day using a mutex to make it thread safe isn't really a performance concern as this is a one time setup thing that would happen only on the very first iteration of a view that has a component that the registry haven't seen before, it would "hide" away a lot of otherwise "Setup" code that the programmer would have to do in order to either prepare the registry like using "Register::prepare" or running all views single threaded for the first iteration.
+Would it be possible to add an overload for the `on_construct()`-family of methods on the sinks to allow for a member function of the underlying component type, without an instance of the member function's type?
+
+Here's a visual example:
+
+```c++
+struct some_component {
+    int i = 0;
+
+    void init() {
+        cout << "I've init'd: " << i << endl;
+    }
+};
+
+registry.on_construct<some_component>().connect<&some_component::init>();
+```
+
+In the above pseudo-code, we don't use a static function nor do we use a member function with a point/reference to a specific instance. Instead, we use a pointer to a member function _of the component itself_ to call, with `this` being the pointer to the newly created component itself.
+
+This would greatly clean up some of the glue code in some parts of the engine, as right now I am either passing lambdas or creating stubs to do pretty much exactly this.
+
+For context, I could be using constructors and destructors, but given the inherently POD-like structures, default move constructors, et al, I'm writing my components in a way they can be re-used via `init()` and `destroy()` member methods (where a call to `destroy()` could, in theory, be followed by `init()` assuming all of the non-default POD properties have been set prior). I fully realize this isn't a design requirement by ENTT but it seems like a clean approach for my use-case.
+
+Would love to hear your thoughts, or why this might not be a good idea. :)
+As mentioned [in chat](https://gitter.im/skypjack/entt?at=5df243cac6ce6027ebab1fd5), there might be an opportunity for the API to save a few characters from being typed, by introducing a `any` to the registry.
+
+**Before**
+
+```cpp
+if (_registry.has<Selected>(entity) ||
+    _registry.has<SelectedByParent>(entity) ||
+    _registry.has<SelectedByChild>(entity))
+{
+  flags |= ImGuiTreeNodeFlags_Selected;
+}
+```
+
+**After**
+
+```cpp
+if (_registry.any<Selected, SelectedByParent, SelectedByChild>(entity) {
+  flags |= ImGuiTreeNodeFlags_Selected;
+}
+```
+## Abstract
+
+A static reflection is a tool that allows adding meta-information to types for using it at compile time for different purposes. One of the use cases is generating data for runtime reflection systems like the one in EnTT or RTTR. Another important use case is generating Lua bindings based on sol2 or similar system. The main advantage of the static reflection in these cases is that it allows defining a single source of truth and generating all the necessary code with the help of generic functions that work for any type.
+
+## Introduction
+
+The inspiration for this definition of static reflection and its use cases comes from the following code snippet by @Milerius:
+
+```c++
+template < typename TypeToRegister >
+void register_type (const char* replace_name = nullptr) noexcept
+{
+    register_type_impl< TypeToRegister > (
+        refl::reflect< TypeToRegister > ().members, replace_name);
+}
+
+template < typename TypeToRegister, typename... Members >
+void register_type_impl (
+    refl::type_list< Members... >, const char* replace_name = nullptr) noexcept
+{
+    std::string current_name = refl::reflect< TypeToRegister > ().name.str ();
+    std::string final_name   = current_name;
+    if (std::size_t found = current_name.find_last_of (':');
+        found != std::string::npos)
+    {
+        //! Skip namespace
+        final_name = current_name.substr (found + 1); //! LCOV_EXCL_LINE
+    }
+
+    auto apply_functor = [this](auto&& final_table) {
+        try
+        {
+            std::apply (
+                [this](auto&&... params) {
+                    // static_assert((std::is_same_v<std::remove_cv_t<std::remove_reference_t<decltype(params)>>,
+                    // std::nullptr_t> || ...), "system is flawed");
+                    this->lua_state_->new_usertype< TypeToRegister > (
+                        std::forward< decltype (params) > (params)...);
+                },
+                final_table);
+        }
+        catch (const std::exception& error)
+        {
+            std::cerr << error.what () << std::endl; //! LCOV_EXCL_LINE
+        }
+    };
+
+    auto name_table =
+        std::make_tuple (replace_name == nullptr ? final_name : replace_name);
+    if constexpr (doom::meta::is_detected_v<
+                      member_type_constructors_detector,
+                      TypeToRegister >)
+    {
+        using ctor       = typename TypeToRegister::constructors;
+        auto final_table = std::tuple_cat (
+            name_table,
+            std::make_tuple (ctor ()),
+            std::make_tuple (Members::name.c_str (), Members::pointer)...);
+        apply_functor (final_table);
+    }
+    else
+    {
+        auto final_table = std::tuple_cat (
+            name_table,
+            std::make_tuple (Members::name.c_str (), Members::pointer)...);
+        apply_functor (final_table);
+    }
+}
+```
+
+The code above uses the meta-information generated with the help of [refl-cpp](https://github.com/veselink1/refl-cpp) library. The downsides of this library are:
+
+ * it's a third-party library which means it cannot be included into the EnTT library;
+ * it makes heavy use of macros for code-generation which makes it relatively hard to comprehend.
+
+Thus, providing a static reflection system would be a great addition to the feature set of the EnTT library. The only technical requirement for it now is not to be a macro-monster.
+
+Requirements:
+
+ * ability to provide meta-information for any type without changing it's definition, not magic macros, inheritance or anything along this line;
+ * no pre-build steps and external code generation;
+ * allow users providing custom names for the reflected entities (types, functions, etc.) and a reasonable default name generation, whenever possible;
+ * ability to query a list of meta-items of different categories (functions, data members, properties) with types, names (`const char*` or similar form)
+   and values - required for using other template-based meta systems (EnTT, sol2);
+ * ability to query meta-items by name or any other identifier.
+
+## Proposed wording
+
+There are several proposals for the static reflection syntax:
+
+1. Chain-calls (@Innokentiy-Alaytsev, a rippoff of current EnTT version of runtime reflection)
+
+   ```c++
+   entt::reflect< T > ()
+       .type< entt::name< "foobar"_hs > > ()
+       .data<
+           entt::target< &T::data >,
+           entt::name< "data"_hs >,
+           entt::properties<
+               my_property,
+               entt::property< "foo"_hs, 4 >,
+               entt::property< "bar"_hs, 2 > >,
+           entt::annotations< my_annotations > > ()
+       .func<
+           entt::target< &T::func >,
+           entt::name< "func"_hs >,
+           entt::properties< another_property > > ();
+   ```
+
+   The obvious problem with this approach is that it is a function call. It    should be tested whether this kind of code can be used to declare a type through `decltype` but it is not clear how exactly to use this approach.
+
+2. Type lists templates (@Innokentiy-Alaytsev)
+
+   ```c++
+   entt::reflect<
+       T,
+       entt::type< entt::name< "foobar"_hs > >,
+       entt::data<
+           entt::target< &T::data >,
+           entt::name< "data"_hs >,
+           entt::properties<
+               my_property,
+               entt::property< "foo"_hs, 4 >,
+               entt::property< "bar"_hs, 2 > >,
+           entt::annotations< my_annotations > >,
+       entt::func<
+           entt::target< &T::func >,
+           entt::name< "func"_hs >,
+           entt::properties< another_property > > > ();
+   ```
+
+   This version shares the problems of being a function call with the vatiant 1. Another problem with this kind of approach is the impossibility of passing values of object types (that is `entt::hashed_string` in the example code) or string literals as template non-type parameters. This will be possible in C++20 but for now EnTT is C++17 library.
+
+   It is most likely that the only way of overcoming this limitation of the language is using macros for generating some kind of class specialisation containing the desired value as `static constexpr` data member.
+
+   There are cases where passing `entt::hashed_string` as template parameter work in EnTT, e.g. `entt::tag` type. The problem here is that in fact the `entt::hashed_string` value is implicitly converted into `entt::hashed_string::hash_type` so that the actual string is lost.
+
+3. Macro-based reflection (by @skypjack)
+
+   ```c++
+   REFLECT(
+       T,
+       TYPE("foobar"_hs),
+       DATA(...),
+       FUNC(...)
+   );
+
+   struct Type {
+       int foo;
+       void bar() {}
+   };
+
+   void quux(const Type &) {}
+
+   META(
+       TYPE(Type, "Type")
+       DATA(&Type::foo, "Foo")
+       FUNC(&Type::bar, "Bar")
+       FUNC(&quux)
+   )
+   ```
+
+   @skypjack:
+
+   > that resembles exactly the definition of refl too :smile: but for the fact that I'd make an abuse of `auto` under the hood to allow more things than what it does
+
+   @Innokentiy-Alaytsev:
+
+   > Would it be possible to unwrap the META macro smartly: at first have every meta-item be turned into a class specialisation and then have every meta-item be actually turned into something else that is the actual meta-data storage?
+
+   This version is mostly intended for hiding the actual code that is most likely a bunch of specialisation. On the plus side, it may be possible to generate some additional code, e.g. specialisation in the global namespace, with this approach. However, it is important to keep those macros as simple as humanly possible.
+
+4. Meta-descriptor reflection (@skypjack)
+
+   ```c++
+   template<typename>
+   struct meta_type;
+
+   template<>
+   struct meta_type<T>: meta_descriptor_t<
+       &type::a_member_function,
+       &type::another_member_function,
+       &type::a_data_member,
+       &type::another_member,
+       ...
+   >;
+
+   template<>
+   struct meta_type<T>: meta_descriptor_t<
+       func<"name"_hs, &type::a_member_function>, // ?
+       &type::another_member_function,
+       &type::a_data_member,
+       &type::another_member,
+       ...
+   >;
+   ```
+
+   @skypjack:
+
+   > where meta_descriptor_t is an alias that forward everything to a template based system that separates the arguments in lists and defines a compile-time object with a bunch of members like data, func and so on
+
+   Meta-descriptor type specialisation shares the same problems as variant 2 as it needs no pass some object-type values as template parameters. Otherwise, it may have the API that resembles the variant 2 to some extent.
+
+   It may be worth considering the implementation based on alias template: pass template arguments to an alias that unwraps them under the hood to form a proper specialisation of meta-descriptor type.
+
+5. [Attachment through template specialisation](https://godbolt.org/z/RjZn170) (@Innokentiy-Alaytsev)
+
+   ```c++
+   struct type_w_p {};
+
+
+   template<class T, class K>
+   struct property{
+       static bool constexpr owned = false;
+   };
+
+
+   #define PROPERTY(i_type, i_key, i_value) \
+       template<> \
+       struct property<i_type, entt::tag<entt::hashed_string{i_key}>> { \
+           static bool constexpr owned = true; \
+           static auto constexpr key = i_key; \
+           static auto constexpr value = i_value; \
+       };
+
+
+   template<class T, class K>
+   constexpr bool has_property () {
+       return property<T, K>::owned;
+   }
+
+
+   PROPERTY (type_w_p, "test", 43);
+   ```
+
+   @Innokentiy-Alaytsev:
+
+   > It is far too limited. The only way to query anything is to call it by name which undermines the whole idea of meta information. It is possible to make yet another specialisation to hold a list of properties, but it is cumbersome and error-prone since it is not possible (from what I can see) to check whether the list is correct or not.
+
+   This version may be usable in certain cases but is most likely not suitable for solving the problem at hand due to lack of querying meta-items functionality.
+
+6. [Static constexpr data structure](https://godbolt.org/z/KckWZG) (@Innokentiy-Alaytsev)
+
+   ```c++
+   struct Structure {
+       int var;
+
+       void f ()
+       {
+       }
+   };
+
+
+   template < class TKey, class TValue >
+   struct meta_property {
+       constexpr meta_property ()
+           : key{}
+           , val{} {};
+       constexpr meta_property (TKey i_k, TValue i_v)
+           : key{i_k}
+           , val{i_v}
+       {
+       }
+
+       TKey   key;
+       TValue val;
+   };
+
+
+   template < class... TProp >
+   struct meta_properties {
+       template < std::size_t Ts = sizeof...(TProp) >
+       constexpr meta_properties (std::enable_if_t< (Ts >= 0) >* a = nullptr)
+           : props{}
+       {
+       }
+       constexpr meta_properties (TProp&&... i_p)
+           : props{i_p...}
+       {
+       }
+
+       std::tuple< TProp... > props;
+   };
+
+
+   template < auto TSource, class TName, class TProperties = meta_properties<> >
+   struct meta_item {
+       constexpr meta_item (TName i_n, TProperties i_p)
+           : name{i_n}
+           , props{i_p}
+       {
+       }
+
+
+       static auto constexpr src = TSource;
+
+       TName       name;
+       TProperties props;
+   };
+
+
+   template < class... TItem >
+   struct meta_items {
+       constexpr meta_items (TItem&&... i_v)
+           : items{i_v...}
+       {
+       }
+
+       std::tuple< TItem... > items;
+   };
+
+
+   /*
+      Template parameters deduction stops working if any template parameter is
+      provided, so using meta_item<&source>(name, properties) does not work.
+      Another way round is using type parameter for source and saving the source as
+      an ordinary member-variable.
+   */
+   template < auto TSource, class TName, class TProperties = meta_properties<> >
+   constexpr auto make_meta_item (TName&& i_n, TProperties&& i_p = {})
+   {
+       return meta_item< TSource, TName, TProperties >{
+           std::forward< TName > (i_n), std::forward< TProperties > (i_p)};
+   }
+
+
+   template < class T >
+   struct meta_info {
+   };
+
+
+   template <>
+   struct meta_info< Structure > {
+       static auto constexpr variables =
+           meta_items{make_meta_item< &Structure::var > ("var"_hs),
+                      make_meta_item< &Structure::var > (
+                          "var_alias"_hs,
+                          meta_properties{meta_property{"foo"_hs, 4},
+                                          meta_property{"bar"_hs, 2}})};
+
+       static auto constexpr functions =
+           meta_items{make_meta_item< &Structure::f > ("f"_hs)};
+   };
+   ```
+
+   @Innokentiy-Alaytsev (applicable to most types of static reflection):
+
+   > It is not possible to extend this meta-information thing because of C++ and compile-time. But in some rare cases, this kind of extension may be wanted. It could be possible to use inheritance for this: the meta-information type for the specific context may be inherited from the default meta-information type and have a distinct name. The default specialisation will just inherit the base without any changes. The user-defined implementation may shadow the base type members definitions with its own that are composed from the base class definition and new items.
+
+   This version represents one of the ways the underlying compile-time data structure of some template-based reflection (variants 3, 4 and 7, something in the style of variant 2). Having to write this kind of data structure by hand is not desired.
+
+
+7. Template type-list (@skypjack)
+
+   ```c++
+   struct Type {
+       int foo;
+       void bar() {}
+   };
+
+   void quux(const Type &) {}
+
+   using type_meta = meta<
+       Type,
+       name("Type"),
+       data<&Type::foo, name("Foo")>,
+       func<&Type::bar, name("Bar")>,
+       func<&Type::quux, name("Quux")>
+   >;
+   ```
+
+   @skypjack:
+
+   > here meta could rely on reordering for parameters and easily handle everything under the hood with a bit of template magic **BUT** there is a problem with the name. mainly because you're already in a context where you cannot push outside the name to define or specialize a class with the sole goal of carrying a `const char *`
+
+8. [Cista](https://cista.rocks/) rippoff
+
+   ```c++
+   struct row {
+     sql_col<
+       int, name("id"),
+       primary, not_null> user_id;
+     sql_col<
+       std::string, name("first"),
+       not_null> first_name;
+     sql_col<
+       std::string, name("last"),
+       not_null> last_name;
+   } r;
+   ```
+   ([Full example](https://www.onlinegdb.com/BkEgNzpkN))
+
+   The idea here is to use the same trick (involving macros) to drag string literals into the type definition.
+
+9. Constexpr function chain (@skypjack):
+
+   ```c++
+   using t_meta_type = entt::meta<T>::type("Foo").data<&T::member>("Bar");
+   // Or
+   type("Foo", data<a_member>("bar").data<another_member>("quux"))
+   ```
+
+   @skypjack
+
+   > Btw it's something like using this and so on - well, this can be constexpr (with a `decltype` and some `typename` here and there).
+   > Then we can add syntactic sugar to get rid of the decltype and all the rest.
+   > This can be fully compile-time time and it solves the problem with the names.
+
+   @Innokentiy-Alaytsev
+
+   > Even if those calls are all constexpr then they still return something so you can't use using the way you've done it. My thought was something like using `t_meta_type = decltype(entt::meta<T>::type("Foo").data<&T::member>("Bar"))`. Another option is turing it into static auto constexpr `t_meta_info = entt::meta<T>::type("Foo").data<&T::member>("Bar")`.
+
+   @skypjack
+
+   > Don't worry about the result, you can still define meta_type_t and hide the decltype to the user.
+   > The important part is that this would be fully macro-less.
+
+
+
+As discussed on gitter :) 
+
+Not quite sure how this feeds into the wiki or if some other configuration is needed to propagate it somewhere...
+At the moment, it seems unclear as to what shared components will actually look like when implemented in EnTT. I thought it would be a good idea to open an issue so that the discussion is all in one place and we can refer to it later. I find that conversations get lost and forgotten on Gitter.
+
+I came up with a few things that I think could be part of the shared components API. This issue is for discussing that API and the use cases for shared components.
+
+- `attach<C>(e, ...)`
+  - Construct `C` and attach it to `e`
+  - `e` will have its own copy of `C`
+  - This is valid even if `e` is already sharing `C`
+- `attach_copy<C>(e)`
+  - Copy construct the existing `C` and attach it to `e`
+  - `e` is given its own copy of `C`
+  - Assert that `e` is sharing `C`
+- `attach_from<C>(e, s)`
+  - Take the `C` that is attached to `s` and share it with `e`
+  - This is valid even if `e` is already sharing `C`
+  - Assert that `s` is sharing `C`
+- `sharing<C>(a, b)`
+  - Are `a` and `b` both sharing the same `C`?
+  - Assert that both `a` and `b` are sharing possibly different instances of `C`
+- `has<C>(e)`
+  - Is `e` sharing `C`?
+- `remove<C>(e)`
+  - Detach `C` from `e`
+  - If `e` was the last entity to share `C`, we must destroy `C`.
+  - Assert that `e` is sharing `C`
+- `unique<C>(e)`
+  - Does `e` have just one `C` all to itself?
+  - No use cases have popped into my head so maybe it's useless. Also, I'd imagine that you'd have to iterate the whole sparse set to find this information so it's probably not a good idea.
+- `sharing_with<C>(e)`
+  - Get the list of entities that share that same `C` shared by `e`. Not sure if we should also include `e`.
+  - I'm not sure how efficient this would be. It might also involve iterating the whole sparse set.
+  - We could return an iterator range so that the user could copy the list to a collection or just iterate the entities if they want to. This is faster and more flexible than returning a `std::vector`.
+  - The iterators could iterate the sparse set and return only the entities that share `C` with `e`. Maybe they could do something more efficient.
+- `view<C>()`
+  - Single component view of shared `C`
+  - Iterations will potentially show the same instance of `C` multiple times
+  - Raw iterations will provide access to each instance of `C` only once
+- `view<C, R>()`
+  - Multi-component view of shared `C` and regular `R`
+  - Iterations will potentially show the same instance of `C` multiple times
+  - Raw iterations are not allowed. It wouldn't make sense anyway.
+
+The names I've chosen are just placeholders. Maybe I'm missing some functions. Maybe I've included something I shouldn't have. Maybe something behaves differently to what users will expect.
+
+Discuss!

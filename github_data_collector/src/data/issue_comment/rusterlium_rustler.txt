@@ -1,0 +1,116 @@
+I’ve been trying to deploy an Elixir app with a rustler based module. Everything works fine in development but when I try to build the docker image on Alpine, I have this error:
+
+```
+Compiling NIF crate :nifty_graph (native/nifty_graph)...
+    Updating crates.io index
+    Updating git repository `https://github.com/rusterlium/rustler`
+ Downloading crates ...
+  Downloaded unreachable v1.0.0
+  Downloaded quote v1.0.2
+  Downloaded which v3.1.0
+  Downloaded petgraph v0.5.0
+  Downloaded heck v0.3.1
+  Downloaded lazy_static v1.4.0
+  Downloaded syn v1.0.13
+  Downloaded proc-macro2 v1.0.7
+  Downloaded indexmap v1.3.1
+  Downloaded failure v0.1.6
+  Downloaded fixedbitset v0.2.0
+  Downloaded libc v0.2.66
+  Downloaded unicode-xid v0.2.0
+  Downloaded unicode-segmentation v1.6.0
+  Downloaded void v1.0.2
+  Downloaded autocfg v1.0.0
+  Downloaded backtrace v0.3.42
+  Downloaded rustc-demangle v0.1.16
+  Downloaded cfg-if v0.1.10
+  Downloaded backtrace-sys v0.1.32
+  Downloaded cc v1.0.50
+error: cannot produce dylib for `nifty_graph v0.1.0 (/build/native/nifty_graph)` as the target `x86_64-unknown-linux-musl` does not support these crate types
+** (RuntimeError) Rust NIF compile error (rustc exit code 101)
+```
+
+This seems to be a known issue of Alpine, but can you guide me on possible solution on building a docker container with a rust dependency?
+
+Thank you!
+std::process::Command determines the path to an executable using the os-specific PATH variable. As we are only interested in calling the `erl` executable when building, but not where the executable is placed within the file system, we can attempt to call it directly. The dependency was introduced with #178.
+I implemented `Decoder` on a type that crashes the VM with a SIGBUS.
+
+I made a minimal reproducible example in this repo: https://github.com/elbow-jason/why_sig_bus
+
+
+[enif_send](http://erlang.org/doc/man/erl_nif.html#enif_send) returns a flag, indicating if the send succeeded or not. From the documentation:
+
+> Returns true if the message is successfully sent. Returns false if the send operation fails, that is:
+>
+> * `*to_pid` does not refer to an alive local process.
+> * The currently executing process (that is, the sender) is not alive.
+
+Functions such as `Env::send()` or `OwnedEnv::send_and_clear()` could indicate the success with `Result`.
+
+- [ ] Add docs (in particular about having to re-run the resource type registration)
+- [ ] Clarify safety of `unload`
+- [ ] Add test
+This changes the `release.sh` script to create releases.
+
+* The release commit is tagged
+* The `rustler_mix` documentation points to that tag
+* If an error occurs during verification by compile, the commit is reverted. This is not done when publishing is already underway!
+
+The PR adds two environment variables for the script to simplify testing:
+
+* `DRYRUN`: Do not publish
+* `DONTREVERT`: Do not revert the changes if an error happened or if `DRYRUN` was used
+
+As explained in #13 it's not feasible to allow for "real" module unloading for rustler-based nif-modules. However, by (automatically) versioning the nif-modules we could achieve something similar:
+
+In my `rebar3_rust` update branch I already place crates in versioned directories and generate a header-file that contains the location of the binaries relative to `priv` on build. We could now go one step further and generate a "wrapper" nif module that refers to exactly one version and make the `rustler_codegen` generate its name from the crate version and compile mode. A nif crate of name `my_nifs` with a single nif `func/1` of version 1.0 would then generate a module like:
+
+```erlang
+-module('my_nifs_crate_1.0_release').
+
+-export([func/1]).
+
+-on_load(init/0).
+
+init() -> erlang:load_nif("/path/to/output").
+
+func(Arg1) -> erlang:nif_error(not_loaded).
+```
+
+The *actual* module to expose this would then be recompiled on version change and look like this, where `crates.hrl` is regenerated on build to refer to the respective current generated module:
+
+```erlang
+-module(my_nifs).
+
+-include("crates.hrl").
+
+-spec func(number()) -> ok.
+func(MyNumber) ->
+    ?crate_my_nifs:func(MyNumber).
+```
+
+The user-defined `my_nifs` module would then, on reload, pick up a new generated module which in turn would load the new so/dll.
+
+Since `'my_nifs_crate_1.0_release'` should be generated on build, we could incorporate it into `rustler_codegen`'s `init!` implementation and even add auto-generated `specs`.
+Currently the mix compiler adds additional work for users in order to get started. The changes proposed in this PR aims to make this go away completely and allow users to turn off compilation completely in favor of loading a pre-compiled binary.
+
+**Pros**
+
+* Users no longer need to add the `rustler` compiler in `mix.exs`
+* Users no longer need to add the `rustler_crates` option in `mix.exs`
+* Crates are automatically compiled when the associated NIF module is compiled.
+* Recompilation only happens when one of Rust files or the NIF module are updated (see [`@external_resource`](https://hexdocs.pm/elixir/Module.html#module-external_resource)).
+
+**Cons**
+
+~* Currently, when changes are made to the rust files in the project, `mix compile` does not recompile unless the NIF module has been saved.~
+* This change breaks existing binary compilation (but I think this can be fixed pretty easily).
+
+There might be more cons than I can think of right now...
+
+**TODO**
+
+- [x] Revamp the docs
+- [x] Support compiling rust binaries
+- [x] Support loading pre-compiled libs/binaries

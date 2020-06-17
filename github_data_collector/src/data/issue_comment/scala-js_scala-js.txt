@@ -1,0 +1,138 @@
+
+<!--
+Please follow these steps to help us fixing the bug:
+
+1. Make sure it is a bug for this repo
+  * Can you reproduce the bug with Scala/JVM? If yes, report it to https://github.com/scala/bug instead
+  * Make sure it is not one of the intended semantic differences: https://www.scala-js.org/doc/semantics.html
+  * Does the bug involve macros? If yes, make sure to reproduce *without* macros, or file an issue to the relevant macro library instead or ask on Gitter if it's your own macro
+  * Is it about the website? If yes, report it to https://github.com/scala-js/scala-js-website/issues instead
+  * If in doubt, ask on Gitter first: https://gitter.im/scala-js/scala-js
+
+2. Make sure we can understand and reproduce the bug
+  * Give code *and* reproducible steps to provoke the bug
+  * Give the version of Scala and Scala.js you are using (if relevant, sbt as well)
+  * What did you expect to happen?
+  * What actually happened?
+
+If possible, minimize the bug. This helps fixing bugs more quickly. Try to get rid of any external library.
+
+Thank you!
+-->
+
+
+Symptom:
+- MethodAccessorImpl NoClassDefError happens with Scala.js 1.0.0-RC2, when compiling multiple Scala.JS projects. We have no such issue with Scala.js 0.6.x
+- After rerunning fastOptJS, the compilation eventually succeeds.
+- I'm using sbt 1.3.6 and JDK11. The same error happens with JDK8.
+
+![image](https://user-images.githubusercontent.com/57538/72209440-0051f800-3463-11ea-9251-3c4bb364b8ae.png) 
+- CI log: https://github.com/wvlet/airframe/runs/385008133
+
+~It might be an issue of sbt-scalajs plugin and sbt-1.3.x's new classloader.~ (The same problem happens with sbt 1.2.8) I'll work on reproduction of this issue. 
+
+It seems the reflection call of PathOutputFile in the LinkerImpl is failing:
+```scala
+    private val outputFileMethod =
+      loadMethod("PathOutputFile", "atomic", classOf[LinkerOutput.File], classOf[Path])
+```
+This is used here:
+```scala
+            val out = LinkerOutput(linkerImpl.outputFile(output.toPath))
+              .withSourceMap(linkerImpl.outputFile(sourceMapFile.toPath)) <--------
+              .withSourceMapURI(relURI(sourceMapFile.getName))
+              .withJSFileURI(relURI(output.getName))
+```
+
+A workaround is splitting an aggregated project into a smaller set of projects and running fastOptJS individually.
+Reproducible in 0.6.x and 1.x, in 2.12 and 2.13. In 2.11, things work correctly. Full repro:
+```scala
+package helloworld
+
+class Apply {
+  def testTraitMixinInLocalLazyVal(): Unit = {
+    trait TraitMixedInLocalLazyVal {
+      val foo = "foobar"
+    }
+
+    lazy val localLazyVal = {
+      class ClassExtendsTraitInLocalLazyVal extends TraitMixedInLocalLazyVal
+      val obj = new ClassExtendsTraitInLocalLazyVal
+      assert(obj.foo == "foobar")
+    }
+    localLazyVal
+  }
+}
+
+object HelloWorld {
+  def main(args: Array[String]): Unit = {
+    new Apply().testTraitMixinInLocalLazyVal()
+  }
+}
+```
+In 2.12 and 2.13, the IR of the inner class is:
+```scala
+class helloworld.Apply$ClassExtendsTraitInLocalLazyVal$1 extends java.lang.Object implements helloworld.Apply$TraitMixedInLocalLazyVal$1 {
+  val foo: java.lang.String
+  val $outer: helloworld.Apply
+  def foo;Ljava.lang.String(): java.lang.String = {
+    this.helloworld.Apply$ClassExtendsTraitInLocalLazyVal$1::foo
+  }
+  def helloworld$Apply$TraitMixedInLocalLazyVal$_setter_$foo_$eq;Ljava.lang.String;V{helloworld$Apply$TraitMixedInLocalLazyVal$_setter_$foo_=}(x$1: java.lang.String) {
+    this.helloworld.Apply$ClassExtendsTraitInLocalLazyVal$1::foo = x$1
+  }
+  def helloworld$Apply$TraitMixedInLocalLazyVal$$$outer;Lhelloworld.Apply{$outer}(): helloworld.Apply = {
+    this.helloworld.Apply$ClassExtendsTraitInLocalLazyVal$1::$outer
+  }
+  constructor def <init>;Lhelloworld.Apply;V(outer{$outer}: helloworld.Apply) {
+    if ((outer === null)) {
+      throw mod:scala.scalajs.runtime.package$.unwrapJavaScriptException;Ljava.lang.Throwable;Ljava.lang.Object(null)
+    } else {
+      this.helloworld.Apply$ClassExtendsTraitInLocalLazyVal$1::$outer = outer
+    };
+    this.java.lang.Object::<init>;V();
+    this.helloworld.Apply$TraitMixedInLocalLazyVal$1::$init$;V()
+  }
+}
+```
+in which the field `foo` is immutable. This is incorrect because it is assigned to in the trait setter `def helloworld$Apply$TraitMixedInLocalLazyVal$_setter_$foo_$eq;Ljava.lang.String;V`. One problem is that, for scalac, that field is not marked as `MUTABLE`. This has always been an issue for `val` fields in traits, so we have logic that patches up fields that are "unexpectedly" mutated. They are recorded as such in `case Assign(...) =>` at
+https://github.com/scala-js/scala-js/blob/043912f8baca36843ea1d31853930c5cd0cfc18a/compiler/src/main/scala/org/scalajs/nscplugin/GenJSCode.scala#L2359-L2360
+and patched up in `genClassFields` at
+https://github.com/scala-js/scala-js/blob/043912f8baca36843ea1d31853930c5cd0cfc18a/compiler/src/main/scala/org/scalajs/nscplugin/GenJSCode.scala#L1130-L1133
+
+However, when all the following conditions are met:
+* Scala 2.12+
+* The class that does the mixin is in the rhs of a `lazy val`
+* That `lazy val` is inside a `def` (so it's a local lazy val, not a field)
+
+then scalac ends up creating *2 different `Symbol`s* for that field. One is used in the `Assign` node, and the other is listed a member of the class, and hence used by `genClassFields`.
+
+This causes our patching up to fail to process that field, since it is not the same symbol (but they have the same name/owner/etc.).
+This is a follow-up of #3072 where we always enabled the IR checker in 1.0.x. Unclear if we should do this in 1.0.0 or in 1.0.1.
+With Node.js 13.3.0 on the PATH, in 0.6.x, `toolsJS/test` fails one test, namely `StackTraceTest.decode_class_name_and_method_name`:
+```
+Test run started
+Test org.scalajs.testsuite.library.StackTraceTest.decode_class_name_and_method_name started
+Test org.scalajs.testsuite.library.StackTraceTest.decode_class_name_and_method_name failed: null, took 0.041000192 sec
+Test org.scalajs.testsuite.library.StackTraceTest.decode_class_name_and_method_name finished, took 0.041000192 sec
+Test run finished: 1 failed, 0 ignored, 1 total, 0.041000192s
+```
+This does not happen on Node.js v10, nor in 1.x (for `testSuite2_12/bootstrap:test` in that branch). Upgrading source-map-support to 0.5.7 (same as in 1.x) does not solve the issue.
+
+My first guess would be that it's related to the fact that `toolsJS/test` executes everything in an `eval()`, whereas in 1.x `testSuite2_12/bootstrap:test` uses all the right setups to execute the bootstrapped test suite as a top-level script, just like the non-bootstrapped one.
+
+If I can't nail it down quickly enough, I will first submit a PR to disable that test in the boostrap, to repair the CI.
+When the ES module option is active:
+```scala
+scalaJSLinkerConfig ~= { _.withModuleKind(ModuleKind.ESModule) }
+```
+the js file obtained trough `fullOptJS` isn't minified and `project-opt.js` is only 3% smaller in size than `project-fast-opt.js`
+See https://github.com/scala-js/scala-js/pull/3874#discussion_r348483358
+
+We should split them into:
+
+- Implementation details of the Emitter (the true Emitter.symbolRequirements).
+- Things that should be reached by the Analyzer.
+
+See https://github.com/scala-js/scala-js/pull/3817#discussion_r344515580 for details.
+See discussion on #3842.

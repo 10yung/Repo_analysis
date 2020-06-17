@@ -1,0 +1,402 @@
+Is future_lapply() intended to be non-blocking? I thought it was, but it's not working for me.
+
+Here is a minimal reproducible example (with a simple function that serves no purpose except to take ~10 seconds to evaluate on my machine so I could test blocking and multicore behavior). I'm running Linux, so my understanding is that multiprocess here implies multicore. (Output shown as comments.)
+
+```r
+# future_lapply() blocks, even in multiprocess. You can see that resolved()
+# does not get evaluated until future_lapply() has finished.
+# But it successfully distributes this across 2 cores.
+plan(multiprocess)
+date()
+### [1] "Fri May 24 14:29:51 2019"
+a <- future_lapply(rep(50000000, 2), function(i) rnorm(i)*rnorm(i))
+resolved(futureOf(a))
+### Error: Future (‘a’) not found in environment ‘R_GlobalEnv’: ‘a’
+date()
+### [1] "Fri May 24 14:30:03 2019"
+head(a[[1]])
+### [1] -1.2233054  0.1918043 -0.4650852  0.5335259 -0.2493615 -0.8267408
+date()
+### [1] "Fri May 24 14:30:03 2019"
+```
+Note that I get an error when trying to call `resolved(futureOf(a))`, because `a` has already been resolved before it gets called, and no future exists because it was implicit. The calls to `date()` are in there to show that it blocked for 12 seconds while it was evaluating `future_lapply()`.
+
+Based on your response in #1, I tried assigning `future_lapply` as an implicit future and using nested multiprocess evaluation (though that was intended for someone running SGE). This also blocks, and now `future_lapply()` is evaluated sequentially, not on multiple cores. I watched process allocation happening, but you can see that it now blocks for twice as long: 24 seconds.
+```r
+# Try nesting it in an implicit future call. Still blocks. But now this gets
+# evaluated sequentially rather than distributed across 2 cores.
+plan(list(multiprocess, multiprocess))
+date()
+### "Fri May 24 14:37:15 2019"
+a %<-% future_lapply(rep(50000000, 2), function(i) rnorm(i)*rnorm(i))
+resolved(futureOf(a))
+### [1] FALSE
+date()
+### [1] "Fri May 24 14:37:15 2019"
+head(a[[1]])
+### [1] -0.9747142 -0.1586670 -0.1039924  4.5885303 -0.4779900  0.3339059
+date()
+### [1] "Fri May 24 14:37:39 2019"
+```
+
+I ran into this issue because I'm trying to switch from `mclapply` to `future_lapply` (for the great parallel RNG!), and I do get non-blocking behavior using an implicit future with `mclapply` (`resolved()` and `date()` are both executed immediately after the `mclapply` call without blocking):
+```r
+# This works as expected: Setting mc.cores explicitly does distribute across
+# multiple cores, and it's non-blocking.
+library(parallel)
+plan(multiprocess)
+date()
+### [1] "Fri May 24 14:51:31 2019"
+a %<-% mclapply(rep(50000000, 2), function(i) rnorm(i)*rnorm(i), mc.cores=2)
+resolved(futureOf(a))
+### [1] FALSE
+date()
+### [1] "Fri May 24 14:51:31 2019"
+head(a[[1]])
+### [1]  0.968440961 -0.015869658  0.321415096 -0.609809739  0.005155251
+date()
+### [1] "Fri May 24 14:51:44 2019"
+```
+
+Incidentally, if I replace the call to explicitly set `mc.cores=2` with `mc.cores=future::availableCores()`, I still get non-blocking behavior, but now `mclapply` gets executed sequentially instead of being distributed across cores. (If I run `mc.cores=future::availableCores()` I get `16`.) I'm not sure if this is a bug, and I didn't explore it thoroughly, but it's not what I expected.
+
+Thanks so much for your help and for all your work to bring R into the future!
+
+This was a bit hard to track down... Here goes.
+
+`data.table` and `bit` both have `setattr` functions. But the annoying thing about `bit:setattr` is that it returns NULL. `data.table::setattr` returns the input object with the attribute modified invisibly. So, if you were to write a code like:
+
+```r
+y <- setattr(18004L, "class", "Date") # today's date
+# [1] "2019-04-18"
+```
+
+(I'm not saying this is how one should go about it, but there are other cases where we need to set an attribute and assign the result to an object.)
+
+In this case, depending on what `setattr` we've, it'll return the right expected result or `NULL`.
+
+With this, consider this code:
+
+```r
+require(parallel)
+require(doSNOW)
+require(foreach)
+require(future)
+require(future.apply)
+require(data.table)
+foo <- function(dt) {
+  cat(sprintf("[%s] %s", Sys.getpid(), capture.output(environment(setattr))), sep="\n")
+  setattr(dt, "key", "val")
+}
+nodes <- 5L
+cl <- future::makeClusterPSOCK(nodes)
+plan(cluster, workers=cl, persistent=TRUE)
+dt <- data.table(x=1, y=2)
+
+ans <- values(
+  lapply(seq_len(nodes), function(node) {
+    future({foo(dt)}, packages=c("bit64", "data.table"))
+  })
+)
+# [15468] <environment: namespace:data.table>
+# [9808] <environment: namespace:data.table>
+# [15016] <environment: namespace:data.table>
+# [23496] <environment: namespace:data.table>
+# [22312] <environment: namespace:data.table>
+```
+
+I've created a `data.table` in the local environment (just 1 for simplicity) and am calling a function that sets the attribute in parallel. Of course this function is terribly simplified as well.
+
+Now, the way this works (as expected), is to *first* load `bit64` first and `data.table` next and then look for functions in `foo` and possibly load more packages and then run `foo()` (AFAICT).
+
+And this works fine as you can see from the output. If you were to check `ans`, you'd get the data.table with their attributes set.
+
+----
+
+Restart session (IMPORTANT). Now, with everything else remaining intact, if instead of running `values(...)`, I use `future_lapply`:
+
+```r
+ans <- future_lapply(cl, function(node) foo(dt), future.packages=c("bit64", "data.table"))
+> ans <- future_lapply(cl, function(node) foo(dt), future.packages=c("bit64", "data.table"))
+# [11976] <environment: namespace:bit>
+# [23212] <environment: namespace:bit>
+# [11732] <environment: namespace:bit>
+# [22964] <environment: namespace:bit>
+# [5748] <environment: namespace:bit>
+> ans
+# [[1]]
+# NULL
+# 
+# [[2]]
+# NULL
+# 
+# [[3]]
+# NULL
+# 
+# [[4]]
+# NULL
+# 
+# [[5]]
+# NULL
+```
+
+Note how `setattr` refers to `bit` package.. I think this is because the packages get loaded *after* assessing `setattr` is used in `foo` and `data.table` from local env has a function called `setattr` and therefore gets loaded first followed by all packages in `future.packages`?
+
+```r
+require(parallel)
+require(doSNOW)
+require(foreach)
+require(future)
+require(future.apply)
+nodes <- 5L
+cl <- future::makeClusterPSOCK(nodes)
+plan(cluster, workers=cl, persistent=TRUE)
+
+foo <- function(i) {
+  if (i %in% 5:8) Sys.sleep(3L)
+  i
+}
+
+x <- 1:20
+system.time(ans <- future_lapply(x, function(i) {
+  msg <- sprintf("[%s] [%5.0f] ans=%2.0f", as.character(Sys.time()), Sys.getpid(), i)
+  cat(msg, sep="\n")
+  ans <- foo(i)
+}))
+# [2019-04-18 13:17:08] [17620] ans= 1
+# [2019-04-18 13:17:08] [17620] ans= 2
+# [2019-04-18 13:17:08] [17620] ans= 3
+# [2019-04-18 13:17:08] [17620] ans= 4
+# [2019-04-18 13:17:08] [16016] ans= 5 # <~~ predefined chunk node = wait until previous one completes
+# [2019-04-18 13:17:11] [16016] ans= 6 # <~~ predefined chunk node = wait until previous one completes
+# [2019-04-18 13:17:14] [16016] ans= 7 # <~~ predefined chunk node = wait until previous one completes
+# [2019-04-18 13:17:17] [16016] ans= 8 # <~~ predefined chunk node = wait until previous one completes
+# [2019-04-18 13:17:08] [ 3992] ans= 9
+# [2019-04-18 13:17:08] [ 3992] ans=10
+# [2019-04-18 13:17:08] [ 3992] ans=11
+# [2019-04-18 13:17:08] [ 3992] ans=12
+# [2019-04-18 13:17:08] [ 3836] ans=13
+# [2019-04-18 13:17:08] [ 3836] ans=14
+# [2019-04-18 13:17:08] [ 3836] ans=15
+# [2019-04-18 13:17:08] [ 3836] ans=16
+# [2019-04-18 13:17:08] [ 8856] ans=17
+# [2019-04-18 13:17:08] [ 8856] ans=18
+# [2019-04-18 13:17:08] [ 8856] ans=19
+# [2019-04-18 13:17:08] [ 8856] ans=20
+#    user  system elapsed 
+#    0.03    0.02   12.14  # <~~ 4x more time
+
+registerDoSNOW(cl)
+system.time(ans <- foreach(i=x) %dopar% {
+  msg <- sprintf("[%s] [%5.0f] ans=%2.0f", as.character(Sys.time()), Sys.getpid(), i)
+  foo_i <- foo(i)
+  return(msg)
+# [2019-04-18 13:17:20] [17620] ans= 1
+# [2019-04-18 13:17:20] [16016] ans= 2
+# [2019-04-18 13:17:20] [ 3992] ans= 3
+# [2019-04-18 13:17:20] [ 3836] ans= 4
+# [2019-04-18 13:17:20] [ 8856] ans= 5 # <~~ runs on next available free node
+# [2019-04-18 13:17:20] [17620] ans= 6 # <~~
+# [2019-04-18 13:17:20] [16016] ans= 7 # <~~
+# [2019-04-18 13:17:20] [ 3992] ans= 8 # <~~
+# [2019-04-18 13:17:20] [ 3836] ans= 9
+# [2019-04-18 13:17:20] [ 3836] ans=10
+# [2019-04-18 13:17:20] [ 3836] ans=11
+# [2019-04-18 13:17:20] [ 3836] ans=12
+# [2019-04-18 13:17:20] [ 3836] ans=13
+# [2019-04-18 13:17:20] [ 3836] ans=14
+# [2019-04-18 13:17:20] [ 3836] ans=15
+# [2019-04-18 13:17:20] [ 3836] ans=16
+# [2019-04-18 13:17:20] [ 3836] ans=17
+# [2019-04-18 13:17:20] [ 3836] ans=18
+# [2019-04-18 13:17:20] [ 3836] ans=19
+# [2019-04-18 13:17:20] [ 3836] ans=20
+#    user  system elapsed 
+#    0.01    0.00    3.07  # <~~ results in 4 times lesser runtime
+```
+
+The point is, even if things are random (I understand there's `ordering="random"`), there can be chunks that get stuck due to a big job, when other nodes are potentially free. I think it's much more efficient to look for free nodes and assign jobs on the fly than to determine chunk sizes / entries upfront.
+
+What do you think?
+
+The example shown below should be quite straightforward to follow. The parallel case doesn't seem to be able to find the global var `x_a`.
+
+```r
+packageVersion("future")        # [1] ‘1.11.1.1’
+packageVersion("future.apply")  # [1] ‘1.1.0’
+
+require(future)
+require(future.apply)
+
+foo <- function(x=getOption("x_a", 2L), y=getOption("x_b", 5L)) x * y
+
+plan(sequential)
+future_lapply(1:2, function(i) foo())
+# [[1]]
+# [1] 10
+
+# [[2]]
+# [1] 10
+
+plan(multisession, workers=2L)
+future_lapply(1:2, function(i) foo())
+# [[1]]
+# [1] 10
+
+# [[2]]
+# [1] 10
+
+options(x_a=5L)
+plan(sequential)
+future_lapply(1:2, function(i) foo())
+# [[1]]
+# [1] 25
+
+# [[2]]
+# [1] 25
+
+plan(multisession, workers=2L)
+future_lapply(1:2, function(i) foo())
+# [[1]]
+# [1] 10
+
+# [[2]]
+# [1] 10
+```
+
+I came across this behaviour while trying to understand the issue in my original scenario, which is slightly different. I've a package say, `PKG`, which has a function say, `FOO` as follows:
+
+    FOO <- function(x=MY_GLOBLALS$x, y=MY_GLOBALS$y) x * y
+
+Then, the `sequential` case works fine but `multisession` / parallel version fails to find 'x' and 'y' defaults when run with the following code:
+
+```r
+require(future)
+require(future.apply)
+require(PKG) # has function FOO
+MY_GLOBALS <- list(x=2L, y=5L)
+plan(multisession, workers=2L)
+future_lapply(1:2, function(i) FOO()) # has to extract the default values from the variable MY_GLOBALS in the global environment.
+# Error in FOO() : object 'MY_GLOBALS' not found
+```
+
+### session info:
+
+```r
+> sessionInfo()
+# R version 3.3.2 (2016-10-31)
+# Platform: x86_64-w64-mingw32/x64 (64-bit)
+# Running under: Windows Server >= 2012 x64 (build 9200)
+
+# locale:
+# [1] LC_COLLATE=English_United Kingdom.1252  LC_CTYPE=English_United Kingdom.1252    LC_MONETARY=English_United Kingdom.1252
+# [4] LC_NUMERIC=C                            LC_TIME=English_United Kingdom.1252    
+
+# attached base packages:
+# [1] stats     graphics  grDevices utils     datasets  methods   base     
+
+# other attached packages:
+# [1] future.apply_1.1.0 future_1.11.1.1   
+
+# loaded via a namespace (and not attached):
+# [1] parallel_3.3.2   tools_3.3.2      listenv_0.7.0    codetools_0.2-15 digest_0.6.14    globals_0.12.4  
+```
+
+I've been using `future_lapply` to submit jobs to a cluster of gcloud compute nodes - which is awesome!! Thanks so much for adding this user-friendly function.
+
+One issue I'm running into, however, concerns the behavior when one of my gcloud compute nodes goes down unexpectedly. 
+
+Here's what I see:
+
+```
+Error in unserialize(node$con) :
+  Failed to retrieve the value of ClusterFuture from cluster node #1 (on ‘35.190.151.35’).  The reason reported was ‘error reading from connection’
+Calls: future_lapply ... FutureRegistry -> collectValues -> value -> value.ClusterFuture
+Execution halted
+```
+
+Is there a good way to catch these errors for individual nodes, so that I can still access results from the nodes which are still executing? IE, can we pass an `on.error` function to call to `values(fs)`? 
+
+For now I have wrapped these in a call to `withCallingHandlers()` to catch & ignore this error. I haven't tested it in a real-life situation, but assuming it works this may be something to include in your vignette [Common Issues with Solutions](https://cran.r-project.org/web/packages/future/vignettes/future-2-issues.html).
+
+The code currently looks like something the following:
+
+```
+withCallingHandlers({
+    remote_jobs <- future_lapply(seq_len(num_data_sims),
+                                 execute_simtest,
+                                 future.seed = 0xBEEF,
+                                 future.scheduling = 2
+                                 )
+    }, FutureError = function(e) NULL
+)
+```
+
+
+@mllg [wrote](https://github.com/HenrikBengtsson/future.apply/issues/25#issuecomment-420955847):
+
+> Have you considered to introduce a control object (in the fashion of passing a `rpart.control`-object to `rpart()`)? A `future.control`-object could bundle all arguments. Would be good for the overview (also in the documentation) and ...
+
+Yes, I've been having internal (as in lots of inner voices ;)) debates about this and it's been discussed with other in the past.  I'm not opposed to it.  The main reason I've stayed away from it is that we have to deside exactly how the control elements should be controlled.
+
+> ... you would avoid inconsistencies like https://github.com/HenrikBengtsson/future.apply/issues/26.
+
+You're meaning in the sense that the future.apply package and other similar high-level packages (e.g. furrr) won't have to know about future-specific arguments and can just pass whatever down to the future package?  That's a nice side effect I haven't thought of before.
+
+However, not all elements in `future.control` should be passed down to the future package.  For instance, `scheduling` and `chunk.size` are higher level properties.  If so, do they belong to a `future.control` argument or should they be separate?
+
+So several things to think of. Thanks for bringing this up.
+(from an old note of mine)
+
+Add support for generating seeds per chunk (=future), i  addition to per element as now.  Although not invariant to the number of workers, and therefore not numerically reproducible if `nbrOfWorkers()` vary, this will still be statistically sound.  The advantage is performance - the number of seeds that need to be pre-generated will be significantly lower when there's a large number of elements.
+
+What should the API be, i.e. how to specify that we want it per chunk without introducing more arguments? Would `future.seed = "per chunk"` vs `future.seed = "per element"` (= `TRUE` as now). Then what about `seed = <numeric>` for specifying an initial seed (which now gives "per element" seeds)?  Hmm...
+
+In future.apply 1.0.0, `future_lapply(X, ...)` searches also `X` for possible globals (Issue #12).  For long `X`:s this introduces a significant overhead, especially if `X` does _not_ contain any globals and we wouldn't have to search `X` in the first place.  For example,
+```r
+X <- vector("list", length = 100e3)
+y <- future_lapply(X, FUN = identity)
+```
+All the slowness comes from an internal:
+```r
+gp <- future::getGlobalsAndPackages(X, globals = TRUE)
+```
+Following the code, this is slow because
+```r
+names <- globals::findGlobals(X)
+```
+is slow, which in turn is because it effetively does:
+```r
+names <- lapply(X, FUN = globals::findGlobals)
+```
+
+We might be able to speed up `globals::findGlobals()` a bit here, ~~but don't know how much.~~ [UPDATE 2018-06-20]: there was a low-hanging fruit in the globals package making it possible to speed this up **lots**, cf. https://github.com/HenrikBengtsson/globals/commit/566e3e9395ab5050387396c894b06fb099f96a66.  I'll be running revdep checks on globals (first and and second generation dependencies) to make sure this doesn't break anything.  If all ok, the need for working around this in future.apply is much smaller.
+
+~~Regardless, there could be a need for an argument controlling whether `X` should be searched for globals or not, especially since it is likely that in most use cases `X` does not have globals.~~ 
+
+Kind of an obscure issue but definitely an issue:
+
+``` r
+library(future.apply)
+
+plan(sequential)
+future_lapply(
+  X = 1, 
+  FUN = function(x) {y}, 
+  future.globals = list(y = 4)
+)
+#> Error in ...future.FUN(...future.X_jj, ...): object 'y' not found
+
+z <- 1
+future_lapply(
+  X = 1, 
+  FUN = function(x) {y}, 
+  future.globals = list(y = z)
+)
+#> Error in ...future.FUN(...future.X_jj, ...): object 'y' not found
+```
+
+Created on 2018-05-09 by the [reprex package](http://reprex.tidyverse.org) (v0.2.0).
+
+
+Interestingly, the `y` value is recognized as a global, and makes it into the environment that the expression is evaluated in. You can see this by debugging and making your way to [this](https://github.com/HenrikBengtsson/future/blob/1e9d3f832137650b4ac2743b60937cc8adba8e27/R/UniprocessFuture-class.R#L61) line of `run.UniprocessFuture()`. Not sure why it can't be seen inside the lapply() after that

@@ -1,0 +1,246 @@
+I've not seen [monet](https://monet.github.io/monet.js/) listed in https://github.com/fantasyland/fantasy-land/blob/master/implementations.md
+
+
+But I'd like to have fantasy-land spec compatible libs for my node JS app.
+Since I am fairly new, I'd love to have your input on this.
+Thank you in advance
+I have suggested this approach in the past\*, but after a recent realization, I think it deserves its own discussion.
+
+\* https://github.com/fantasyland/fantasy-land/pull/315#issuecomment-480882286 
+
+----
+
+### The reason for switch *to* symbols are as follows:
+
+1. Two conflicting versions of Fantasy Land would automatically not try to interact with each other, because they would have two different symbols. More on this thought (before Symbols existed) here: https://github.com/rpominov/static-land/issues/45#issuecomment-363119257.
+
+2. Symbols can be used to mutate prototypes of built-ins without stepping on anyone's toes. It seems to me that this is how [first class protocols](https://github.com/michaelficarra/proposal-first-class-protocols) are implemented under-the-hood, and so by using symbols, we are taking a first step towards https://github.com/fantasyland/fantasy-land/issues/291. It would allow a library to extend built-in prototypes with Fantasy-Land methods, rather than implementing support for built-in types at the dispatcher level.
+
+3. Last but not least, my recent realization: Using strings means that code which uses Fantasy Land is vulnerable to the exact same problem that Promise-based code is vulnerable to. I have created a write-up about this vulnerability here: https://github.com/minimaxir/big-list-of-naughty-strings/pull/159.
+
+   In summary, code that creates StrMaps like `{ [userInput]: AnyFunction }` and passes it to a fantasy-land compliant `map` implementation such as Ramda's `map` or Sanctuary's `map` with the intend of mapping over the values, will behave differently if the user passes `fantasy-land/map` as input. The same goes of course for all other algebras and all implementations of those that might get mixed with user-input. 
+
+   Using symbols would remove this vulnerability, as users have no way to pass symbols into a typical application from the outside.
+
+### Reasons I see against using symbols:
+
+1. Managing compatibility between libraries might become more difficult. Let's say Fantasy Land 5.0.0 adopts symbols. Now ADT library authors such as myself would have to add `fantasy-land` as a dependency in order to use the "correct" symbols for interoperability with a dispatcher lib. Then later when Fantasy Land 5.1.0 comes out with some new algebra, the dispatcher library might upgrade to it whilst the ADT library doesn't.
+
+   At this point it might happen that a package manager such as `npm` installs two distinct versions of Fantasy Land in a project which uses both the dispatcher lib and the ADT lib. Those two distinct installations of Fantasy Land will provide two distinct symbols, and as such, the dispatcher lib will no longer be able to interact with the ADT. This can be avoided in some ways (having Fantasy Land as a peer dependency, or using some automated deduplication strategies), but either way it's not as easy as it was with Strings.
+
+2. It might take some time before symbols see full adoption. It's a hard-reset for the Fantasy Land community, and for some transition period, libraries would probably need to provide both strings and symbols.
+
+----
+
+### `Symbol.for`
+
+Instead of using the distinct [`Symbol`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Symbol/for) constructor, Fantasy Land could use [`Symbol.for('fantasy-land/map')`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Symbol/for). Library authors would not need to rely on a `fantasy-land` package in order to provide interoperability. This would remove benefit `1` and problem `1` from the pros and cons listed above, leaving us with benefit `2` and `3`.
+This is an issue in spirit rather than a pull request. I am submitting the proposal in pull request form to facilitate threaded discussions and to allow changes to be made and tracked via Git.
+
+The proposal is, I believe, sufficiently detailed, so I won't repeat myself here.
+
+I asked @Avaq to review the proposal earlier today. He noted that this approach solves rpominov/fantasy-land#3. Aldwin has many ideas on this topic, which I hope he will share here. :)
+
+/cc @alexandru, @robotlolita, @rpominov
+
+This repository contains two things:
+
+1. The _Fantasy Land_ specification
+2. The source for the `fantasy-land` package on npm
+
+Currently, both are subjected to the same version number: the one specified in `package.json`. Over the lifetime of Fantasy Land, the "major" part of this version number has been bumped whenever a breaking change in the _specification_ occurred (the prefixing of method names, the flipping `ap`, etc). The major version of "Fantasy Land" has therefore always been a decent indication of what libraries are compatible with one another, and so a good means of communication and disambiguation.
+
+With [the latest major version bump](https://github.com/fantasyland/fantasy-land/releases/tag/v4.0.0), the breaking changes did not apply to the specification itself, but to the npm package. This means that all libraries conforming to Fantasy Land 3, also conform to "Fantasy Land 4". I think this might become a source of confusion.
+
+Perhaps - if others agree that this issue needs solving, - instead of relying on the package version number for communicating the version of the specification, we could embed a formal version number in the specification document. Or alternatively, perhaps the npm package source code could be moved into its own, separately versioned, repository.
+It is often useful to be able to traverse a non-empty structure with respect to a functor that is not quite `Applicative`, but is nevertheless `Apply`. A common use case I run into is transposing a \<something\> of objects into an object of \<something\>s.
+
+```js
+const result = Arr.sequence(Obj)([{ x: 1, y: 2 }, { x: 3, y: 4 }])
+// => { x: [1, 3], y: [2, 4] }
+```
+
+
+The problem is that objects in JS have a straightforward implementation of `lift2`, but lawfully implementing `pure` would require the ability to construct infinite objects with the same value at every possible key (this is possible with proxies, but let's not go there).
+
+Instead, we want a weakening of the constraints of `Traversable` so that it can work with `Apply`s. Conversely, the requirements on the traversable container are tightened; more things are `Traversable` than are `Traversable1`.
+
+Here is an example of what an instance might look like for non-empty arrays:
+
+```js
+// :: type Apply f = (Functor f) & { lift2: (a -> b -> c) -> f a -> f b -> f c }
+// :: type Traversable1 t = { traverse1: Apply f -> (a -> f b) -> t a -> f (t b) }
+
+// :: Traversable1 Array1
+const Arr1 = (() => {
+  const snoc = xs => x => [...xs, x];
+  const traverse1 = A => f => ([x, ...xs]) =>
+    xs.reduce((p, c) => A.lift2(snoc)(p)(f(c)), A.map(x => [x])(f(x)));
+
+  return { snoc, traverse1 };
+})();
+
+// :: String[] -> String[] -> String[]
+const intersection = s1 => s2 => {
+  const s2_ = new Set(s2);
+  return s1.filter(x => s2_.has(x));
+};
+
+// :: Apply Obj
+const Obj = (() => {
+  // :: Obj v -> String
+  const keys = o => Object.keys(o);
+
+  const zipWith = f => o1 => o2 => {
+    const k1 = keys(o1);
+    const k2 = keys(o2);
+    const ks = intersection(k1)(k2);
+
+    return ks.reduce((p, k) => ({ ...p, [k]: f(o1[k])(o2[k]) }), {});
+  };
+
+  const map = f => o => keys(o).reduce((p, k) => ({ ...p, [k]: f(o[k]) }), {});
+
+  const lift2 = zipWith;
+
+  return { zipWith, map, lift2 };
+})();
+
+// :: Traversable1 t -> Apply f -> t (f a) -> f (t a)
+const sequence1 = T1 => A => xs => T1.traverse1(A)(x => x)(xs);
+
+// :: Array1 (Obj x) -> Obj (Array1 x)
+const s = sequence1(Arr1)(Obj);
+
+// :: Array1 (Obj x)
+const input = [{ x: 1, y: 2 }, { x: 3, y: 4 }];
+
+console.log(s(input));
+// => { x: [1, 3], y: [2, 4] }
+```
+
+Similar instances exist for non-empty objects themselves, non-empty trees, non-empty sets, etc.
+
+Perhaps obvious, but it's worth noting that all `Traversable1`s are `Traversable` for free; since all `Applicative`s are (at least) `Apply`.
+Hi!
+
+After reading #210, I still don't understand why these kind of law are needed. The topic starts talking about "No parts of `b` return value should be checked. But, finally, it concludes that the implementations that perform this kind of checks are breaking other laws. 
+
+For example:
+``` javascript
+class Maybe {
+    static of(val) {
+      return new Just(val);
+    }
+}
+
+class Just extends Maybe {
+    constructor(val) {
+        super()
+        this.val = val;
+    }
+    map(f) {
+        const r = f(this.val)
+        return r === null ? new Nothing() : Maybe.of(r);
+    }
+}
+
+class Nothing extends Maybe {
+    map(f) {
+        return this;
+    }
+}
+```
+This implementation breaks `No parts of f's return value should be checked`. However, it is also breaking the composition law:
+
+``` javascript
+const f = x => x === 2 ? null : x;
+const g = x => x === null ? 2 : x;
+
+Maybe.of(2).map(f).map(g) // Nothing {}
+Maybe.of(2).map(x => g(f(x))) // Just {val: 2}
+```
+
+Then, I wonder if `No parts of f's return value should be checked` is a really necessary law. For me it's a weird law because is talking about the implementation. For example these two implementations of Maybe:
+
+``` javascript
+class Just extends Maybe {
+    ...
+    map(f) {
+        const r = f(this.val);
+        return Maybe.of(r);
+    }
+}
+```
+and
+``` javascript
+class Just extends Maybe {
+    ...
+    map(f) {
+        const r = f(this.val)
+        return r === null ? Maybe.of(r) : Maybe.of(r);
+    }
+}
+```
+behave the same and are identity and composition law compliant. However, the second breaks the `No parts of f's return value should be checked` and is not functor lawful. It doesn't make sense for me. 
+
+Cheers!
+Wondering what `ReadableStream` and other streaming data structures are instances of.
+
+https://hackage.haskell.org/package/lazysmallcheck-0.6/docs/Test-LazySmallCheck.html#t:Serial
+https://hackage.haskell.org/package/Stream-0.4.7.2/docs/Data-Stream.html
+I'd love to see a version of Fantasy Land which takes advantage of @michaelficarra's First-Class Protocols proposal:
+
+https://github.com/michaelficarra/proposal-first-class-protocols
+This proposal unifies Fantasy Land and Static Land. The unified specification is based on _modules_ (simple objects with functions that don't use `this`) as opposed to putting methods directly to values. Although values still have a single property, reference to a module, which makes the unified specification equivalent in flexibility to Fantasy Land.
+
+I see following advantages of this approach:
+
+1. We need only one property that is subject to name clashes.
+1. Sometimes it's impossible to add even a single property to values, but we still can implement a compliant module, which we'll have to pass explicitly everywhere though.
+1. Also, we may implement multiple modules for a single type. Although again only one can be referenced from values, and another we'll have to pass explicitly.
+1. Since every implementation will have modules, it allows for a whole different programming style where we choose to always pass modules explicitly even though they can be referenced from values. This may have some advantages, for example, types are more explicit in code.
+
+Also, this approach should be easier to works with when we want to use static type systems like TypeScript or Flow. To be honest, I don't know much about this area. But other people did a lot of research. @gcanti works on https://github.com/gcanti/fp-ts and https://github.com/gcanti/flow-static-land . @alexandru works on https://github.com/funfix/funfix and argued that static functions are much easier to work with than method here https://github.com/rpominov/static-land/issues/45#issuecomment-363084044 . To my shame, I still haven't looked into these projects. But I hope @gcanti and @alexandru can participate in the discussion here.
+
+Previous discussions about this unification approach can be found here: https://github.com/fantasyland/fantasy-land/issues/199 https://github.com/rpominov/static-land/issues/45
+
+I also want to say a big thank you to @briancavalier who came up with the idea of unification!
+
+This PR comes with a huge diff and comments may become hard to follow if we discuss every single change here. I think it'll be better if we only discuss here whether we want this or not in general, and for particular changes create issues or PRs in the fork https://github.com/rpominov/fantasy-land .
+
+This PR is a competitor with #280 and based on a [comment](https://github.com/fantasyland/fantasy-land/pull/280#issuecomment-356686110) from @i-am-tom.
+
+Benefits over #280:
+1. The Fantasy Land organization could provide a library of canonical types which could be used or wrapped by (or not) by conforming libraries.
+2. `cata` provides a simple, easy to remember interface to the type which provides it.
+3. `cata` doesn't prescribe any naming convention for conforming libraries to follow.
+4. The `cata` interface provides a means for conforming libraries to automatically convert between each other.
+
+An example for point 4:
+```js
+var Maybe = {
+  Just: x => ({
+    x,
+    cata: (_, f) => f(x),
+    map(f) { return Maybe.Just(f(x)); }
+  }),
+  Nothing: {
+    cata: (d, _) => d,
+    map(f) { return Maybe.Nothing;}
+  },
+  map: f => m => m.cata(Maybe.Nothing, compose(Maybe.Just, f))
+}
+
+var Maybe2 = require('otherlib/maybe');
+Maybe.map (f) (Maybe2.Just(1))
+     .equals(Maybe.Just(1).map(f))
+```
+
+Drawbacks:
+1. Native types can't be overload with different "views" as mentioned in https://github.com/fantasyland/fantasy-land/issues/185#issuecomment-356500208
+2. `cata` has a different signature for each type. This _could_ be confusing for newcomers.
+3. No enforced name standardization.
+
+Edit: add point 3 under "Drawbacks"
+

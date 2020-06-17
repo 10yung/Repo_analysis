@@ -1,0 +1,314 @@
+LTO cannot be checked unless the language is specified with the
+'project' option. Move the check to re-enable LTO.
+
+Fixes: 58f0d81925ec ("Fixing issue 99")
+___
+I noticed this by accident while reviewing users of the `CMAKE_INTERPROCEDURAL_OPTIMIZATION` option.
+No need to merge for now ...  I am here due to a general mild confusion due to the lack of architectural/design documentation. Hopefully, the outcome of discussion here will be better documentation, and perhaps even better implementation.
+
+### Exhibit A : simdjson streams
+Let the code speak. Questions are in the comments.
+
+```cpp
+#include "simdjson.h"
+#include "simdjson.cpp"
+
+int parse_file(const char *filename) {
+    // padded_string copies the json string taken from a file
+   // into the memory, true ?
+   //  after this line p contains potentially  very large amount of heap alocated storage, right?
+    simdjson::padded_string p = simdjson::get_corpus(filename);
+
+   // 'ParsedJson' seems to be what the 'Tape' is?
+   // it is a final product of json parsing, also staying in the memory
+   // thus it will contain a very large amount of heap allocated storage, true?
+   // thus size of the heap taken in this function will be minimum twice the 
+   // size of the file read in. True?
+    simdjson::ParsedJson pj;
+    simdjson::JsonStream js{p};
+    int parse_res = simdjson::SUCCESS_AND_HAS_MORE;
+    
+    while (parse_res == simdjson::SUCCESS_AND_HAS_MORE) 
+        {
+           // I fail to see how is 'JsonStream' helping here
+          // it seems stream vs tape interaction can be 
+          // encapsulted into the 'ParsedJson'
+            parse_res = js.json_parse(pj);
+
+            //Do something with pj...
+        }
+}
+```
+Talking about API, in general, I fail to see what might be wrong with the following refactoring of the above :
+(beside the fact huge amounts might be allocated on the heap, leading to excessive paging) 
+```cpp
+#include "simdjson.h"
+#include "simdjson.cpp"
+
+int parse_file(const char *filename) {
+
+   // refactored into standard container
+    simdjson::ParsedJson parsed_json_( filename );
+    // thus one can do standard C++ range 
+    // for example
+     for ( auto & dom_iterator_ :  parsed_json_ )
+    {
+        // dom_iterator_  type is  simdjson::ParsedJson::Iterator 
+        // refactored into standard C++ bidirectional iterator
+    }
+    // thus one can use
+    // std alorigthms, for example
+   auto  first_image = std::find(  parsed_json_.begin(),  parsed_json_.end() ,
+          [](  string const & key, auto & value ) { 
+                       if ( key == "Image" ) return true; else return false;   
+           }
+    );
+}
+```
+
+made me think how does simdjson handle white spaces in the input?
+
+with C++ raw string literals one can easily introduce white spaces in the json input.
+We divide documents into small (e.g., 16kB) chunks. The document is copied (in units of say 16kB) where it may be padded as needed. We run stage 1 over it, then stage 2. Then we continue parsing with the next block. (Better yet: stage 1 can do the copy since it is reading the data in any case.)
+
+This would solve https://github.com/lemire/simdjson/issues/174 and might improve performance over large documents.
+
+
+Reference: [How fast can you allocate a large block of memory in C++? ](https://lemire.me/blog/2020/01/14/how-fast-can-you-allocate-a-large-block-of-memory-in-c/)
+We are currently somewhat stuck with respect to how we might support efficiently large files
+(issues https://github.com/lemire/simdjson/issues/393 https://github.com/lemire/simdjson/issues/171 https://github.com/lemire/simdjson/issues/177 https://github.com/lemire/simdjson/issues/128 and others). I feel that it is currently blocking (psychologically) a move to a wider tape (https://github.com/lemire/simdjson/issues/428) because I am scared of the unforeseen (and costly) consequences.
+
+There are non-trivial issues with respect to memory usage when the files get large. Ideally, you'd want to have small stage 1, building cache-fitting indexes and work from there. But it is hard when our stage 2 is a monolith (hard to change without significant performance penalties).
+
+Instead of working harder, maybe we should be working "smarter" and simply move to more flexible code.
+
+Furthermore, if you have very large files, you probably do not want to materialize "our" kind of DOM (a tape). It is more likely that you will be want to eat up the data into your own favorite data structure. 
+
+The issue has to do with how tightly integrated everything in our code is. So it is not easy or even possible to handle files of different size differently. The tape production should be just one possible output.
+
+We should allow and encourage users to provide their own consumer.
+
+A consumer would have to implement methods such as these ones...
+
+```C
+// return true if you want to continue, false to stop
+bool found_double(double d);
+bool found_int64(int64_t d);
+bool found_uint64(uint64_t d);
+bool found_start_object();
+bool found_end_object();
+bool found_start_array();
+bool found_end_array();
+bool found_true();
+bool found_false();
+bool found_null();
+void found_end_of_document();
+void found_error(int error_code);
+// gives me a pointer to an available buffer where I could write up to "budget" bytes, return null if unavailable
+char * string_buffer(size_t budget);
+// I wrote a string of length "len" on the string buffer
+bool found_string(size_t len);
+```
+
+So the `structural_parser` that John (@jkeiser) wrote and that currently handles what we call stage 2 would become a template... where every instance of `write_tape`(and similar functions) would become a call to the generic consumer. So we would *separate* the production of the tape from stage 2. If done right, with a template and proper inlining (`really_inline`), there should be no performance penalty over our current code.
+
+So the 8-byte tape we have right now would become our first "consumer".
+
+
+Regarding the wider tape (https://github.com/lemire/simdjson/issues/428): it makes it a much safer choice. Indeed, we could keep the 8-byte tape and construct a new consumer that would be a 16-byte tape.
+
+Regarding UTF-8 validation, I would give the user a choice (as a compile-time templated parameter) to do it as part of stage 1. If the user does not want to do UTF-8 validation in stage 1, then they become responsible for doing it in their consumer. In practice, the consumer could write to a string buffer, and then validate this string buffer once. We could make it easy with a clean API for the users to do this work.
+
+
+
+We also make it a bit easier to add support for fancy features like large integers (https://github.com/lemire/simdjson/issues/167, https://github.com/lemire/simdjson/issues/425). The consumer can have options... we could have a "bool supports_bigint() const" functions that activates only if bigint are needed. This makes it possible to add features without necessarily having to include it into our tape (and default consumers).
+
+By itself, this does not solve the "large document" problems. However, it modularize the problem and gives us a fighting chance. E.g., currently, the only way we could support >4GB documents is by changing the tape structure. This makes it a daunting task. Now we could say that we have consumers that work only regular JSON documents, and have special consumers that scale better.
+
+But how can we ever crack the large document problem? I think that the bulk of the problem resides in this one function that John  (@jkeiser) wrote...
+
+
+```C++
+char advance_char() {
+    idx = pj.structural_indexes[i++];
+    c = buf[idx];
+    return c;
+  }
+```
+
+For the most part, `structural_parser` only needs `c` and ` idx` as well as access to `buf`. But exactly how `advance_char()` does it work, the rest of the code does not need to care.
+
+
+This means that `structural_parser` could take another templated parameter that would provide this function `char advance_char()` and little else. This means, in particular, that if I want to do stage 1 into chunks, I could... 
+
+```C++
+char advance_char() {
+    if(i >= pj.n_structural_indexes) { // if I am running out of indexes
+      refresh(); // call stage 1 over a new block of data, somehow
+      i = 0;
+    } 
+    idx = pj.structural_indexes[i++];
+    c = buf[idx];
+    return c;
+  }
+```
+
+Furthermore, currently `pj.structural_indexes` is a 32-bit array, which limits us to 4GB documents, but, obvious, if `advance_char` can be replaced, then we can have a "large file" provider of some kind.
+
+Comments and pull requests invited.
+
+
+Here is the first sketch of a proposal to have a (wider and flatter) 16-byte tape up from our current hybrid 8-byte tape. (This is issue https://github.com/lemire/simdjson/issues/361) In this new tape, all nodes would be represented with a single 16-byte value. Except for scopes (arrays and objects) that would contain two 16-byte values. The tape could be iterated efficiently in either order (forward and backward). 
+
+The tape would have an accompanying string tape, as currently, but the string tape would contain *only* UTF-8 string content, the strings would be appended one after the other. Currently, the string tape contains 32-bit length-prefixed strings. In the new model, the string length would be part of the tape.
+
+Having exactly 16-byte values all the way ensures that we could navigate the document backward and forward without any problem. (Issue https://github.com/lemire/simdjson/issues/292 ) It can also improve performance when navigating in forward order since there is no possible misprediction when loading the next tape element.
+
+We would support arbitrarily large JSON documents containing arbitrarily large strings.
+
+The new string tape would be made of just valid UTF-8 string content, so we could do UTF-8 validation there, instead of doing it in stage 1 as is done currently. This could potentially improve the performance drastically. This is issue https://github.com/lemire/simdjson/issues/185
+
+## General formal of the tape elements
+
+We would reserve a byte out of each tape element for an ASCII character identifying the nature of the node 't', 'f', 'n', 'l', 'u', 'd', '"', '{', '}', '[', ']' ,'r' (where 'r' stands for root)
+
+## Simple JSON values
+
+Simple JSON nodes are represented with one tape element containing the type 'n', 't', 'f' and nothing else. This is massively wasteful of memory since we use one byte out of 16. But it is not clear what else to do without wasting performance.
+
+Both 64-bit ARM and x64 can turn a 16-byte write into a single instruction, if the write to the tape is a constant value.
+
+## Integer and Double values
+
+Numbers are already represented as 16-byte values on the tape, so that they would not change.
+
+Integer values are represented as two 64-bit tape elements:
+- The 64-bit value `('l' << 56)` followed by the 64-bit integer value litterally. Integer values are assumed to be signed 64-bit values, using two's complement notation.
+- The 64-bit value `('u' << 56)` followed by the 64-bit integer value litterally. Integer values are assumed to be unsigned 64-bit values.
+
+Float values are represented as two 64-bit tape elements:
+- The 64-bit value `('d' << 56)` followed by the 64-bit double value litterally in standard IEEE 754 notation.
+
+We have 7 bytes of free space, but it is not clear what to do with it.
+
+There are demands to support big integers and arbitrary-precision values. We could engineer a special secondary tape where such values are coded, and we could refer to this off-tape value.
+
+Performance consideration: We store numbers of the main tape because we believe that locality of reference is helpful for performance. 
+
+## Root node
+
+Each JSON document will have two special  tape elements representing a root node, one at the beginning and one at the end.
+
+- The first 16-byte tape element contains the marker value 'r' and  the location on the tape of the last root element as a 64-bit value.
+- The last 16-byte tape element contains the value  'r'.
+
+All of the parsed document is located between these two tape elements.
+
+It might be possible to use the extra space leftover to store other useful information.
+
+Hint: We can read the first tape element to determine the length of the tape.
+
+
+## Strings
+
+
+We store string values using UTF-8 encoding with null termination on a separate tape. A string value is represented on the main tape as the 16-byte tape element with the marker '"' and a 64-bit pointer to the string tape. We use the remaining 7 bytes to store the length of the string. Thus we would limit strings within JSON documents to 2^58 bytes, but that's truly enormous.
+
+
+## Short strings (proposal)
+
+We would introduce a "short string" type. It would be made of short strings, containing fewer than 16 bytes and not null-terminated. We would use null padding. 
+
+The benefit of these short strings is that they would fit in the main tape, so that they could drastically improve the performance when querying the documents. Many JSON documents are filled with short strings.
+
+## Arrays 
+
+JSON arrays are represented using two 16-byte tape elements.
+
+- The first 16-byte  tape element contains the value marker '['. We store the number of elements in the array. We store a pointer to second  16-byte tape element.
+- The second  16-byte tape element contains the value ']'. We store the number of elements in the array. e a pointer to first  16-byte tape element.
+
+All the content of the array is located between these two tape elements, including arrays and objects.
+
+Knowing up front how many elements are in the array would solve issue https://github.com/lemire/simdjson/issues/308
+
+Explanation: we need a first and last tape element if we are to be able to navigate the document in backward order.
+
+Performance consideration: We can skip the content of an array entirely by accessing the first tape element, reading the payload and moving to the corresponding index on the tape.
+
+## Objects 
+
+JSON objects are represented using two 16-byte tape elements. 
+
+- The first  16-byte tape element contains the marker value '{'. We store the number of keys in the object. We store a pointer to second  16-byte tape element.
+- The second 16-byte t tape element contains the marker value }'. We store the number of keys in the object. We store a pointer to first  16-byte tape element.
+
+In-between these two tape elements, we alternate between key (which must be strings) and values. A value could be an object or an array.
+
+All the content of the object is located between these two tape elements, including arrays and objects. 
+
+Performance consideration: We can skip the content of an object entirely by accessing the first tape element, reading the payload and moving to the corresponding index on the tape.
+
+
+## Trade-offs
+
+A 16-byte tape would be able to support very large files whereas our 8-byte tape is limited to 4GB files. However, somewhat ironically, a 16-byte tape might use more memory and thus make page allocation more expensive, a bottleneck when processing large files (Doubling the size of the tape would make page allocation more expensive and could make the processing of large files much more expensive: https://github.com/lemire/simdjson/pull/443).
+
+[On some systems, memory allocation runs far slower than we can parse (e.g., 1.4GB/s), especially when using small pages. ](https://lemire.me/blog/2020/01/14/how-fast-can-you-allocate-a-large-block-of-memory-in-c/)
+ 
+cc @jkeiser 
+This code moves the structural indexing from stage 1 to stage 2, on the theory that stage 2 already has a loop that runs once per structural so this is less taxing there. At the moment the combined stages run about 15-20% slower; thus "engineering research."
+
+1. **Stage 1:** Stores only structural bits in stage 1, removing the highly branchy index gathering.
+2. **Stage 2:** Gathers one index per ADVANCE in stage 2. (This is now done with functions instead of #defines--trying to remove those where it makes sense.)
+3. **Empty Blocks**: We do *not* store empty masks for 64-byte blocks devoid of structural characters, so that stage 2 can be assured of having a bit to process on every iteration. To compensate for this, stage 2 detects when these 64-bit "blank spots" happen in the three places they can happen:
+   - spaces: if the document contains one or more 64-byte blocks full of spaces (or the tail of a number/string/literal plus spaces filling a block), the next offset will always land on a space. This should be exceedingly rare. Each time we read a structural, we check for spaces, increment the offset by 64, and retry. (ED.: now that I say this out loud, I'm pretty sure it's not true. If a block consists of 62 string characters, an end quote, and a space, the block will have no structurals, but the next block may have a structural that lands on a string character, which could be anything. Posting anyway, because (a) some of the todos may fix it, and (b) even negative results have useful learnings.)
+   - strings: if a string contains one or more 64-byte blocks, we adjust the offset after parsing the string.
+   - numbers: if a number contains one or more 64-byte blocks filled with digits/signifiers, we adjust the offset after parsing the number. (NOTE: we don't actually do this yet. it's a TODO.)
+4. **Strings:** we return the end offset of the string so the caller can adjust the offset.
+
+Further experiments:
+- [ ] Write out the base index of each block in stage 1, and don't do any compensation in stage 2
+- [ ] Write out 0-structural masks in stage 2, and amortize the cost somehow
+  - [ ] Adjust structural offsets based on the end index of each value before doing any space adjustments
+  - [ ] Write out an "structural end character mask" along with 0-structural masks (and maybe "special characters" like \ for string and . and e for numbers) in an "end structural mask".
+- [ ] Move UTF8 validation to the string tape, to see if it improves stage 1 enough to compensate (theory being that a 100% branchless stage 1 will have disproportionate benefits).
+- [ ] Do string and number index adjustment inside the string parsing algorithm, possibly changing the algorithm to run on block boundaries to match up better.
+- [ ] Don't have two stages: pass the structurals list directly on to stage 2 for each block / series of blocks.
+It would helpful, when an iterator is at an int or double value, to have an option to parse it as a string. This allows the consumer to decide how to do the parsing (it is helpful for me for dealing with the BigInt class https://developer.apple.com/documentation/foundation/decimal ). I can hack up something good enough for myself, but might be useful for others to have an officially supported way
+Currently stage 2 is mostly a bulky function. Moreover, it can only process a whole JSON document (or nothing).
+
+In PR https://github.com/lemire/simdjson/pull/406, it was rewritten using a functions and an object-oriented approach, but with a significant performance penalty.
+
+This new PR tries to simplify stage 2 and add the ability to process only part of a JSON document with (theoretically) the ability to resume parsing the rest of the document.
+
+There are many applications of such an approach. One is parallelization as in PR https://github.com/lemire/simdjson/pull/406, another one is to do away with the need for whole string padding.
+
+The idea here is that you can stop parsing before the beginning of an array or an object. So there are only two states to keep track off... either you are at the start of the array or at the start of an object.
+
+This PR has a small performance penalty. However, it may be a penalty that we are willing to pay for the improved flexibility.
+
+This PR is deliberately minimalist: instead of doing massive changes, I try to change as little as possible.
+
+Comments are invited.
+
+cc @jkeiser @piotte13 @pauldreik 
+This is a work-in-progress version of simdjson which can parse large documents in a multithreaded fashion. There is an interleave of stage 1 and stage 2. The expectation is that we should be able to boost the parsing speed of large files by ~50% while using 2 cores.
+
+This would solve https://github.com/lemire/simdjson/issues/171
+
+I brought it here from a fork @piotte13 did. It is not clean and not approved by Jérémie, but I wanted to start discussion around it, early.
+
+The stage 2 has been reengineered to be more flexible. Basically, you can run stage 2 over pieces of a JSON document, not just entire JSON documents. This implies that we must be able to persist the current state, and resume where we were (e.g., in the middle of an object).
+
+Doing so has other engineering benefits. For example, it should allow us to avoid having to pad the inputs (solving https://github.com/lemire/simdjson/issues/174). We could also allow the user to just parse the documents in small pieces.
+
+Besides the fact that this PR is not clean, there are still unresolved performance issues. The expectation is that the more flexible stage 2 should run at the same speed. We worked hard to keep the fancy computed gotos. Sadly, the single-threaded can be far worse (-25%). For large files, this is fine because the second thread more than compensate, but for small files, we can't use the new approach without a substantial penalty.
+
+The new stage 2 should be identical in computation cost, except for one additional comparison and conditional jump per structural element. We can expect that this comparison and condition jump should be highly predictable and, effectively free. So something else is hurting us. Unfortunately, the new code is quite different from the old code in structure, so a straight-forward comparison is not trivial.
+
+I expect that @piotte13 might come around, clean and report. When he does, this PR will become obsolete.
+
+Cheers!
+
+ - Daniel

@@ -1,0 +1,512 @@
+When using tonic/h2 over UDS, I think it should be possible to allow the '/' in the authority header. This looks related to #345 where Jan is also mentioning potential issues might arise once h2 would be used over UDS.  
+
+From RFC-3986:
+
+```
+For example, the "file" URI  scheme is defined so that no authority, 
+an empty host, and "localhost"  all mean the end-user's machine, 
+whereas the "http"  scheme considers a missing authority or
+empty host invalid.
+```
+
+A longer description of the issue can be found at https://github.com/hyperium/tonic/issues/243
+
+Perhaps it would be possible to support file:// (and then also perhaps the unix:// scheme) and depending on that, determine if the authority header is valid for the current scheme? 
+
+
+Most of the `unsafe` code used when interacting with `BytesStr` is during construction to ensure that the bytes supplied are in valid utf8 but without performing validation on the input. It turns out that all usages of `BytesStr::from_utf8_unchecked` can be replaced with two functions, `fn from(str: &str) -> BytesStr` and `const fn from_static(str: &'static str) -> BytesStr` and I can't see any reason for there to be a difference in performance.
+
+I have already coded up the changes before I realised that the contribution guide suggested that a ticket should be raised before creating a PR. You can find my changes here: https://github.com/jhinch/h2/commit/5229090af42f53dbac8973760327705d668f142f. If you are happy for me to go ahead, I'll make it a PR.
+I'm trying to create a service using h2. I can use 0.2.0, but 0.2.1 doesn't build.
+
+Version: 
+
+```
+$ grep h2 Cargo.toml Cargo.lock
+Cargo.toml:h2 = "=0.2.1"
+Cargo.lock:name = "h2"
+Cargo.lock: "h2 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
+Cargo.lock:"checksum h2 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)" = "b9433d71e471c1736fd5a61b671fc0b148d7a2992f666c958d03cd8feb3b88d1"
+```
+
+```
+   Compiling h2 v0.2.1
+error[E0271]: type mismatch resolving `<impl core::future::future::Future as core::future::future::Future>::Output == std::option::Option<std::result::Result<usize, error::Error>>`
+   --> /Users/martin/.cargo/registry/src/github.com-1ecc6299db9ec823/h2-0.2.1/src/share.rs:400:53
+    |
+400 |     pub async fn data(&mut self, buf: &mut [u8]) -> Option<Result<usize, crate::Error>> {
+    |                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected struct `bytes::bytes::Bytes`, found usize
+    |
+    = note: expected type `std::option::Option<std::result::Result<bytes::bytes::Bytes, _>>`
+               found type `std::option::Option<std::result::Result<usize, _>>`
+    = note: the return type of a function must have a statically known size
+```
+
+Looking at the code in my cargo cache, it does look strange. `data()` which takes buf and returns `usize`, delegates to the hidden `poll_data` which returns a `Bytes`.
+
+```
+   400     pub async fn data(&mut self, buf: &mut [u8]) -> Option<Result<usize, crate::Error>> {
+    401         futures_util::future::poll_fn(move |cx| self.poll_data(cx)).await
+    402     }
+    403 
+    404     /// Get optional trailers for this stream.
+    405     pub async fn trailers(&mut self) -> Result<Option<HeaderMap>, crate::Error> {
+    406         futures_util::future::poll_fn(move |cx| self.poll_trailers(cx)).await
+    407     }
+    408 
+    409     #[doc(hidden)]
+    410     pub fn poll_data(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes, crate::Er
+    410 ror>>> {
+    411         self.inner.inner.poll_data(cx).map_err_(Into::into)
+    412     }
+```
+
+Is 0.2.1 a strange release? Somewhere in between std futures and bytes?
+See, e.g., [`h2::server::Connection`](https://docs.rs/h2/0.2.1/h2/server/struct.Connection.html), which doesn't mention the `Stream` instance at all.
+A `server_push` and `client_push` example is added to show the usage of `server_push`
+Hi, I'm testing the `server_push` feature that was just recently merged, but tokio seems to always panic when using this feature.
+Here is the code I use for the `server` and the `client`.
+
+In `server_push2.rs`
+```rust
+use h2::server;
+
+use bytes::*;
+use http::uri;
+use http::{Request, Response, StatusCode};
+
+use std::error::Error;
+use tokio::net::{TcpListener, TcpStream};
+
+#[tokio::main]
+pub async fn main() -> Result<(), Box<dyn Error>> {
+    let _ = env_logger::try_init();
+
+    let mut listener = TcpListener::bind("127.0.0.1:5928").await?;
+
+    println!("listening on {:?}", listener.local_addr());
+
+    loop {
+        if let Ok((socket, _peer_addr)) = listener.accept().await {
+            tokio::spawn(async move {
+                if let Err(e) = handle(socket).await {
+                    println!("  -> err={:?}", e);
+                }
+            });
+        }
+    }
+}
+
+async fn handle(socket: TcpStream) -> Result<(), Box<dyn Error>> {
+    let mut connection = server::handshake(socket).await?;
+    println!("H2 connection bound");
+
+    while let Some(result) = connection.accept().await {
+        let (request, mut respond) = result?;
+        println!("request uri: {}", request.uri());
+        println!("GOT request: {:?}", request);
+        let response = Response::builder().status(StatusCode::OK).body(()).unwrap();
+
+        let mut pushed_uri_parts: uri::Parts  = request.into_parts().0.uri.into();
+        pushed_uri_parts.path_and_query = uri::PathAndQuery::from_static("/pushed").into();
+        let uri1 = uri::Uri::from_parts(pushed_uri_parts).unwrap();
+        println!("uri1 {}", uri1);
+
+        //let uri2 = uri::Uri::from_static("http://127.0.0.1:5928/pushed2");
+        let uri2 = uri::Uri::from_static("https://http2.akamai.com/pushed2");
+
+        println!("uri2 {}", uri2);
+
+        let pushed_req = Request::builder()
+            .uri(uri1)
+            .body(())
+            .unwrap();
+
+        let pushed_req2 = Request::builder()
+            .uri(uri2)
+            .body(())
+            .unwrap();
+
+        let pushed_rsp = http::Response::builder().status(200).body(()).unwrap();
+        let pushed_rsp2 = http::Response::builder().status(200).body(()).unwrap();
+        let mut send_pushed = respond
+            .push_request(pushed_req)
+            .unwrap()
+            .send_response(pushed_rsp, false)
+            .unwrap();
+
+        let mut send_pushed2 = respond
+            .push_request(pushed_req2)
+            .unwrap()
+            .send_response(pushed_rsp2, false)
+            .unwrap();
+
+        let mut send = respond.send_response(response, false)?;
+
+        println!(">>>> pushing data");
+        send_pushed.send_data(Bytes::from_static(b"Pushed data!\n"), true)?;
+        send_pushed2.send_data(Bytes::from_static(b"Another Pushed data!\n"), true)?;
+        println!(">>>> sending data");
+        send.send_data(Bytes::from_static(b"hello world"), true)?;
+    }
+
+    println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~ H2 connection CLOSE !!!!!! ~~~~~~~~~~~");
+
+    Ok(())
+}
+```
+
+
+In `client.rs`
+
+```rust
+use h2::client;
+use http::{HeaderMap, Request};
+
+use std::error::Error;
+
+use tokio::net::TcpStream;
+
+#[tokio::main]
+pub async fn main() -> Result<(), Box<dyn Error>> {
+    let _ = env_logger::try_init();
+
+    let tcp = TcpStream::connect("127.0.0.1:5928").await?;
+    let (mut client, h2) = client::handshake(tcp).await?;
+
+    println!("sending request");
+
+    let request = Request::builder()
+        .uri("https://http2.akamai.com/")
+        .body(())
+        .unwrap();
+
+    let request1 = Request::builder()
+        .uri("https://http2.akamai.com/pushed")
+        .body(())
+        .unwrap();
+
+    let request2 = Request::builder()
+        .uri("https://http2.akamai.com/pushed2")
+        .body(())
+        .unwrap();
+
+    let mut trailers = HeaderMap::new();
+    trailers.insert("zomg", "hello".parse().unwrap());
+
+    let (response, mut stream) = client.send_request(request, false).unwrap();
+    let (response1, mut stream1) = client.send_request(request1, false).unwrap();
+    let (response2, mut stream2) = client.send_request(request2, false).unwrap();
+
+    // send trailers
+    stream.send_trailers(trailers).unwrap();
+
+    // Spawn a task to run the conn...
+    tokio::spawn(async move {
+        if let Err(e) = h2.await {
+            println!("GOT ERR={:?}", e);
+        }
+    });
+
+    let response = response.await?;
+    println!("GOT RESPONSE: {:?}", response);
+
+    let response1 = response1.await?;
+    println!("GOT RESPONSE1: {:?}", response1);
+
+    let response2 = response2.await?;
+    println!("GOT RESPONSE2: {:?}", response1);
+
+    // Get the body
+    let mut body = response.into_body();
+    let mut body1 = response1.into_body();
+    let mut body2 = response2.into_body();
+
+    while let Some(chunk) = body.data().await {
+        println!("GOT CHUNK = {:?}", chunk?);
+    }
+
+    while let Some(chunk1) = body1.data().await {
+        println!("GOT CHUNK1 = {:?}", chunk1?);
+    }
+
+    while let Some(chunk2) = body2.data().await {
+        println!("GOT CHUNK2 = {:?}", chunk2?);
+    }
+
+    if let Some(trailers) = body.trailers().await? {
+        println!("GOT TRAILERS: {:?}", trailers);
+    }
+
+    Ok(())
+}
+```
+A panic caused by a failed assertion in h2 0.1.26 has been observed in https://github.com/input-output-hk/jormungandr/issues/881.
+
+The assertion `self.slab.is_empty()` fails under some circumstances in the `Drop` impl for `proto::streams::store::Store`. The diagnostic gives me no idea whether this could be an application problem or how to mitigate it.
+Hellom
+I'm trying to use the new push_promise feature, I edited the server example to reply a index.html page and push a script.js file, but it ends up with a PROTOCOL_ERROR and I'm unable to debug it:
+```use h2::server;
+
+use http::{Response, Request, StatusCode};
+
+use tokio::net::TcpListener;
+
+#[tokio::main]
+pub async fn main() {
+    let mut listener = TcpListener::bind("127.0.0.1:5927").await.expect("Bind error");
+
+    // Accept all incoming TCP connections.
+    loop {
+        if let Ok((socket, _peer_addr)) = listener.accept().await {
+            // Spawn a new task to process each connection.
+            tokio::spawn(async move {
+                // Start the HTTP/2.0 connection handshake
+                let mut h2 = server::handshake(socket).await.expect("Handshake error");
+                // Accept all inbound HTTP/2.0 streams sent over the
+                // connection.
+                while let Some(request) = h2.accept().await {
+                    let (request, mut respond) = request.expect("Incoming request error");
+                    println!("Received request: {:?}", request);
+
+                    // Build a response with no body
+                    let response = Response::builder()
+                        .status(StatusCode::OK)
+                        .body(())
+                        .expect("First response build error");
+
+                    // Send the response back to the client
+                    let mut stream = respond.send_response(response, false)
+                        .expect("First response send error");
+
+                    let contents = b"index.html contents".to_vec();
+                    stream.send_data(contents.into(), true).expect("index.html send error");
+
+                    // prepare the PUSH request
+                    let request = Request::builder()
+                        .uri("script.js")
+                        .body(())
+                        .expect("script.js request build error");
+                    
+                    // init the PUSH sequence
+                    let mut push = respond.push_request(request)
+                        .expect("script.js request send error");
+
+                    // Build a response with no body
+                    let response = Response::builder()
+                        .status(StatusCode::OK)
+                        .body(())
+                        .expect("Second response build error");
+
+                    // Send the response back to the client
+                    let mut stream = push.send_response(response, false)
+                        .expect("Second response send error");
+
+                    let contents = b"script.js contents".to_vec();
+                    stream.send_data(contents.into(), true).expect("script.js send error");
+                }
+            });
+        }
+    }
+}
+```
+
+Can you please help me creating a working PUSH example?
+Thank you
+A curious thing happened, 2 panics from the same server, same process, within a second. Both related to the h2 crate:
+
+**Aug 17, 2019 3:33:15 PM UTC**
+
+```
+OS Version: Linux 4.18.0-21-generic (None)
+Report Version: 104
+
+
+Application Specific Information:
+value out of range
+
+Thread 0
+0   h2                              0xc27b4e            h2::hpack::encoder::encode_int (encoder.rs:381)
+1   h2                              0xc25cb1            [inlined] h2::hpack::encoder::encode_size_update (encoder.rs:260)
+2   h2                              0xc25cb1            [inlined] h2::hpack::encoder::Encoder::encode_size_updates (encoder.rs:161)
+3   h2                              0xc25cb1            h2::hpack::encoder::Encoder::encode (encoder.rs:85)
+4   h2                              0xc1e4e3            [inlined] h2::frame::headers::EncodingHeaderBlock::encode (headers.rs:551)
+5   h2                              0xc1e4e3            h2::frame::headers::Headers::encode (headers.rs:267)
+6   h2                              0x42ed62            h2::codec::framed_write::FramedWrite<T>::buffer (framed_write.rs:128)
+7   h2                              0x56811f            [inlined] h2::codec::Codec<T>::buffer (mod.rs:149)
+8   h2                              0x56811f            [inlined] h2::proto::streams::prioritize::Prioritize::poll_complete (prioritize.rs:516)
+9   h2                              0x56811f            h2::proto::streams::send::Send::poll_complete (send.rs:242)
+10  h2                              0x4d7e8e            h2::proto::streams::streams::Streams<T>::poll_complete (streams.rs:595)
+11  h2                              0x4819f6            h2::proto::connection::Connection<T>::poll (connection.rs:211)
+12  h2                              0x4a1dc0            [inlined] h2::server::Connection<T>::poll_close (server.rs:424)
+13  h2                              0x4a1dc0            <h2::server::Connection<T> as futures::stream::Stream>::poll (server.rs:487)
+14  hyper                           0x44f518            [inlined] hyper::proto::h2::server::Serving<T>::poll_server (server.rs:164)
+15  hyper                           0x44f518            [inlined] <hyper::proto::h2::server::Server<T> as futures::future::Future>::poll (server.rs:106)
+16  futures                         0x44f518            <futures::future::either::Either<T> as futures::future::Future>::poll (either.rs:36)
+17  futures                         0x5c18e0            [inlined] futures::future::option::<T>::poll (option.rs:12)
+18  hyper                           0x5c18e0            <hyper::server::conn::Connection<T> as futures::future::Future>::poll (conn.rs:636)
+19  fly_proxy                       0x4add87            [inlined] <fly_proxy::session::http::HttpSession as futures::future::Future>::poll (mod.rs:65)
+20  fly_proxy                       0x4add87            <fly_proxy::session::Session as futures::future::Future>::poll (mod.rs:96)
+21  fly_proxy                       0x5cb655            [inlined] <fly_proxy::dispatch::Machine as fly_proxy::dispatch::PollMachine>::poll_driving_session (mod.rs:185)
+22  core                            0x5cb655            [inlined] core::ops::function::FnOnce::call_once (function.rs:231)
+23  rent_to_own                     0x5cb655            [inlined] rent_to_own::RentToOwn<T>::with (lib.rs:179)
+24  fly_proxy                       0x5cb655            [inlined] <fly_proxy::dispatch::MachineFuture as futures::future::Future>::poll (mod.rs:89)
+25  fly_proxy                       0x5cb655            <fly_proxy::dispatch::DispatchFuture as futures::future::Future>::poll (mod.rs:85)
+26  fly_proxy                       0x428ff6            [inlined] <fly_proxy::frontend::tls::Machine as fly_proxy::frontend::tls::PollMachine>::poll_dispatch (tls.rs:159)
+27  fly_proxy                       0x428ff6            [inlined] <fly_proxy::frontend::tls::MachineFuture as futures::future::Future>::poll::{{closure}}::{{closure}} (tls.rs:74)
+28  rent_to_own                     0x428ff6            [inlined] rent_to_own::RentToOwn<T>::with (lib.rs:179)
+29  fly_proxy                       0x428ff6            [inlined] <fly_proxy::frontend::tls::MachineFuture as futures::future::Future>::poll::{{closure}} (tls.rs:74)
+30  rent_to_own                     0x428ff6            rent_to_own::RentToOwn<T>::with (lib.rs:179)
+31  fly_proxy                       0x50e143            [inlined] <fly_proxy::frontend::tls::MachineFuture as futures::future::Future>::poll (tls.rs:74)
+32  fly_proxy                       0x50e143            <fly_proxy::frontend::tls::TlsHandlerFuture as futures::future::Future>::poll (tls.rs:70)
+33  fly_proxy                       0x598440            <fly_proxy::runtime::Temporary<T> as futures::future::Future>::poll (runtime.rs:218)
+34  alloc                           0xbfcb92            [inlined] <alloc::boxed::Box<T> as futures::future::Future>::poll (mod.rs:113)
+35  futures                         0xbfcb92            [inlined] futures::task_impl::Spawn<T>::poll_future_notify::{{closure}} (mod.rs:329)
+36  futures                         0xbfcb92            [inlined] futures::task_impl::Spawn<T>::enter::{{closure}} (mod.rs:399)
+37  futures                         0xbfcb92            futures::task_impl::std::set (mod.rs:83)
+38  futures                         0xbfc722            [inlined] futures::task_impl::Spawn<T>::enter (mod.rs:399)
+39  futures                         0xbfc722            [inlined] futures::task_impl::Spawn<T>::poll_fn_notify (mod.rs:291)
+40  futures                         0xbfc722            [inlined] futures::task_impl::Spawn<T>::poll_future_notify (mod.rs:329)
+41  tokio_threadpool                0xbfc722            [inlined] tokio_threadpool::task::Task::run::{{closure}} (mod.rs:145)
+42  core                            0xbfc722            [inlined] core::ops::function::FnOnce::call_once (function.rs:231)
+43  std                             0xbfc722            [inlined] <std::panic::AssertUnwindSafe<T> as core::ops::function::FnOnce<T>>::call_once (panic.rs:315)
+44  std                             0xbfc722            std::panicking::try::do_call (panicking.rs:293)
+45  <unknown>                       0xdce5ea            __rust_maybe_catch_panic (lib.rs:85)
+46  std                             0xbf9db9            [inlined] std::panicking::try (panicking.rs:272)
+47  std                             0xbf9db9            [inlined] std::panic::catch_unwind (panic.rs:394)
+48  tokio_threadpool                0xbf9db9            tokio_threadpool::task::Task::run (mod.rs:130)
+49  tokio_threadpool                0xbf3805            [inlined] tokio_threadpool::worker::Worker::run_task2 (mod.rs:567)
+50  tokio_threadpool                0xbf3805            tokio_threadpool::worker::Worker::run_task (mod.rs:459)
+51  tokio_threadpool                0xbf2ee9            [inlined] tokio_threadpool::worker::Worker::try_steal_task (mod.rs:416)
+52  tokio_threadpool                0xbf2ee9            [inlined] tokio_threadpool::worker::Worker::try_run_task (mod.rs:301)
+53  tokio_threadpool                0xbf2ee9            tokio_threadpool::worker::Worker::run (mod.rs:241)
+54  tokio                           0xbcf11e            [inlined] tokio::runtime::threadpool::builder::Builder::build::{{closure}}::{{closure}}::{{closure}}::{{closure}} (builder.rs:390)
+55  tokio_timer                     0xbcf11e            [inlined] tokio_timer::timer::handle::with_default::{{closure}} (handle.rs:101)
+56  std                             0xbcf11e            [inlined] std::thread::local::LocalKey<T>::try_with (local.rs:299)
+57  std                             0xbcf11e            std::thread::local::LocalKey<T>::with (local.rs:245)
+58  tokio_timer                     0xbcefdf            [inlined] tokio_timer::timer::handle::with_default (handle.rs:84)
+59  tokio                           0xbcefdf            [inlined] tokio::runtime::threadpool::builder::Builder::build::{{closure}}::{{closure}}::{{closure}} (builder.rs:382)
+60  tokio_timer                     0xbcefdf            [inlined] tokio_timer::clock::clock::with_default::{{closure}} (clock.rs:137)
+61  std                             0xbcefdf            [inlined] std::thread::local::LocalKey<T>::try_with (local.rs:299)
+62  std                             0xbcefdf            std::thread::local::LocalKey<T>::with (local.rs:245)
+63  tokio_timer                     0xbcf30b            [inlined] tokio_timer::clock::clock::with_default (clock.rs:117)
+64  tokio                           0xbcf30b            [inlined] tokio::runtime::threadpool::builder::Builder::build::{{closure}}::{{closure}} (builder.rs:381)
+65  tokio_reactor                   0xbcf30b            [inlined] tokio_reactor::with_default::{{closure}} (lib.rs:237)
+66  std                             0xbcf30b            [inlined] std::thread::local::LocalKey<T>::try_with (local.rs:299)
+67  std                             0xbcf30b            std::thread::local::LocalKey<T>::with (local.rs:245)
+68  tokio_reactor                   0xbd090e            [inlined] tokio_reactor::with_default (lib.rs:217)
+69  tokio                           0xbd090e            tokio::runtime::threadpool::builder::Builder::build::{{closure}} (builder.rs:380)
+70  tokio_threadpool                0xbfd593            [inlined] tokio_threadpool::callback::Callback::call (callback.rs:22)
+71  tokio_threadpool                0xbfd593            [inlined] tokio_threadpool::worker::Worker::do_run::{{closure}}::{{closure}} (mod.rs:127)
+72  tokio_executor                  0xbfd593            [inlined] tokio_executor::global::with_default::{{closure}} (global.rs:209)
+73  std                             0xbfd593            [inlined] std::thread::local::LocalKey<T>::try_with (local.rs:299)
+74  std                             0xbfd593            std::thread::local::LocalKey<T>::with (local.rs:245)
+75  tokio_executor                  0xbfd36e            [inlined] tokio_executor::global::with_default (global.rs:178)
+76  tokio_threadpool                0xbfd36e            [inlined] tokio_threadpool::worker::Worker::do_run::{{closure}} (mod.rs:125)
+77  std                             0xbfd36e            [inlined] std::thread::local::LocalKey<T>::try_with (local.rs:299)
+78  std                             0xbfd36e            std::thread::local::LocalKey<T>::with (local.rs:245)
+79  tokio_threadpool                0xbf53e1            [inlined] tokio_threadpool::worker::Worker::do_run (mod.rs:116)
+80  tokio_threadpool                0xbf53e1            [inlined] tokio_threadpool::pool::Pool::spawn_thread::{{closure}} (mod.rs:344)
+81  std                             0xbf53e1            std::sys_common::backtrace::__rust_begin_short_backtrace (backtrace.rs:136)
+82  std                             0xbfc67c            [inlined] std::thread::Builder::spawn_unchecked::{{closure}}::{{closure}} (mod.rs:470)
+83  std                             0xbfc67c            [inlined] <std::panic::AssertUnwindSafe<T> as core::ops::function::FnOnce<T>>::call_once (panic.rs:315)
+84  std                             0xbfc67c            std::panicking::try::do_call (panicking.rs:293)
+85  <unknown>                       0xdce5ea            __rust_maybe_catch_panic (lib.rs:85)
+86  std                             0xbf5ed0            [inlined] std::panicking::try (panicking.rs:272)
+87  std                             0xbf5ed0            [inlined] std::panic::catch_unwind (panic.rs:394)
+88  std                             0xbf5ed0            [inlined] std::thread::Builder::spawn_unchecked::{{closure}} (mod.rs:469)
+89  core                            0xbf5ed0            core::ops::function::FnOnce::call_once{{vtable.shim}} (function.rs:231)
+90  alloc                           0xdb513f            <alloc::boxed::Box<T> as core::ops::function::FnOnce<T>>::call_once (boxed.rs:704)
+91  alloc                           0xdcdc40            [inlined] <alloc::boxed::Box<T> as core::ops::function::FnOnce<T>>::call_once (boxed.rs:704)
+92  std                             0xdcdc40            [inlined] std::sys_common::thread::start_thread (thread.rs:13)
+93  std                             0xdcdc40            std::sys::unix::thread::Thread::new::thread_start (thread.rs:79)
+```
+
+**Aug 17, 2019 3:33:16 PM UTC**
+
+```
+OS Version: Linux 4.18.0-21-generic (None)
+Report Version: 104
+
+
+Application Specific Information:
+called `Result::unwrap()` on an `Err` value: "PoisonError { inner: .. }"
+
+Thread 0
+0   core                            0x60bf14            core::result::unwrap_failed (macros.rs:18)
+1   core                            0x4d4380            [inlined] core::result::Result<T>::unwrap (result.rs:800)
+2   h2                              0x4d4380            h2::proto::streams::streams::StreamRef<T>::reserve_capacity (streams.rs:953)
+3   h2                              0x5e5f7d            [inlined] h2::share::SendStream<T>::reserve_capacity (share.rs:287)
+4   hyper                           0x5e5f7d            <hyper::proto::h2::PipeToSendStream<T> as futures::future::Future>::poll (mod.rs:122)
+5   hyper                           0x453d61            [inlined] hyper::proto::h2::server::H2Stream<T>::poll2 (server.rs:290)
+6   hyper                           0x453d61            <hyper::proto::h2::server::H2Stream<T> as futures::future::Future>::poll (server.rs:308)
+7   alloc                           0xbfcb92            [inlined] <alloc::boxed::Box<T> as futures::future::Future>::poll (mod.rs:113)
+8   futures                         0xbfcb92            [inlined] futures::task_impl::Spawn<T>::poll_future_notify::{{closure}} (mod.rs:329)
+9   futures                         0xbfcb92            [inlined] futures::task_impl::Spawn<T>::enter::{{closure}} (mod.rs:399)
+10  futures                         0xbfcb92            futures::task_impl::std::set (mod.rs:83)
+11  futures                         0xbfc722            [inlined] futures::task_impl::Spawn<T>::enter (mod.rs:399)
+12  futures                         0xbfc722            [inlined] futures::task_impl::Spawn<T>::poll_fn_notify (mod.rs:291)
+13  futures                         0xbfc722            [inlined] futures::task_impl::Spawn<T>::poll_future_notify (mod.rs:329)
+14  tokio_threadpool                0xbfc722            [inlined] tokio_threadpool::task::Task::run::{{closure}} (mod.rs:145)
+15  core                            0xbfc722            [inlined] core::ops::function::FnOnce::call_once (function.rs:231)
+16  std                             0xbfc722            [inlined] <std::panic::AssertUnwindSafe<T> as core::ops::function::FnOnce<T>>::call_once (panic.rs:315)
+17  std                             0xbfc722            std::panicking::try::do_call (panicking.rs:293)
+18  <unknown>                       0xdce5ea            __rust_maybe_catch_panic (lib.rs:85)
+19  std                             0xbf9db9            [inlined] std::panicking::try (panicking.rs:272)
+20  std                             0xbf9db9            [inlined] std::panic::catch_unwind (panic.rs:394)
+21  tokio_threadpool                0xbf9db9            tokio_threadpool::task::Task::run (mod.rs:130)
+22  tokio_threadpool                0xbf3805            [inlined] tokio_threadpool::worker::Worker::run_task2 (mod.rs:567)
+23  tokio_threadpool                0xbf3805            tokio_threadpool::worker::Worker::run_task (mod.rs:459)
+24  tokio_threadpool                0xbf2ee9            [inlined] tokio_threadpool::worker::Worker::try_steal_task (mod.rs:416)
+25  tokio_threadpool                0xbf2ee9            [inlined] tokio_threadpool::worker::Worker::try_run_task (mod.rs:301)
+26  tokio_threadpool                0xbf2ee9            tokio_threadpool::worker::Worker::run (mod.rs:241)
+27  tokio                           0xbcf11e            [inlined] tokio::runtime::threadpool::builder::Builder::build::{{closure}}::{{closure}}::{{closure}}::{{closure}} (builder.rs:390)
+28  tokio_timer                     0xbcf11e            [inlined] tokio_timer::timer::handle::with_default::{{closure}} (handle.rs:101)
+29  std                             0xbcf11e            [inlined] std::thread::local::LocalKey<T>::try_with (local.rs:299)
+30  std                             0xbcf11e            std::thread::local::LocalKey<T>::with (local.rs:245)
+31  tokio_timer                     0xbcefdf            [inlined] tokio_timer::timer::handle::with_default (handle.rs:84)
+32  tokio                           0xbcefdf            [inlined] tokio::runtime::threadpool::builder::Builder::build::{{closure}}::{{closure}}::{{closure}} (builder.rs:382)
+33  tokio_timer                     0xbcefdf            [inlined] tokio_timer::clock::clock::with_default::{{closure}} (clock.rs:137)
+34  std                             0xbcefdf            [inlined] std::thread::local::LocalKey<T>::try_with (local.rs:299)
+35  std                             0xbcefdf            std::thread::local::LocalKey<T>::with (local.rs:245)
+36  tokio_timer                     0xbcf30b            [inlined] tokio_timer::clock::clock::with_default (clock.rs:117)
+37  tokio                           0xbcf30b            [inlined] tokio::runtime::threadpool::builder::Builder::build::{{closure}}::{{closure}} (builder.rs:381)
+38  tokio_reactor                   0xbcf30b            [inlined] tokio_reactor::with_default::{{closure}} (lib.rs:237)
+39  std                             0xbcf30b            [inlined] std::thread::local::LocalKey<T>::try_with (local.rs:299)
+40  std                             0xbcf30b            std::thread::local::LocalKey<T>::with (local.rs:245)
+41  tokio_reactor                   0xbd090e            [inlined] tokio_reactor::with_default (lib.rs:217)
+42  tokio                           0xbd090e            tokio::runtime::threadpool::builder::Builder::build::{{closure}} (builder.rs:380)
+43  tokio_threadpool                0xbfd593            [inlined] tokio_threadpool::callback::Callback::call (callback.rs:22)
+44  tokio_threadpool                0xbfd593            [inlined] tokio_threadpool::worker::Worker::do_run::{{closure}}::{{closure}} (mod.rs:127)
+45  tokio_executor                  0xbfd593            [inlined] tokio_executor::global::with_default::{{closure}} (global.rs:209)
+46  std                             0xbfd593            [inlined] std::thread::local::LocalKey<T>::try_with (local.rs:299)
+47  std                             0xbfd593            std::thread::local::LocalKey<T>::with (local.rs:245)
+48  tokio_executor                  0xbfd36e            [inlined] tokio_executor::global::with_default (global.rs:178)
+49  tokio_threadpool                0xbfd36e            [inlined] tokio_threadpool::worker::Worker::do_run::{{closure}} (mod.rs:125)
+50  std                             0xbfd36e            [inlined] std::thread::local::LocalKey<T>::try_with (local.rs:299)
+51  std                             0xbfd36e            std::thread::local::LocalKey<T>::with (local.rs:245)
+52  tokio_threadpool                0xbf53e1            [inlined] tokio_threadpool::worker::Worker::do_run (mod.rs:116)
+53  tokio_threadpool                0xbf53e1            [inlined] tokio_threadpool::pool::Pool::spawn_thread::{{closure}} (mod.rs:344)
+54  std                             0xbf53e1            std::sys_common::backtrace::__rust_begin_short_backtrace (backtrace.rs:136)
+55  std                             0xbfc67c            [inlined] std::thread::Builder::spawn_unchecked::{{closure}}::{{closure}} (mod.rs:470)
+56  std                             0xbfc67c            [inlined] <std::panic::AssertUnwindSafe<T> as core::ops::function::FnOnce<T>>::call_once (panic.rs:315)
+57  std                             0xbfc67c            std::panicking::try::do_call (panicking.rs:293)
+58  <unknown>                       0xdce5ea            __rust_maybe_catch_panic (lib.rs:85)
+59  std                             0xbf5ed0            [inlined] std::panicking::try (panicking.rs:272)
+60  std                             0xbf5ed0            [inlined] std::panic::catch_unwind (panic.rs:394)
+61  std                             0xbf5ed0            [inlined] std::thread::Builder::spawn_unchecked::{{closure}} (mod.rs:469)
+62  core                            0xbf5ed0            core::ops::function::FnOnce::call_once{{vtable.shim}} (function.rs:231)
+63  alloc                           0xdb513f            <alloc::boxed::Box<T> as core::ops::function::FnOnce<T>>::call_once (boxed.rs:704)
+64  alloc                           0xdcdc40            [inlined] <alloc::boxed::Box<T> as core::ops::function::FnOnce<T>>::call_once (boxed.rs:704)
+65  std                             0xdcdc40            [inlined] std::sys_common::thread::start_thread (thread.rs:13)
+66  std                             0xdcdc40            std::sys::unix::thread::Thread::new::thread_start (thread.rs:79)
+```
+
+Running rust 1.36.0.
+
+This only happened once, and we're serving a lot of requests. Still could be interesting to fix it though (if possible). Not panicking would probably be good if it's unfixable.
+It might be a good idea to check to see if h2 is vulnerable to any of these HTTP/2 issues that Netflix has drawn attention to:
+
+https://github.com/Netflix/security-bulletins/blob/master/advisories/third-party/2019-002.md
+
+Hacker News comment thread: https://news.ycombinator.com/item?id=20688178

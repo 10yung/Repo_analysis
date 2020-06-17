@@ -1,0 +1,150 @@
+None
+
+
+    
+[I just ran into this issue](https://github.com/japaric/steed/issues/153) trying to build in Arch using the lld strategy (e.g. not Docker/cross). I'm trying to compile steed itself, not a dependent crate.
+
+Note: The redox issue linked to seems to be closed. So I'm assuming we still need to use naive_ralloc.
+
+I edited Xargo.toml per #153 discussion, but it didn't quite work.
+
+```toml
+[dependencies]
+collections = {}
+rand = {}
+
+[dependencies.std]
+default-features = false
+features = ["naive_ralloc"]
+
+[dependencies.compiler_builtins]
+features = ["mem"]
+stage = 1
+```
+
+That config still yielded a similar error
+
+```
+error: Package `ralloc v1.0.0 (https://github.com/redox-os/ralloc#
+b521bac2)` does not have these features: `allocator`
+```
+
+Instead I fiddled with **Cargo.toml**, to try building with naive_alloc.
+
+```toml
+[package]
+# This is NOT an official Rust project but since most code will come from
+# the rust-lang/rust repo it makes sense to use this author.
+authors = ["The Rust Project Developers"]
+name = "std"
+version = "0.1.0"
+
+[dependencies]
+sc = "0.2.1"
+
+[dependencies.ralloc]
+default-features = false
+features = ["allocator"]
+optional = true
+git = "https://github.com/redox-os/ralloc"
+
+[dependencies.naive_ralloc]
+optional = true
+path = "naive_ralloc"
+
+[features]
+default = ["naive_ralloc"]
+
+[profile.release]
+lto = true
+```
+
+Then I tried building with
+```
+xargo build 
+```
+
+The output
+
+```
+error: failed to load source for a dependency on `collections`
+
+Caused by:
+  Unable to update file:///home/coleman/.rustup/toolchains/nightly
+-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/src/libcollections
+
+Caused by:
+  failed to read `/home/coleman/.rustup/toolchains/nightly-x86_64-
+unknown-linux-gnu/lib/rustlib/src/rust/src/libcollections/Cargo.to
+ml`
+
+Caused by:
+  No such file or directory (os error 2)
+error: `"cargo" "build" "--release" "--manifest-path" "/tmp/xargo.
+KcG2oOf3bp5o/Cargo.toml" "--target" "x86_64-unknown-linux-gnu" "-p
+" "collections"` failed with exit code: Some(101)
+note: run with `RUST_BACKTRACE=1` for a backtrace
+```
+
+I'd like to set up a development environment for steed, but I'm not quite sure how to get past this compiler error. Any pointers?
+
+
+
+
+
+  
+I'm guessing the entire rand folder can be deleted (still contains rand/reader.rs), but I left it for now, since it wasn't removed in rust/src/libstd yet.
+
+Rust lang commit: 6bc8f164b09b9994e6a2d4c4ca60d7d36c09d3fe
+`xargo build` throws an error while compiling [ralloc](https://github.com/redox-os/ralloc) dependency:
+
+```
+   Compiling ralloc v1.0.0 (https://github.com/redox-os/ralloc#a93871cd)
+error[E0557]: feature has been removed
+  --> /home/boss/.cargo/git/checkouts/ralloc-797ee1a3f928155b/a93871c/src/lib.rs:18:12
+   |
+18 | #![feature(allocator, const_fn, core_intrinsics, stmt_expr_attributes, drop_types_in_const,
+   |            ^^^^^^^^^
+
+error: The attribute `allocator` is currently unknown to the compiler and may have meaning added to it in the future (see issue #29642)
+  --> /home/boss/.cargo/git/checkouts/ralloc-797ee1a3f928155b/a93871c/src/lib.rs:12:36
+   |
+12 | #![cfg_attr(feature = "allocator", allocator)]
+   |                                    ^^^^^^^^^^
+   |
+   = help: add #![feature(custom_attribute)] to the crate attributes to enable
+
+error: aborting due to 2 previous errors
+
+error: Could not compile `ralloc`.
+```
+
+Related issue: https://github.com/redox-os/ralloc/issues/56
+Currently `steed` source tree is based on some mix of rust's `libstd` sources manually handpicked at different periods of time. Copying files one-by-one and maintaining tree up-to-date consumes time. There were several breakages recently that required copying changes from Rust `master` branch to steed.
+
+In instead of maintaining source parity this way I propose to *rebase* `steed` changes on top of `libstd`. I tried to make a proof-of-concept, [extracted `libstd` out of rust master branch](https://github.com/anatol/steed/commits/filter-branch-master), moved some changes from `steed` and I was able to compile static "hello world" example successfully. It works great.
+
+Here is a git command that extracts `libstd` from [Rust sources](https://github.com/rust-lang/rust):
+`git filter-branch --prune-empty --subdirectory-filter src/libstd && git filter-branch -f --tree-filter 'mkdir -p src; mv * src; mv src/Cargo.toml .; true'`
+
+Developing steed on top of upstream `libstd` has following advantages:
+ * bringing upstream changes simplified and becomes automatic
+ * it is much easier to see delta between upstream `libstd` and steed. Keeping this delta small will help in the future when merging libc-less support back to upstream
+
+
+Currently, the mutex is just commented out which is bad because we now *do* have threads.
+This code:
+``` Rust
+fn main() {
+    use std::io::{BufRead, BufReader};
+    let buf = vec![0u8; 10];
+    let reader = BufReader::new(&buf[..]);
+}
+```
+segfaults at:
+```
+0x0000000000204763 in core::ptr::write<u8> (dst=0x215000 <error: Cannot access memory at address 0x215000>, src=0) at /home/usov/.rustup/toolchains/nightly-2017-04-15-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/src/libcore/ptr.rs:246
+246	    intrinsics::move_val_init(&mut *dst, src)
+
+```
+Not a priority either, needs a working `pthread_detach`.

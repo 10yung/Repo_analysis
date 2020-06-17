@@ -1,0 +1,190 @@
+Here `conn` is net.socket instance, so it should be called as one.
+Otherwise request is very likely to end up with crash and PANIC.
+
+- [ ] This PR is for the `dev` branch rather than for `master`.
+- [x] This PR is compliant with the [other contributing guidelines](https://github.com/nodemcu/nodemcu-firmware/blob/dev/CONTRIBUTING.md) as well (if not, please describe why).
+- [x] I have thoroughly tested my contribution.
+- [ ] The code changes are reflected in the documentation at `docs/*`.
+
+### Summary
+I have experienced I2C hardware timeouts due to clock stretching
+I have solved the issue and thought I might share some insights with the community.
+
+The title would spoil any attempt to write this as a high-suspense investigation report so here are the essentials.
+### Situation: 
+ESP-32, with the latest, standard NodeMCU firmware connected by I2C to a Bosch BNO055 IMU.
+I am using the i2c module with the `i2c.SW` interface (software based bitbanging, master mode only, synchronous operation).
+
+It's convenient for validation and testing of my I2C commands and making sure I read the BNO055 datasheet correctly :-)
+With a I2C bus speed set to `i2c.SLOW` (100 kHz), the ESP32 and the BNO055 are communicating happily and reliably.
+
+### Expectation:
+The I2C bus is slow and ties down the CPU in synchronous mode.
+So why not delegate the work to one of the ESP32 hardware I2C subsystems ?
+This should be simple, specify `i2c.HW0/1` in `i2c.setup,` add the appropriate `i2c.transfer` call with a call back function to handle the results of the I2C operation whenever they are available.
+### Issue:
+It just doesn't work.
+The call back function returns nonsense/random data and a false ACK flag.
+
+Using `i2c.transfer` without a call back doesn't work better, it just fails with a Lua error and a timeout message.
+That's surprising because I call `i2c.transfer` without a timeout parameter so it should default to infinite...
+### Diagnostic:
+The ESP32 hardware I2C interfaces have a timeout parameter and that's a good feature for reacting to I2C bus faults.
+The ESP-SDK driver sets this to a default value corresponding to 8 I2C SCL clock cycle lengths.
+More precisely, with a 80 Mhz ESP clock and a 100KHz I2C bus speed, this value is 8*80/0.1=6400 ESP clock cycles, i.e. 80 µS.
+
+The BNO055 is a busy chip and can ask to slow down I2C communication by using clock stretching.
+There is no documented upper bound to this so it could cause a timeout on the ESP.
+
+You can set any I2C bus speed via `i2c.setup` and you don't have to stick to the predefined values of `i2c.SLOW` etc
+A slower I2C bus speed means a higher timeout value.
+In my case, an I2C bus speed of 30000 (30 Khz) does the trick and I am getting reliable I2C interaction again.
+However, checking the ACK flag of the call back function is still highly recommended !
+### Workaround:
+Leave the firmware as it is and possibly add a cautionary note in the documentation of the i2c module.
+I can do that, but read further...
+
+### Suggestions:
+#### Add a parameter to `i2c.setup` to modify the default timeout value
+I find it a pity to have to use a slower I2C bus speed, just because one I2C peripheral chip may need some extra time to return results.
+I would rather keep the higher bus speed and adapt the timeout value.
+
+I have extended the `i2c.setup` function to accept a fifth, optional parameter as a (integer) timeout multiplier.
+I had to reduce the bus speed by three previously to get reliable operation, so now a x4 timeout multiplier should be enough.
+
+I can now call
+`i2c.setup( i2c.HW0, pinSDA, pinSCL, i2c.SLOW, 4 )`
+The timeout value is now 25 600 CPU clock cycles and I get reliable operations !
+
+#### Adapt `i2c.setup` to return a value
+By the way, `i2c.setup` does not return any value, contrary what the documentation states.
+I have also adapted this function to return the I2C bus speed for the `i2c.SW` interface or the timeout value for the `i2c.HW0/1` interfaces.
+
+#### Adapt `i2c.read` to standard I2C multibyte read practice
+ By the way also, standard I2C practice for a multi byte read is to have the master (receiver) ACK'ing each byte except the last.
+The ESP-SDK does this but the the glue routines from lua double-guess this with the end result of ACK'ing the last byte.
+Not really according to specifications, but it still works, most likely because the I2C slave will stop sending data after seeing an bus STOP condition.
+
+For compliance's sake, I have also adapted the `i2c.read` function to that effect.
+### Conclusion
+I hope this comments can help any others with similar issues.
+If it is of interest to the community, I can contribute my code and the updated documentation, via, I suppose, a GitHub fork, adapt and pull request.
+
+Let me know what you think of it.
+Fixes #2578.
+
+- [x] This PR is for the `dev` branch rather than for `master`.
+- [x] This PR is compliant with the [other contributing guidelines](https://github.com/nodemcu/nodemcu-firmware/blob/dev/CONTRIBUTING.md) as well (if not, please describe why).
+- [x] I have thoroughly tested my contribution.
+- [x] The code changes are reflected in the documentation at `docs/*`.
+
+\<Description of and rationale behind this PR\>
+Trying to add documentation for tls.cert.auth
+Please review and tell me if it is nonsens as I don't really know much about tls.
+
+https://github.com/espressif/ESP8266_NONOS_SDK/releases/tag/v3.0.1 is possibly are more stable version of what we currently use.
+- [x] This PR is for the `dev` branch rather than for `master`.
+- [x] This PR is compliant with the [other contributing guidelines](https://github.com/nodemcu/nodemcu-firmware/blob/dev/CONTRIBUTING.md) as well (if not, please describe why).
+- [ ] I have thoroughly tested my contribution.
+- [x] The code changes are reflected in the documentation at `docs/*`.
+
+These are addressing #3004, but there is a long way to go.  Still, open PRs early and often!
+As per #2938 and in solidarity with #3004, this file is basically a random subset of lwip and needs to go away.  That's going to take some fairly deep surgery, but we'll be better for it.
+As far as I can tell, anyway, these things are just obstruction, rather than abstraction, over lwip.  See, for example, the damage they cause with #2987: it is neither obvious nor documented that `espconn_gethostbyname` passes the espconn structure as the callback argument, and even if it were, it's also not obvious that this could be cast back to the `lmqtt_userdata` structure of which it is the first member.  We should just be calling `dns_gethostbyname` ourselves and passing the appropriate lua object to the callback.
+
+Am I missing something and espconn is actually useful?  If not, I think I will propose that we attempt to excise it from our tree.
+### Actual behavior
+Build fails in Docker:
+```
+Generating esp32.project.ld
+/bin/sh: 1: /opt/nodemcu-firmware/components/base_nodemcu//add_rodata_ld.sh: not found
+/opt/nodemcu-firmware/components/base_nodemcu/Makefile.projbuild:13: recipe for target '/opt/nodemcu-firmware/build/base_nodemcu/ld_patched' failed
+make[1]: *** [/opt/nodemcu-firmware/build/base_nodemcu/ld_patched] Error 127
+make[1]: Leaving directory '/opt/nodemcu-firmware'
+Makefile:18: recipe for target 'all' failed
+make: *** [all] Error 2
+```
+```
+ Directory of D:\Home\ESP32\nodemcu-firmware\components\base_nodemcu
+
+04.01.2020  12:22    <DIR>          .
+04.01.2020  12:22    <DIR>          ..
+04.01.2020  01:48               575 add_rodata_ld.sh
+04.01.2020  01:48                 0 component.mk
+04.01.2020  12:22    <DIR>          include
+04.01.2020  01:48             2 347 ip_fmt.c
+04.01.2020  01:48               689 Kconfig
+04.01.2020  12:22    <DIR>          ld
+04.01.2020  01:48             1 845 lextra.c
+04.01.2020  01:48             4 342 linit.c
+04.01.2020  01:48             6 165 lnodeaux.c
+04.01.2020  13:49               519 Makefile.projbuild
+04.01.2020  01:48             8 711 uart.c
+04.01.2020  01:48             4 831 user_main.c
+              10 File(s)         30 024 bytes
+               4 Dir(s)  98 434 908 160 bytes free
+```
+Since the file is there, I thought it's because of the double slash in the path `base_nodemcu//add_rodata_ld.sh` and I wrapped `BASE_NODEMCU_DIR` with `$(abspath)` in the `Makefile.projbuild`:
+```
+BASE_NODEMCU_DIR:=$(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+```
+Double slash has gone but the build is still failing:
+```
+Generating esp32.project.ld
+/bin/sh: 1: /opt/nodemcu-firmware/components/base_nodemcu/add_rodata_ld.sh: not found
+/opt/nodemcu-firmware/components/base_nodemcu/Makefile.projbuild:13: recipe for target '/opt/nodemcu-firmware/build/base_nodemcu/ld_patched' failed
+make[1]: *** [/opt/nodemcu-firmware/build/base_nodemcu/ld_patched] Error 127
+make[1]: Leaving directory '/opt/nodemcu-firmware'
+Makefile:18: recipe for target 'all' failed
+make: *** [all] Error 2
+```
+
+### Versions
+Windows 10 Enterprise 1909 x64
+Docker desktop: 2.1.0.5 (40693)
+Git branch: dev-esp32
+Latest commit: bfd22591
+### Expected behavior
+Compiling with ``` #define I2C_MASTER_OLD_VERSION```  commented out should enable usage of new I2C driver.
+### Actual behavior
+Code does not compile with error thrown:
+```C
+CC app/driver/i2c_master.c
+i2c_master.c: In function 'i2c_master_setDC':
+i2c_master.c:176:62: error: value computed is not used [-Werror=unused-value]
+             READ_PERI_REG(RTC_GPIO_IN_DATA) & 1; asm volatile("nop;nop;nop;nop;");
+                                                              ^
+cc1: all warnings being treated as errors
+../../Makefile:422: recipe for target '.output/eagle/debug/obj/i2c_master.o' failed
+make[2]: *** [.output/eagle/debug/obj/i2c_master.o] Error 1
+make[2]: Leaving directory '/opt/nodemcu-firmware/app/driver'
+../Makefile:380: recipe for target '.subdirs' failed
+make[1]: *** [.subdirs] Error 2
+make[1]: Leaving directory '/opt/nodemcu-firmware/app'
+Makefile:380: recipe for target '.subdirs' failed
+make: *** [.subdirs] Error 2
+make: Leaving directory '/opt/nodemcu-firmware'
+```
+### Test code
+``` //#define I2C_MASTER_OLD_VERSION``` on `user_config.h`
+
+### NodeMCU version
+commit 8c08e7648d5a0e98e3e293e36ec7e73b31958874 (HEAD -> dev, origin/dev)
+
+### Hardware
+docker nodemcu-build
+
+
+### Missing feature
+An easy way to generate `app/include/user_*.h` from config presets that can inherit and override each other. At the very minimum, let's do that Debian priority config thingy where a bash script sources all `[0-9][0-9][0-9]*.rc` from some directory in alphabetical order. (And I say bash because in that case we should use a config dictionary, not export top level environment variables.)
+
+### Justification
+Look at the sed commands in [nodemcu-custom-build](https://github.com/marcelstoer/nodemcu-custom-build/blob/master/set-config.sh). They're clearly a cry for help. While I might help with making the sed stuff more readable, I'd prefer we dig deeper, to the root of the problem.
+
+### Workarounds
+I'm currently trying to roll my own 3rd party config wizard, but with the current user header files approach it's a mess to even confirm compatibility of firmware and wizard versions.
+
+### My approach
+… would be to combine this with #2989, add a top-level directory `build-config.default` with some lua files that describe available options, and a top-level directory `build-config.custom` where users can put numbered subdirs with numbered config override lua files. (Having the subdirs should make it easier to docker-mount or symlink independent config patch collections without messing up their internal numbering.)
+Since I'm new to LUA, in case LUA turns out too cumbersome, I might use python or bash as a temporary draft just so we have a better basis to talk about.
+Would that be a good start?

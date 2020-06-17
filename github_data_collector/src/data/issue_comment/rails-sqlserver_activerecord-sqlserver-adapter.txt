@@ -1,0 +1,227 @@
+I've fixed the logic. I would happily alter the unit tests but I couldn't see any for this class?
+I'm not really sure what the fix is, so I'll describe the symptom and my resolution.
+
+At some point I had added a `default_scope { order(primary_key => :ASC) }` to all my sql server record. I didn't recall why until I accidentally removed it, and our ci tests using `"metaskills/mssql-server-linux-rails@sha256:c00b768d0a201fcb6de3db90c1cfc468e57c913fc1369d59868f5be6e79ece17"` started failing. 
+
+```
+-- SELECT @@VERSION
+Microsoft SQL Server 2017 (RTM) - 14.0.1000.169 (X64)
+        Aug 22 2017 17:04:49
+        Copyright (C) 2017 Microsoft Corporation
+        Developer Edition (64-bit) on Linux (Ubuntu 16.04.3 LTS)
+```
+
+gem versions
+
+```
+    activerecord-sqlserver-adapter (5.1.6)
+    tiny_tds (2.1.2)
+```
+
+with
+
+```
+  TinyTds::Error: Invalid column name '"TicketNo", "UniqueID", "ItemNo"'.
+  ... ORDER BY [Tkscale].["TicketNo", "UniqueID", "ItemNo"] ASC ....
+```
+
+i.e. the table `Tkscale` has a composite primary key on the three fields `TicketNo", "UniqueID", "ItemNo"`  which is getting executed as a single key.
+
+Which is somewhat odd because I've defined the primary key in the record `self.primary_key = "UniqueID"`
+
+
+This was getting triggered where by a `find_by` query or a `where().take(1)` and I traced it from the rails query_methods 
+
+```
+ $HOME/.rvm/rubies/ruby-2.6.2/lib/ruby/gems/2.6.0/gems/activerecord-5.1.7/lib/active_record/connection_adapters/abstract/schema_statements.rb:142:in `primary_key'",
+ $HOME/.rvm/rubies/ruby-2.6.2/lib/ruby/gems/2.6.0/gems/activerecord-5.1.7/lib/active_record/connection_adapters/schema_cache.rb:41:in `primary_keys'",
+ $HOME/.rvm/rubies/ruby-2.6.2/lib/ruby/gems/2.6.0/gems/activerecord-sqlserver-adapter-5.1.6/lib/arel/visitors/sqlserver.rb:205:in `primary_Key_From_Table'",
+ $HOME/.rvm/rubies/ruby-2.6.2/lib/ruby/gems/2.6.0/gems/activerecord-sqlserver-adapter-5.1.6/lib/arel/visitors/sqlserver.rb:173:in `make_Fetch_Possible_And_Deterministic'",
+ $HOME/.rvm/rubies/ruby-2.6.2/lib/ruby/gems/2.6.0/gems/activerecord-sqlserver-adapter-5.1.6/lib/arel/visitors/sqlserver.rb:135:in `visit_Orders_And_Let_Fetch_Happen'",
+ $HOME/.rvm/rubies/ruby-2.6.2/lib/ruby/gems/2.6.0/gems/activerecord-sqlserver-adapter-5.1.6/lib/arel/visitors/sqlserver.rb:65:in `visit_Arel_Nodes_SelectStatement'",
+ $HOME/.rvm/rubies/ruby-2.6.2/lib/ruby/gems/2.6.0/gems/arel-8.0.0/lib/arel/visitors/reduce.rb:14:in `visit'",
+ $HOME/.rvm/rubies/ruby-2.6.2/lib/ruby/gems/2.6.0/gems/arel-8.0.0/lib/arel/visitors/reduce.rb:8:in `accept'",
+ $HOME/.rvm/rubies/ruby-2.6.2/lib/ruby/gems/2.6.0/gems/activerecord-5.1.7/lib/active_record/connection_adapters/abstract/database_statements.rb:12:in `to_sql'",
+ $HOME/.rvm/rubies/ruby-2.6.2/lib/ruby/gems/2.6.0/gems/activerecord-5.1.7/lib/active_record/connection_adapters/abstract/database_statements.rb:33:in `select_all'",
+ $HOME/.rvm/rubies/ruby-2.6.2/lib/ruby/gems/2.6.0/gems/activerecord-5.1.7/lib/active_record/connection_adapters/abstract/query_cache.rb:97:in `select_all'",
+ $HOME/.rvm/rubies/ruby-2.6.2/lib/ruby/gems/2.6.0/gems/activerecord-5.1.7/lib/active_record/querying.rb:39:in `find_by_sql'",
+ $HOME/.rvm/rubies/ruby-2.6.2/lib/ruby/gems/2.6.0/gems/activerecord-5.1.7/lib/active_record/relation.rb:678:in `exec_queries'",
+ $HOME/.rvm/rubies/ruby-2.6.2/lib/ruby/gems/2.6.0/gems/goldiloader-3.1.1/lib/goldiloader/active_record_patches.rb:35:in `exec_queries'",
+ $HOME/.rvm/rubies/ruby-2.6.2/lib/ruby/gems/2.6.0/gems/activerecord-5.1.7/lib/active_record/relation.rb:546:in `load'",
+ $HOME/.rvm/rubies/ruby-2.6.2/lib/ruby/gems/2.6.0/gems/activerecord-5.1.7/lib/active_record/relation.rb:255:in `records'",
+ $HOME/.rvm/rubies/ruby-2.6.2/lib/ruby/gems/2.6.0/gems/activerecord-5.1.7/lib/active_record/relation/finder_methods.rb:508:in `find_take'",
+ $HOME/.rvm/rubies/ruby-2.6.2/lib/ruby/gems/2.6.0/gems/activerecord-5.1.7/lib/active_record/relation/finder_methods.rb:100:in `take'",
+```
+
+to
+
+
+`require 'active_record/connection_adapters/sqlserver/schema_statements'`
+
+```ruby
+def primary_keys(table_name)
+  primaries = primary_keys_select(table_name)
+  primaries.present? ? primaries : identity_columns(table_name).map(&:name)
+end
+```
+
+as used by
+
+`require 'arel/visitors/sqlserver'`
+
+```ruby
+      def primary_Key_From_Table t
+        return unless t
+        column_name = @connection.schema_cache.primary_keys(t.name) ||
+          @connection.schema_cache.columns_hash(t.name).first.try(:second).try(:name)
+        column_name ? t[column_name] : nil
+      end
+```
+
+and was able to resolve by just patching the `primary_Key_From_Table` and leaving the `connection.schema_cache.primary_key` alone
+
+i.e.
+
+```diff
+require 'arel/visitors/sqlserver'
+module Arel
+  module Visitors
+    class SQLServer < Arel::Visitors::ToSql
+      private
+
+      def primary_Key_From_Table t
+        return unless t
++        #
++        # NOTE(BF): Always use the schema_cache.primary_key(table_name) to be get one key
++        # else we get generated sql with invalid order clauses
++        #   TinyTds::Error: Invalid column name '"TicketNo", "UniqueID", "ItemNo"'.
++        #   ... ORDER BY [Tkscale].["TicketNo", "UniqueID", "ItemNo"] ASC ....
++        #
+-        column_name = @connection.schema_cache.primary_keys(t.name) ||
++        column_name = @connection.schema_cache.primary_keys(t.name).try(:first) ||
+          @connection.schema_cache.columns_hash(t.name).first.try(:second).try(:name)
+        column_name ? t[column_name] : nil
+      end
+    end
+  end
+end
+```
+
+but that interacted poorly with table without a composite primary key, since it got the first character in the key name, (from pk.first), so instead, I patched `module ActiveRecord::ConnectionAdapters::SQLServer::SchemaStatements` or add to it `primary_key` with the diff below as compared to the ar schema statement
+
+```diff
+        def primary_key(table_name)
+          pk = primary_keys(table_name)
++          pk = suppress_composite_primary_key(pk, table_name)
+          pk = pk.first unless pk.size > 1
+          pk
+        end
+
++        # per https://github.com/rails/rails/blob/5-1-stable/activerecord/lib/active_record/attribute_methods/primary_key.rb#L130-L137
++        def suppress_composite_primary_key(pk, table_name)
++          return pk unless pk.size > 1
++
++          ActiveRecord::Base.logger.debug do
++            <<-WARNING.strip_heredoc
++            WARNING: Active Record does not support composite primary key.
++              #{table_name} has composite primary key. Composite primary key is ignored.
++              WARNING
++          end
++          pk[0..0]
++        end
+```
+
+
+Hi. @wpolicarpo
+
+Now, this gem's test is broken.
+It occurs a lot of `NoMethodError: undefined method split' for nil:NilClass` , because of Rails backtrace cleaner silences all backtrace.
+https://github.com/seattlerb/minitest/blob/15ed8e4ce504c8313058a1d6fc4918299be34328/lib/minitest/spec.rb#L12
+
+So, I use Rails backtrace in first commit.
+And next commit supresses minitest warning.
+
+But test fails with some `TinyTds::Error` yet.
+I will try to success the test in next pull request.
+The tiny_tds lib might return false on execute when the call fails.
+This caused exceptions when active? is called after the connection
+was lost.
+
+fixes #707
+Hi there,  
+We have connection issues in our production environment.  
+It is supposed to be an easy fix but we cannot safely rescue the exception because it is billed as an `ActiveRecord::StatementInvalid` exception.
+
+I add my exception translation where it is supposed to be. It is not feasible to emulate the same issue in tests so I simply don't add any test.
+
+Hopes you guys could release a quick fix version soon.
+Does tinytds -v 0.7.0 running on ruby 1.9.3,rails 3.x support sql server -v 2019 ? It worked for me till sql server -v2017 but not beyond that. 
+ My activerecord-sqlserver-adapter version is 3.2.18
+Included #710 changes from @serkaniyigun 
+Since rails 6.0 has been released, I changed the gem depency from rails ~>6.0 beta3 to ~> 6.0
+
+Tests are failing: 
+`TinyTds::Error: Cannot insert explicit value for identity column in table [tasks] when IDENTITY_INSERT is set to OFF`
+
+This could be as simple as setting IDENTITY_INSERT to ON/OFF. Doesn't help with activerecord tests that fail. 
+`before do`
+`    connection.execute("SET IDENTITY_INSERT on [table] ON;")`
+`   ...`
+`after do `
+`  connection.execute("SET IDENTITY_INSERT [table] OFF;") `
+`  .... `
+I'm currently attempting to get the master branch tests to work as there are a bunch of tests that are failing.  I have managed to resolve many of the errors in test/cases folder, but it appears the errors I'm now getting are mostly ActiveRecord tests from coerced_tests.rb that haven't been implemented.  My knowledge on how to resolve some of these at this point is very limited due to I've not collaborated on many projects.  What's the best way to share my current cloned project changes to allow others in assisting fixing these?  Creating a pull request?
+
+**Current Status**
+```
+$ bundle exec rake test ONLY_SQLSERVER=1
+
+Finished in 13.108786s, 17.9269 runs/s, 110.0026 assertions/s.
+235 runs, 1442 assertions, 0 failures, 0 errors, 1 skips
+
+$ bundle exec rake test ONLY_ACTIVERECORD=1
+
+Finished in 138.995701s, 37.7494 runs/s, 107.3702 assertions/s.
+5247 runs, 14924 assertions, 0 failures, 13 errors, 3 skips
+```
+
+An example of a test I tried to correct from one of the 13 errors mentioned above would be the one below:
+
+```
+  coerce_tests! :test_pluck_with_from_includes_quoted_original_table_name
+  def test_pluck_with_from_includes_quoted_original_table_name_coerced
+    relations = Post.joins(:author).order(:id)
+    subquery = Post.from("#{Post.quoted_table_name} /*! USE INDEX (PRIMARY) */").includes(:author).order(:id)
+    assert_equal relations.pluck(:id), subquery.pluck(:id)
+  end
+```
+
+```
+Error:
+RelationTest#test_pluck_with_from_includes_quoted_original_table_name_coerced:
+ActiveRecord::StatementInvalid: TinyTds::Error: Ambiguous column name 'id'.: SELECT [id] FROM [posts] /*! USE INDEX (PRIMARY) */ LEFT OUTER JOIN [authors] ON [authors].[id] = [posts].[author_id]  ORDER BY [id] ASC
+
+bin/rails test mnt/c/Users/mcdonaldd/Documents/open_source/sqlserver-main/test/cases/coerced_tests.rb:763
+```
+
+Now to my knowledge I'd expect having to change the following line... 
+
+`assert_equal relations.pluck(:id), subquery.pluck(:id)`
+
+to 
+
+`assert_equal relations.pluck(:id), subquery.pluck('authors.id')`
+
+But, I'm not sure if that really tests for what it's intended to test for...  So this is where I'm currently stuck.
+
+**Actual Questions:**
+
+I've covered a couple of things here so I'll summarize into these two questions...
+
+1. What's the best way for me to share my current changes so that others might be able to assist me in correcting these tests?  Can I do a pull request with the changes even though nothing is really totally resolved?
+
+2. What would be the approach to fixing the new test I added:
+RelationTest#test_pluck_with_from_includes_quoted_original_table_name_coerced
+
+As I would expect the Ambiguous column 'id' name error if I had not specified which table the id column was supposed to come from...
+

@@ -1,0 +1,98 @@
+Currently there is a method available to filter logged requests:
+`ignoreRequests(matchingPredicate predicate: NSPredicate)`
+
+The goal here is to create a method with the same idea to filter responses that are logged into console.
+
+Motivation - I've integrated the library into the app and instantly deintegrated it due to amount of logged stuff that became totally unreadable. Single logs are really useful and readable, but I want to filter only responses that failed for some reason to investigate possible bugs.
+As libxml cannot be imported to Swift directly, ResponseDetective currently uses `RDTBodyDeserializer`, `RDTXMLBodyDeserializer` and `RDTHTMLBodyDeserializer` types, thus making its unwanted Objective-C nature public.
+
+Ideally, I'd like to remove all traces of Objective-C files from the project. This could be achieved in a couple of ways:
+
+1. Use an Objective-C libxml wrapper as an external framework and import it directly in Swift. This is the worst solution because it adds an unwanted third-party dependency to ResponseDetective.
+
+2. Create a project-private libxml wrapper as a separate framework and import it directly in Swift. This is better than the 1st solution, but adds a lot of unwanted complexity, especially with header search paths, linking and module maps.
+
+3. Use a project-private module (not to be mistaken with framework) that exposes needed libxml functionalities internally to ResponseDetective, but no further. This is the best solution.
+
+Assuming the 3rd solution is chosen, the proposed implementation would consist of the following files:
+
+- A `.m` file that uses libxml and contains implementation of XML and HTML pretty-printing,
+- A non-public `.h` file that contains interface of above implementation,
+- A `.modulemap` file that defines a module including the above header.
+
+As a result, ResponseDetective could `import XMLPrettyPrinting` (exemplary name of module) directly and use refined-for-Swift APIs without them leaking to the outside world.
+Currently ResponseDetective prints `<none>` for bodies in the following situations:
+
+1. when the body is empty, i.e. has 0 bytes;
+2. and when the body cannot be deserialized, i.e. has an unsupported content-type.
+
+The 2nd situation might be confusing as `<none>` might suggest that a request has an empty body.
+
+The proposal is to improve handling of empty and non-deserializable bodies in the following way:
+
+1. for empty bodies → print `<empty>`;
+2. for non-deserializable bodies → print `<unrecognizable x bytes>`.
+
+In addition, other non-raw bodies, such as `1px × 1px image` for `image/*` content-type, should also be wrapped in triangular brackets (i.e. `<1px × 1px image>`) so that it can be distinguished from plain text bodies with similar contents.
+ResponseDetective should support `multipart/form-data` requests, deserializing each data segment as if they were at the root level.
+
+The output of body section should provide information on all segments:
+
+```none
+Segment 0
+ ├─ Headers
+ │ Content-Type: image/png
+ │ Content-Disposition: form-data; name="foo"; filename="image.png"
+ ├─ Body
+ │ 10px × 10px image
+
+Segment 1
+ ├─ Headers
+ │ Content-Disposition: form-data; name="bar"
+ ├─ Body
+ │ baz
+
+Segment 2
+ ├─ Headers
+ │ Content-Type: application/octet-stream
+ │ Content-Disposition: form-data; name="qux"
+ ├─ Body
+ │ <none>
+```
+Logging long request/response bodies may block the main thread significantly. Logging should be moved to background thread.
+Using a custom `URLProtocol` subclass to intercept HTTP(S) traffic surely results in being a good citizen, but, as a way to debug apps, it comes with disadvantages:
+
+1. First of all, the architecture of `URLProtocol` requires the subclasses to operate on static levels, essentially making them singletons. This has an implication that only one interception mechanism can exist at a time, even when using multiple `URLSession`s.
+
+2. Using `URLProtocol` that internally uses another `URLSession` prevents users of ResponseDetective from using their custom `URLSession` subclasses or even `URLSessionDelegate`s. Since `URLProtocol` doesn't have access to the custom delegates, issues line #2 emerge.
+
+The alternative to using a custom `URLProtocol` is to use swizzling to create a trampoline of `URLSessionDelegate` that would have the following advantages:
+
+1. There can be multiple instances of interceptors, one per each `URLSession` instance. This makes them more configurable and even more testable. This resolves the first problem of `URLProtocol`.
+
+2. Since the trampoline of `URLSessionDelegate` would bounce back to the "original" delegate set by user, users will still be able to customize the behavior of `URLSession` directly (even by subclassing it). This resolves the second problem of `URLProtocol` and #2.
+
+3. Swizzling doesn't require users to pass custom `URLSessionConfiguration`s to `URLSession`s during initialization, which enables them to inject ResponseDetective at any time to any existing instance of `URLSession`.
+
+4. Swizzling can optionally be done globally during application launch, which would enable users to inject ResponseDetective to `URLSession` instances _they do not own_. This would enable them to debug traffic in third-party dependencies.
+
+As seen above, using swizzling may eventually be a better, more customizable and safer implementation of ResponseDetective.
+I have to use server with invalid SSL certificate for development. So I set up Alamofire manager to skipping SSL verification with this code (applicable for `NSURLSession` too):
+
+```
+manager.delegate.sessionDidReceiveChallenge = { session, challenge in
+    if challenge.protectionSpace.authenticationMethod == "NSURLAuthenticationMethodServerTrust" {
+        return (.UseCredential, NSURLCredential(forTrust: challenge.protectionSpace.serverTrust))
+    }
+
+    return (.PerformDefaultHandling, nil)
+}
+```
+
+When I try to use your library with this setup, communication is interrupted and this line is printed out:
+
+```
+NSURLConnection/CFURLConnection HTTP load failed (kCFStreamErrorDomainSSL, -9814)
+```
+
+So is possible to use your library with skipped certificate verification?
